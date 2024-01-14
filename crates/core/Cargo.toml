@@ -1,23 +1,18 @@
 [package]
-name = "redis-rover"
+name = "redis-rover-core"
 version = "0.1.0"
 edition = "2021"
 authors = ["Daniil Trotsenko <daniil.trotsenko.dev@gmail.com>"]
 readme = "README.md"
 keywords = ["redis", "tui", "cli", "terminal"]
 categories = ["command-line-utilities"]
-documentation = "https://docs.rs/redis-rover"
+documentation = "https://docs.rs/redis-rover-core"
 homepage = "https://github.com/danik-tro/redis-rover"
 repository = "https://github.com/danik-tro/redis-rover"
 license = "MIT"
 description = "A Redis terminal-ui client written in rust 🦀"
 rust-version = "1.72"
 
-[[bin]]
-bench = false
-path = "src/main.rs"
-name = "rrover"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[workspace]
-resolver = "2"
-members = ["crates/core"]
+[dependencies]
