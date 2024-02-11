@@ -1,37 +1,17 @@
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
-use redis_rover::app::{App, AppResult};
-use redis_rover::event::{Event, EventHandler};
-use redis_rover::handler::handle_key_events;
-use redis_rover::tui::Tui;
-use std::io;
+use redis_rover::errors;
+use redis_rover::termination::{create_termination, Interrupted};
 
 #[tokio::main]
-async fn main() -> AppResult<()> {
-    // Create an application.
-    let mut app = App::new();
+async fn main() -> color_eyre::Result<()> {
+    errors::install_hooks()?;
 
-    // Initialize the terminal user interface.
-    let backend = CrosstermBackend::new(io::stderr());
-    let terminal = Terminal::new(backend)?;
-    let events = EventHandler::new(250);
-    let mut tui = Tui::new(terminal, events);
-    tui.init()?;
+    let (terminator, mut interrupt_rx) = create_termination();
 
-    // Start the main loop.
-    while app.running {
-        // Render the user interface.
-        tui.draw(&mut app)?;
-        // Handle events.
-        match tui.events.next().await? {
-            Event::Tick => app.tick(),
-            Event::Key(key_event) => handle_key_events(key_event, &mut app)?,
-            Event::Mouse(_) => {}
-            Event::Resize(_, _) => {}
+    if let Ok(reason) = interrupt_rx.recv().await {
+        match reason {
+            Interrupted::UserInt => println!("exited per user request"),
+            Interrupted::OsSigInt => println!("exited because of an os sig int"),
         }
     }
-
-    // Exit the user interface.
-    tui.exit()?;
     Ok(())
 }
