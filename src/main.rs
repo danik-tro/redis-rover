@@ -5,7 +5,7 @@ use redis_rover::termination::{create_termination, Interrupted};
 async fn main() -> color_eyre::Result<()> {
     errors::install_hooks()?;
 
-    let (terminator, mut interrupt_rx) = create_termination();
+    let (_terminator, mut interrupt_rx) = create_termination();
 
     if let Ok(reason) = interrupt_rx.recv().await {
         match reason {
