@@ -36,7 +36,3 @@ redis = { version = "0.24.0", default-features = false, features = ["aio", "toki
 bench = false
 path = "src/main.rs"
 name = "rrover"
-
-[workspace]
-resolver = "2"
-members = ["crates/core"]
