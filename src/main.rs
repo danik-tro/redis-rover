@@ -5,11 +5,12 @@
 pub mod action;
 pub mod app;
 pub mod cli;
-pub mod components;
 pub mod config;
 pub mod mode;
+pub mod redis_client;
 pub mod tui;
 pub mod utils;
+pub mod widgets;
 
 use clap::Parser;
 use cli::Cli;
