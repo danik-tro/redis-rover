@@ -42,7 +42,7 @@ tracing = "0.1.37"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "serde"] }
 
-redis = { version = "0.25.3", default-features = false, features = ["aio", "tokio-comp"]}
+redis = { version = "0.25.3", default-features = false, features = ["aio", "tokio-comp", "connection-manager"]}
 
 [build-dependencies]
 vergen = { version = "8.2.6", features = [ "build", "git", "gitoxide", "cargo" ]}

@@ -1,29 +1,51 @@
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
+
 use color_eyre::eyre::Result;
 use crossterm::event::KeyEvent;
 use ratatui::{
+    layout::Layout,
     prelude::Rect,
     style::Stylize,
-    widgets::{Block, StatefulWidget, Widget},
+    widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
     Frame,
 };
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use crate::{action::Action, config::Config, mode::Mode, tui, widgets::home::Home};
+use crate::{
+    action::Action,
+    config::Config,
+    mode::Mode,
+    redis_client::runner::Runner,
+    tui,
+    widgets::{
+        home::Home,
+        summary::{Summary, SummaryWidget},
+    },
+};
 
 pub struct AppWidget;
 
 pub struct App {
-    pub home: Home,
-    pub config: Config,
-    pub tick_rate: f64,
-    pub frame_rate: f64,
-    pub should_quit: bool,
-    pub should_suspend: bool,
-    pub mode: Mode,
-    pub last_tick_key_events: Vec<KeyEvent>,
+    home: Home,
+    config: Config,
+
+    tick_rate: f64,
+    frame_rate: f64,
+
+    should_quit: bool,
+    mode: Mode,
+    last_tick_key_events: Vec<KeyEvent>,
+
     tx: mpsc::UnboundedSender<Action>,
     rx: mpsc::UnboundedReceiver<Action>,
+
+    summary: Summary,
 }
 
 impl App {
@@ -34,12 +56,14 @@ impl App {
         let home = Home::default();
         let mode = Mode::Home;
 
+        let summary = Summary::new(Arc::new(Mutex::new(None)), tx.clone());
+
         Ok(Self {
+            summary,
             home,
             tick_rate,
             frame_rate,
             should_quit: false,
-            should_suspend: false,
             config,
             mode,
             last_tick_key_events: Vec::new(),
@@ -49,11 +73,22 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let cancellation_token = CancellationToken::new();
+
         let mut tui = tui::Tui::new()?
             .tick_rate(self.tick_rate)
-            .frame_rate(self.frame_rate);
+            .frame_rate(self.frame_rate)
+            .cancelation_token(cancellation_token);
+
         // tui.mouse(true);
         tui.enter()?;
+
+        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let manager = ConnectionManager::new(client).await.unwrap();
+
+        let mut watcher = Runner::new(manager.clone(), self.summary.info());
+
+        watcher.start();
 
         loop {
             if let Some(e) = tui.next().await {
@@ -150,11 +185,24 @@ impl StatefulWidget for AppWidget {
 
     fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer, state: &mut Self::State) {
         Block::default()
-            .bg(ratatui::style::Color::Rgb(18, 74, 72))
+            .bg(ratatui::style::Color::from_str("#282936").unwrap())
             .render(area, buf);
 
-        match state.mode {
-            Mode::Home => state.home.render(area, buf),
-        }
+        use ratatui::layout::Constraint;
+
+        let [header, main, footer, _] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
+        StatefulWidget::render(SummaryWidget, header, buf, &mut state.summary);
+        Block::default()
+            .bg(ratatui::style::Color::from_str("#382936").unwrap())
+            .title("MODE: Home")
+            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+            .render(footer, buf);
     }
 }

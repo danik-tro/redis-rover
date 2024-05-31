@@ -45,7 +45,7 @@ pub enum Event {
 
 pub struct Tui {
     pub terminal: ratatui::Terminal<Backend<IO>>,
-    pub task: JoinHandle<()>,
+    pub event_task: JoinHandle<()>,
     pub cancellation_token: CancellationToken,
     pub event_rx: UnboundedReceiver<Event>,
     pub event_tx: UnboundedSender<Event>,
@@ -62,12 +62,13 @@ impl Tui {
         let terminal = ratatui::Terminal::new(Backend::new(io()))?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
-        let task = tokio::spawn(async {});
+        let event_task = tokio::spawn(async {});
+
         let mouse = false;
         let paste = false;
         Ok(Self {
             terminal,
-            task,
+            event_task,
             cancellation_token,
             event_rx,
             event_tx,
@@ -88,6 +89,11 @@ impl Tui {
         self
     }
 
+    pub fn cancelation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
+    }
+
     pub fn mouse(mut self, mouse: bool) -> Self {
         self.mouse = mouse;
         self
@@ -102,22 +108,23 @@ impl Tui {
         let tick_delay = std::time::Duration::from_secs_f64(1.0 / self.tick_rate);
         let render_delay = std::time::Duration::from_secs_f64(1.0 / self.frame_rate);
 
-        self.cancel();
-        self.cancellation_token = CancellationToken::new();
-        let _cancellation_token = self.cancellation_token.clone();
+        let tui_cancelation_token = self.cancellation_token.clone();
+
         let _event_tx = self.event_tx.clone();
 
-        self.task = tokio::spawn(async move {
+        self.event_task = tokio::spawn(async move {
             let mut reader = crossterm::event::EventStream::new();
             let mut tick_interval = tokio::time::interval(tick_delay);
             let mut render_interval = tokio::time::interval(render_delay);
+
             _event_tx.send(Event::Init).unwrap();
+
             loop {
                 let tick_delay = tick_interval.tick();
                 let render_delay = render_interval.tick();
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
-                  _ = _cancellation_token.cancelled() => {
+                  _ = tui_cancelation_token.cancelled() => {
                     break;
                   }
                   maybe_event = crossterm_event => {
@@ -166,11 +173,11 @@ impl Tui {
     pub fn stop(&self) -> Result<()> {
         self.cancel();
         let mut counter = 0;
-        while !self.task.is_finished() {
+        while !self.event_task.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
             counter += 1;
             if counter > 50 {
-                self.task.abort();
+                self.event_task.abort();
             }
             if counter > 100 {
                 log::error!("Failed to abort task in 100 milliseconds for unknown reason");
@@ -211,18 +218,6 @@ impl Tui {
 
     pub fn cancel(&self) {
         self.cancellation_token.cancel();
-    }
-
-    pub fn suspend(&mut self) -> Result<()> {
-        self.exit()?;
-        #[cfg(not(windows))]
-        signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
-        Ok(())
-    }
-
-    pub fn resume(&mut self) -> Result<()> {
-        self.enter()?;
-        Ok(())
     }
 
     pub async fn next(&mut self) -> Option<Event> {
