@@ -1,11 +1,10 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-
 pub mod action;
 pub mod app;
 pub mod cli;
+pub mod command;
 pub mod config;
+pub mod keybindings;
+mod mappings;
 pub mod mode;
 pub mod redis_client;
 pub mod tui;
@@ -18,7 +17,7 @@ use color_eyre::eyre::Result;
 
 use crate::{
     app::App,
-    utils::{initialize_logging, initialize_panic_handler, version},
+    utils::{initialize_logging, initialize_panic_handler},
 };
 
 async fn tokio_main() -> Result<()> {
