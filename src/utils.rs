@@ -18,6 +18,7 @@ const VERSION_MESSAGE: &str = concat!(
     ")"
 );
 
+// TODO: get rid of the lazy_static. Replace with a native OnceLock/OnceCell
 lazy_static! {
     pub static ref PROJECT_NAME: String = env!("CARGO_CRATE_NAME").to_uppercase().to_string();
     pub static ref DATA_FOLDER: Option<PathBuf> =

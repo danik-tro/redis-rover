@@ -150,7 +150,7 @@ impl App {
             None
         };
 
-        Ok(maybe_action)
+        Ok(maybe_action.map(Into::into))
     }
 
     fn handle_action(&mut self, action: Action, tui: &mut tui::Tui) -> Result<Option<Action>> {
