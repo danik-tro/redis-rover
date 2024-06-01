@@ -53,7 +53,7 @@ impl Runner {
 
                         match info_res {
                             Ok(redis_info) => *info.lock().unwrap() = Some(redis_info),
-                            Err(err) => {
+                            Err(_err) => {
                                 // TODO: show the popup
                             },
                         }
