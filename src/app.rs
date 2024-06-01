@@ -9,11 +9,9 @@ use ratatui::{
     layout::Layout,
     prelude::Rect,
     style::Stylize,
-    widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
-    Frame,
+    widgets::{Block, Borders, StatefulWidget, Widget},
 };
 use redis::aio::ConnectionManager;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -190,7 +188,7 @@ impl StatefulWidget for AppWidget {
 
         use ratatui::layout::Constraint;
 
-        let [header, main, footer, _] = Layout::vertical([
+        let [header, _main, footer, _] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Fill(1),
             Constraint::Length(1),

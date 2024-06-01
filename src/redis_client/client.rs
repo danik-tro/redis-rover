@@ -1,6 +1,6 @@
 use color_eyre::eyre::Result;
 
-use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection};
+use redis::aio::ConnectionManager;
 
 use super::types::RedisInfo;
 
