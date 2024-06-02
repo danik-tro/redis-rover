@@ -6,10 +6,11 @@ use std::{
 use color_eyre::eyre::Result;
 use crossterm::event::KeyEvent;
 use ratatui::{
-    layout::Layout,
+    buffer::Buffer,
+    layout::{Flex, Layout},
     prelude::Rect,
     style::Stylize,
-    widgets::{Block, Borders, StatefulWidget, Widget},
+    widgets::{Block, StatefulWidget, Tabs, Widget},
 };
 use redis::aio::ConnectionManager;
 use tokio::sync::mpsc;
@@ -23,7 +24,8 @@ use crate::{
     tui,
     widgets::{
         home::Home,
-        summary::{Summary, SummaryWidget},
+        info::{Info, InfoWidget},
+        tabs::SelectedTab,
     },
 };
 
@@ -43,7 +45,8 @@ pub struct App {
     tx: mpsc::UnboundedSender<Action>,
     rx: mpsc::UnboundedReceiver<Action>,
 
-    summary: Summary,
+    summary: Info,
+    selected_tab: SelectedTab,
 }
 
 impl App {
@@ -54,7 +57,8 @@ impl App {
         let home = Home::default();
         let mode = Mode::Home;
 
-        let summary = Summary::new(Arc::new(Mutex::new(None)), tx.clone());
+        let summary = Info::new(Arc::new(Mutex::new(None)));
+        let selected_tab = SelectedTab::default();
 
         Ok(Self {
             summary,
@@ -67,6 +71,7 @@ impl App {
             last_tick_key_events: Vec::new(),
             tx,
             rx,
+            selected_tab,
         })
     }
 
@@ -181,26 +186,39 @@ impl App {
 impl StatefulWidget for AppWidget {
     type State = App;
 
-    fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer, state: &mut Self::State) {
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         Block::default()
             .bg(ratatui::style::Color::from_str("#282936").unwrap())
             .render(area, buf);
 
         use ratatui::layout::Constraint;
 
-        let [header, _main, footer, _] = Layout::vertical([
-            Constraint::Length(3),
+        let [tabs, main, footer] = Layout::vertical([
+            Constraint::Min(15),
             Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
+        .flex(Flex::Center)
         .areas(area);
 
-        StatefulWidget::render(SummaryWidget, header, buf, &mut state.summary);
-        Block::default()
-            .bg(ratatui::style::Color::from_str("#382936").unwrap())
-            .title("MODE: Home")
-            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-            .render(footer, buf);
+        state.render_tabs(tabs, buf);
+
+        StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
+    }
+}
+
+impl App {
+    fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
+        use strum::IntoEnumIterator;
+        let titles = SelectedTab::iter().map(|tab| tab.title());
+        let highlight_style = SelectedTab::highlight_style();
+
+        let selected_tab_index = self.selected_tab as usize;
+        Tabs::new(titles)
+            .highlight_style(highlight_style)
+            .select(selected_tab_index)
+            .padding("", "")
+            .divider(" ")
+            .render(area, buf);
     }
 }
