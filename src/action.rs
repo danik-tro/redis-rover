@@ -6,8 +6,11 @@ pub enum Action {
     Tick,
     Render,
     Resize(u16, u16),
-    Quit,
     Refresh,
     Error(String),
     Help,
+    // Commands actions
+    Quit,
+    NextTab,
+    PreviousTab,
 }
