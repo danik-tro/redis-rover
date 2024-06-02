@@ -55,7 +55,7 @@ impl App {
         let config = Config::new()?;
 
         let home = Home::default();
-        let mode = Mode::Home;
+        let mode = Mode::Info;
 
         let summary = Info::new(Arc::new(Mutex::new(None)));
         let selected_tab = SelectedTab::default();
@@ -132,28 +132,22 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
-        let maybe_action = if let Some(keymap) = self.config.keybindings.get(&self.mode) {
-            if let Some(action) = keymap.get(&vec![key]) {
-                log::info!("Got action: {action:?}");
-                Some(action.clone())
-            } else {
-                // If the key was not handled as a single key action,
-                // then consider it for multi-key combinations.
-                self.last_tick_key_events.push(key);
+        let action = self.handle_keybindings(key);
+        Ok(action.map(Into::into))
+    }
 
-                // Check for multi-key combinations
-                if let Some(action) = keymap.get(&self.last_tick_key_events) {
-                    log::info!("Got action: {action:?}");
-                    Some(action.clone())
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    fn handle_keybindings(&mut self, key: KeyEvent) -> Option<Action> {
+        self.last_tick_key_events.push(key);
 
-        Ok(maybe_action.map(Into::into))
+        self.config
+            .keybindings
+            .event_to_command(self.mode, &self.last_tick_key_events)
+            .or_else(|| {
+                self.config
+                    .keybindings
+                    .event_to_command(Mode::Common, &self.last_tick_key_events)
+            })
+            .map(Into::into)
     }
 
     fn handle_action(&mut self, action: Action, tui: &mut tui::Tui) -> Result<Option<Action>> {
@@ -167,6 +161,8 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => self.resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
+            Action::NextTab => self.next_tab(),
+            Action::PreviousTab => self.next_tab(),
             _ => {}
         }
 
@@ -207,6 +203,7 @@ impl StatefulWidget for AppWidget {
     }
 }
 
+/// Render logic
 impl App {
     fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
         use strum::IntoEnumIterator;
@@ -220,5 +217,32 @@ impl App {
             .padding("", "")
             .divider(" ")
             .render(area, buf);
+    }
+}
+
+/// Handling events logic
+impl App {
+    fn next_tab(&mut self) {
+        match self.mode {
+            Mode::Info => self.switch_mode(Mode::KeySpace),
+            Mode::KeySpace => self.switch_mode(Mode::Info),
+            Mode::Common => self.switch_mode(Mode::Info),
+        }
+    }
+
+    fn switch_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+
+        match self.mode {
+            Mode::Info => {
+                self.selected_tab.select(SelectedTab::Info);
+            }
+            Mode::KeySpace => {
+                self.selected_tab.select(SelectedTab::KeySpace);
+            }
+            Mode::Common => {
+                self.selected_tab.select(SelectedTab::Info);
+            }
+        }
     }
 }
