@@ -1,0 +1,67 @@
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style, Stylize},
+    symbols,
+    text::Line,
+    widgets::{Block, Borders, Padding, Paragraph, Widget},
+};
+use strum::{Display, EnumIter, FromRepr};
+
+#[derive(Debug, Default, Clone, Copy, Display, FromRepr, EnumIter)]
+pub enum SelectedTab {
+    #[default]
+    Info,
+    KeySpace,
+}
+
+impl SelectedTab {
+    pub fn select(&mut self, selected_tab: SelectedTab) {
+        *self = selected_tab
+    }
+
+    pub fn highlight_style() -> Style {
+        Style::default()
+            .fg("#282936".parse().unwrap())
+            .bg("#00f769".parse().unwrap())
+            .bold()
+    }
+}
+
+impl Widget for &SelectedTab {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        match self {
+            SelectedTab::Info => self.render_tab_info(area, buf),
+            SelectedTab::KeySpace => self.render_tab_key_space(area, buf),
+        }
+    }
+}
+
+impl SelectedTab {
+    pub fn title(&self) -> Line<'static> {
+        match self {
+            _ => format!("  {self}  ")
+                .fg("#62d6e8".parse::<Color>().unwrap())
+                .bg("#282936".parse().unwrap())
+                .into(),
+        }
+    }
+
+    fn render_tab_info(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new("Info").block(self.block()).render(area, buf)
+    }
+
+    fn render_tab_key_space(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new("Key Space")
+            .block(self.block())
+            .render(area, buf)
+    }
+
+    fn block(&self) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(symbols::border::PLAIN)
+            .padding(Padding::horizontal(1))
+            .border_style("#626483".parse::<Color>().unwrap())
+    }
+}

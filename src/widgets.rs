@@ -1,2 +1,3 @@
 pub mod home;
-pub mod summary;
+pub mod info;
+pub mod tabs;
