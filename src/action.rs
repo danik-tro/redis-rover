@@ -13,4 +13,12 @@ pub enum Action {
     Quit,
     NextTab,
     PreviousTab,
+    PreviousMode,
+    EnterCmd,
+    Ignore,
+    ScrollDown,
+    ScrollUp,
+    LoadKeySpace,
+    RefreshSpace,
+    LoadKeysIntoKeySpace,
 }

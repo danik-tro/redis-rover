@@ -6,4 +6,10 @@ pub enum Command {
     Quit,
     NextTab,
     PreviousTab,
+    EnterCmd,
+    PreviousMode,
+    ScrollDown,
+    ScrollUp,
+    RefreshSpace,
+    Ignore,
 }
