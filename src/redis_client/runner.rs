@@ -1,55 +1,103 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::time::Duration;
 
-use color_eyre::eyre::Result;
 use redis::aio::ConnectionManager;
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::broadcast::{self, Sender},
+    sync::mpsc::UnboundedSender,
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
-use super::{client::redis_info, types::RedisInfo};
+use crate::{action::Action, state::SharedState};
+
+use super::{client, event::RedisEvent};
+
+const BROADCAST_CAPACITY: usize = 50;
 
 pub struct Runner {
     cancelation_token: CancellationToken,
     manager: ConnectionManager,
-    info: Arc<Mutex<Option<RedisInfo>>>,
 
+    state: SharedState,
     info_task: JoinHandle<()>,
+
+    action_tx: UnboundedSender<Action>,
+    tx: Sender<RedisEvent>,
 }
 
 impl Runner {
-    pub fn new(manager: ConnectionManager, info: Arc<Mutex<Option<RedisInfo>>>) -> Self {
+    pub fn new(
+        manager: ConnectionManager,
+        state: SharedState,
+        action_tx: UnboundedSender<Action>,
+    ) -> Self {
         let info_task = tokio::spawn(async {});
         let cancelation_token = CancellationToken::new();
 
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+
         Self {
             manager,
-            info,
             info_task,
             cancelation_token,
+            action_tx,
+            tx,
+            state,
         }
     }
 
+    #[must_use]
     pub fn cancelation_token(mut self, token: CancellationToken) -> Self {
         self.cancelation_token = token;
         self
     }
 
+    pub fn tx(&self) -> Sender<RedisEvent> {
+        self.tx.clone()
+    }
+
     pub fn start(&mut self) {
-        let tick: Duration = std::time::Duration::from_secs_f64(2.0);
-        let cancelation_token = self.cancelation_token.clone();
+        self.launch_refresh_info_task();
+        self.launch_refresh_state_task()
+    }
+
+    fn launch_refresh_state_task(&mut self) {
         let manager = self.manager.clone();
-        let info = self.info.clone();
+        let cancelation_token = self.cancelation_token.clone();
+
+        let action_tx = self.action_tx.clone();
+        let mut rx = self.tx.subscribe();
+        let state = self.state.clone();
+
+        tokio::spawn(async move {
+            let mut event_handler = EventHandler::new(state, action_tx, manager);
+
+            loop {
+                tokio::select! {
+                    Ok(event) = rx.recv() => {
+                        event_handler.handle(event).await;
+                    },
+                    _ = cancelation_token.cancelled() => {
+                        break;
+                    },
+                }
+            }
+        });
+    }
+
+    fn launch_refresh_info_task(&mut self) {
+        let tick: Duration = std::time::Duration::from_secs_f64(2.0);
+        let info = self.state.info.clone();
+        let mut manager = self.manager.clone();
+        let cancelation_token = self.cancelation_token.clone();
 
         self.info_task = tokio::spawn(async move {
             let mut refresh_interval = tokio::time::interval(tick);
-            let mut manager = manager;
 
             loop {
                 tokio::select! {
                     _ = refresh_interval.tick() => {
-                        let info_res = redis_info(&mut manager).await;
+                        let info_res = client::redis_info(&mut manager).await;
 
                         match info_res {
                             Ok(redis_info) => *info.lock().unwrap() = Some(redis_info),
@@ -65,26 +113,39 @@ impl Runner {
             }
         });
     }
+}
 
-    pub fn stop(&self) -> Result<()> {
-        self.cancel();
+pub struct EventHandler {
+    state: SharedState,
+    tx: UnboundedSender<Action>,
+    manager: ConnectionManager,
+}
 
-        let mut counter = 0;
-        while !self.info_task.is_finished() {
-            std::thread::sleep(Duration::from_millis(1));
-            counter += 1;
-            if counter > 50 {
-                self.info_task.abort();
-            }
-            if counter > 100 {
-                log::error!("Failed to abort task in 100 milliseconds for unknown reason");
-                break;
-            }
-        }
-        Ok(())
+impl EventHandler {
+    fn new(state: SharedState, tx: UnboundedSender<Action>, manager: ConnectionManager) -> Self {
+        Self { state, tx, manager }
     }
 
-    pub fn cancel(&self) {
-        self.cancelation_token.cancel();
+    async fn handle(&mut self, event: RedisEvent) {
+        match event {
+            RedisEvent::FetchKeys { cursor, pattern } => {
+                match client::keys(&mut self.manager, cursor, pattern).await {
+                    Ok((_cursor, keys)) => {
+                        let mut store = self.state.keys.lock().unwrap();
+                        _ = std::mem::replace(&mut *store, keys);
+                        self.action_hook(Action::LoadKeysIntoKeySpace);
+                    }
+                    Err(_) => {
+                        todo!("TODO: implement error popup")
+                    }
+                }
+            }
+        }
+    }
+
+    fn action_hook(&self, action: Action) {
+        if let Err(err) = self.tx.send(action) {
+            log::debug!("failed to send action hook: {err:?}");
+        }
     }
 }

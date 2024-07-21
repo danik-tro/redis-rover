@@ -47,3 +47,9 @@ impl RedisInfo {
         )
     }
 }
+
+pub struct KeysPagination {
+    pub cursor: Option<String>,
+    pub pattern: Option<String>,
+    pub count: usize,
+}
