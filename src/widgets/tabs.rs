@@ -1,12 +1,14 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style, Stylize},
+    style::{Style, Stylize},
     symbols,
     text::Line,
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 use strum::{Display, EnumIter, FromRepr};
+
+use crate::config;
 
 #[derive(Debug, Default, Clone, Copy, Display, FromRepr, EnumIter)]
 pub enum SelectedTab {
@@ -22,8 +24,8 @@ impl SelectedTab {
 
     pub fn highlight_style() -> Style {
         Style::default()
-            .fg("#282936".parse().unwrap())
-            .bg("#00f769".parse().unwrap())
+            .fg(config::get().colors.base00)
+            .bg(config::get().colors.base0a)
             .bold()
     }
 }
@@ -41,8 +43,8 @@ impl SelectedTab {
     pub fn title(&self) -> Line<'static> {
         match self {
             _ => format!("  {self}  ")
-                .fg("#62d6e8".parse::<Color>().unwrap())
-                .bg("#282936".parse().unwrap())
+                .fg(config::get().colors.base04)
+                .bg(config::get().colors.base00)
                 .into(),
         }
     }
@@ -62,6 +64,6 @@ impl SelectedTab {
             .borders(Borders::ALL)
             .border_set(symbols::border::PLAIN)
             .padding(Padding::horizontal(1))
-            .border_style("#626483".parse::<Color>().unwrap())
+            .border_style(config::get().colors.base03)
     }
 }
