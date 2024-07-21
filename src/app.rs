@@ -3,28 +3,32 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::{config, redis_client::event::RedisEvent, state::SharedState};
 use color_eyre::eyre::Result;
 use crossterm::event::KeyEvent;
 use ratatui::{
     buffer::Buffer,
     layout::{Flex, Layout},
     prelude::Rect,
-    style::Stylize,
-    widgets::{Block, StatefulWidget, Tabs, Widget},
+    style::{Modifier, Style, Stylize},
+    symbols::border::Set,
+    widgets::{Block, Borders, Clear, List, ListState, StatefulWidget, Tabs, Widget},
 };
 use redis::aio::ConnectionManager;
-use tokio::sync::mpsc;
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     action::Action,
-    config::Config,
     mode::Mode,
     redis_client::runner::Runner,
     tui,
     widgets::{
-        home::Home,
         info::{Info, InfoWidget},
+        keyspace::{KeySpace, KeySpaceWidget},
         tabs::SelectedTab,
     },
 };
@@ -32,66 +36,68 @@ use crate::{
 pub struct AppWidget;
 
 pub struct App {
-    home: Home,
-    config: Config,
+    state: SharedState,
 
     tick_rate: f64,
     frame_rate: f64,
 
-    should_quit: bool,
     mode: Mode,
+    previous_mode: Option<Mode>,
+
+    should_quit: bool,
     last_tick_key_events: Vec<KeyEvent>,
 
     tx: mpsc::UnboundedSender<Action>,
     rx: mpsc::UnboundedReceiver<Action>,
 
+    redis_tx: broadcast::Sender<RedisEvent>,
     summary: Info,
+    keyspace: KeySpace,
     selected_tab: SelectedTab,
 }
 
 impl App {
-    pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let config = Config::new()?;
+    pub fn new(
+        state: SharedState,
+        tx: UnboundedSender<Action>,
+        rx: UnboundedReceiver<Action>,
+        redis_tx: broadcast::Sender<RedisEvent>,
+        tick_rate: f64,
+        frame_rate: f64,
+    ) -> Result<Self> {
+        let _ = config::get();
 
-        let home = Home::default();
         let mode = Mode::Info;
 
-        let summary = Info::new(Arc::new(Mutex::new(None)));
+        let summary = Info::new(state.info.clone());
         let selected_tab = SelectedTab::default();
+        let keyspace = KeySpace::new(Vec::new());
 
         Ok(Self {
+            state,
             summary,
-            home,
+            keyspace,
             tick_rate,
             frame_rate,
             should_quit: false,
-            config,
             mode,
+            previous_mode: None,
             last_tick_key_events: Vec::new(),
             tx,
             rx,
+            redis_tx,
             selected_tab,
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        let cancellation_token = CancellationToken::new();
-
+    pub async fn run(&mut self, cancellation_token: CancellationToken) -> Result<()> {
         let mut tui = tui::Tui::new()?
             .tick_rate(self.tick_rate)
             .frame_rate(self.frame_rate)
-            .cancelation_token(cancellation_token);
+            .cancelation_token(cancellation_token.clone());
 
         // tui.mouse(true);
         tui.enter()?;
-
-        let client = redis::Client::open("redis://localhost:6379").unwrap();
-        let manager = ConnectionManager::new(client).await.unwrap();
-
-        let mut watcher = Runner::new(manager.clone(), self.summary.info());
-
-        watcher.start();
 
         loop {
             if let Some(e) = tui.next().await {
@@ -132,6 +138,11 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match self.mode {
+            Mode::Cmd => self.summary.handle_key(key),
+            _ => {}
+        }
+
         let action = self.handle_keybindings(key);
         Ok(action.map(Into::into))
     }
@@ -139,11 +150,11 @@ impl App {
     fn handle_keybindings(&mut self, key: KeyEvent) -> Option<Action> {
         self.last_tick_key_events.push(key);
 
-        self.config
+        config::get()
             .keybindings
             .event_to_command(self.mode, &self.last_tick_key_events)
             .or_else(|| {
-                self.config
+                config::get()
                     .keybindings
                     .event_to_command(Mode::Common, &self.last_tick_key_events)
             })
@@ -163,6 +174,13 @@ impl App {
             Action::Render => self.draw(tui)?,
             Action::NextTab => self.next_tab(),
             Action::PreviousTab => self.next_tab(),
+            Action::EnterCmd => self.enter_cmd_mode(),
+            Action::PreviousMode => self.switch_to_previous_mode(),
+            Action::LoadKeySpace => self.load_keyspace(),
+            Action::RefreshSpace => self.refresh_space(),
+            Action::LoadKeysIntoKeySpace => self.load_new_keys(),
+            Action::ScrollDown => self.scroll_down(),
+            Action::ScrollUp => self.scroll_up(),
             _ => {}
         }
 
@@ -184,22 +202,22 @@ impl StatefulWidget for AppWidget {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         Block::default()
-            .bg(ratatui::style::Color::from_str("#282936").unwrap())
+            .bg(config::get().colors.base00)
             .render(area, buf);
 
         use ratatui::layout::Constraint;
 
         let [tabs, main, footer] = Layout::vertical([
-            Constraint::Min(15),
-            Constraint::Fill(1),
-            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Percentage(100),
+            Constraint::Length(4),
         ])
         .flex(Flex::Center)
         .areas(area);
 
         state.render_tabs(tabs, buf);
-
         StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
+        state.render_main_block(main, buf);
     }
 }
 
@@ -215,8 +233,19 @@ impl App {
             .highlight_style(highlight_style)
             .select(selected_tab_index)
             .padding("", "")
-            .divider(" ")
+            .divider("")
             .render(area, buf);
+    }
+
+    fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
+        match self.mode {
+            Mode::KeySpace => self.render_key_space(area, buf),
+            _ => {}
+        }
+    }
+
+    fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
+        StatefulWidget::render(KeySpaceWidget, area, buf, &mut self.keyspace);
     }
 }
 
@@ -227,10 +256,33 @@ impl App {
             Mode::Info => self.switch_mode(Mode::KeySpace),
             Mode::KeySpace => self.switch_mode(Mode::Info),
             Mode::Common => self.switch_mode(Mode::Info),
+            Mode::Cmd | Mode::Popup(_) => self.switch_to_previous_mode(),
+        }
+    }
+
+    fn enter_cmd_mode(&mut self) {
+        self.previous_mode = Some(self.mode);
+        self.mode = Mode::Cmd;
+
+        self.summary.enter_cmd();
+    }
+
+    fn reset_inputs(&mut self) {
+        if self.mode.is_cmd() {
+            self.summary.exit_cmd();
+        }
+    }
+
+    fn switch_to_previous_mode(&mut self) {
+        self.reset_inputs();
+
+        if let Some(ref mut m) = self.previous_mode.or(Some(Mode::Info)) {
+            std::mem::swap(&mut self.mode, m);
         }
     }
 
     fn switch_mode(&mut self, mode: Mode) {
+        self.previous_mode = Some(self.mode);
         self.mode = mode;
 
         match self.mode {
@@ -243,6 +295,53 @@ impl App {
             Mode::Common => {
                 self.selected_tab.select(SelectedTab::Info);
             }
+            Mode::Cmd | Mode::Popup(_) => {}
+        }
+        self.on_switch_mode();
+    }
+
+    fn on_switch_mode(&self) {
+        if let Mode::KeySpace = self.mode {
+            if let Err(err) = self.tx.send(Action::LoadKeySpace) {
+                log::error!("Failed to send redis event: {err:?}");
+            }
+        }
+    }
+
+    fn load_new_keys(&mut self) {
+        self.keyspace
+            .set_keys(self.state.keys.lock().unwrap().clone());
+    }
+
+    fn load_keyspace(&self) {
+        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys {
+            cursor: Some(0),
+            pattern: Some("*".to_string()),
+        }) {
+            log::error!("Failed to send redis event: {err:?}");
+        }
+    }
+
+    fn refresh_space(&self) {
+        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys {
+            cursor: Some(0),
+            pattern: Some("*".to_string()),
+        }) {
+            log::error!("Failed to send redis event: {err:?}");
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        match self.mode {
+            Mode::KeySpace => self.keyspace.scroll_next(),
+            _ => {}
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        match self.mode {
+            Mode::KeySpace => self.keyspace.scroll_previous(),
+            _ => {}
         }
     }
 }
