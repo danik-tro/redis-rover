@@ -1,13 +1,19 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::OnceLock};
 
 use color_eyre::eyre::Result;
 use derive_deref::{Deref, DerefMut};
 use ratatui::style::{Color, Modifier, Style};
-use serde::{de::Deserializer, Deserialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
 
 use crate::{keybindings::KeyBindings, mode::Mode};
 
-const CONFIG: &str = include_str!("../.config/config.json5");
+const CONFIG_PATH: &str = include_str!("../.config/config.json5");
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+pub fn get() -> &'static Config {
+    CONFIG.get_or_init(|| Config::new().expect("Configuration file is not set."))
+}
 
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct AppConfig {
@@ -25,11 +31,13 @@ pub struct Config {
     pub keybindings: KeyBindings,
     #[serde(default)]
     pub styles: Styles,
+    #[serde(default)]
+    pub colors: Base16Palette,
 }
 
 impl Config {
     pub fn new() -> Result<Self, config::ConfigError> {
-        let default_config: Config = json5::from_str(CONFIG).unwrap();
+        let default_config: Config = json5::from_str(CONFIG_PATH).unwrap();
         let data_dir = crate::utils::get_data_dir();
         let config_dir = crate::utils::get_config_dir();
         let mut builder = config::Config::builder()
@@ -77,7 +85,100 @@ impl Config {
             }
         }
 
+        cfg.colors = default_config.colors;
+
         Ok(cfg)
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Base16Palette {
+    /// Default Background
+    #[serde_as(as = "DisplayFromStr")]
+    pub base00: Color,
+
+    /// Lighter Background (Used for status bars, line number and folding marks)
+    #[serde_as(as = "DisplayFromStr")]
+    pub base01: Color,
+
+    /// Selection Background (Settings where you need to highlight text, such as find results)
+    #[serde_as(as = "DisplayFromStr")]
+    pub base02: Color,
+
+    /// Comments, Invisibles, Line Highlighting
+    #[serde_as(as = "DisplayFromStr")]
+    pub base03: Color,
+
+    /// Dark Foreground (Used for status bars)
+    #[serde_as(as = "DisplayFromStr")]
+    pub base04: Color,
+
+    /// Default Foreground, Caret, Delimiters, Operators
+    #[serde_as(as = "DisplayFromStr")]
+    pub base05: Color,
+
+    /// Light Foreground (Not often used, could be used for hover states or dividers)
+    #[serde_as(as = "DisplayFromStr")]
+    pub base06: Color,
+
+    /// Light Background (Probably at most for cursor line background color)
+    #[serde_as(as = "DisplayFromStr")]
+    pub base07: Color,
+
+    /// Variables, XML Tags, Markup Link Text, Markup Lists, Diff Deleted
+    #[serde_as(as = "DisplayFromStr")]
+    pub base08: Color,
+
+    /// Integers, Boolean, Constants, XML Attributes, Markup Link Url
+    #[serde_as(as = "DisplayFromStr")]
+    pub base09: Color,
+
+    /// Classes, Keywords, Storage, Selector, Markup Italic, Diff Changed
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0a: Color,
+
+    /// Strings, Inherited Class, Markup Code, Diff Inserted
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0b: Color,
+
+    /// Support, Regular Expressions, Escape Characters, Markup Quotes
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0c: Color,
+
+    /// Functions, Methods, Attribute IDs, Headings
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0d: Color,
+
+    /// Keywords, Storage, Selector, Markup Bold, Diff Renamed
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0e: Color,
+
+    /// Deprecated, Opening/Closing Embedded Language Tags e.g., `<? ?>`
+    #[serde_as(as = "DisplayFromStr")]
+    pub base0f: Color,
+}
+
+impl Default for Base16Palette {
+    fn default() -> Self {
+        Self {
+            base00: Color::from_str("#191724").unwrap(),
+            base01: Color::from_str("#1f1d2e").unwrap(),
+            base02: Color::from_str("#26233a").unwrap(),
+            base03: Color::from_str("#6e6a86").unwrap(),
+            base04: Color::from_str("#908caa").unwrap(),
+            base05: Color::from_str("#e0def4").unwrap(),
+            base06: Color::from_str("#e0def4").unwrap(),
+            base07: Color::from_str("#524f67").unwrap(),
+            base08: Color::from_str("#eb6f92").unwrap(),
+            base09: Color::from_str("#f6c177").unwrap(),
+            base0a: Color::from_str("#ebbcba").unwrap(),
+            base0b: Color::from_str("#31748f").unwrap(),
+            base0c: Color::from_str("#9ccfd8").unwrap(),
+            base0d: Color::from_str("#c4a7e7").unwrap(),
+            base0e: Color::from_str("#f6c177").unwrap(),
+            base0f: Color::from_str("#524f67").unwrap(),
+        }
     }
 }
 
