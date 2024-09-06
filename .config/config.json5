@@ -18,6 +18,8 @@
       "j": "ScrollDown",
       "k": "ScrollUp",
       "r": "RefreshSpace",
+      "n": "LoadNextPage",
+      "p": "LoadPreviousPage",
     },
   },
   "colors": {
@@ -37,5 +39,14 @@
     "base0d": "#62d6e8",
     "base0e": "#b45bcf",
     "base0f": "#00f769",
+  },
+  "keyspace": {
+    "string": "#600CC0",
+    "hash": "#5861FF",
+    "list": "#51CBCA",
+    "zset": "#D62DFF",
+    "set": "#F08A10",
+    "json": "#324466",
+    "unknown": "#f71638",
   }
 }
