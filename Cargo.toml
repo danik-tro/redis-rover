@@ -17,34 +17,35 @@ build = "build.rs"
 
 [dependencies]
 better-panic = "0.3.0"
-clap = { version = "4.4.5", features = ["derive", "cargo", "wrap_help", "unicode", "string", "unstable-styles"] }
-color-eyre = "0.6.2"
+clap = { version = "4.5.17", features = ["derive", "cargo", "wrap_help", "unicode", "string", "unstable-styles"] }
+color-eyre = "0.6.3"
 config = "0.14.0"
 crossterm = { version = "0.28.1", features = ["serde", "event-stream"] }
 derive_deref = "1.1.1"
 directories = "5.0.1"
 futures = "0.3.28"
-human-panic = "2.0.0"
+human-panic = "2.0.1"
 json5 = "0.4.1"
-lazy_static = "1.4.0"
+lazy_static = "1.5.0"
 libc = "0.2.148"
 log = "0.4.20"
 pretty_assertions = "1.4.0"
 ratatui = { version = "0.28.1", features = ["serde", "macros"] }
 serde = { version = "1.0.188", features = ["derive"] }
-serde_json = "1.0.107"
+serde_json = "1.0.128"
 serde_with = "3.8.1"
 signal-hook = "0.3.17"
 strip-ansi-escapes = "0.2.0"
-strum = { version = "0.26.1", features = ["derive"] }
+strum = { version = "0.26.3", features = ["derive"] }
 itertools = "0.13.0"
-tokio = { version = "1.32.0", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }
 tokio-util = "0.7.9"
 tracing = "0.1.37"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "serde"] }
 
 redis = { version = "0.27.2", default-features = false, features = ["aio", "tokio-comp", "connection-manager"]}
+byte-unit = { version = "5.1.4", features = ["serde", "byte"], default-features = false}
 tui-input = "0.10.1"
 
 [build-dependencies]
@@ -54,5 +55,3 @@ vergen = { version = "8.2.6", features = [ "build", "git", "gitoxide", "cargo" ]
 bench = false
 path = "src/main.rs"
 name = "rrover"
-
-
