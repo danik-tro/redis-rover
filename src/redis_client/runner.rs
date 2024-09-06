@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{action::Action, state::SharedState};
 
-use super::{client, event::RedisEvent};
+use super::{client, event::RedisEvent, storage::Storage, types::KeysList};
 
 const BROADCAST_CAPACITY: usize = 50;
 
@@ -68,9 +68,10 @@ impl Runner {
         let action_tx = self.action_tx.clone();
         let mut rx = self.tx.subscribe();
         let state = self.state.clone();
+        let storage = Storage::new(manager);
 
         tokio::spawn(async move {
-            let mut event_handler = EventHandler::new(state, action_tx, manager);
+            let mut event_handler = EventHandler::new(state, action_tx, storage);
 
             loop {
                 tokio::select! {
@@ -118,21 +119,45 @@ impl Runner {
 pub struct EventHandler {
     state: SharedState,
     tx: UnboundedSender<Action>,
-    manager: ConnectionManager,
+    storage: Storage,
 }
 
 impl EventHandler {
-    fn new(state: SharedState, tx: UnboundedSender<Action>, manager: ConnectionManager) -> Self {
-        Self { state, tx, manager }
+    fn new(state: SharedState, tx: UnboundedSender<Action>, storage: Storage) -> Self {
+        Self { state, tx, storage }
     }
 
     async fn handle(&mut self, event: RedisEvent) {
         match event {
-            RedisEvent::FetchKeys { cursor, pattern } => {
-                match client::keys(&mut self.manager, cursor, pattern).await {
-                    Ok((_cursor, keys)) => {
+            RedisEvent::FetchKeys => {
+                let (cursor, pattern) = {
+                    let state = self.state.keyspace_state.lock().unwrap();
+
+                    (state.cursor, state.pattern.clone())
+                };
+
+                let keys = self
+                    .storage
+                    .fetch_keys_with_meta()
+                    .cursor(cursor)
+                    .pattern(pattern.as_deref())
+                    .execute()
+                    .await;
+
+                match keys {
+                    Ok(KeysList::Keys { cursor, keys }) => {
+                        {
+                            let mut state = self.state.keyspace_state.lock().unwrap();
+                            state.set_next_cursor(cursor);
+                        }
+
                         let mut store = self.state.keys.lock().unwrap();
                         _ = std::mem::replace(&mut *store, keys);
+                        self.action_hook(Action::LoadKeysIntoKeySpace);
+                    }
+                    Ok(KeysList::Empty) => {
+                        let mut store = self.state.keys.lock().unwrap();
+                        _ = std::mem::take(&mut *store);
                         self.action_hook(Action::LoadKeysIntoKeySpace);
                     }
                     Err(_) => {
