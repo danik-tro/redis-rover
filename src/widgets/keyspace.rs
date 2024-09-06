@@ -1,29 +1,46 @@
+use byte_unit::{Byte, Unit, UnitType};
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::Stylize,
-    text::Line,
+    text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, HighlightSpacing, Paragraph, Row, StatefulWidget, Table, TableState,
-        Widget,
+        Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, StatefulWidget, Table,
+        TableState, Widget, Wrap,
     },
 };
 
-use crate::config;
+use crate::{
+    config,
+    redis_client::types::{KeyMeta, RedisType},
+};
 
 pub struct KeySpace {
     table: TableState,
-    keys: Vec<String>,
+    keys: Vec<KeyMeta>,
+    cursor: Option<usize>,
+    pattern: Option<String>,
 }
 
 impl KeySpace {
-    pub fn new(keys: Vec<String>) -> Self {
+    pub fn new(keys: Vec<KeyMeta>) -> Self {
         Self {
             keys,
             table: TableState::default(),
+            cursor: None,
+            pattern: None,
         }
     }
 
-    pub fn set_keys(&mut self, keys: Vec<String>) {
+    pub fn refresh(&mut self) {
+        self.table.select(None);
+    }
+
+    pub fn update_filters(&mut self, pattern: Option<String>, cursor: Option<usize>) {
+        self.cursor = cursor;
+        self.pattern = pattern;
+    }
+
+    pub fn set_keys(&mut self, keys: Vec<KeyMeta>) {
         _ = std::mem::replace(&mut self.keys, keys);
     }
 
@@ -125,47 +142,122 @@ impl StatefulWidget for KeySpaceWidget {
         buf: &mut ratatui::prelude::Buffer,
         state: &mut Self::State,
     ) {
-        let [table_area, view_area] =
-            Layout::horizontal([Constraint::Percentage(33), Constraint::Fill(1)])
+        let [t_area, view_area] =
+            Layout::horizontal([Constraint::Percentage(20), Constraint::Fill(1)])
                 .flex(ratatui::layout::Flex::Center)
                 .areas(area);
 
-        let widths = [Constraint::Max(25)];
-        let header: Row<'_> = Row::new(["Key"].map(|h| Line::from(h.bold())))
+        Block::new()
+            .bg(config::get().colors.base00)
             .fg(config::get().colors.base04)
-            .bg(config::get().colors.base01)
-            .height(3);
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .borders(Borders::all())
+            .title("Keys")
+            .render(t_area, buf);
+
+        let [_, t_area, _] = Layout::horizontal([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(t_area);
+
+        Block::new()
+            .bg(config::get().colors.base00)
+            .fg(config::get().colors.base04)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .borders(Borders::all())
+            .title("Values")
+            .render(view_area, buf);
+
+        let [_, filter_area, table_area] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(2),
+            Constraint::Fill(3),
+        ])
+        .flex(ratatui::layout::Flex::SpaceAround)
+        .areas(t_area);
+
+        let [_, filter_area, _] = Layout::horizontal([
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(2),
+        ])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(filter_area);
+
+        let [cursor_size_are, pattern_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
+                .flex(ratatui::layout::Flex::Center)
+                .areas(filter_area);
+
+        let [cursor_area, size_area] = Layout::horizontal([Constraint::Min(1), Constraint::Min(1)])
+            .flex(ratatui::layout::Flex::Center)
+            .areas(cursor_size_are);
+
+        Paragraph::new(format!("Cursor: {}", state.cursor.unwrap_or_default()))
+            .bold()
+            .alignment(Alignment::Left)
+            .render(cursor_area, buf);
+
+        Paragraph::new("Size: 10")
+            .bold()
+            .alignment(Alignment::Right)
+            .render(size_area, buf);
+
+        Paragraph::new(format!(
+            "Pattern: {}",
+            state.pattern.as_deref().unwrap_or_else(|| "*")
+        ))
+        .bold()
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true })
+        .render(pattern_area, buf);
+
+        let widths = [
+            Constraint::Max(25),
+            Constraint::Max(25),
+            Constraint::Max(25),
+            Constraint::Max(25),
+        ];
+        let header: Row<'_> =
+            Row::new(["Type", "Key", "TTL(s)", "Size"].map(|h| Cell::from(h.bold())))
+                .top_margin(1)
+                .bottom_margin(1)
+                .fg(config::get().colors.base04)
+                .bg(config::get().colors.base02);
 
         let rows = state
             .keys
             .clone()
             .into_iter()
             .enumerate()
-            .map(|(idx, key)| {
-                Row::new([Line::from(key)])
-                    .fg(config::get().colors.base04)
-                    .bg(if idx % 2 == 0 {
-                        config::get().colors.base00
-                    } else {
-                        config::get().colors.base01
-                    })
+            .map(|(idx, meta)| {
+                Row::new([
+                    Cell::from(RedisType::from(meta.r_type)),
+                    Cell::from(meta.key),
+                    Cell::from(meta.ttl.to_string()),
+                    Cell::from(format!(
+                        "{:.2}",
+                        unsafe { Byte::from_u128_unsafe(meta.size) }
+                            .get_appropriate_unit(UnitType::Binary)
+                    )),
+                ])
+                .fg(config::get().colors.base04)
+                .bg(if idx % 2 == 0 {
+                    config::get().colors.base00
+                } else {
+                    config::get().colors.base01
+                })
             });
         let table: Table<'_> = Table::new(rows, widths)
             .header(header)
-            .block(
-                Block::new()
-                    .bg(config::get().colors.base00)
-                    .fg(config::get().colors.base04)
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .borders(Borders::all())
-                    .title("Keys"),
-            )
+            .flex(ratatui::layout::Flex::Center)
             .highlight_symbol(HIGHLIGHT_SYMBOL)
             .highlight_style(config::get().colors.base05)
-            .column_spacing(3)
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(table, table_area, buf, &mut state.table);
-        self.render_confirm_popup("Delete key?".into(), area, buf);
     }
 }

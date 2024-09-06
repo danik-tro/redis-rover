@@ -13,8 +13,8 @@ use crate::config;
 #[derive(Debug, Default, Clone, Copy, Display, FromRepr, EnumIter)]
 pub enum SelectedTab {
     #[default]
-    Info,
     KeySpace,
+    Info,
 }
 
 impl SelectedTab {
