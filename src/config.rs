@@ -33,6 +33,8 @@ pub struct Config {
     pub styles: Styles,
     #[serde(default)]
     pub colors: Base16Palette,
+    #[serde(default)]
+    pub keyspace: KeyspacePalette,
 }
 
 impl Config {
@@ -178,6 +180,45 @@ impl Default for Base16Palette {
             base0d: Color::from_str("#c4a7e7").unwrap(),
             base0e: Color::from_str("#f6c177").unwrap(),
             base0f: Color::from_str("#524f67").unwrap(),
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct KeyspacePalette {
+    #[serde_as(as = "DisplayFromStr")]
+    pub string: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub set: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub zset: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub hash: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub json: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub list: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
+    pub unknown: Color,
+}
+
+impl Default for KeyspacePalette {
+    fn default() -> Self {
+        Self {
+            string: Color::from_str("#600CC0").unwrap(),
+            set: Color::from_str("#F08A10").unwrap(),
+            zset: Color::from_str("#D62DFF").unwrap(),
+            json: Color::from_str("#324466").unwrap(),
+            hash: Color::from_str("#5861FF").unwrap(),
+            list: Color::from_str("#51CBCA").unwrap(),
+            unknown: Color::from_str("#f71638").unwrap(),
         }
     }
 }
