@@ -12,4 +12,6 @@ pub enum Command {
     ScrollUp,
     RefreshSpace,
     Ignore,
+    LoadNextPage,
+    LoadPreviousPage,
 }

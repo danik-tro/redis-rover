@@ -12,6 +12,8 @@ impl From<Command> for Action {
             Command::ScrollDown => Self::ScrollDown,
             Command::ScrollUp => Self::ScrollUp,
             Command::RefreshSpace => Self::RefreshSpace,
+            Command::LoadNextPage => Self::LoadNextPage,
+            Command::LoadPreviousPage => Self::LoadPreviousPage,
         }
     }
 }

@@ -21,4 +21,6 @@ pub enum Action {
     LoadKeySpace,
     RefreshSpace,
     LoadKeysIntoKeySpace,
+    LoadNextPage,
+    LoadPreviousPage,
 }
