@@ -1,20 +1,13 @@
-use std::{
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
-
 use crate::{config, redis_client::event::RedisEvent, state::SharedState};
 use color_eyre::eyre::Result;
-use crossterm::event::KeyEvent;
 use ratatui::{
     buffer::Buffer,
+    crossterm::event::KeyEvent,
     layout::{Flex, Layout},
     prelude::Rect,
-    style::{Modifier, Style, Stylize},
-    symbols::border::Set,
-    widgets::{Block, Borders, Clear, List, ListState, StatefulWidget, Tabs, Widget},
+    style::Stylize,
+    widgets::{Block, StatefulWidget, Tabs, Widget},
 };
-use redis::aio::ConnectionManager;
 use tokio::sync::{
     broadcast,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -24,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     action::Action,
     mode::Mode,
-    redis_client::runner::Runner,
     tui,
     widgets::{
         info::{Info, InfoWidget},
@@ -67,7 +59,7 @@ impl App {
     ) -> Result<Self> {
         let _ = config::get();
 
-        let mode = Mode::Info;
+        let mode = Mode::KeySpace;
 
         let summary = Info::new(state.info.clone());
         let selected_tab = SelectedTab::default();
@@ -100,6 +92,8 @@ impl App {
         tui.enter()?;
 
         loop {
+            // TODO: refactor with async_channel crate
+            // replace with select multiplex
             if let Some(e) = tui.next().await {
                 self.handle_event(e)?.map(|action| self.tx.send(action));
             }
@@ -181,6 +175,8 @@ impl App {
             Action::LoadKeysIntoKeySpace => self.load_new_keys(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
+            Action::LoadNextPage => self.load_next_page(),
+            Action::LoadPreviousPage => self.load_previous_page(),
             _ => {}
         }
 
@@ -191,7 +187,7 @@ impl App {
 
     fn draw(&mut self, tui: &mut tui::Tui) -> Result<()> {
         tui.draw(|frame| {
-            frame.render_stateful_widget(AppWidget, frame.size(), self);
+            frame.render_stateful_widget(AppWidget, frame.area(), self);
         })?;
         Ok(())
     }
@@ -308,25 +304,40 @@ impl App {
         }
     }
 
+    fn load_next_page(&mut self) {
+        {
+            let mut state = self.state.keyspace_state.lock().unwrap();
+            state.update_cursor();
+            self.keyspace
+                .update_filters(state.pattern.clone(), state.cursor);
+        }
+        self.refresh_space();
+    }
+
+    fn load_previous_page(&mut self) {
+        {
+            let mut state = self.state.keyspace_state.lock().unwrap();
+            state.set_previous_cursor();
+            self.keyspace
+                .update_filters(state.pattern.clone(), state.cursor);
+        }
+        self.refresh_space();
+    }
+
     fn load_new_keys(&mut self) {
         self.keyspace
             .set_keys(self.state.keys.lock().unwrap().clone());
     }
 
     fn load_keyspace(&self) {
-        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys {
-            cursor: Some(0),
-            pattern: Some("*".to_string()),
-        }) {
+        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys) {
             log::error!("Failed to send redis event: {err:?}");
         }
     }
 
-    fn refresh_space(&self) {
-        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys {
-            cursor: Some(0),
-            pattern: Some("*".to_string()),
-        }) {
+    fn refresh_space(&mut self) {
+        self.keyspace.refresh();
+        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys) {
             log::error!("Failed to send redis event: {err:?}");
         }
     }
