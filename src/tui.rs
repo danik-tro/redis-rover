@@ -24,7 +24,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub type IO = std::io::Stdout;
-pub type Frame<'a> = ratatui::Frame<'a>;
 
 pub fn io() -> IO {
     std::io::stdout()
