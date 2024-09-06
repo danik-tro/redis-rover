@@ -1,3 +1,11 @@
+use std::borrow::Cow;
+use std::collections::VecDeque;
+
+use crate::config;
+use ratatui::{
+    style::Stylize,
+    text::{Span, Text},
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,8 +56,104 @@ impl RedisInfo {
     }
 }
 
-pub struct KeysPagination {
-    pub cursor: Option<String>,
+#[derive(Debug, Clone)]
+pub struct KeyMeta {
+    pub key: String,
+    pub r_type: String,
+    pub size: u128,
+    pub ttl: isize,
+}
+
+pub enum KeysList {
+    Empty,
+    Keys { cursor: usize, keys: Vec<KeyMeta> },
+}
+
+#[derive(Debug)]
+pub enum RedisType {
+    Set,
+    List,
+    Hash,
+    Zset,
+    Json,
+    String,
+    Unknown,
+}
+
+impl RedisType {
+    fn from_str<'a>(value: Cow<'a, str>) -> Self {
+        match value.as_ref() {
+            "string" => Self::String,
+            "hash" => Self::Hash,
+            "set" => Self::Set,
+            "zset" => Self::Zset,
+            "json" => Self::Json,
+            "list" => Self::List,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl<'a> Into<Text<'a>> for RedisType {
+    fn into(self) -> Text<'a> {
+        match self {
+            Self::String => Span::raw(" STRING ")
+                .bg(config::get().keyspace.string)
+                .into(),
+            Self::Json => Span::raw(" JSON ").bg(config::get().keyspace.json).into(),
+            Self::List => Span::raw(" LIST ").bg(config::get().keyspace.list).into(),
+            Self::Set => Span::raw(" SET ").bg(config::get().keyspace.set).into(),
+            Self::Zset => Span::raw(" ZSET ").bg(config::get().keyspace.zset).into(),
+            Self::Hash => Span::raw(" HASH ").bg(config::get().keyspace.hash).into(),
+            Self::Unknown => Span::raw(" ? ").bg(config::get().keyspace.unknown).into(),
+        }
+    }
+}
+
+impl<'a, T> From<T> for RedisType
+where
+    T: Into<Cow<'a, str>>,
+{
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::from_str(value.into())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyspaceState {
+    pub cursor: Option<usize>,
+    pub next_cursor: Option<usize>,
     pub pattern: Option<String>,
     pub count: usize,
+    pub cursor_stack: VecDeque<usize>,
+}
+
+impl KeyspaceState {
+    pub fn set_next_cursor(&mut self, cursor: usize) {
+        self.next_cursor = Some(cursor);
+    }
+
+    pub fn update_cursor(&mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            self.cursor_stack.push_back(cursor);
+        }
+        self.cursor = self.next_cursor.take();
+    }
+
+    pub fn set_previous_cursor(&mut self) {
+        self.cursor = self.cursor_stack.pop_back();
+    }
+}
+
+impl Default for KeyspaceState {
+    fn default() -> Self {
+        Self {
+            count: 10,
+            pattern: None,
+            cursor: None,
+            next_cursor: None,
+            cursor_stack: VecDeque::new(),
+        }
+    }
 }

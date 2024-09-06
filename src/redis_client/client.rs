@@ -2,7 +2,7 @@ use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use super::types::RedisInfo;
+use super::types::{KeyMeta, RedisInfo};
 
 // TODO: should be a better solution to handle this.
 pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
@@ -40,4 +40,49 @@ pub async fn keys(
         .await?;
 
     Ok((cursor, keys))
+}
+
+pub async fn retrieve_type(
+    mut manager: redis::aio::ConnectionManager,
+    key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(manager.key_type(key).await?)
+}
+
+pub async fn retrieve_memory_usage(
+    mut manager: redis::aio::ConnectionManager,
+    key: &str,
+) -> Result<u128, Box<dyn std::error::Error + Send + Sync>> {
+    let size: Option<u128> = redis::cmd("MEMORY")
+        .arg("USAGE")
+        .arg(key)
+        .query_async(&mut manager)
+        .await?;
+
+    Ok(size.unwrap_or_default())
+}
+
+pub async fn retrieve_ttl(
+    mut manager: redis::aio::ConnectionManager,
+    key: &str,
+) -> Result<isize, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(manager.ttl(key).await?)
+}
+
+pub async fn fetch_meta(
+    manager: redis::aio::ConnectionManager,
+    key: &str,
+) -> Result<KeyMeta, Box<dyn std::error::Error + Sync + Send>> {
+    let (r_type, size, ttl) = tokio::try_join!(
+        retrieve_type(manager.clone(), key),
+        retrieve_memory_usage(manager.clone(), key),
+        retrieve_ttl(manager, key),
+    )?;
+
+    Ok(KeyMeta {
+        r_type,
+        size,
+        ttl,
+        key: key.into(),
+    })
 }
