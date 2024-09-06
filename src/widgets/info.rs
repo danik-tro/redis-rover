@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::KeyEvent;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{
+    crossterm::event::{Event, KeyEvent},
+    prelude::*,
+    widgets::*,
+};
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::{config, redis_client::types::RedisInfo};
@@ -22,7 +25,7 @@ impl Info {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        self.input.handle_event(&crossterm::event::Event::Key(key));
+        self.input.handle_event(&Event::Key(key));
     }
 
     pub fn clear(&mut self) {
