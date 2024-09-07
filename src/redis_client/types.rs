@@ -135,6 +135,10 @@ impl KeyspaceState {
     }
 
     pub fn update_cursor(&mut self) {
+        if self.next_cursor == Some(0) {
+            return;
+        }
+
         if let Some(cursor) = self.cursor.take() {
             self.cursor_stack.push_back(cursor);
         }
