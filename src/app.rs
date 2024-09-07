@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Flex, Layout},
     prelude::Rect,
     style::Stylize,
-    widgets::{Block, StatefulWidget, Tabs, Widget},
+    widgets::{Block, StatefulWidget, Widget},
 };
 use tokio::sync::{
     broadcast,
@@ -21,7 +21,6 @@ use crate::{
     widgets::{
         info::{Info, InfoWidget},
         keyspace::{KeySpace, KeySpaceWidget},
-        tabs::SelectedTab,
     },
 };
 
@@ -45,7 +44,6 @@ pub struct App {
     redis_tx: broadcast::Sender<RedisEvent>,
     summary: Info,
     keyspace: KeySpace,
-    selected_tab: SelectedTab,
 }
 
 impl App {
@@ -62,7 +60,6 @@ impl App {
         let mode = Mode::KeySpace;
 
         let summary = Info::new(state.info.clone());
-        let selected_tab = SelectedTab::default();
         let keyspace = KeySpace::new(Vec::new());
 
         Ok(Self {
@@ -78,7 +75,6 @@ impl App {
             tx,
             rx,
             redis_tx,
-            selected_tab,
         })
     }
 
@@ -132,9 +128,8 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
-        match self.mode {
-            Mode::Cmd => self.summary.handle_key(key),
-            _ => {}
+        if let Mode::Cmd = self.mode {
+            self.summary.handle_key(key);
         }
 
         let action = self.handle_keybindings(key);
@@ -166,8 +161,6 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => self.resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
-            Action::NextTab => self.next_tab(),
-            Action::PreviousTab => self.next_tab(),
             Action::EnterCmd => self.enter_cmd_mode(),
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::LoadKeySpace => self.load_keyspace(),
@@ -203,15 +196,11 @@ impl StatefulWidget for AppWidget {
 
         use ratatui::layout::Constraint;
 
-        let [tabs, main, footer] = Layout::vertical([
-            Constraint::Min(10),
-            Constraint::Percentage(100),
-            Constraint::Length(4),
-        ])
-        .flex(Flex::Center)
-        .areas(area);
+        let [main, footer] = Layout::vertical([Constraint::Percentage(100), Constraint::Length(4)])
+            .flex(Flex::Center)
+            .margin(1)
+            .areas(area);
 
-        state.render_tabs(tabs, buf);
         StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
         state.render_main_block(main, buf);
     }
@@ -219,20 +208,6 @@ impl StatefulWidget for AppWidget {
 
 /// Render logic
 impl App {
-    fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
-        use strum::IntoEnumIterator;
-        let titles = SelectedTab::iter().map(|tab| tab.title());
-        let highlight_style = SelectedTab::highlight_style();
-
-        let selected_tab_index = self.selected_tab as usize;
-        Tabs::new(titles)
-            .highlight_style(highlight_style)
-            .select(selected_tab_index)
-            .padding("", "")
-            .divider("")
-            .render(area, buf);
-    }
-
     fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
         match self.mode {
             Mode::KeySpace => self.render_key_space(area, buf),
@@ -247,15 +222,6 @@ impl App {
 
 /// Handling events logic
 impl App {
-    fn next_tab(&mut self) {
-        match self.mode {
-            Mode::Info => self.switch_mode(Mode::KeySpace),
-            Mode::KeySpace => self.switch_mode(Mode::Info),
-            Mode::Common => self.switch_mode(Mode::Info),
-            Mode::Cmd | Mode::Popup(_) => self.switch_to_previous_mode(),
-        }
-    }
-
     fn enter_cmd_mode(&mut self) {
         self.previous_mode = Some(self.mode);
         self.mode = Mode::Cmd;
@@ -272,35 +238,8 @@ impl App {
     fn switch_to_previous_mode(&mut self) {
         self.reset_inputs();
 
-        if let Some(ref mut m) = self.previous_mode.or(Some(Mode::Info)) {
+        if let Some(ref mut m) = self.previous_mode.or(Some(Mode::KeySpace)) {
             std::mem::swap(&mut self.mode, m);
-        }
-    }
-
-    fn switch_mode(&mut self, mode: Mode) {
-        self.previous_mode = Some(self.mode);
-        self.mode = mode;
-
-        match self.mode {
-            Mode::Info => {
-                self.selected_tab.select(SelectedTab::Info);
-            }
-            Mode::KeySpace => {
-                self.selected_tab.select(SelectedTab::KeySpace);
-            }
-            Mode::Common => {
-                self.selected_tab.select(SelectedTab::Info);
-            }
-            Mode::Cmd | Mode::Popup(_) => {}
-        }
-        self.on_switch_mode();
-    }
-
-    fn on_switch_mode(&self) {
-        if let Mode::KeySpace = self.mode {
-            if let Err(err) = self.tx.send(Action::LoadKeySpace) {
-                log::error!("Failed to send redis event: {err:?}");
-            }
         }
     }
 

@@ -11,8 +11,6 @@ pub enum Action {
     Help,
     // Commands actions
     Quit,
-    NextTab,
-    PreviousTab,
     PreviousMode,
     EnterCmd,
     Ignore,
