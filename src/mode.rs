@@ -11,7 +11,6 @@ pub enum PopupMode {
 pub enum Mode {
     Common,
     #[default]
-    Info,
     KeySpace,
     Cmd,
     Popup(PopupMode),

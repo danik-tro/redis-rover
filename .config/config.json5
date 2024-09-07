@@ -2,13 +2,7 @@
   "keybindings": {
     "Common": {
       "<Ctrl-c>": "Quit",
-      "<Tab>": "NextTab",
-      "<Shift-Tab>": "PreviousTab",
       "<:>": "EnterCmd", 
-    },
-    "Info": {
-      "<Ctrl-d>": "Quit", // Another way to quit
-
     },
     "Cmd": {
       "Esc": "PreviousMode",
