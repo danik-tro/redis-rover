@@ -48,7 +48,7 @@ redis = { version = "0.27.2", default-features = false, features = ["aio", "toki
 tui-input = "0.10.1"
 
 [build-dependencies]
-vergen = { version = "8.2.6", features = [ "build", "git", "gitoxide", "cargo" ]}
+vergen = { version = "9.0.0", features = [ "build", "git", "gitoxide", "cargo" ]}
 
 [[bin]]
 bench = false
