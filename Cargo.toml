@@ -50,8 +50,3 @@ tui-input = "0.10.1"
 
 [build-dependencies]
 vergen = { version = "8.2.6", features = [ "build", "git", "gitoxide", "cargo" ]}
-
-[[bin]]
-bench = false
-path = "src/main.rs"
-name = "rrover"
