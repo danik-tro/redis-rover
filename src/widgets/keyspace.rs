@@ -1,8 +1,7 @@
-use byte_unit::{Byte, Unit, UnitType};
+use byte_unit::{Byte, UnitType};
 use ratatui::{
-    layout::{Alignment, Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Margin},
     style::Stylize,
-    text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, StatefulWidget, Table,
         TableState, Widget, Wrap,
@@ -131,7 +130,7 @@ impl KeySpaceWidget {
     }
 }
 
-const HIGHLIGHT_SYMBOL: &str = " █ ";
+const HIGHLIGHT_SYMBOL: &str = " >> ";
 
 impl StatefulWidget for KeySpaceWidget {
     type State = KeySpace;
@@ -143,25 +142,19 @@ impl StatefulWidget for KeySpaceWidget {
         state: &mut Self::State,
     ) {
         let [t_area, view_area] =
-            Layout::horizontal([Constraint::Percentage(20), Constraint::Fill(1)])
+            Layout::horizontal([Constraint::Percentage(25), Constraint::Fill(1)])
                 .flex(ratatui::layout::Flex::Center)
                 .areas(area);
 
-        Block::new()
+        let space_block = Block::new()
             .bg(config::get().colors.base00)
             .fg(config::get().colors.base04)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .borders(Borders::all())
-            .title("Keys")
-            .render(t_area, buf);
+            .title("Keys");
 
-        let [_, t_area, _] = Layout::horizontal([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(t_area);
+        let table_area = space_block.inner(t_area);
+        space_block.render(t_area, buf);
 
         Block::new()
             .bg(config::get().colors.base00)
@@ -171,26 +164,25 @@ impl StatefulWidget for KeySpaceWidget {
             .title("Values")
             .render(view_area, buf);
 
-        let [_, filter_area, table_area] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(2),
-            Constraint::Fill(3),
-        ])
-        .flex(ratatui::layout::Flex::SpaceAround)
-        .areas(t_area);
+        let [filter_area, table_area] = Layout::vertical([Constraint::Min(2), Constraint::Fill(3)])
+            .flex(ratatui::layout::Flex::Center)
+            .margin(1)
+            .areas(table_area);
 
-        let [_, filter_area, _] = Layout::horizontal([
-            Constraint::Length(2),
-            Constraint::Fill(1),
-            Constraint::Length(2),
-        ])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(filter_area);
+        let filters_block = Block::new()
+            .bg(config::get().colors.base00)
+            .fg(config::get().colors.base04)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .borders(Borders::all())
+            .title("Filters");
+
+        let filters_area = filters_block.inner(filter_area);
+        filters_block.render(filter_area, buf);
 
         let [cursor_size_are, pattern_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
                 .flex(ratatui::layout::Flex::Center)
-                .areas(filter_area);
+                .areas(filters_area);
 
         let [cursor_area, size_area] = Layout::horizontal([Constraint::Min(1), Constraint::Min(1)])
             .flex(ratatui::layout::Flex::Center)
@@ -216,10 +208,10 @@ impl StatefulWidget for KeySpaceWidget {
         .render(pattern_area, buf);
 
         let widths = [
-            Constraint::Max(25),
-            Constraint::Max(25),
-            Constraint::Max(25),
-            Constraint::Max(25),
+            Constraint::Percentage(20),
+            Constraint::Percentage(35),
+            Constraint::Percentage(20),
+            Constraint::Percentage(25),
         ];
         let header: Row<'_> =
             Row::new(["Type", "Key", "TTL(s)", "Size"].map(|h| Cell::from(h.bold())))

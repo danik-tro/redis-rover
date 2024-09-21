@@ -128,10 +128,6 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
-        if let Mode::Cmd = self.mode {
-            self.summary.handle_key(key);
-        }
-
         let action = self.handle_keybindings(key);
         Ok(action.map(Into::into))
     }
@@ -161,7 +157,6 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => self.resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
-            Action::EnterCmd => self.enter_cmd_mode(),
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
@@ -222,22 +217,7 @@ impl App {
 
 /// Handling events logic
 impl App {
-    fn enter_cmd_mode(&mut self) {
-        self.previous_mode = Some(self.mode);
-        self.mode = Mode::Cmd;
-
-        self.summary.enter_cmd();
-    }
-
-    fn reset_inputs(&mut self) {
-        if self.mode.is_cmd() {
-            self.summary.exit_cmd();
-        }
-    }
-
     fn switch_to_previous_mode(&mut self) {
-        self.reset_inputs();
-
         if let Some(ref mut m) = self.previous_mode.or(Some(Mode::KeySpace)) {
             std::mem::swap(&mut self.mode, m);
         }
