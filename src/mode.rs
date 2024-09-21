@@ -12,12 +12,5 @@ pub enum Mode {
     Common,
     #[default]
     KeySpace,
-    Cmd,
     Popup(PopupMode),
-}
-
-impl Mode {
-    pub fn is_cmd(&self) -> bool {
-        *self == Mode::Cmd
-    }
 }

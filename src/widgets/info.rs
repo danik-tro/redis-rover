@@ -1,44 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use ratatui::{
-    crossterm::event::{Event, KeyEvent},
-    prelude::*,
-    widgets::*,
-};
-use tui_input::backend::crossterm::EventHandler;
+use ratatui::{prelude::*, widgets::*};
 
 use crate::{config, redis_client::types::RedisInfo};
 
 pub struct Info {
-    is_cmd: bool,
     info: Arc<Mutex<Option<RedisInfo>>>,
-    input: tui_input::Input,
 }
 
 impl Info {
     pub fn new(info: Arc<Mutex<Option<RedisInfo>>>) -> Self {
-        Self {
-            is_cmd: false,
-            info,
-            input: Default::default(),
-        }
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        self.input.handle_event(&Event::Key(key));
-    }
-
-    pub fn clear(&mut self) {
-        self.input.reset();
-    }
-
-    pub fn enter_cmd(&mut self) {
-        self.is_cmd = true;
-    }
-
-    pub fn exit_cmd(&mut self) {
-        self.is_cmd = false;
-        self.clear();
+        Self { info }
     }
 }
 
@@ -63,7 +35,7 @@ impl StatefulWidget for InfoWidget {
             .flex(layout::Flex::Center)
             .areas(area);
 
-        let [version_area, cmd_bar, cpu_area] =
+        let [version_area, _, cpu_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Fill(1), Constraint::Min(0)])
                 .flex(layout::Flex::Center)
                 .horizontal_margin(3)
@@ -106,15 +78,5 @@ impl StatefulWidget for InfoWidget {
         Paragraph::new(clients)
             .alignment(Alignment::Center)
             .render(clients_area, buf);
-
-        if state.is_cmd {
-            Line::styled(
-                format!(":{}", state.input.value()),
-                Style::new()
-                    .bg(config::get().colors.base0a)
-                    .fg(config::get().colors.base00),
-            )
-            .render(cmd_bar, buf);
-        }
     }
 }

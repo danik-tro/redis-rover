@@ -12,8 +12,6 @@ pub enum Action {
     // Commands actions
     Quit,
     PreviousMode,
-    EnterCmd,
-    Ignore,
     ScrollDown,
     ScrollUp,
     LoadKeySpace,

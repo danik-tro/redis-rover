@@ -2,11 +2,6 @@
   "keybindings": {
     "Common": {
       "<Ctrl-c>": "Quit",
-      "<:>": "EnterCmd", 
-    },
-    "Cmd": {
-      "Esc": "PreviousMode",
-      "<:>": "Ignore",
     },
     "KeySpace": {
       "j": "ScrollDown",

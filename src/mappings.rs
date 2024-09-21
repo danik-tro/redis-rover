@@ -4,9 +4,7 @@ impl From<Command> for Action {
     fn from(cmd: Command) -> Self {
         match cmd {
             Command::Quit => Self::Quit,
-            Command::EnterCmd => Self::EnterCmd,
             Command::PreviousMode => Self::PreviousMode,
-            Command::Ignore => Self::Ignore,
             Command::ScrollDown => Self::ScrollDown,
             Command::ScrollUp => Self::ScrollUp,
             Command::RefreshSpace => Self::RefreshSpace,
