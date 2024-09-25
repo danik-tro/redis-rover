@@ -1,5 +1,6 @@
 use crate::{config, redis_client::event::RedisEvent, state::SharedState};
 use color_eyre::eyre::Result;
+use crossterm::event::KeyCode;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::KeyEvent,
@@ -128,6 +129,11 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        if self.keyspace.is_popup() && (key.code != KeyCode::Enter && key.code != KeyCode::Esc) {
+            self.keyspace.handle_key(key);
+            return Ok(None);
+        }
+
         let action = self.handle_keybindings(key);
         Ok(action.map(Into::into))
     }
@@ -165,6 +171,10 @@ impl App {
             Action::ScrollUp => self.scroll_up(),
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
+            Action::SetKeyspaceFilter => self.enter_filter_popup(),
+            Action::DiscardKeyspacePopup => self.close_popup(),
+            Action::ConfirmKeyspacePopup => self.set_keyspace_filter(),
+            Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
             _ => {}
         }
 
@@ -221,6 +231,42 @@ impl App {
         if let Some(ref mut m) = self.previous_mode.or(Some(Mode::KeySpace)) {
             std::mem::swap(&mut self.mode, m);
         }
+    }
+
+    fn enter_filter_popup(&mut self) {
+        self.keyspace.enter_filter_pattern();
+    }
+
+    fn close_popup(&mut self) {
+        if !self.keyspace.is_popup() {
+            return;
+        }
+
+        self.keyspace.exit_popup();
+    }
+
+    fn set_keyspace_filter(&mut self) {
+        if !self.keyspace.is_popup() {
+            return;
+        }
+
+        {
+            let pattern = self.keyspace.confirm_filter_pattern();
+            let mut state = self.state.keyspace_state.lock().unwrap();
+            state.set_pattern(pattern.clone());
+
+            self.keyspace.update_filters(pattern, None);
+        }
+        self.refresh_space();
+    }
+
+    fn delete_keyspace_filter(&mut self) {
+        {
+            let mut state = self.state.keyspace_state.lock().unwrap();
+            state.delete_pattern();
+            self.keyspace.update_filters(None, None);
+        }
+        self.refresh_space();
     }
 
     fn load_next_page(&mut self) {

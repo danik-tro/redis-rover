@@ -1,8 +1,10 @@
+use std::collections::{HashMap, HashSet};
+
 use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use super::types::{KeyMeta, RedisInfo};
+use super::types::{KeyMeta, KeyValue, RedisInfo, RedisType};
 
 // TODO: should be a better solution to handle this.
 pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
@@ -42,11 +44,41 @@ pub async fn keys(
     Ok((cursor, keys))
 }
 
-pub async fn retrieve_type(
+pub async fn retrieve_type_and_value(
     mut manager: redis::aio::ConnectionManager,
     key: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(manager.key_type(key).await?)
+) -> Result<(RedisType, KeyValue), Box<dyn std::error::Error + Send + Sync>> {
+    let r_type: String = manager.key_type(key).await?;
+    let r_type = RedisType::from(r_type);
+
+    match r_type {
+        RedisType::String => {
+            let value: String = manager.get(key).await?;
+            Ok((r_type, KeyValue::String(value)))
+        }
+        RedisType::List => {
+            let value: Vec<String> = manager.lrange(key, 0, -1).await?;
+            Ok((r_type, KeyValue::List(value)))
+        }
+        RedisType::Set => {
+            let value: HashSet<String> = manager.smembers(key).await?;
+            Ok((r_type, KeyValue::Set(value)))
+        }
+        RedisType::Hash => {
+            let value: HashMap<String, String> = manager.hgetall(key).await?;
+            Ok((r_type, KeyValue::Hash(value)))
+        }
+        RedisType::Zset => {
+            let value: Vec<(String, f64)> = manager.zrange_withscores(key, 0, -1).await?;
+            Ok((r_type, KeyValue::Zset(value)))
+        }
+        RedisType::Json => {
+            // TODO: impleent json type
+            // let value: serde_json::Value = manager.get(key).await?;
+            Ok((r_type, KeyValue::Unknown))
+        }
+        RedisType::Unknown => Ok((r_type, KeyValue::Unknown)),
+    }
 }
 
 pub async fn retrieve_memory_usage(
@@ -73,13 +105,14 @@ pub async fn fetch_meta(
     manager: redis::aio::ConnectionManager,
     key: &str,
 ) -> Result<KeyMeta, Box<dyn std::error::Error + Sync + Send>> {
-    let (r_type, size, ttl) = tokio::try_join!(
-        retrieve_type(manager.clone(), key),
+    let ((r_type, value), size, ttl) = tokio::try_join!(
+        retrieve_type_and_value(manager.clone(), key),
         retrieve_memory_usage(manager.clone(), key),
         retrieve_ttl(manager, key),
     )?;
 
     Ok(KeyMeta {
+        value,
         r_type,
         size,
         ttl,
