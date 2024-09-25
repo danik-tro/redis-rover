@@ -47,6 +47,7 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter", "serde"] }
 redis = { version = "0.27.2", default-features = false, features = ["aio", "tokio-comp", "connection-manager"]}
 byte-unit = { version = "5.1.4", features = ["serde", "byte"], default-features = false}
 tui-input = "0.10.1"
+tui-textarea = "0.6.1"
 
 [build-dependencies]
 vergen = { version = "8.2.6", features = [ "build", "git", "gitoxide", "cargo" ]}
