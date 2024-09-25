@@ -10,4 +10,8 @@ pub enum Command {
     RefreshSpace,
     LoadNextPage,
     LoadPreviousPage,
+    SetPattern,
+    DeletePattern,
+    ClosePopup,
+    EnterPopup,
 }

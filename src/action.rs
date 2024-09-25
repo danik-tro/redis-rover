@@ -19,4 +19,8 @@ pub enum Action {
     LoadKeysIntoKeySpace,
     LoadNextPage,
     LoadPreviousPage,
+    SetKeyspaceFilter,
+    DeleteKeyspaceFilter,
+    ConfirmKeyspacePopup,
+    DiscardKeyspacePopup,
 }
