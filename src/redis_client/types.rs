@@ -1,5 +1,5 @@
-use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::{borrow::Cow, collections::HashSet};
 
 use crate::config;
 use ratatui::{
@@ -57,11 +57,23 @@ impl RedisInfo {
 }
 
 #[derive(Debug, Clone)]
+pub enum KeyValue {
+    String(String),
+    List(Vec<String>),
+    Set(HashSet<String>),
+    Hash(HashMap<String, String>),
+    Zset(Vec<(String, f64)>), // Tuple of value and score
+    Json(serde_json::Value),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
 pub struct KeyMeta {
     pub key: String,
-    pub r_type: String,
+    pub r_type: RedisType,
     pub size: u128,
     pub ttl: isize,
+    pub value: KeyValue,
 }
 
 pub enum KeysList {
@@ -69,7 +81,7 @@ pub enum KeysList {
     Keys { cursor: usize, keys: Vec<KeyMeta> },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum RedisType {
     Set,
     List,
@@ -147,6 +159,20 @@ impl KeyspaceState {
 
     pub fn set_previous_cursor(&mut self) {
         self.cursor = self.cursor_stack.pop_back();
+    }
+
+    pub fn set_pattern(&mut self, pattern: Option<String>) {
+        self.pattern = pattern;
+        self.cursor_stack.clear();
+        self.next_cursor = None;
+        self.cursor = None;
+    }
+
+    pub fn delete_pattern(&mut self) {
+        self.pattern = None;
+        self.cursor_stack.clear();
+        self.next_cursor = None;
+        self.cursor = None;
     }
 }
 

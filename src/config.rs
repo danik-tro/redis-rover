@@ -217,7 +217,7 @@ impl Default for KeyspacePalette {
             zset: Color::from_str("#D62DFF").unwrap(),
             json: Color::from_str("#324466").unwrap(),
             hash: Color::from_str("#5861FF").unwrap(),
-            list: Color::from_str("#51CBCA").unwrap(),
+            list: Color::from_str("#620faa").unwrap(),
             unknown: Color::from_str("#f71638").unwrap(),
         }
     }

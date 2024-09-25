@@ -10,6 +10,10 @@ impl From<Command> for Action {
             Command::RefreshSpace => Self::RefreshSpace,
             Command::LoadNextPage => Self::LoadNextPage,
             Command::LoadPreviousPage => Self::LoadPreviousPage,
+            Command::ClosePopup => Self::DiscardKeyspacePopup,
+            Command::SetPattern => Self::SetKeyspaceFilter,
+            Command::DeletePattern => Self::DeleteKeyspaceFilter,
+            Command::EnterPopup => Self::ConfirmKeyspacePopup,
         }
     }
 }

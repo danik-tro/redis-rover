@@ -1,23 +1,36 @@
 use byte_unit::{Byte, UnitType};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin},
     style::Stylize,
     widgets::{
-        Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, StatefulWidget, Table,
-        TableState, Widget, Wrap,
+        Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, StatefulWidget,
+        Table, TableState, Widget, Wrap,
     },
 };
+use tui_textarea::TextArea;
 
 use crate::{
     config,
-    redis_client::types::{KeyMeta, RedisType},
+    redis_client::types::{KeyMeta, KeyValue, RedisType},
 };
+
+enum KeySpacePopupMode {
+    FilterPattern,
+}
+
+enum KeySpaceMode {
+    Normal,
+    Popup(KeySpacePopupMode),
+}
 
 pub struct KeySpace {
     table: TableState,
     keys: Vec<KeyMeta>,
     cursor: Option<usize>,
     pattern: Option<String>,
+    mode: KeySpaceMode,
+    text_area: Option<TextArea<'static>>,
 }
 
 impl KeySpace {
@@ -27,7 +40,57 @@ impl KeySpace {
             table: TableState::default(),
             cursor: None,
             pattern: None,
+            mode: KeySpaceMode::Normal,
+            text_area: None,
         }
+    }
+
+    pub fn is_popup(&self) -> bool {
+        matches!(self.mode, KeySpaceMode::Popup(_))
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(ref mut text_area) = self.text_area {
+            text_area.input(key);
+        }
+    }
+
+    pub fn enter_filter_pattern(&mut self) {
+        self.mode = KeySpaceMode::Popup(KeySpacePopupMode::FilterPattern);
+        let mut text_area = TextArea::default();
+        text_area.set_placeholder_text("Enter pattern");
+        text_area.set_block(
+            Block::default()
+                .border_style(config::get().colors.base04)
+                .border_type(BorderType::Rounded)
+                .borders(Borders::ALL)
+                .title("Pattern"),
+        );
+
+        self.text_area = Some(text_area);
+    }
+
+    pub fn confirm_filter_pattern(&mut self) -> Option<String> {
+        let pattern = if let Some(text_area) = self.text_area.take() {
+            let line = text_area.lines()[0].clone();
+
+            if line == "" {
+                self.pattern = None;
+            } else {
+                self.pattern = Some(line.clone());
+            }
+
+            Some(line)
+        } else {
+            None
+        };
+
+        self.exit_popup();
+        pattern
+    }
+
+    pub fn exit_popup(&mut self) {
+        self.mode = KeySpaceMode::Normal;
     }
 
     pub fn refresh(&mut self) {
@@ -73,7 +136,7 @@ pub struct KeySpaceWidget;
 impl KeySpaceWidget {
     fn render_confirm_popup(
         &self,
-        message: String,
+        state: &mut KeySpace,
         area: ratatui::prelude::Rect,
         buf: &mut ratatui::prelude::Buffer,
     ) {
@@ -87,46 +150,162 @@ impl KeySpaceWidget {
 
         let [_, popup_area, _] = Layout::horizontal([
             Constraint::Percentage(30),
-            Constraint::Min(message.len() as u16 + 1),
+            Constraint::Min(15),
             Constraint::Percentage(30),
         ])
         .flex(ratatui::layout::Flex::Center)
         .areas(popup_area);
 
-        let [yes_area, no_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        if let Some(ref text_area) = state.text_area {
+            text_area.render(popup_area, buf);
+        }
+    }
+
+    fn render_key_view(
+        &self,
+        state: &mut KeySpace,
+        area: ratatui::prelude::Rect,
+        buf: &mut ratatui::prelude::Buffer,
+    ) {
+        let Some(selected_index) = state.table.selected() else {
+            return;
+        };
+
+        let Some(key) = state.keys.get(selected_index) else {
+            return;
+        };
+
+        let key_details_block = Block::default()
+            .title("Key Details")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded);
+
+        let key_details_area = key_details_block.inner(area);
+        key_details_block.render(area, buf);
+
+        let [key_meta_area, view_area] =
+            Layout::vertical([Constraint::Max(6), Constraint::Fill(1)])
                 .flex(ratatui::layout::Flex::Center)
-                .areas(popup_area);
+                .areas(key_details_area);
 
-        let [_, confirm_area, _] = Layout::vertical([
-            Constraint::Percentage(80),
-            Constraint::Min(1),
-            Constraint::Percentage(10),
-        ])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(popup_area);
+        let key_info = format!(
+            "Key: {}\nType: {:?}\nTTL: {}\nSize: {}",
+            key.key,
+            key.r_type,
+            key.ttl,
+            unsafe { Byte::from_u128_unsafe(key.size) }.get_appropriate_unit(UnitType::Binary)
+        );
 
-        let [yes_area, no_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .flex(ratatui::layout::Flex::Center)
-                .areas(confirm_area);
+        Paragraph::new(key_info)
+            .wrap(Wrap { trim: true })
+            .render(key_meta_area, buf);
 
-        Widget::render(Clear, popup_area, buf);
-        Block::new()
-            .title(message)
-            .title_alignment(ratatui::layout::Alignment::Left)
-            .borders(Borders::all())
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .fg(config::get().colors.base04)
-            .bg(config::get().colors.base00)
-            .render(popup_area, buf);
+        match key.value {
+            KeyValue::String(ref value) => {
+                Paragraph::new(format!("Value: {}", value))
+                    .wrap(Wrap { trim: true })
+                    .render(view_area, buf);
+            }
+            KeyValue::List(ref value) => {
+                let mut table_state = TableState::default();
 
-        Paragraph::new("[y] Confirm")
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(yes_area, buf);
-        Paragraph::new("[n] Discard")
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(no_area, buf);
+                let widths = [Constraint::Percentage(100)];
+                let header: Row<'_> = Row::new(["Item"].map(|h| Cell::from(h.bold())))
+                    .top_margin(1)
+                    .bottom_margin(1)
+                    .fg(config::get().colors.base04)
+                    .bg(config::get().colors.base02);
+
+                let rows = value.iter().cloned().map(|(value)| {
+                    Row::new([Cell::from(value)])
+                        .fg(config::get().colors.base04)
+                        .bg(config::get().colors.base00)
+                });
+                let table: Table<'_> = Table::new(rows, widths)
+                    .header(header)
+                    .flex(ratatui::layout::Flex::Center)
+                    .highlight_symbol(HIGHLIGHT_SYMBOL)
+                    .highlight_style(config::get().colors.base05)
+                    .highlight_spacing(HighlightSpacing::Always);
+
+                StatefulWidget::render(table, view_area, buf, &mut table_state);
+            }
+            KeyValue::Hash(ref value) => {
+                let mut table_state = TableState::default();
+
+                let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+                let header: Row<'_> = Row::new(["Field", "Value"].map(|h| Cell::from(h.bold())))
+                    .top_margin(1)
+                    .bottom_margin(1)
+                    .fg(config::get().colors.base04)
+                    .bg(config::get().colors.base02);
+
+                let rows = value.iter().map(|(field, value)| {
+                    Row::new([Cell::from(field.clone()), Cell::from(value.clone())])
+                        .fg(config::get().colors.base04)
+                        .bg(config::get().colors.base00)
+                });
+                let table: Table<'_> = Table::new(rows, widths)
+                    .header(header)
+                    .widths(widths)
+                    .flex(ratatui::layout::Flex::Center)
+                    .highlight_symbol(HIGHLIGHT_SYMBOL)
+                    .highlight_style(config::get().colors.base05)
+                    .highlight_spacing(HighlightSpacing::Always);
+
+                StatefulWidget::render(table, view_area, buf, &mut table_state);
+            }
+            KeyValue::Set(ref value) => {
+                let mut table_state = TableState::default();
+
+                let widths = [Constraint::Percentage(100)];
+                let header: Row<'_> = Row::new(["Member"].map(|h| Cell::from(h.bold())))
+                    .top_margin(1)
+                    .bottom_margin(1)
+                    .fg(config::get().colors.base04)
+                    .bg(config::get().colors.base02);
+
+                let rows = value.iter().cloned().map(|member| {
+                    Row::new([Cell::from(member)])
+                        .fg(config::get().colors.base04)
+                        .bg(config::get().colors.base00)
+                });
+                let table: Table<'_> = Table::new(rows, widths)
+                    .header(header)
+                    .flex(ratatui::layout::Flex::Center)
+                    .highlight_symbol(HIGHLIGHT_SYMBOL)
+                    .highlight_style(config::get().colors.base05)
+                    .highlight_spacing(HighlightSpacing::Always);
+
+                StatefulWidget::render(table, view_area, buf, &mut table_state);
+            }
+            KeyValue::Zset(ref value) => {
+                let mut table_state = TableState::default();
+
+                let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+                let header: Row<'_> = Row::new(["Member", "Score"].map(|h| Cell::from(h.bold())))
+                    .top_margin(1)
+                    .bottom_margin(1)
+                    .fg(config::get().colors.base04)
+                    .bg(config::get().colors.base02);
+
+                let rows = value.iter().map(|(member, score)| {
+                    Row::new([Cell::from(member.clone()), Cell::from(score.to_string())])
+                        .fg(config::get().colors.base04)
+                        .bg(config::get().colors.base00)
+                });
+                let table: Table<'_> = Table::new(rows, widths)
+                    .header(header)
+                    .widths(widths)
+                    .flex(ratatui::layout::Flex::Center)
+                    .highlight_symbol(HIGHLIGHT_SYMBOL)
+                    .highlight_style(config::get().colors.base05)
+                    .highlight_spacing(HighlightSpacing::Always);
+
+                StatefulWidget::render(table, view_area, buf, &mut table_state);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -142,7 +321,7 @@ impl StatefulWidget for KeySpaceWidget {
         state: &mut Self::State,
     ) {
         let [t_area, view_area] =
-            Layout::horizontal([Constraint::Percentage(25), Constraint::Fill(1)])
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)])
                 .flex(ratatui::layout::Flex::Center)
                 .areas(area);
 
@@ -251,5 +430,11 @@ impl StatefulWidget for KeySpaceWidget {
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(table, table_area, buf, &mut state.table);
+
+        self.render_key_view(state, view_area, buf);
+
+        if state.is_popup() {
+            self.render_confirm_popup(state, area, buf)
+        }
     }
 }
