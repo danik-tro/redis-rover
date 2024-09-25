@@ -9,6 +9,10 @@
       "r": "RefreshSpace",
       "n": "LoadNextPage",
       "p": "LoadPreviousPage",
+      "f": "SetPattern",
+      "l": "DeletePattern",
+      "<Esc>": "ClosePopup",
+      "<Enter>": "EnterPopup",
     },
   },
   "colors": {
@@ -32,7 +36,7 @@
   "keyspace": {
     "string": "#600CC0",
     "hash": "#5861FF",
-    "list": "#51CBCA",
+    "list": "#620faa",
     "zset": "#D62DFF",
     "set": "#F08A10",
     "json": "#324466",
