@@ -9,6 +9,33 @@ on:
     branches: "*"
 
 jobs:
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  deny:
+    name: Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  machete:
+    name: Machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
   fmt:
     name: Fmt
     runs-on: ubuntu-latest
