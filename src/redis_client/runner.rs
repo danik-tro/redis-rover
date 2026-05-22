@@ -37,12 +37,12 @@ impl Runner {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
 
         Self {
-            manager,
-            info_task,
             cancelation_token,
+            manager,
+            state,
+            info_task,
             action_tx,
             tx,
-            state,
         }
     }
 
@@ -58,7 +58,7 @@ impl Runner {
 
     pub fn start(&mut self) {
         self.launch_refresh_info_task();
-        self.launch_refresh_state_task()
+        self.launch_refresh_state_task();
     }
 
     fn launch_refresh_state_task(&mut self) {
@@ -78,7 +78,7 @@ impl Runner {
                     Ok(event) = rx.recv() => {
                         event_handler.handle(event).await;
                     },
-                    _ = cancelation_token.cancelled() => {
+                    () = cancelation_token.cancelled() => {
                         break;
                     },
                 }
@@ -107,7 +107,7 @@ impl Runner {
                             },
                         }
                     },
-                    _ = cancelation_token.cancelled() => {
+                    () = cancelation_token.cancelled() => {
                         break;
                     }
                 }

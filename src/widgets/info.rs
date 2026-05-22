@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use ratatui::{prelude::*, widgets::*};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{self, Alignment, Constraint, Layout, Rect};
+use ratatui::style::Stylize;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, StatefulWidget, Widget};
 
 use crate::{config, redis_client::types::RedisInfo};
 

@@ -58,6 +58,12 @@ pub struct Tui {
 }
 
 impl Tui {
+    /// Build a new TUI wrapping a crossterm-backed terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ratatui terminal cannot be constructed
+    /// (typically a stdout I/O failure).
     pub fn new() -> Result<Self> {
         let tick_rate = 4.0;
         let frame_rate = 10.0;
@@ -81,26 +87,33 @@ impl Tui {
         })
     }
 
+    #[must_use]
     pub fn tick_rate(mut self, tick_rate: f64) -> Self {
         self.tick_rate = tick_rate;
         self
     }
 
+    #[must_use]
     pub fn frame_rate(mut self, frame_rate: f64) -> Self {
         self.frame_rate = frame_rate;
         self
     }
 
+    #[must_use]
     pub fn cancelation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
     }
 
+    #[must_use]
+    #[allow(dead_code)]
     pub fn mouse(mut self, mouse: bool) -> Self {
         self.mouse = mouse;
         self
     }
 
+    #[must_use]
+    #[allow(dead_code)]
     pub fn paste(mut self, paste: bool) -> Self {
         self.paste = paste;
         self
@@ -126,7 +139,7 @@ impl Tui {
                 let render_delay = render_interval.tick();
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
-                  _ = tui_cancelation_token.cancelled() => {
+                  () = tui_cancelation_token.cancelled() => {
                     break;
                   }
                   maybe_event = crossterm_event => {
@@ -172,7 +185,7 @@ impl Tui {
         });
     }
 
-    pub fn stop(&self) -> Result<()> {
+    pub fn stop(&self) {
         self.cancel();
         let mut counter = 0;
         while !self.event_task.is_finished() {
@@ -186,9 +199,14 @@ impl Tui {
                 break;
             }
         }
-        Ok(())
     }
 
+    /// Enter the alternate screen, enable raw mode, and spawn the
+    /// terminal event task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a crossterm terminal command fails.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(io(), EnterAlternateScreen, cursor::Hide)?;
@@ -202,8 +220,13 @@ impl Tui {
         Ok(())
     }
 
+    /// Tear down the alternate screen and disable raw mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a crossterm terminal command fails.
     pub fn exit(&mut self) -> Result<()> {
-        self.stop()?;
+        self.stop();
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
             if self.paste {

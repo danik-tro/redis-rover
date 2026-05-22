@@ -4,22 +4,27 @@ use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use super::types::{KeyMeta, KeyValue, RedisInfo, RedisType};
+use super::types::{KeyValue, RedisInfo, RedisType};
 
 const VALUE_PREVIEW_LIMIT: isize = 100;
 
+/// Run `INFO` against Redis and parse the response into [`RedisInfo`].
+///
+/// # Errors
+///
+/// Returns an error if the command fails or the response cannot be parsed.
 // TODO: should be a better solution to handle this.
 pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
     let info: String = redis::cmd("INFO").query_async(manager).await?;
 
     let mut map = std::collections::HashMap::new();
 
-    for c in info.split_terminator("\n") {
-        if c.starts_with("#") || c == "" {
+    for c in info.split_terminator('\n') {
+        if c.starts_with('#') || c.is_empty() {
             continue;
         }
 
-        let pair_op = c.split_once(":");
+        let pair_op = c.split_once(':');
 
         let Some((header, value)) = pair_op else {
             continue;
@@ -31,21 +36,12 @@ pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
     Ok(serde_json::from_value(serde_json::json!(map))?)
 }
 
-pub async fn keys(
-    manager: &mut ConnectionManager,
-    cursor: Option<usize>,
-    pattern: Option<String>,
-) -> Result<(usize, Vec<String>)> {
-    let (cursor, keys): (usize, Vec<String>) = redis::cmd("SCAN")
-        .arg(cursor.unwrap_or_default())
-        .arg("MATCH")
-        .arg(pattern.unwrap_or_else(|| "*".into()))
-        .query_async(manager)
-        .await?;
-
-    Ok((cursor, keys))
-}
-
+/// Fetch the value behind a key, bounded to the first
+/// [`VALUE_PREVIEW_LIMIT`] items for collection types.
+///
+/// # Errors
+///
+/// Returns an error if any of the underlying Redis commands fails.
 pub async fn fetch_value(
     mut manager: ConnectionManager,
     key: &str,
@@ -80,29 +76,4 @@ pub async fn fetch_value(
         }
         RedisType::Json | RedisType::Unknown => Ok(KeyValue::Unknown),
     }
-}
-
-pub async fn fetch_meta_light(
-    manager: ConnectionManager,
-    key: &str,
-) -> Result<KeyMeta, Box<dyn std::error::Error + Sync + Send>> {
-    let mut conn = manager;
-    let (r_type, size, ttl): (String, Option<u128>, isize) = redis::pipe()
-        .cmd("TYPE")
-        .arg(key)
-        .cmd("MEMORY")
-        .arg("USAGE")
-        .arg(key)
-        .cmd("TTL")
-        .arg(key)
-        .query_async(&mut conn)
-        .await?;
-
-    Ok(KeyMeta {
-        key: key.into(),
-        r_type: RedisType::from(r_type),
-        size: size.unwrap_or_default(),
-        ttl,
-        value: KeyValue::Unknown,
-    })
 }

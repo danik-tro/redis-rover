@@ -26,6 +26,7 @@ pub struct AppConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default, flatten)]
+    #[allow(dead_code, clippy::struct_field_names)]
     pub config: AppConfig,
     #[serde(default)]
     pub keybindings: KeyBindings,
@@ -38,6 +39,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load the application configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the user's configuration file cannot be
+    /// read or deserialized into [`Config`].
     pub fn new() -> Result<Self, config::ConfigError> {
         let default_config: Config = json5::from_str(CONFIG_PATH).unwrap();
         let data_dir = crate::utils::get_data_dir();
@@ -61,7 +68,7 @@ impl Config {
                     .required(false),
             );
             if config_dir.join(file).exists() {
-                found_config = true
+                found_config = true;
             }
         }
         if !found_config {
@@ -70,20 +77,16 @@ impl Config {
 
         let mut cfg: Self = builder.build()?.try_deserialize()?;
 
-        for (mode, default_bindings) in default_config.keybindings.iter() {
+        for (mode, default_bindings) in &default_config.keybindings.0 {
             let user_bindings = cfg.keybindings.entry(*mode).or_default();
-            for (key, cmd) in default_bindings.iter() {
-                user_bindings
-                    .entry(key.clone())
-                    .or_insert_with(|| cmd.clone());
+            for (key, cmd) in default_bindings {
+                user_bindings.entry(key.clone()).or_insert(*cmd);
             }
         }
-        for (mode, default_styles) in default_config.styles.iter() {
+        for (mode, default_styles) in &default_config.styles.0 {
             let user_styles = cfg.styles.entry(*mode).or_default();
-            for (style_key, style) in default_styles.iter() {
-                user_styles
-                    .entry(style_key.clone())
-                    .or_insert_with(|| style.clone());
+            for (style_key, style) in default_styles {
+                user_styles.entry(style_key.clone()).or_insert(*style);
             }
         }
 
@@ -310,9 +313,18 @@ fn parse_color(s: &str) -> Option<Color> {
                 .unwrap_or_default();
         Some(Color::Indexed(c))
     } else if s.contains("rgb") {
-        let red = (s.as_bytes()[3] as char).to_digit(10).unwrap_or_default() as u8;
-        let green = (s.as_bytes()[4] as char).to_digit(10).unwrap_or_default() as u8;
-        let blue = (s.as_bytes()[5] as char).to_digit(10).unwrap_or_default() as u8;
+        let red = u8::try_from(
+            (s.as_bytes()[3] as char).to_digit(10).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        let green = u8::try_from(
+            (s.as_bytes()[4] as char).to_digit(10).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        let blue = u8::try_from(
+            (s.as_bytes()[5] as char).to_digit(10).unwrap_or_default(),
+        )
+        .unwrap_or_default();
         let c = 16 + red * 36 + green * 6 + blue;
         Some(Color::Indexed(c))
     } else if s == "bold black" {
@@ -397,7 +409,7 @@ mod tests {
     #[test]
     fn test_parse_color_rgb() {
         let color = parse_color("rgb123");
-        let expected = 16 + 1 * 36 + 2 * 6 + 3;
+        let expected = 16 + 36 + 2 * 6 + 3;
         assert_eq!(color, Some(Color::Indexed(expected)));
     }
 

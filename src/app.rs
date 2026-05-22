@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::KeyEvent,
-    layout::{Flex, Layout},
+    layout::{Constraint, Flex, Layout},
     prelude::Rect,
     style::Stylize,
     widgets::{Block, StatefulWidget, Widget},
@@ -55,7 +55,7 @@ impl App {
         redis_tx: broadcast::Sender<RedisEvent>,
         tick_rate: f64,
         frame_rate: f64,
-    ) -> Result<Self> {
+    ) -> Self {
         let _ = config::get();
 
         let mode = Mode::KeySpace;
@@ -63,7 +63,7 @@ impl App {
         let summary = Info::new(state.info.clone());
         let keyspace = KeySpace::new(Vec::new());
 
-        Ok(Self {
+        Self {
             state,
             summary,
             keyspace,
@@ -76,9 +76,15 @@ impl App {
             tx,
             rx,
             redis_tx,
-        })
+        }
     }
 
+    /// Run the main event loop until quit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TUI fails to enter or if any action
+    /// dispatch returns an error.
     pub async fn run(&mut self, cancellation_token: CancellationToken) -> Result<()> {
         let mut tui = tui::Tui::new()?
             .tick_rate(self.tick_rate)
@@ -94,15 +100,18 @@ impl App {
             // TODO: refactor with async_channel crate
             // replace with select multiplex
             if let Some(e) = tui.next().await {
-                self.handle_event(e)?.map(|action| self.tx.send(action));
+                if let Some(action) = self.handle_event(&e) {
+                    let _ = self.tx.send(action);
+                }
             }
 
             while let Ok(action) = self.rx.try_recv() {
-                self.handle_action(action, &mut tui)?
-                    .map(|action| self.tx.send(action));
+                if let Some(next) = self.handle_action(&action, &mut tui)? {
+                    let _ = self.tx.send(next);
+                }
             }
             if self.should_quit {
-                tui.stop()?;
+                tui.stop();
                 break;
             }
         }
@@ -117,27 +126,24 @@ impl App {
         Ok(())
     }
 
-    fn handle_event(&mut self, e: tui::Event) -> Result<Option<Action>> {
-        let maybe_action = match e {
+    fn handle_event(&mut self, e: &tui::Event) -> Option<Action> {
+        match e {
             tui::Event::Quit => Some(Action::Quit),
             tui::Event::Tick => Some(Action::Tick),
             tui::Event::Render => Some(Action::Render),
-            tui::Event::Resize(x, y) => Some(Action::Resize(x, y)),
-            tui::Event::Key(key) => self.handle_key_event(key)?,
+            tui::Event::Resize(x, y) => Some(Action::Resize(*x, *y)),
+            tui::Event::Key(key) => self.handle_key_event(*key),
             _ => None,
-        };
-
-        Ok(maybe_action)
+        }
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+    fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         if self.keyspace.is_popup() && (key.code != KeyCode::Enter && key.code != KeyCode::Esc) {
             self.keyspace.handle_key(key);
-            return Ok(None);
+            return None;
         }
 
-        let action = self.handle_keybindings(key);
-        Ok(action.map(Into::into))
+        self.handle_keybindings(key)
     }
 
     fn handle_keybindings(&mut self, key: KeyEvent) -> Option<Action> {
@@ -154,11 +160,11 @@ impl App {
             .map(Into::into)
     }
 
-    fn handle_action(&mut self, action: Action, tui: &mut tui::Tui) -> Result<Option<Action>> {
-        if action != Action::Tick && action != Action::Render {
+    fn handle_action(&mut self, action: &Action, tui: &mut tui::Tui) -> Result<Option<Action>> {
+        if action != &Action::Tick && action != &Action::Render {
             log::debug!("{action:?}");
         }
-        match action {
+        match *action {
             Action::Tick => {
                 self.last_tick_key_events.drain(..);
             }
@@ -182,9 +188,7 @@ impl App {
             _ => {}
         }
 
-        let maybe_action = None;
-
-        Ok(maybe_action)
+        Ok(None)
     }
 
     fn draw(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -202,8 +206,6 @@ impl StatefulWidget for AppWidget {
         let cfg = config::get();
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
-        use ratatui::layout::Constraint;
-
         let [main, footer] = Layout::vertical([Constraint::Percentage(100), Constraint::Length(4)])
             .flex(Flex::Center)
             .margin(1)
@@ -217,9 +219,8 @@ impl StatefulWidget for AppWidget {
 /// Render logic
 impl App {
     fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
-        match self.mode {
-            Mode::KeySpace => self.render_key_space(area, buf),
-            _ => {}
+        if self.mode == Mode::KeySpace {
+            self.render_key_space(area, buf);
         }
     }
 
@@ -325,24 +326,18 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        match self.mode {
-            Mode::KeySpace => {
-                self.keyspace.scroll_next();
-                self.keyspace.clear_selected_value();
-                let _ = self.tx.send(Action::RequestSelectedValue);
-            }
-            _ => {}
+        if self.mode == Mode::KeySpace {
+            self.keyspace.scroll_next();
+            self.keyspace.clear_selected_value();
+            let _ = self.tx.send(Action::RequestSelectedValue);
         }
     }
 
     fn scroll_up(&mut self) {
-        match self.mode {
-            Mode::KeySpace => {
-                self.keyspace.scroll_previous();
-                self.keyspace.clear_selected_value();
-                let _ = self.tx.send(Action::RequestSelectedValue);
-            }
-            _ => {}
+        if self.mode == Mode::KeySpace {
+            self.keyspace.scroll_previous();
+            self.keyspace.clear_selected_value();
+            let _ = self.tx.send(Action::RequestSelectedValue);
         }
     }
 }

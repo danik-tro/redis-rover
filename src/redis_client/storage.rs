@@ -1,43 +1,45 @@
 use redis::aio::ConnectionManager;
+use redis::FromRedisValue;
 
 use super::{
     client::fetch_value,
     types::{KeyMeta, KeyValue, KeysList, RedisType},
 };
-use redis::FromRedisValue;
 
 pub struct FetchKeysWithMeta<'a> {
-    manager: redis::aio::ConnectionManager,
-    size: Option<usize>,
+    manager: ConnectionManager,
     cursor: Option<usize>,
     pattern: Option<&'a str>,
 }
 
 impl<'a> FetchKeysWithMeta<'a> {
-    pub fn new(manager: redis::aio::ConnectionManager) -> Self {
+    pub fn new(manager: ConnectionManager) -> Self {
         Self {
             manager,
             cursor: None,
             pattern: None,
-            size: None,
         }
     }
 
-    pub fn size(mut self, size: Option<usize>) -> Self {
-        self.size = size;
-        self
-    }
-
+    #[must_use]
     pub fn cursor(mut self, cursor: Option<usize>) -> Self {
         self.cursor = cursor;
         self
     }
 
+    #[must_use]
     pub fn pattern(mut self, pattern: Option<&'a str>) -> Self {
         self.pattern = pattern;
         self
     }
 
+    /// Run a single SCAN followed by a TYPE / MEMORY USAGE / TTL
+    /// pipeline for every key in the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SCAN fails, the pipeline fails, or any
+    /// pipeline reply has an unexpected shape.
     pub async fn execute(mut self) -> Result<KeysList, Box<dyn std::error::Error + Sync + Send>> {
         let cursor = self.cursor.unwrap_or_default();
         let pattern = self.pattern.unwrap_or("*");
@@ -67,7 +69,7 @@ impl<'a> FetchKeysWithMeta<'a> {
 
         let mut metas = Vec::with_capacity(keys.len());
         let mut iter = raw.into_iter();
-        for key in keys.into_iter() {
+        for key in keys {
             let r_type_val = iter.next().ok_or("pipeline response truncated")?;
             let size_val = iter.next().ok_or("pipeline response truncated")?;
             let ttl_val = iter.next().ok_or("pipeline response truncated")?;
@@ -106,6 +108,11 @@ impl Storage {
         FetchKeysWithMeta::new(self.manager.clone())
     }
 
+    /// Fetch the value for a key. Delegates to [`fetch_value`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
     pub async fn fetch_value(
         &self,
         key: &str,

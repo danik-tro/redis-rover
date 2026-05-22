@@ -21,6 +21,7 @@ impl KeyBindings {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_keybindings_for_command(&self, mode: Mode, command: Command) -> Vec<Vec<KeyEvent>> {
         let bindings_for_mode = self.0.get(&mode).cloned().unwrap_or_default();
         bindings_for_mode
@@ -30,6 +31,7 @@ impl KeyBindings {
             .collect_vec()
     }
 
+    #[allow(dead_code)]
     pub fn get_config_for_command(&self, mode: Mode, command: Command) -> Vec<String> {
         self.get_keybindings_for_command(mode, command)
             .iter()
@@ -66,15 +68,21 @@ impl<'de> Deserialize<'de> for KeyBindings {
     }
 }
 
+/// Parse a `<...>`-encoded key sequence into a list of [`KeyEvent`]s.
+///
+/// # Errors
+///
+/// Returns an error if the angle brackets are unbalanced or if any
+/// sub-sequence cannot be parsed by [`parse_key_event`].
 pub fn parse_key_sequence(raw: &str) -> Result<Vec<KeyEvent>, String> {
     if raw.chars().filter(|c| *c == '>').count() != raw.chars().filter(|c| *c == '<').count() {
-        return Err(format!("Unable to parse `{}`", raw));
+        return Err(format!("Unable to parse `{raw}`"));
     }
-    let raw = if !raw.contains("><") {
-        let raw = raw.strip_prefix('<').unwrap_or(raw);
-        let raw = raw.strip_prefix('>').unwrap_or(raw);
+    let raw = if raw.contains("><") {
         raw
     } else {
+        let raw = raw.strip_prefix('<').unwrap_or(raw);
+        let raw = raw.strip_prefix('>').unwrap_or(raw);
         raw
     };
     let sequences = raw
@@ -117,7 +125,7 @@ fn extract_modifiers(raw: &str) -> (&str, KeyModifiers) {
                 current = &rest[6..];
             }
             _ => break, // break out of the loop if no known prefix is detected
-        };
+        }
     }
 
     (current, modifiers)
@@ -158,8 +166,7 @@ fn parse_key_code_with_modifiers(
         "f11" => KeyCode::F(11),
         "f12" => KeyCode::F(12),
         "space" => KeyCode::Char(' '),
-        "hyphen" => KeyCode::Char('-'),
-        "minus" => KeyCode::Char('-'),
+        "hyphen" | "minus" => KeyCode::Char('-'),
         "tab" => KeyCode::Tab,
         c if c.len() == 1 => {
             let mut c = raw.chars().next().unwrap();
@@ -173,6 +180,7 @@ fn parse_key_code_with_modifiers(
     Ok(KeyEvent::new(c, modifiers))
 }
 
+#[allow(dead_code)]
 pub fn key_event_to_string(key_event: &KeyEvent) -> String {
     let char;
     let key_code = match key_event.code {
@@ -200,16 +208,16 @@ pub fn key_event_to_string(key_event: &KeyEvent) -> String {
             &char
         }
         KeyCode::Esc => "Esc",
-        KeyCode::Null => "",
-        KeyCode::CapsLock => "",
-        KeyCode::Menu => "",
-        KeyCode::ScrollLock => "",
-        KeyCode::Media(_) => "",
-        KeyCode::NumLock => "",
-        KeyCode::PrintScreen => "",
-        KeyCode::Pause => "",
-        KeyCode::KeypadBegin => "",
-        KeyCode::Modifier(_) => "",
+        KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::Menu
+        | KeyCode::ScrollLock
+        | KeyCode::Media(_)
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::KeypadBegin
+        | KeyCode::Modifier(_) => "",
     };
 
     let mut modifiers = Vec::with_capacity(3);
