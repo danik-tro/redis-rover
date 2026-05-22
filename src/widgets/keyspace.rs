@@ -211,7 +211,9 @@ impl KeySpaceWidget {
             key.key,
             key.r_type,
             key.ttl,
-            Byte::from_u128(key.size).unwrap_or_default().get_appropriate_unit(UnitType::Binary)
+            Byte::from_u128(key.size)
+                .unwrap_or_default()
+                .get_appropriate_unit(UnitType::Binary)
         );
 
         Paragraph::new(key_info)

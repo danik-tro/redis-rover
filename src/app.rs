@@ -200,9 +200,7 @@ impl StatefulWidget for AppWidget {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        Block::default()
-            .bg(cfg.colors.base00)
-            .render(area, buf);
+        Block::default().bg(cfg.colors.base00).render(area, buf);
 
         use ratatui::layout::Constraint;
 
@@ -295,8 +293,7 @@ impl App {
     }
 
     fn load_new_keys(&mut self) {
-        self.keyspace
-            .set_keys(self.state.keys.lock().clone());
+        self.keyspace.set_keys(self.state.keys.lock().clone());
         self.keyspace.clear_selected_value();
     }
 
@@ -304,10 +301,7 @@ impl App {
         let Some((key, r_type)) = self.keyspace.selected_key() else {
             return;
         };
-        if let Err(err) = self
-            .redis_tx
-            .send(RedisEvent::FetchValue { key, r_type })
-        {
+        if let Err(err) = self.redis_tx.send(RedisEvent::FetchValue { key, r_type }) {
             log::error!("Failed to send FetchValue: {err:?}");
         }
     }
