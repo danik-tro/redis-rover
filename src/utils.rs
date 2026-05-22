@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
 use directories::ProjectDirs;
 use lazy_static::lazy_static;
 use tracing::error;
@@ -162,6 +162,40 @@ macro_rules! trace_dbg {
     };
 }
 
+/// Injects `token` as the password component of a Redis URL.
+///
+/// Handles the three common Redis URL schemes:
+///   redis://[user@]host:port[/db]   → redis://:token@host:port[/db]
+///   rediss://...                     → same, TLS variant
+///   redis+unix://...                 → same, Unix socket variant
+pub fn inject_token(url: &str, token: &str) -> Result<String> {
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| eyre!("Invalid Redis URL: missing '://'"))?;
+
+    let scheme = &url[..scheme_end];
+    let rest = &url[scheme_end + 3..];
+
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path = &rest[authority_end..];
+
+    let new_authority = if let Some(at_pos) = authority.rfind('@') {
+        let userinfo = &authority[..at_pos];
+        let hostport = &authority[at_pos + 1..];
+        let user = userinfo.split(':').next().unwrap_or("");
+        if user.is_empty() {
+            format!(":{token}@{hostport}")
+        } else {
+            format!("{user}:{token}@{hostport}")
+        }
+    } else {
+        format!(":{token}@{authority}")
+    };
+
+    Ok(format!("{scheme}://{new_authority}{path}"))
+}
+
 pub fn version() -> String {
     let author = clap::crate_authors!();
 
@@ -178,4 +212,54 @@ Authors: {author}
 Config directory: {config_dir_path}
 Data directory: {data_dir_path}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_bare_url() {
+        assert_eq!(
+            inject_token("redis://localhost:6379", "secret").unwrap(),
+            "redis://:secret@localhost:6379"
+        );
+    }
+
+    #[test]
+    fn inject_url_with_db() {
+        assert_eq!(
+            inject_token("redis://localhost:6379/1", "secret").unwrap(),
+            "redis://:secret@localhost:6379/1"
+        );
+    }
+
+    #[test]
+    fn inject_url_with_existing_user() {
+        assert_eq!(
+            inject_token("redis://alice@localhost:6379", "secret").unwrap(),
+            "redis://alice:secret@localhost:6379"
+        );
+    }
+
+    #[test]
+    fn inject_url_with_existing_userinfo() {
+        assert_eq!(
+            inject_token("redis://alice:old@localhost:6379", "secret").unwrap(),
+            "redis://alice:secret@localhost:6379"
+        );
+    }
+
+    #[test]
+    fn inject_tls_url() {
+        assert_eq!(
+            inject_token("rediss://localhost:6380", "s3cr3t").unwrap(),
+            "rediss://:s3cr3t@localhost:6380"
+        );
+    }
+
+    #[test]
+    fn inject_invalid_url() {
+        assert!(inject_token("not-a-url", "secret").is_err());
+    }
 }

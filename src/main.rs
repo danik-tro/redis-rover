@@ -35,9 +35,11 @@ async fn tokio_main(args: Cli) -> Result<()> {
 
     let state = SharedState::default();
 
-    // TODO: fix error handling. Move to Trait
-    let client = redis::Client::open("redis://localhost:6379").unwrap();
-    let manager: ConnectionManager = ConnectionManager::new(client).await.unwrap();
+    let redis_url = args.redis_url()?;
+    let client = redis::Client::open(redis_url).map_err(|e| color_eyre::eyre::eyre!(e))?;
+    let manager: ConnectionManager = ConnectionManager::new(client)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     let mut watcher = Runner::new(manager.clone(), state.clone(), tx.clone())
         .cancelation_token(cancellation_token.clone());

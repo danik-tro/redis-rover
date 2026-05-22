@@ -71,7 +71,7 @@ impl Storage {
         Self { manager }
     }
 
-    pub fn fetch_keys_with_meta(&self) -> FetchKeysWithMeta {
+    pub fn fetch_keys_with_meta(&self) -> FetchKeysWithMeta<'_> {
         FetchKeysWithMeta::new(self.manager.clone())
     }
 }
