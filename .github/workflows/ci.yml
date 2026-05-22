@@ -1,21 +1,53 @@
-name: CI 
+name: CI
 
 on:
-    push:
-      branches: '*'
-      tags:
-        - 'v*'
-    pull_request:
-      branches: '*'
+  push:
+    branches: "*"
+    tags:
+      - "v*"
+  pull_request:
+    branches: "*"
 
 jobs:
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    # TODO: remove continue-on-error once known advisories are triaged
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  deny:
+    name: Deny
+    runs-on: ubuntu-latest
+    # TODO: remove continue-on-error once deny.toml license allowlist is complete
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  machete:
+    name: Machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
   fmt:
     name: Fmt
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
-          - 1.78.0 
+          - 1.93.1
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -27,7 +59,7 @@ jobs:
           components: rustfmt
 
       - name: Run cargo fmt
-        run: cargo fmt --all -- --check
+        run: cargo +${{ matrix.rust }} fmt --all -- --check
 
   clippy:
     needs: [fmt]
@@ -36,7 +68,8 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.93.1
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -48,16 +81,16 @@ jobs:
           components: clippy
 
       - name: Run cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings  -W clippy::all -W clippy::pedantic
+        run: cargo +${{ matrix.rust }} clippy --all-targets --all-features -- -D warnings -W clippy::all -W clippy::pedantic
 
   build:
     needs: [fmt, clippy]
-    name: Build 
+    name: Build
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.93.1
 
     steps:
       - name: Checkout sources
@@ -68,17 +101,18 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
-      - name: Run cargo check
-        run: cargo build --all-features
+      - name: Run cargo build
+        run: cargo +${{ matrix.rust }} build --all-features
 
   test:
     needs: [build]
-    name: Tests 
+    name: Tests
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.93.1
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -91,5 +125,5 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Nextest 
-        run: cargo nextest run --workspace --all-targets
+      - name: Nextest
+        run: cargo +${{ matrix.rust }} nextest run --workspace --all-targets

@@ -37,12 +37,12 @@ impl Runner {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
 
         Self {
-            manager,
-            info_task,
             cancelation_token,
+            manager,
+            state,
+            info_task,
             action_tx,
             tx,
-            state,
         }
     }
 
@@ -58,7 +58,7 @@ impl Runner {
 
     pub fn start(&mut self) {
         self.launch_refresh_info_task();
-        self.launch_refresh_state_task()
+        self.launch_refresh_state_task();
     }
 
     fn launch_refresh_state_task(&mut self) {
@@ -78,7 +78,7 @@ impl Runner {
                     Ok(event) = rx.recv() => {
                         event_handler.handle(event).await;
                     },
-                    _ = cancelation_token.cancelled() => {
+                    () = cancelation_token.cancelled() => {
                         break;
                     },
                 }
@@ -101,13 +101,13 @@ impl Runner {
                         let info_res = client::redis_info(&mut manager).await;
 
                         match info_res {
-                            Ok(redis_info) => *info.lock().unwrap() = Some(redis_info),
+                            Ok(redis_info) => *info.lock() = Some(redis_info),
                             Err(_err) => {
                                 // TODO: show the popup
                             },
                         }
                     },
-                    _ = cancelation_token.cancelled() => {
+                    () = cancelation_token.cancelled() => {
                         break;
                     }
                 }
@@ -129,9 +129,20 @@ impl EventHandler {
 
     async fn handle(&mut self, event: RedisEvent) {
         match event {
+            RedisEvent::FetchValue { key, r_type } => {
+                match self.storage.fetch_value(&key, r_type).await {
+                    Ok(value) => {
+                        *self.state.selected_value.lock() = Some(value);
+                        self.action_hook(Action::LoadSelectedValueIntoView);
+                    }
+                    Err(err) => {
+                        log::error!("FetchValue failed for {key}: {err:?}");
+                    }
+                }
+            }
             RedisEvent::FetchKeys => {
                 let (cursor, pattern) = {
-                    let state = self.state.keyspace_state.lock().unwrap();
+                    let state = self.state.keyspace_state.lock();
 
                     (state.cursor, state.pattern.clone())
                 };
@@ -147,16 +158,16 @@ impl EventHandler {
                 match keys {
                     Ok(KeysList::Keys { cursor, keys }) => {
                         {
-                            let mut state = self.state.keyspace_state.lock().unwrap();
+                            let mut state = self.state.keyspace_state.lock();
                             state.set_next_cursor(cursor);
                         }
 
-                        let mut store = self.state.keys.lock().unwrap();
+                        let mut store = self.state.keys.lock();
                         _ = std::mem::replace(&mut *store, keys);
                         self.action_hook(Action::LoadKeysIntoKeySpace);
                     }
                     Ok(KeysList::Empty) => {
-                        let mut store = self.state.keys.lock().unwrap();
+                        let mut store = self.state.keys.lock();
                         _ = std::mem::take(&mut *store);
                         self.action_hook(Action::LoadKeysIntoKeySpace);
                     }

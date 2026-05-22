@@ -63,6 +63,7 @@ pub enum KeyValue {
     Set(HashSet<String>),
     Hash(HashMap<String, String>),
     Zset(Vec<(String, f64)>), // Tuple of value and score
+    #[allow(dead_code)]
     Json(serde_json::Value),
     Unknown,
 }
@@ -73,6 +74,7 @@ pub struct KeyMeta {
     pub r_type: RedisType,
     pub size: u128,
     pub ttl: isize,
+    #[allow(dead_code)]
     pub value: KeyValue,
 }
 
@@ -93,8 +95,8 @@ pub enum RedisType {
 }
 
 impl RedisType {
-    fn from_str<'a>(value: Cow<'a, str>) -> Self {
-        match value.as_ref() {
+    fn from_str(value: &str) -> Self {
+        match value {
             "string" => Self::String,
             "hash" => Self::Hash,
             "set" => Self::Set,
@@ -106,18 +108,17 @@ impl RedisType {
     }
 }
 
-impl<'a> Into<Text<'a>> for RedisType {
-    fn into(self) -> Text<'a> {
-        match self {
-            Self::String => Span::raw(" STRING ")
-                .bg(config::get().keyspace.string)
-                .into(),
-            Self::Json => Span::raw(" JSON ").bg(config::get().keyspace.json).into(),
-            Self::List => Span::raw(" LIST ").bg(config::get().keyspace.list).into(),
-            Self::Set => Span::raw(" SET ").bg(config::get().keyspace.set).into(),
-            Self::Zset => Span::raw(" ZSET ").bg(config::get().keyspace.zset).into(),
-            Self::Hash => Span::raw(" HASH ").bg(config::get().keyspace.hash).into(),
-            Self::Unknown => Span::raw(" ? ").bg(config::get().keyspace.unknown).into(),
+impl From<RedisType> for Text<'_> {
+    fn from(value: RedisType) -> Self {
+        let palette = &config::get().keyspace;
+        match value {
+            RedisType::String => Span::raw(" STRING ").bg(palette.string).into(),
+            RedisType::Json => Span::raw(" JSON ").bg(palette.json).into(),
+            RedisType::List => Span::raw(" LIST ").bg(palette.list).into(),
+            RedisType::Set => Span::raw(" SET ").bg(palette.set).into(),
+            RedisType::Zset => Span::raw(" ZSET ").bg(palette.zset).into(),
+            RedisType::Hash => Span::raw(" HASH ").bg(palette.hash).into(),
+            RedisType::Unknown => Span::raw(" ? ").bg(palette.unknown).into(),
         }
     }
 }
@@ -128,7 +129,7 @@ where
 {
     #[inline]
     fn from(value: T) -> Self {
-        Self::from_str(value.into())
+        Self::from_str(value.into().as_ref())
     }
 }
 
@@ -137,6 +138,7 @@ pub struct KeyspaceState {
     pub cursor: Option<usize>,
     pub next_cursor: Option<usize>,
     pub pattern: Option<String>,
+    #[allow(dead_code)]
     pub count: usize,
     pub cursor_stack: VecDeque<usize>,
 }

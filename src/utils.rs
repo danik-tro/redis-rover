@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{eyre, Result};
 use directories::ProjectDirs;
-use lazy_static::lazy_static;
 use tracing::error;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
@@ -19,24 +18,38 @@ const VERSION_MESSAGE: &str = concat!(
 );
 
 // TODO: get rid of the lazy_static. Replace with a native OnceLock/OnceCell
-lazy_static! {
-    pub static ref PROJECT_NAME: String = env!("CARGO_CRATE_NAME").to_uppercase().to_string();
-    pub static ref DATA_FOLDER: Option<PathBuf> =
-        std::env::var(format!("{}_DATA", PROJECT_NAME.clone()))
-            .ok()
-            .map(PathBuf::from);
-    pub static ref CONFIG_FOLDER: Option<PathBuf> =
-        std::env::var(format!("{}_CONFIG", PROJECT_NAME.clone()))
-            .ok()
-            .map(PathBuf::from);
-    pub static ref LOG_ENV: String = format!("{}_LOGLEVEL", PROJECT_NAME.clone());
-    pub static ref LOG_FILE: String = format!("{}.log", env!("CARGO_PKG_NAME"));
+#[allow(clippy::ref_option)]
+mod statics {
+    use super::PathBuf;
+    use lazy_static::lazy_static;
+
+    lazy_static! {
+        pub static ref PROJECT_NAME: String = env!("CARGO_CRATE_NAME").to_uppercase();
+        pub static ref DATA_FOLDER: Option<PathBuf> =
+            std::env::var(format!("{}_DATA", PROJECT_NAME.as_str()))
+                .ok()
+                .map(PathBuf::from);
+        pub static ref CONFIG_FOLDER: Option<PathBuf> =
+            std::env::var(format!("{}_CONFIG", PROJECT_NAME.as_str()))
+                .ok()
+                .map(PathBuf::from);
+        pub static ref LOG_ENV: String = format!("{}_LOGLEVEL", PROJECT_NAME.as_str());
+        pub static ref LOG_FILE: String = format!("{}.log", env!("CARGO_PKG_NAME"));
+    }
 }
+
+pub use statics::{CONFIG_FOLDER, DATA_FOLDER, LOG_ENV, LOG_FILE};
 
 fn project_directory() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "kdheepak", env!("CARGO_PKG_NAME"))
 }
 
+/// Install panic + eyre hooks that tear down the TUI and emit a
+/// human-readable crash report.
+///
+/// # Errors
+///
+/// Returns an error if the eyre hook cannot be installed.
 pub fn initialize_panic_handler() -> Result<()> {
     let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default()
         .panic_section(format!(
@@ -51,7 +64,7 @@ pub fn initialize_panic_handler() -> Result<()> {
     std::panic::set_hook(Box::new(move |panic_info| {
         if let Ok(mut t) = crate::tui::Tui::new() {
             if let Err(r) = t.exit() {
-                error!("Unable to exit Terminal: {:?}", r);
+                error!("Unable to exit Terminal: {r:?}");
             }
         }
 
@@ -72,7 +85,7 @@ pub fn initialize_panic_handler() -> Result<()> {
             eprintln!("{}", panic_hook.panic_report(panic_info)); // prints color-eyre stack trace to stderr
         }
         let msg = format!("{}", panic_hook.panic_report(panic_info));
-        log::error!("Error: {}", strip_ansi_escapes::strip_str(msg));
+        log::error!("Error: {error}", error = strip_ansi_escapes::strip_str(msg));
 
         #[cfg(debug_assertions)]
         {
@@ -111,15 +124,21 @@ pub fn get_config_dir() -> PathBuf {
     directory
 }
 
+/// Initialise the file-based tracing subscriber under the data directory.
+///
+/// # Errors
+///
+/// Returns an error if the data directory cannot be created or the log
+/// file cannot be opened for writing.
 pub fn initialize_logging() -> Result<()> {
     let directory = get_data_dir();
-    std::fs::create_dir_all(directory.clone())?;
-    let log_path = directory.join(LOG_FILE.clone());
+    std::fs::create_dir_all(&directory)?;
+    let log_path = directory.join(LOG_FILE.as_str());
     let log_file = std::fs::File::create(log_path)?;
     std::env::set_var(
         "RUST_LOG",
         std::env::var("RUST_LOG")
-            .or_else(|_| std::env::var(LOG_ENV.clone()))
+            .or_else(|_| std::env::var(LOG_ENV.as_str()))
             .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME"))),
     );
     let file_subscriber = tracing_subscriber::fmt::layer()
@@ -168,6 +187,10 @@ macro_rules! trace_dbg {
 ///   redis://[user@]host:port[/db]   → redis://:token@host:port[/db]
 ///   rediss://...                     → same, TLS variant
 ///   redis+unix://...                 → same, Unix socket variant
+///
+/// # Errors
+///
+/// Returns an error if `url` is missing a `://` separator.
 pub fn inject_token(url: &str, token: &str) -> Result<String> {
     let scheme_end = url
         .find("://")
