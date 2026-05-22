@@ -16,17 +16,19 @@ jobs:
       matrix:
         rust:
           - 1.91.0
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install ${{ matrix.rust }} --component rustfmt
-          rustup default ${{ matrix.rust }}
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt
 
       - name: Run cargo fmt
-        run: cargo fmt --all -- --check
+        run: cargo +${{ matrix.rust }} fmt --all -- --check
 
   clippy:
     needs: [fmt]
@@ -36,17 +38,19 @@ jobs:
       matrix:
         rust:
           - 1.91.0
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install ${{ matrix.rust }} --component clippy
-          rustup default ${{ matrix.rust }}
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
 
       - name: Run cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::all -W clippy::pedantic
+        run: cargo +${{ matrix.rust }} clippy --all-targets --all-features -- -D warnings -W clippy::all -W clippy::pedantic
 
   build:
     needs: [fmt, clippy]
@@ -61,13 +65,13 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install ${{ matrix.rust }}
-          rustup default ${{ matrix.rust }}
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
 
       - name: Run cargo build
-        run: cargo build --all-features
+        run: cargo +${{ matrix.rust }} build --all-features
 
   test:
     needs: [build]
@@ -77,17 +81,18 @@ jobs:
       matrix:
         rust:
           - 1.91.0
+
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install ${{ matrix.rust }}
-          rustup default ${{ matrix.rust }}
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
       - name: Nextest
-        run: cargo nextest run --workspace --all-targets
+        run: cargo +${{ matrix.rust }} nextest run --workspace --all-targets
