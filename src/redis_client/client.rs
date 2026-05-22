@@ -1,10 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
 use super::types::{KeyMeta, KeyValue, RedisInfo, RedisType};
+
+const VALUE_PREVIEW_LIMIT: isize = 100;
 
 // TODO: should be a better solution to handle this.
 pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
@@ -44,78 +46,63 @@ pub async fn keys(
     Ok((cursor, keys))
 }
 
-pub async fn retrieve_type_and_value(
-    mut manager: redis::aio::ConnectionManager,
+pub async fn fetch_value(
+    mut manager: ConnectionManager,
     key: &str,
-) -> Result<(RedisType, KeyValue), Box<dyn std::error::Error + Send + Sync>> {
-    let r_type: String = manager.key_type(key).await?;
-    let r_type = RedisType::from(r_type);
-
+    r_type: RedisType,
+) -> Result<KeyValue, Box<dyn std::error::Error + Send + Sync>> {
     match r_type {
         RedisType::String => {
             let value: String = manager.get(key).await?;
-            Ok((r_type, KeyValue::String(value)))
+            Ok(KeyValue::String(value))
         }
         RedisType::List => {
-            let value: Vec<String> = manager.lrange(key, 0, -1).await?;
-            Ok((r_type, KeyValue::List(value)))
+            let value: Vec<String> = manager.lrange(key, 0, VALUE_PREVIEW_LIMIT - 1).await?;
+            Ok(KeyValue::List(value))
         }
         RedisType::Set => {
-            let value: HashSet<String> = manager.smembers(key).await?;
-            Ok((r_type, KeyValue::Set(value)))
+            let members: Vec<String> = redis::cmd("SRANDMEMBER")
+                .arg(key)
+                .arg(VALUE_PREVIEW_LIMIT)
+                .query_async(&mut manager)
+                .await?;
+            Ok(KeyValue::Set(members.into_iter().collect()))
         }
         RedisType::Hash => {
             let value: HashMap<String, String> = manager.hgetall(key).await?;
-            Ok((r_type, KeyValue::Hash(value)))
+            Ok(KeyValue::Hash(value))
         }
         RedisType::Zset => {
-            let value: Vec<(String, f64)> = manager.zrange_withscores(key, 0, -1).await?;
-            Ok((r_type, KeyValue::Zset(value)))
+            let value: Vec<(String, f64)> = manager
+                .zrange_withscores(key, 0, VALUE_PREVIEW_LIMIT - 1)
+                .await?;
+            Ok(KeyValue::Zset(value))
         }
-        RedisType::Json => {
-            // TODO: impleent json type
-            // let value: serde_json::Value = manager.get(key).await?;
-            Ok((r_type, KeyValue::Unknown))
-        }
-        RedisType::Unknown => Ok((r_type, KeyValue::Unknown)),
+        RedisType::Json | RedisType::Unknown => Ok(KeyValue::Unknown),
     }
 }
 
-pub async fn retrieve_memory_usage(
-    mut manager: redis::aio::ConnectionManager,
-    key: &str,
-) -> Result<u128, Box<dyn std::error::Error + Send + Sync>> {
-    let size: Option<u128> = redis::cmd("MEMORY")
-        .arg("USAGE")
-        .arg(key)
-        .query_async(&mut manager)
-        .await?;
-
-    Ok(size.unwrap_or_default())
-}
-
-pub async fn retrieve_ttl(
-    mut manager: redis::aio::ConnectionManager,
-    key: &str,
-) -> Result<isize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(manager.ttl(key).await?)
-}
-
-pub async fn fetch_meta(
-    manager: redis::aio::ConnectionManager,
+pub async fn fetch_meta_light(
+    manager: ConnectionManager,
     key: &str,
 ) -> Result<KeyMeta, Box<dyn std::error::Error + Sync + Send>> {
-    let ((r_type, value), size, ttl) = tokio::try_join!(
-        retrieve_type_and_value(manager.clone(), key),
-        retrieve_memory_usage(manager.clone(), key),
-        retrieve_ttl(manager, key),
-    )?;
+    let mut conn = manager;
+    let (r_type, size, ttl): (String, Option<u128>, isize) = redis::pipe()
+        .cmd("TYPE")
+        .arg(key)
+        .cmd("MEMORY")
+        .arg("USAGE")
+        .arg(key)
+        .cmd("TTL")
+        .arg(key)
+        .query_async(&mut conn)
+        .await?;
 
     Ok(KeyMeta {
-        value,
-        r_type,
-        size,
-        ttl,
         key: key.into(),
+        r_type: RedisType::from(r_type),
+        size: size.unwrap_or_default(),
+        ttl,
+        value: KeyValue::Unknown,
     })
 }

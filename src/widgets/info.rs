@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use ratatui::{prelude::*, widgets::*};
 
@@ -20,16 +22,17 @@ impl StatefulWidget for InfoWidget {
     type State = Info;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let cfg = config::get();
         Block::new()
-            .fg(config::get().colors.base04)
-            .bg(config::get().colors.base00)
+            .fg(cfg.colors.base04)
+            .bg(cfg.colors.base00)
             .borders(Borders::ALL)
             .title("Info")
             .title_alignment(Alignment::Left)
             .border_type(BorderType::Rounded)
             .render(area, buf);
 
-        let common_info = { state.info.lock().unwrap().as_ref().map(Clone::clone) };
+        let common_info = { state.info.lock().as_ref().map(Clone::clone) };
 
         let [top, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
             .flex(layout::Flex::Center)

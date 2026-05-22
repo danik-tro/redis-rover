@@ -17,6 +17,8 @@ pub enum Action {
     LoadKeySpace,
     RefreshSpace,
     LoadKeysIntoKeySpace,
+    RequestSelectedValue,
+    LoadSelectedValueIntoView,
     LoadNextPage,
     LoadPreviousPage,
     SetKeyspaceFilter,

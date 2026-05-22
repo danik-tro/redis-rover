@@ -88,6 +88,8 @@ impl App {
         // tui.mouse(true);
         tui.enter()?;
 
+        self.tx.send(Action::LoadKeySpace)?;
+
         loop {
             // TODO: refactor with async_channel crate
             // replace with select multiplex
@@ -167,6 +169,8 @@ impl App {
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
             Action::LoadKeysIntoKeySpace => self.load_new_keys(),
+            Action::RequestSelectedValue => self.request_selected_value(),
+            Action::LoadSelectedValueIntoView => self.load_selected_value(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
             Action::LoadNextPage => self.load_next_page(),
@@ -195,8 +199,9 @@ impl StatefulWidget for AppWidget {
     type State = App;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let cfg = config::get();
         Block::default()
-            .bg(config::get().colors.base00)
+            .bg(cfg.colors.base00)
             .render(area, buf);
 
         use ratatui::layout::Constraint;
@@ -252,7 +257,7 @@ impl App {
 
         {
             let pattern = self.keyspace.confirm_filter_pattern();
-            let mut state = self.state.keyspace_state.lock().unwrap();
+            let mut state = self.state.keyspace_state.lock();
             state.set_pattern(pattern.clone());
 
             self.keyspace.update_filters(pattern, None);
@@ -262,7 +267,7 @@ impl App {
 
     fn delete_keyspace_filter(&mut self) {
         {
-            let mut state = self.state.keyspace_state.lock().unwrap();
+            let mut state = self.state.keyspace_state.lock();
             state.delete_pattern();
             self.keyspace.update_filters(None, None);
         }
@@ -271,7 +276,7 @@ impl App {
 
     fn load_next_page(&mut self) {
         {
-            let mut state = self.state.keyspace_state.lock().unwrap();
+            let mut state = self.state.keyspace_state.lock();
             state.update_cursor();
             self.keyspace
                 .update_filters(state.pattern.clone(), state.cursor);
@@ -281,7 +286,7 @@ impl App {
 
     fn load_previous_page(&mut self) {
         {
-            let mut state = self.state.keyspace_state.lock().unwrap();
+            let mut state = self.state.keyspace_state.lock();
             state.set_previous_cursor();
             self.keyspace
                 .update_filters(state.pattern.clone(), state.cursor);
@@ -291,7 +296,25 @@ impl App {
 
     fn load_new_keys(&mut self) {
         self.keyspace
-            .set_keys(self.state.keys.lock().unwrap().clone());
+            .set_keys(self.state.keys.lock().clone());
+        self.keyspace.clear_selected_value();
+    }
+
+    fn request_selected_value(&self) {
+        let Some((key, r_type)) = self.keyspace.selected_key() else {
+            return;
+        };
+        if let Err(err) = self
+            .redis_tx
+            .send(RedisEvent::FetchValue { key, r_type })
+        {
+            log::error!("Failed to send FetchValue: {err:?}");
+        }
+    }
+
+    fn load_selected_value(&mut self) {
+        let value = self.state.selected_value.lock().clone();
+        self.keyspace.set_selected_value(value);
     }
 
     fn load_keyspace(&self) {
@@ -309,14 +332,22 @@ impl App {
 
     fn scroll_down(&mut self) {
         match self.mode {
-            Mode::KeySpace => self.keyspace.scroll_next(),
+            Mode::KeySpace => {
+                self.keyspace.scroll_next();
+                self.keyspace.clear_selected_value();
+                let _ = self.tx.send(Action::RequestSelectedValue);
+            }
             _ => {}
         }
     }
 
     fn scroll_up(&mut self) {
         match self.mode {
-            Mode::KeySpace => self.keyspace.scroll_previous(),
+            Mode::KeySpace => {
+                self.keyspace.scroll_previous();
+                self.keyspace.clear_selected_value();
+                let _ = self.tx.send(Action::RequestSelectedValue);
+            }
             _ => {}
         }
     }
