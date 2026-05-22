@@ -35,7 +35,6 @@ ratatui = { version = "0.28.1", features = ["serde", "macros"] }
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1.0.150"
 serde_with = "3.20.0"
-signal-hook = "0.4.4"
 strip-ansi-escapes = "0.2.1"
 strum = { version = "0.28.0", features = ["derive"] }
 itertools = "0.13.0"
@@ -47,7 +46,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "serde"] }
 
 redis = { version = "1.2.1", default-features = false, features = ["aio", "tokio-comp", "connection-manager"]}
 byte-unit = { version = "5.2.0", features = ["serde", "byte"], default-features = false}
-tui-input = "0.10.1"
 tui-textarea = "0.6.1"
 rpassword = "7.5.2"
 

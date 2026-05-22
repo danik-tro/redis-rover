@@ -322,6 +322,7 @@ const HIGHLIGHT_SYMBOL: &str = " >> ";
 impl StatefulWidget for KeySpaceWidget {
     type State = KeySpace;
 
+    #[allow(clippy::too_many_lines)]
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
         let [t_area, view_area] =
