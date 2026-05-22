@@ -1,12 +1,12 @@
-name: CI 
+name: CI
 
 on:
-    push:
-      branches: '*'
-      tags:
-        - 'v*'
-    pull_request:
-      branches: '*'
+  push:
+    branches: "*"
+    tags:
+      - "v*"
+  pull_request:
+    branches: "*"
 
 jobs:
   fmt:
@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.78.0 
+          - 1.91.0
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -36,7 +36,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.91.0
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -52,12 +52,12 @@ jobs:
 
   build:
     needs: [fmt, clippy]
-    name: Build 
+    name: Build
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.91.0
 
     steps:
       - name: Checkout sources
@@ -73,12 +73,12 @@ jobs:
 
   test:
     needs: [build]
-    name: Tests 
+    name: Tests
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
-          - 1.78.0
+          - 1.91.0
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4.1.6
@@ -91,5 +91,5 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Nextest 
+      - name: Nextest
         run: cargo nextest run --workspace --all-targets
