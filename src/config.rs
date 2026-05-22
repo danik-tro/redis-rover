@@ -313,18 +313,12 @@ fn parse_color(s: &str) -> Option<Color> {
                 .unwrap_or_default();
         Some(Color::Indexed(c))
     } else if s.contains("rgb") {
-        let red = u8::try_from(
-            (s.as_bytes()[3] as char).to_digit(10).unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        let green = u8::try_from(
-            (s.as_bytes()[4] as char).to_digit(10).unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        let blue = u8::try_from(
-            (s.as_bytes()[5] as char).to_digit(10).unwrap_or_default(),
-        )
-        .unwrap_or_default();
+        let red = u8::try_from((s.as_bytes()[3] as char).to_digit(10).unwrap_or_default())
+            .unwrap_or_default();
+        let green = u8::try_from((s.as_bytes()[4] as char).to_digit(10).unwrap_or_default())
+            .unwrap_or_default();
+        let blue = u8::try_from((s.as_bytes()[5] as char).to_digit(10).unwrap_or_default())
+            .unwrap_or_default();
         let c = 16 + red * 36 + green * 6 + blue;
         Some(Color::Indexed(c))
     } else if s == "bold black" {

@@ -251,7 +251,12 @@ impl KeySpaceWidget {
         }
     }
 
-    fn render_single_column_table(header_label: &str, rows_data: &[String], area: Rect, buf: &mut Buffer) {
+    fn render_single_column_table(
+        header_label: &str,
+        rows_data: &[String],
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
         let cfg = config::get();
         let mut table_state = TableState::default();
         let widths = [Constraint::Percentage(100)];
@@ -286,11 +291,14 @@ impl KeySpaceWidget {
         let cfg = config::get();
         let mut table_state = TableState::default();
         let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
-        let header = Row::new([Cell::from(left_label.bold()), Cell::from(right_label.bold())])
-            .top_margin(1)
-            .bottom_margin(1)
-            .fg(cfg.colors.base04)
-            .bg(cfg.colors.base02);
+        let header = Row::new([
+            Cell::from(left_label.bold()),
+            Cell::from(right_label.bold()),
+        ])
+        .top_margin(1)
+        .bottom_margin(1)
+        .fg(cfg.colors.base04)
+        .bg(cfg.colors.base02);
 
         let rows = rows_data.iter().map(|(left, right)| {
             Row::new([Cell::from(left.as_str()), Cell::from(right.as_str())])
@@ -363,10 +371,13 @@ impl StatefulWidget for KeySpaceWidget {
             .flex(ratatui::layout::Flex::Center)
             .areas(cursor_size_are);
 
-        Paragraph::new(format!("Cursor: {cursor}", cursor = state.cursor.unwrap_or_default()))
-            .bold()
-            .alignment(Alignment::Left)
-            .render(cursor_area, buf);
+        Paragraph::new(format!(
+            "Cursor: {cursor}",
+            cursor = state.cursor.unwrap_or_default()
+        ))
+        .bold()
+        .alignment(Alignment::Left)
+        .render(cursor_area, buf);
 
         Paragraph::new("Size: 10")
             .bold()
