@@ -21,7 +21,6 @@ impl KeyBindings {
         }
     }
 
-    #[allow(dead_code)]
     pub fn get_keybindings_for_command(&self, mode: Mode, command: Command) -> Vec<Vec<KeyEvent>> {
         let bindings_for_mode = self.0.get(&mode).cloned().unwrap_or_default();
         bindings_for_mode
@@ -31,7 +30,6 @@ impl KeyBindings {
             .collect_vec()
     }
 
-    #[allow(dead_code)]
     pub fn get_config_for_command(&self, mode: Mode, command: Command) -> Vec<String> {
         self.get_keybindings_for_command(mode, command)
             .iter()
@@ -180,7 +178,6 @@ fn parse_key_code_with_modifiers(
     Ok(KeyEvent::new(c, modifiers))
 }
 
-#[allow(dead_code)]
 pub fn key_event_to_string(key_event: &KeyEvent) -> String {
     let char;
     let key_code = match key_event.code {

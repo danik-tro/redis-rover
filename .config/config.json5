@@ -13,6 +13,7 @@
       "l": "DeletePattern",
       "<Esc>": "ClosePopup",
       "<Enter>": "EnterPopup",
+      "?": "ToggleHelp",
     },
   },
   "colors": {

@@ -14,6 +14,7 @@ impl From<Command> for Action {
             Command::SetPattern => Self::SetKeyspaceFilter,
             Command::DeletePattern => Self::DeleteKeyspaceFilter,
             Command::EnterPopup => Self::ConfirmKeyspacePopup,
+            Command::ToggleHelp => Self::Help,
         }
     }
 }

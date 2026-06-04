@@ -14,4 +14,5 @@ pub enum Command {
     DeletePattern,
     ClosePopup,
     EnterPopup,
+    ToggleHelp,
 }

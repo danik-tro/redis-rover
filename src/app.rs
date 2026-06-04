@@ -1,13 +1,16 @@
+use std::time::{Duration, Instant};
+
 use crate::{config, mode::PopupMode, redis_client::event::RedisEvent, state::SharedState};
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
+use ratatui::prelude::Rect;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::KeyEvent,
-    layout::{Constraint, Flex, Layout},
-    prelude::Rect,
+    layout::{Alignment, Constraint, Flex, Layout},
     style::Stylize,
-    widgets::{Block, StatefulWidget, Widget},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, StatefulWidget, Widget},
 };
 use tokio::sync::{
     broadcast,
@@ -17,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     action::{self, Action},
+    command::Command,
     mode::Mode,
     tui,
     widgets::{
@@ -27,6 +31,9 @@ use crate::{
 
 pub struct AppWidget;
 
+/// How long the `?` help overlay stays up before auto-dismissing.
+const HELP_TIMEOUT: Duration = Duration::from_secs(7);
+
 pub struct App {
     state: SharedState,
 
@@ -36,6 +43,9 @@ pub struct App {
     mode: Mode,
     previous_mode: Option<Mode>,
     error_message: Option<String>,
+    /// When the `?` help overlay was opened. `None` means it's hidden. The
+    /// overlay auto-dismisses after [`HELP_TIMEOUT`] or on the next command.
+    help_opened_at: Option<Instant>,
 
     should_quit: bool,
     last_tick_key_events: Vec<KeyEvent>,
@@ -74,6 +84,7 @@ impl App {
             mode,
             previous_mode: None,
             error_message: None,
+            help_opened_at: None,
             last_tick_key_events: Vec::new(),
             tx,
             rx,
@@ -149,7 +160,16 @@ impl App {
         self.handle_keybindings(key)
     }
 
-    fn handle_keybindings(&mut self, key: KeyEvent) -> Option<Action> {
+    fn handle_keybindings(&mut self, mut key: KeyEvent) -> Option<Action> {
+        // Symbol keys like `?` arrive with `SHIFT` set on most terminals, but
+        // the config writes them literally (no modifier). Drop a lone `SHIFT`
+        // on punctuation/symbol chars so those bindings match.
+        if let KeyCode::Char(c) = key.code {
+            if !c.is_alphanumeric() && key.modifiers == crossterm::event::KeyModifiers::SHIFT {
+                key.modifiers = crossterm::event::KeyModifiers::empty();
+            }
+        }
+
         self.last_tick_key_events.push(key);
 
         config::get()
@@ -167,6 +187,7 @@ impl App {
         if action != &Action::Tick && action != &Action::Render {
             log::debug!("{action:?}");
         }
+        self.maybe_dismiss_help(action);
         match *action {
             Action::Tick => {
                 self.last_tick_key_events.drain(..);
@@ -188,8 +209,9 @@ impl App {
             Action::DiscardKeyspacePopup => self.close_popup(),
             Action::ConfirmKeyspacePopup => self.set_keyspace_filter(),
             Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
+            Action::Help => self.toggle_help(),
             Action::Error(ref msg) => self.show_error_popup(msg),
-            _ => {}
+            Action::Refresh => {}
         }
 
         Ok(None)
@@ -217,6 +239,10 @@ impl StatefulWidget for AppWidget {
 
         StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
         state.render_main_block(main, buf);
+
+        if state.help_is_open() {
+            App::render_help_overlay(area, buf);
+        }
     }
 }
 
@@ -230,6 +256,98 @@ impl App {
 
     fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
         StatefulWidget::render(KeySpaceWidget, area, buf, &mut self.keyspace);
+    }
+
+    /// Render the `?` help overlay: a centered popup listing every command and
+    /// the key sequence(s) bound to it. The box grows ("extends") to fit its
+    /// content — both width and height are derived from the rows — and is
+    /// clamped to the available area.
+    fn render_help_overlay(area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let keybindings = &cfg.keybindings;
+
+        // Commands shown in the help, paired with a human-readable label. Each
+        // is resolved to its configured key sequences via
+        // `KeyBindings::get_config_for_command`.
+        let entries: [(Command, &str); 11] = [
+            (Command::ScrollDown, "Scroll down"),
+            (Command::ScrollUp, "Scroll up"),
+            (Command::LoadNextPage, "Next page"),
+            (Command::LoadPreviousPage, "Previous page"),
+            (Command::RefreshSpace, "Refresh keyspace"),
+            (Command::SetPattern, "Set filter pattern"),
+            (Command::DeletePattern, "Delete filter pattern"),
+            (Command::EnterPopup, "Confirm popup"),
+            (Command::ClosePopup, "Close popup / overlay"),
+            (Command::ToggleHelp, "Toggle this help"),
+            (Command::Quit, "Quit"),
+        ];
+
+        let rows: Vec<(String, String)> = entries
+            .iter()
+            .map(|(command, label)| {
+                let mut binds = keybindings.get_config_for_command(Mode::KeySpace, *command);
+                binds.extend(keybindings.get_config_for_command(Mode::Common, *command));
+                let keys = if binds.is_empty() {
+                    "—".to_string()
+                } else {
+                    binds.join(", ")
+                };
+                ((*label).to_string(), keys)
+            })
+            .collect();
+
+        // "Extend" the box to its content: longest "label    keys" line plus
+        // borders and padding, clamped to the available area.
+        let content_width = rows
+            .iter()
+            .map(|(label, keys)| label.len() + keys.len() + 4)
+            .max()
+            .unwrap_or(0);
+        let title = " Help ";
+        let inner_width = content_width.max(title.len());
+        #[allow(clippy::cast_possible_truncation)]
+        let popup_w = (inner_width as u16 + 4).min(area.width);
+        #[allow(clippy::cast_possible_truncation)]
+        let popup_h = (rows.len() as u16 + 3).min(area.height);
+
+        let [_, popup_area, _] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(popup_h),
+            Constraint::Fill(1),
+        ])
+        .flex(Flex::Center)
+        .areas(area);
+        let [_, popup_area, _] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(popup_w),
+            Constraint::Fill(1),
+        ])
+        .flex(Flex::Center)
+        .areas(popup_area);
+
+        let block = Block::default()
+            .title(title)
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(cfg.colors.base04)
+            .bg(cfg.colors.base00)
+            .fg(cfg.colors.base05);
+
+        let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+        let lines: Vec<Line> = rows
+            .iter()
+            .map(|(label, keys)| {
+                Line::from(vec![
+                    Span::raw(format!("{label:<label_width$}  ")),
+                    Span::styled(keys.clone(), cfg.colors.base04),
+                ])
+            })
+            .collect();
+
+        Clear.render(popup_area, buf);
+        Paragraph::new(lines).block(block).render(popup_area, buf);
     }
 }
 
@@ -250,7 +368,48 @@ impl App {
         self.keyspace.enter_filter_pattern();
     }
 
+    fn toggle_help(&mut self) {
+        self.help_opened_at = if self.help_opened_at.is_some() {
+            None
+        } else {
+            Some(Instant::now())
+        };
+    }
+
+    fn help_is_open(&self) -> bool {
+        self.help_opened_at.is_some()
+    }
+
+    /// Hide the help overlay when it has been up longer than [`HELP_TIMEOUT`]
+    /// (checked on `Tick`) or as soon as the user issues any real command —
+    /// `Help` itself toggles it, and `Tick`/`Render` are background noise.
+    fn maybe_dismiss_help(&mut self, action: &Action) {
+        let Some(opened_at) = self.help_opened_at else {
+            return;
+        };
+
+        match action {
+            // `Help` toggles the overlay; `Tick`/`Render` are background noise.
+            // `DiscardKeyspacePopup` (Esc) is handled by `close_popup`, which
+            // already gives the help overlay precedence — leave it alone here so
+            // a single Esc doesn't also dismiss an underlying keyspace popup.
+            Action::Help | Action::Render | Action::DiscardKeyspacePopup => {}
+            Action::Tick => {
+                if opened_at.elapsed() >= HELP_TIMEOUT {
+                    self.help_opened_at = None;
+                }
+            }
+            _ => self.help_opened_at = None,
+        }
+    }
+
     fn close_popup(&mut self) {
+        // Esc dismisses the help overlay first if it's open.
+        if self.help_is_open() {
+            self.help_opened_at = None;
+            return;
+        }
+
         if !self.keyspace.is_popup() {
             return;
         }

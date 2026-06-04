@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{self, Alignment, Constraint, Layout, Rect};
 use ratatui::style::Stylize;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, StatefulWidget, Widget};
 
 use crate::{config, redis_client::types::RedisInfo};
@@ -32,6 +33,7 @@ impl StatefulWidget for InfoWidget {
             .borders(Borders::ALL)
             .title("Info")
             .title_alignment(Alignment::Left)
+            .title_top(Line::from(" ? Help ").right_aligned())
             .border_type(BorderType::Rounded)
             .render(area, buf);
 

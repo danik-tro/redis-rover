@@ -27,6 +27,7 @@ enum KeySpaceMode {
 
 pub struct KeySpace {
     table: TableState,
+    value_table: TableState,
     keys: Vec<KeyMeta>,
     cursor: Option<usize>,
     pattern: Option<String>,
@@ -40,6 +41,7 @@ impl KeySpace {
         Self {
             keys,
             table: TableState::default(),
+            value_table: TableState::default(),
             cursor: None,
             pattern: None,
             mode: KeySpaceMode::Normal,
@@ -60,6 +62,9 @@ impl KeySpace {
 
     pub fn clear_selected_value(&mut self) {
         self.selected_value = None;
+        // The detail-view selection belongs to the previously selected key;
+        // reset it so the new value's table starts unselected.
+        self.value_table.select(None);
     }
 
     pub fn is_popup(&self) -> bool {
@@ -216,36 +221,39 @@ impl KeySpaceWidget {
             return;
         };
 
-        Self::render_value(loaded_value, view_area, buf);
+        Self::render_value(loaded_value, view_area, buf, &mut state.value_table);
     }
 
-    fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer) {
+    fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, table_state: &mut TableState) {
         match value {
             KeyValue::String(s) => {
                 Paragraph::new(format!("Value: {s}"))
                     .wrap(Wrap { trim: true })
                     .render(area, buf);
             }
-            KeyValue::List(items) => Self::render_single_column_table("Item", items, area, buf),
+            KeyValue::List(items) => {
+                Self::render_single_column_table("Item", items, area, buf, table_state);
+            }
             KeyValue::Set(members) => Self::render_single_column_table(
                 "Member",
                 members.iter().cloned().collect::<Vec<_>>().as_slice(),
                 area,
                 buf,
+                table_state,
             ),
             KeyValue::Hash(entries) => {
                 let pairs: Vec<(String, String)> = entries
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                Self::render_two_column_table("Field", "Value", &pairs, area, buf);
+                Self::render_two_column_table("Field", "Value", &pairs, area, buf, table_state);
             }
             KeyValue::Zset(entries) => {
                 let pairs: Vec<(String, String)> = entries
                     .iter()
                     .map(|(member, score)| (member.clone(), score.to_string()))
                     .collect();
-                Self::render_two_column_table("Member", "Score", &pairs, area, buf);
+                Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
             }
             KeyValue::Json(_) | KeyValue::Unknown => {}
         }
@@ -256,9 +264,9 @@ impl KeySpaceWidget {
         rows_data: &[String],
         area: Rect,
         buf: &mut Buffer,
+        table_state: &mut TableState,
     ) {
         let cfg = config::get();
-        let mut table_state = TableState::default();
         let widths = [Constraint::Percentage(100)];
         let header = Row::new([Cell::from(header_label.bold())])
             .top_margin(1)
@@ -278,7 +286,7 @@ impl KeySpaceWidget {
             .highlight_style(cfg.colors.base05)
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, area, buf, &mut table_state);
+        StatefulWidget::render(table, area, buf, table_state);
     }
 
     fn render_two_column_table(
@@ -287,9 +295,9 @@ impl KeySpaceWidget {
         rows_data: &[(String, String)],
         area: Rect,
         buf: &mut Buffer,
+        table_state: &mut TableState,
     ) {
         let cfg = config::get();
-        let mut table_state = TableState::default();
         let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
         let header = Row::new([
             Cell::from(left_label.bold()),
@@ -313,7 +321,7 @@ impl KeySpaceWidget {
             .highlight_style(cfg.colors.base05)
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, area, buf, &mut table_state);
+        StatefulWidget::render(table, area, buf, table_state);
     }
 }
 
