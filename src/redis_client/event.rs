@@ -1,4 +1,4 @@
-use super::types::RedisType;
+use super::types::{KeyItem, NewKeySpec, RedisType};
 
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
@@ -18,5 +18,15 @@ pub enum RedisEvent {
     SetTtl {
         key: String,
         secs: i64,
+    },
+    /// Create a new key from the add-key wizard. Rejected if the key exists.
+    CreateKey {
+        key: String,
+        spec: NewKeySpec,
+    },
+    /// Append a single element to an existing collection (in-collection `i`).
+    AddItem {
+        key: String,
+        item: KeyItem,
     },
 }

@@ -16,6 +16,8 @@
       "d": "DeleteKey",
       "t": "SetTtl",
       "e": "EditValue",
+      "a": "AddKey",
+      "i": "AddItem",
       "?": "ToggleHelp",
     },
   },

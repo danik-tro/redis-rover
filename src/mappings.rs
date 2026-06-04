@@ -19,6 +19,8 @@ impl From<Command> for Action {
             Command::DeleteKey => Self::RequestDeleteKey,
             Command::SetTtl => Self::RequestSetTtl,
             Command::EditValue => Self::RequestEditValue,
+            Command::AddKey => Self::RequestAddKey,
+            Command::AddItem => Self::RequestAddItem,
         }
     }
 }

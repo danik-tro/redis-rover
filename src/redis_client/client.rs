@@ -4,7 +4,7 @@ use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use super::types::{KeyValue, RedisInfo, RedisType};
+use super::types::{KeyItem, KeyValue, NewKeySpec, RedisInfo, RedisType};
 
 const VALUE_PREVIEW_LIMIT: isize = 100;
 
@@ -121,6 +121,82 @@ pub async fn set_ttl(
         let _: () = manager.expire(key, secs).await?;
     } else {
         let _: () = manager.persist(key).await?;
+    }
+    Ok(())
+}
+
+/// Return whether a key already exists (`EXISTS`). Used to guard key creation so
+/// the wizard never silently clobbers an existing key.
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn key_exists(
+    mut manager: ConnectionManager,
+    key: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let exists: bool = manager.exists(key).await?;
+    Ok(exists)
+}
+
+/// Create a key from a fully-specified [`NewKeySpec`]. STRING uses `SET`; the
+/// collection types seed every accumulated element in a single command
+/// (`RPUSH` / `SADD` / `HSET` / `ZADD`).
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn create_key(
+    mut manager: ConnectionManager,
+    key: &str,
+    spec: &NewKeySpec,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match spec {
+        NewKeySpec::String(value) => {
+            let _: () = manager.set(key, value).await?;
+        }
+        NewKeySpec::List(items) => {
+            let _: () = manager.rpush(key, items).await?;
+        }
+        NewKeySpec::Set(members) => {
+            let _: () = manager.sadd(key, members).await?;
+        }
+        NewKeySpec::Hash(pairs) => {
+            let _: () = manager.hset_multiple(key, pairs).await?;
+        }
+        NewKeySpec::Zset(pairs) => {
+            // redis crate expects (score, member); our pairs are (member, score).
+            let scored: Vec<(f64, &str)> = pairs.iter().map(|(m, s)| (*s, m.as_str())).collect();
+            let _: () = manager.zadd_multiple(key, &scored).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Append a single element to an existing collection (`RPUSH` / `SADD` / `HSET`
+/// / `ZADD`). The [`KeyItem`] variant must match the key's type.
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn add_item(
+    mut manager: ConnectionManager,
+    key: &str,
+    item: &KeyItem,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match item {
+        KeyItem::ListValue(value) => {
+            let _: () = manager.rpush(key, value).await?;
+        }
+        KeyItem::SetMember(member) => {
+            let _: () = manager.sadd(key, member).await?;
+        }
+        KeyItem::HashField { field, value } => {
+            let _: () = manager.hset(key, field, value).await?;
+        }
+        KeyItem::ZsetMember { member, score } => {
+            let _: () = manager.zadd(key, member, *score).await?;
+        }
     }
     Ok(())
 }

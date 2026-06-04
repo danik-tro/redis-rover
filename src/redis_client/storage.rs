@@ -3,7 +3,7 @@ use redis::FromRedisValue;
 
 use super::{
     client::{self, fetch_value},
-    types::{KeyMeta, KeyValue, KeysList, RedisType},
+    types::{KeyItem, KeyMeta, KeyValue, KeysList, NewKeySpec, RedisType},
 };
 
 pub struct FetchKeysWithMeta<'a> {
@@ -157,5 +157,37 @@ impl Storage {
         secs: i64,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         client::set_ttl(self.manager.clone(), key, secs).await
+    }
+
+    /// Create a new key, rejecting the write if the key already exists. Delegates
+    /// to [`client::create_key`] after a [`client::key_exists`] guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key already exists or the underlying Redis
+    /// command fails.
+    pub async fn create_key(
+        &self,
+        key: &str,
+        spec: &NewKeySpec,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        if client::key_exists(self.manager.clone(), key).await? {
+            return Err(format!("Key '{key}' already exists").into());
+        }
+        client::create_key(self.manager.clone(), key, spec).await
+    }
+
+    /// Append a single element to an existing collection. Delegates to
+    /// [`client::add_item`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
+    pub async fn add_item(
+        &self,
+        key: &str,
+        item: &KeyItem,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::add_item(self.manager.clone(), key, item).await
     }
 }

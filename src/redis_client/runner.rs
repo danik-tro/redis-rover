@@ -183,6 +183,28 @@ impl EventHandler {
                     self.action_hook(Action::Error(format!("Failed to set TTL on {key}: {err}")));
                 }
             },
+            RedisEvent::CreateKey { key, spec } => {
+                match self.storage.create_key(&key, &spec).await {
+                    // Cursor lands on the new key via `App::reselect_key`.
+                    Ok(()) => self.action_hook(Action::RefreshSpace),
+                    Err(err) => {
+                        log::error!("CreateKey failed for {key}: {err:?}");
+                        self.action_hook(Action::Error(format!("Failed to create {key}: {err}")));
+                    }
+                }
+            }
+            RedisEvent::AddItem { key, item } => match self.storage.add_item(&key, &item).await {
+                Ok(()) => {
+                    // Re-fetch the value so the detail table reflects the new
+                    // element, and refresh the keyspace so the size column updates.
+                    self.action_hook(Action::RequestSelectedValue);
+                    self.action_hook(Action::RefreshSpace);
+                }
+                Err(err) => {
+                    log::error!("AddItem failed for {key}: {err:?}");
+                    self.action_hook(Action::Error(format!("Failed to add item to {key}: {err}")));
+                }
+            },
             RedisEvent::FetchValue { key, r_type } => {
                 match self.storage.fetch_value(&key, r_type).await {
                     Ok(value) => {

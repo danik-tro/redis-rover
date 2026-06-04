@@ -39,9 +39,14 @@ impl StatefulWidget for InfoWidget {
 
         let common_info = { state.info.lock().as_ref().map(Clone::clone) };
 
-        let [top, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-            .flex(layout::Flex::Center)
-            .areas(area);
+        // Reserve the last inner row for the always-on key-hint legend (#41).
+        let [top, bottom, hint] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .flex(layout::Flex::Center)
+        .areas(area);
 
         let [version_area, _, cpu_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Fill(1), Constraint::Min(0)])
@@ -86,5 +91,14 @@ impl StatefulWidget for InfoWidget {
         Paragraph::new(clients)
             .alignment(Alignment::Center)
             .render(clients_area, buf);
+
+        // One-line key-hint legend (#41) so the common actions are discoverable
+        // without opening the full `?` help overlay.
+        Paragraph::new(Line::styled(
+            "a add  i add-item  e edit  d del  t ttl  ⏎ open  f filter  ? help",
+            cfg.colors.base04,
+        ))
+        .alignment(Alignment::Center)
+        .render(hint, buf);
     }
 }

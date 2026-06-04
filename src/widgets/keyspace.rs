@@ -1,5 +1,5 @@
 use byte_unit::{Byte, UnitType};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -14,7 +14,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     config,
-    redis_client::types::{KeyMeta, KeyValue, RedisType},
+    redis_client::types::{KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType},
 };
 
 enum KeySpacePopupMode {
@@ -55,6 +55,191 @@ struct ActionOverlay {
     text_area: Option<TextArea<'static>>,
 }
 
+/// The set of key types the add-key wizard can create. JSON is intentionally
+/// excluded (the wizard cannot construct `RedisJSON` documents this way).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewKind {
+    String,
+    List,
+    Set,
+    Hash,
+    Zset,
+}
+
+impl NewKind {
+    /// The kinds in selector order, used both for the radio list and to map the
+    /// selection cursor back to a kind.
+    const ALL: [NewKind; 5] = [
+        NewKind::String,
+        NewKind::List,
+        NewKind::Set,
+        NewKind::Hash,
+        NewKind::Zset,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            NewKind::String => "STRING",
+            NewKind::List => "LIST",
+            NewKind::Set => "SET",
+            NewKind::Hash => "HASH",
+            NewKind::Zset => "ZSET",
+        }
+    }
+
+    /// Whether this kind's element step needs two inputs (HASH field+value,
+    /// ZSET member+score) rather than one.
+    fn is_pair(self) -> bool {
+        matches!(self, NewKind::Hash | NewKind::Zset)
+    }
+
+    /// Titles for the two paired inputs (`A`, `B`). Only meaningful for the pair
+    /// kinds; other kinds return their single-input title in `A`.
+    fn pair_titles(self) -> (&'static str, &'static str) {
+        match self {
+            NewKind::Hash => ("Field", "Value"),
+            NewKind::Zset => ("Member", "Score"),
+            NewKind::String => ("Value", ""),
+            NewKind::List | NewKind::Set => ("Item", ""),
+        }
+    }
+}
+
+/// Ordered steps of the add-key wizard.
+enum NewKeyStep {
+    /// Choose the type (radio list).
+    Type,
+    /// Enter the key name (single input).
+    Name,
+    /// Enter an element: STRING value / LIST|SET item / HASH field+value /
+    /// ZSET member+score. Repeatable for collections.
+    Element,
+    /// A blocking validation message (e.g. bad ZSET score). `Esc`/`Enter` returns
+    /// to the element step.
+    Notice(String),
+}
+
+/// Which of the two element inputs has focus (HASH/ZSET only).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveField {
+    A,
+    B,
+}
+
+/// Draft state accumulated by the add-key wizard across its steps.
+struct NewKeyDraft {
+    step: NewKeyStep,
+    kind: NewKind,
+    kind_cursor: usize,
+    name: String,
+    string_value: Option<String>,
+    list_items: Vec<String>,
+    hash_pairs: Vec<(String, String)>,
+    zset_pairs: Vec<(String, f64)>,
+    input_a: TextArea<'static>,
+    input_b: Option<TextArea<'static>>,
+    active: ActiveField,
+    /// Set when the user requests finalization; polled by `App`.
+    finalize: bool,
+}
+
+impl NewKeyDraft {
+    fn new() -> Self {
+        Self {
+            step: NewKeyStep::Type,
+            kind: NewKind::String,
+            kind_cursor: 0,
+            name: String::new(),
+            string_value: None,
+            list_items: Vec::new(),
+            hash_pairs: Vec::new(),
+            zset_pairs: Vec::new(),
+            input_a: TextArea::default(),
+            input_b: None,
+            active: ActiveField::A,
+            finalize: false,
+        }
+    }
+
+    /// Number of elements accumulated so far for the current kind.
+    fn item_count(&self) -> usize {
+        match self.kind {
+            NewKind::String => usize::from(self.string_value.is_some()),
+            NewKind::List | NewKind::Set => self.list_items.len(),
+            NewKind::Hash => self.hash_pairs.len(),
+            NewKind::Zset => self.zset_pairs.len(),
+        }
+    }
+
+    /// Build the input widget(s) for the element step of the active kind.
+    fn enter_element_step(&mut self) {
+        self.step = NewKeyStep::Element;
+        self.active = ActiveField::A;
+        match self.kind {
+            NewKind::String => {
+                self.input_a = build_input_text_area("Value", "Enter value", None);
+                self.input_b = None;
+            }
+            NewKind::List | NewKind::Set => {
+                self.input_a = build_input_text_area("Item", "Enter item", None);
+                self.input_b = None;
+            }
+            NewKind::Hash => {
+                self.input_a = build_input_text_area("Field", "Enter field", None);
+                self.input_b = Some(build_input_text_area("Value", "Enter value", None));
+            }
+            NewKind::Zset => {
+                self.input_a = build_input_text_area("Member", "Enter member", None);
+                self.input_b = Some(build_input_text_area("Score", "Enter score", None));
+            }
+        }
+    }
+
+    /// Convert the finished draft into a [`NewKeySpec`] paired with its name.
+    /// Returns `None` if no element was supplied.
+    fn into_spec(self) -> Option<(String, NewKeySpec)> {
+        let spec = match self.kind {
+            NewKind::String => NewKeySpec::String(self.string_value?),
+            NewKind::List => {
+                if self.list_items.is_empty() {
+                    return None;
+                }
+                NewKeySpec::List(self.list_items)
+            }
+            NewKind::Set => {
+                if self.list_items.is_empty() {
+                    return None;
+                }
+                NewKeySpec::Set(self.list_items)
+            }
+            NewKind::Hash => {
+                if self.hash_pairs.is_empty() {
+                    return None;
+                }
+                NewKeySpec::Hash(self.hash_pairs)
+            }
+            NewKind::Zset => {
+                if self.zset_pairs.is_empty() {
+                    return None;
+                }
+                NewKeySpec::Zset(self.zset_pairs)
+            }
+        };
+        Some((self.name, spec))
+    }
+}
+
+/// Draft state for the in-collection add-item overlay (`i`). Scoped to the
+/// already-selected collection key; `kind` is its [`RedisType`].
+struct AddItemDraft {
+    key: String,
+    kind: RedisType,
+    input_a: TextArea<'static>,
+    input_b: Option<TextArea<'static>>,
+    active: ActiveField,
+    notice: Option<String>,
+}
+
 pub struct KeySpace {
     table: TableState,
     value_table: TableState,
@@ -66,6 +251,8 @@ pub struct KeySpace {
     selected_value: Option<KeyValue>,
     focus: Focus,
     action_overlay: Option<ActionOverlay>,
+    new_key: Option<NewKeyDraft>,
+    add_item: Option<AddItemDraft>,
 }
 
 impl KeySpace {
@@ -81,6 +268,8 @@ impl KeySpace {
             selected_value: None,
             focus: Focus::Keys,
             action_overlay: None,
+            new_key: None,
+            add_item: None,
         }
     }
 
@@ -254,6 +443,29 @@ impl KeySpace {
         self.focus == Focus::Value
     }
 
+    /// The currently selected row within the value table, if value-focused.
+    /// Used to remember the cursor position across an add-item refresh.
+    pub fn value_selected_row(&self) -> Option<usize> {
+        if self.is_value_focused() {
+            self.value_table.selected()
+        } else {
+            None
+        }
+    }
+
+    /// Re-enter value focus at `row` (clamped to the reloaded value's row count)
+    /// after a refresh, so adding an item keeps the user inside the collection
+    /// instead of bouncing back to the key list. No-op if the value is no longer
+    /// navigable.
+    pub fn restore_value_focus(&mut self, row: usize) {
+        let len = self.value_row_count();
+        if len == 0 {
+            return;
+        }
+        self.focus = Focus::Value;
+        self.value_table.select(Some(row.min(len - 1)));
+    }
+
     // --- Action overlays (delete / edit / TTL / notice) ---
 
     pub fn is_overlay_open(&self) -> bool {
@@ -346,6 +558,368 @@ impl KeySpace {
             OverlayKind::Notice(_) => None,
         }
     }
+
+    // --- Add-key wizard ---
+
+    pub fn is_wizard_active(&self) -> bool {
+        self.new_key.is_some()
+    }
+
+    /// Open the add-key wizard at the type-selection step.
+    pub fn open_new_key(&mut self) {
+        self.new_key = Some(NewKeyDraft::new());
+    }
+
+    pub fn close_new_key(&mut self) {
+        self.new_key = None;
+    }
+
+    /// True once the wizard has signalled it wants to finalize (STRING `Enter`,
+    /// or a collection `Tab`-finish with ≥1 element). `App` checks this after
+    /// routing each wizard key and, when set, drains
+    /// [`Self::take_new_key_request`].
+    pub fn wizard_wants_finalize(&self) -> bool {
+        self.new_key.as_ref().is_some_and(|d| d.finalize)
+    }
+
+    /// Feed a raw key into whichever wizard input currently has focus.
+    fn wizard_input(&mut self, key: KeyEvent) {
+        let Some(draft) = self.new_key.as_mut() else {
+            return;
+        };
+        match draft.active {
+            ActiveField::A => {
+                draft.input_a.input(key);
+            }
+            ActiveField::B => {
+                if let Some(input_b) = draft.input_b.as_mut() {
+                    input_b.input(key);
+                }
+            }
+        }
+    }
+
+    /// Drive the wizard's step machine. Returns a finished
+    /// [`OverlayRequest::CreateKey`] when the user finalizes; otherwise `None`.
+    /// `App` routes `Enter`/`Esc` here as `commit`/`cancel`; all other keys are
+    /// raw input (handled before this is called).
+    #[allow(clippy::too_many_lines)]
+    pub fn handle_wizard_key(&mut self, key: KeyEvent) {
+        let Some(draft) = self.new_key.as_mut() else {
+            return;
+        };
+
+        match draft.step {
+            NewKeyStep::Type => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    draft.kind_cursor = (draft.kind_cursor + 1) % NewKind::ALL.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    draft.kind_cursor =
+                        (draft.kind_cursor + NewKind::ALL.len() - 1) % NewKind::ALL.len();
+                }
+                KeyCode::Enter => {
+                    draft.kind = NewKind::ALL[draft.kind_cursor];
+                    draft.step = NewKeyStep::Name;
+                    draft.input_a = build_input_text_area("Key name", "Enter key name", None);
+                    draft.input_b = None;
+                    draft.active = ActiveField::A;
+                }
+                _ => {}
+            },
+            NewKeyStep::Name => {
+                if key.code == KeyCode::Enter {
+                    let name = input_text(&draft.input_a).trim().to_string();
+                    if name.is_empty() {
+                        return;
+                    }
+                    draft.name = name;
+                    draft.enter_element_step();
+                } else if key.code == KeyCode::Tab {
+                    // No-op on the single-input name step.
+                } else {
+                    self.wizard_input(key);
+                }
+            }
+            NewKeyStep::Element => self.handle_element_key(key),
+            NewKeyStep::Notice(_) => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    if let Some(d) = self.new_key.as_mut() {
+                        d.step = NewKeyStep::Element;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a key on the repeatable element step. Controls are unified across
+    /// every kind:
+    ///
+    /// - `Enter`: STRING finalizes; collections commit the current element and
+    ///   stay for the next one.
+    /// - `Ctrl+S`: finish — commit any pending element, then finalize (collections
+    ///   need ≥1 element).
+    /// - `Tab`: switch field on the paired kinds (HASH/ZSET); ignored otherwise.
+    /// - `Esc`: cancel the whole flow (handled by `App`).
+    fn handle_element_key(&mut self, key: KeyEvent) {
+        let Some(draft) = self.new_key.as_mut() else {
+            return;
+        };
+
+        let is_finish = key.code == KeyCode::Char('s')
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+
+        if is_finish {
+            self.finish_element();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Enter if matches!(draft.kind, NewKind::String) => {
+                draft.finalize = true;
+            }
+            KeyCode::Enter => self.commit_element(),
+            KeyCode::Tab if draft.kind.is_pair() => {
+                draft.active = match draft.active {
+                    ActiveField::A => ActiveField::B,
+                    ActiveField::B => ActiveField::A,
+                };
+            }
+            // Tab is meaningless on single-input kinds; swallow it so it doesn't
+            // get typed into the input.
+            KeyCode::Tab | KeyCode::BackTab => {}
+            _ => self.wizard_input(key),
+        }
+    }
+
+    /// Finish a collection: commit any pending (typed-but-uncommitted) element so
+    /// a single item the user typed without pressing Enter still counts, then
+    /// finalize if there's ≥1 element and no pending validation notice.
+    fn finish_element(&mut self) {
+        self.commit_element();
+        let blocked = matches!(
+            self.new_key.as_ref().map(|d| &d.step),
+            Some(NewKeyStep::Notice(_))
+        );
+        if !blocked && self.wizard_can_finalize() {
+            if let Some(d) = self.new_key.as_mut() {
+                d.finalize = true;
+            }
+        }
+    }
+
+    /// Commit the current element input(s) into the draft's accumulator and
+    /// reset the input(s) for the next element.
+    fn commit_element(&mut self) {
+        let Some(draft) = self.new_key.as_mut() else {
+            return;
+        };
+        match draft.kind {
+            NewKind::String => {
+                draft.string_value = Some(input_text(&draft.input_a));
+            }
+            NewKind::List | NewKind::Set => {
+                let item = input_text(&draft.input_a);
+                if item.is_empty() {
+                    return;
+                }
+                draft.list_items.push(item);
+                draft.input_a = build_input_text_area("Item", "Enter item", None);
+            }
+            NewKind::Hash => {
+                let field = input_text(&draft.input_a);
+                let value = draft.input_b.as_ref().map_or_else(String::new, input_text);
+                if field.is_empty() {
+                    return;
+                }
+                draft.hash_pairs.push((field, value));
+                draft.input_a = build_input_text_area("Field", "Enter field", None);
+                draft.input_b = Some(build_input_text_area("Value", "Enter value", None));
+                draft.active = ActiveField::A;
+            }
+            NewKind::Zset => {
+                let member = input_text(&draft.input_a);
+                let raw = draft.input_b.as_ref().map_or_else(String::new, input_text);
+                if member.is_empty() {
+                    return;
+                }
+                let Ok(score) = raw.trim().parse::<f64>() else {
+                    draft.step = NewKeyStep::Notice("Score must be a number.".to_string());
+                    return;
+                };
+                draft.zset_pairs.push((member, score));
+                draft.input_a = build_input_text_area("Member", "Enter member", None);
+                draft.input_b = Some(build_input_text_area("Score", "Enter score", None));
+                draft.active = ActiveField::A;
+            }
+        }
+    }
+
+    /// Whether the wizard has enough to finalize (STRING after a value commit;
+    /// any collection with ≥1 element).
+    fn wizard_can_finalize(&self) -> bool {
+        self.new_key.as_ref().is_some_and(|d| {
+            // A pending element on the input still counts toward STRING via
+            // commit on confirm; collections require already-committed items.
+            match d.kind {
+                NewKind::String => true,
+                NewKind::List | NewKind::Set => !d.list_items.is_empty(),
+                NewKind::Hash => !d.hash_pairs.is_empty(),
+                NewKind::Zset => !d.zset_pairs.is_empty(),
+            }
+        })
+    }
+
+    /// Consume the wizard, finalizing it into a create request. STRING commits
+    /// its current input value; collections use their accumulated elements (and
+    /// also fold in a pending non-empty element if present). Returns `None` if
+    /// nothing valid was supplied.
+    pub fn take_new_key_request(&mut self) -> Option<(String, NewKeySpec)> {
+        // Fold any pending input into the accumulator before finalizing.
+        if let Some(draft) = self.new_key.as_mut() {
+            match draft.kind {
+                NewKind::String => {
+                    draft.string_value = Some(input_text(&draft.input_a));
+                }
+                NewKind::List | NewKind::Set => {
+                    let item = input_text(&draft.input_a);
+                    if !item.is_empty() {
+                        draft.list_items.push(item);
+                    }
+                }
+                NewKind::Hash => {
+                    let field = input_text(&draft.input_a);
+                    let value = draft.input_b.as_ref().map_or_else(String::new, input_text);
+                    if !field.is_empty() {
+                        draft.hash_pairs.push((field, value));
+                    }
+                }
+                NewKind::Zset => {
+                    let member = input_text(&draft.input_a);
+                    let raw = draft.input_b.as_ref().map_or_else(String::new, input_text);
+                    if !member.is_empty() {
+                        if let Ok(score) = raw.trim().parse::<f64>() {
+                            draft.zset_pairs.push((member, score));
+                        }
+                    }
+                }
+            }
+        }
+        let draft = self.new_key.take()?;
+        draft.into_spec()
+    }
+
+    // --- In-collection add-item (`i`) ---
+
+    pub fn is_add_item_active(&self) -> bool {
+        self.add_item.is_some()
+    }
+
+    /// Open the add-item overlay for the focused collection `key` of type `kind`.
+    /// Scalar/JSON types are rejected (the caller already restricts to focus).
+    pub fn open_add_item(&mut self, key: String, kind: RedisType) {
+        let (input_a, input_b) = match kind {
+            RedisType::List => (build_input_text_area("Item", "Enter item", None), None),
+            RedisType::Set => (build_input_text_area("Member", "Enter member", None), None),
+            RedisType::Hash => (
+                build_input_text_area("Field", "Enter field", None),
+                Some(build_input_text_area("Value", "Enter value", None)),
+            ),
+            RedisType::Zset => (
+                build_input_text_area("Member", "Enter member", None),
+                Some(build_input_text_area("Score", "Enter score", None)),
+            ),
+            RedisType::String | RedisType::Json | RedisType::Unknown => return,
+        };
+        self.add_item = Some(AddItemDraft {
+            key,
+            kind,
+            input_a,
+            input_b,
+            active: ActiveField::A,
+            notice: None,
+        });
+    }
+
+    pub fn close_add_item(&mut self) {
+        self.add_item = None;
+    }
+
+    /// Feed a raw key into the active add-item input, or toggle paired inputs on
+    /// `Tab`. (`Enter`/`Esc` are routed by `App` to confirm/cancel.)
+    pub fn handle_add_item_key(&mut self, key: KeyEvent) {
+        let Some(draft) = self.add_item.as_mut() else {
+            return;
+        };
+        // Dismiss a notice on any key.
+        if draft.notice.is_some() {
+            draft.notice = None;
+            return;
+        }
+        match key.code {
+            KeyCode::Tab if draft.input_b.is_some() => {
+                draft.active = match draft.active {
+                    ActiveField::A => ActiveField::B,
+                    ActiveField::B => ActiveField::A,
+                };
+            }
+            _ => match draft.active {
+                ActiveField::A => {
+                    draft.input_a.input(key);
+                }
+                ActiveField::B => {
+                    if let Some(input_b) = draft.input_b.as_mut() {
+                        input_b.input(key);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Consume the add-item overlay into a `(key, item)` request. Returns `None`
+    /// on invalid input (empty field / unparsable score), leaving a notice for
+    /// the user instead.
+    pub fn take_add_item_request(&mut self) -> Option<(String, KeyItem)> {
+        let draft = self.add_item.as_mut()?;
+        let a = input_text(&draft.input_a);
+        let b = draft.input_b.as_ref().map_or_else(String::new, input_text);
+        let item = match draft.kind {
+            RedisType::List => {
+                if a.is_empty() {
+                    return None;
+                }
+                KeyItem::ListValue(a)
+            }
+            RedisType::Set => {
+                if a.is_empty() {
+                    return None;
+                }
+                KeyItem::SetMember(a)
+            }
+            RedisType::Hash => {
+                if a.is_empty() {
+                    return None;
+                }
+                KeyItem::HashField { field: a, value: b }
+            }
+            RedisType::Zset => {
+                if a.is_empty() {
+                    return None;
+                }
+                let Ok(score) = b.trim().parse::<f64>() else {
+                    draft.notice = Some("Score must be a number.".to_string());
+                    return None;
+                };
+                KeyItem::ZsetMember { member: a, score }
+            }
+            RedisType::String | RedisType::Json | RedisType::Unknown => return None,
+        };
+        let key = draft.key.clone();
+        self.add_item = None;
+        Some((key, item))
+    }
 }
 
 /// A confirmed action overlay, ready for `App` to translate into a `RedisEvent`.
@@ -387,6 +961,48 @@ fn build_input_text_area(
             .title(title.to_string()),
     );
     text_area
+}
+
+/// Render one of two paired inputs (hash field/value, zset member/score) with a
+/// border color that signals focus: the active field is drawn in an accent
+/// color with a `▸ … ◂` title, the inactive one dimmed. Renders a styled clone
+/// so the stored `TextArea` keeps its neutral default; `title` is supplied by
+/// the caller (ratatui's `Block` exposes no title getter).
+fn render_focused_input(
+    text_area: &TextArea<'static>,
+    title: &str,
+    is_active: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let cfg = config::get();
+    let mut clone = text_area.clone();
+
+    let (border, title_line) = if is_active {
+        (cfg.colors.base0a, format!("▸ {title} ◂"))
+    } else {
+        (cfg.colors.base03, title.to_string())
+    };
+
+    clone.set_block(
+        Block::default()
+            .border_style(border)
+            .border_type(BorderType::Rounded)
+            .borders(Borders::ALL)
+            .title(title_line),
+    );
+    clone.render(area, buf);
+}
+
+/// Titles for the two paired add-item inputs of a collection type. Single-input
+/// types return their label in `A` (their `B` is unused).
+fn add_item_pair_titles(kind: RedisType) -> (&'static str, &'static str) {
+    match kind {
+        RedisType::Hash => ("Field", "Value"),
+        RedisType::Zset => ("Member", "Score"),
+        RedisType::Set => ("Member", ""),
+        RedisType::List | RedisType::String | RedisType::Json | RedisType::Unknown => ("Item", ""),
+    }
 }
 
 pub struct KeySpaceWidget;
@@ -478,6 +1094,212 @@ impl KeySpaceWidget {
             .wrap(Wrap { trim: true })
             .block(block)
             .render(popup_area, buf);
+    }
+
+    /// Center a popup of `height` rows in `area`, returning the inner Rect (after
+    /// clearing it). Mirrors the centering used by the other overlays.
+    fn centered_popup(area: Rect, height: u16, buf: &mut Buffer) -> Rect {
+        let [_, popup_area, _] = Layout::vertical([
+            Constraint::Percentage(30),
+            Constraint::Length(height),
+            Constraint::Percentage(30),
+        ])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(area);
+
+        let [_, popup_area, _] = Layout::horizontal([
+            Constraint::Percentage(20),
+            Constraint::Min(34),
+            Constraint::Percentage(20),
+        ])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(popup_area);
+
+        Clear.render(popup_area, buf);
+        popup_area
+    }
+
+    /// Render the add-key wizard overlay for whichever step is active.
+    fn render_new_key_overlay(state: &KeySpace, area: Rect, buf: &mut Buffer) {
+        let Some(draft) = state.new_key.as_ref() else {
+            return;
+        };
+        let cfg = config::get();
+
+        match &draft.step {
+            NewKeyStep::Type => {
+                // 5 kinds + border (2) + blank + hint line.
+                let popup = Self::centered_popup(area, NEW_KIND_POPUP_HEIGHT, buf);
+                let block = Block::default()
+                    .title(" Select type ")
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(cfg.colors.base04)
+                    .bg(cfg.colors.base00)
+                    .fg(cfg.colors.base05);
+
+                let mut lines: Vec<Line> = NewKind::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, kind)| {
+                        let marker = if idx == draft.kind_cursor {
+                            "(●)"
+                        } else {
+                            "( )"
+                        };
+                        let line = Line::from(format!("  {marker} {}", kind.label()));
+                        if idx == draft.kind_cursor {
+                            line.style(cfg.colors.base04)
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
+                lines.push(Line::from(""));
+                lines.push(
+                    Line::styled("j/k move   Enter: next   Esc: cancel", cfg.colors.base03)
+                        .alignment(Alignment::Center),
+                );
+
+                Paragraph::new(lines).block(block).render(popup, buf);
+            }
+            NewKeyStep::Name => {
+                let popup = Self::centered_popup(area, 5, buf);
+                let [input_area, hint_area] =
+                    Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(popup);
+                draft.input_a.render(input_area, buf);
+                Self::render_wizard_hint(
+                    &format!("New {} key   Enter: next   Esc: cancel", draft.kind.label()),
+                    hint_area,
+                    buf,
+                );
+            }
+            NewKeyStep::Element => Self::render_element_inputs(draft, area, buf),
+            NewKeyStep::Notice(msg) => {
+                let popup = Self::centered_popup(area, 5, buf);
+                let block = Block::default()
+                    .title(" Notice ")
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(cfg.colors.base04)
+                    .bg(cfg.colors.base00)
+                    .fg(cfg.colors.base05);
+                let lines = vec![
+                    Line::from(msg.as_str()).alignment(Alignment::Center),
+                    Line::from(""),
+                    Line::styled("Enter / Esc: back", cfg.colors.base03)
+                        .alignment(Alignment::Center),
+                ];
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: true })
+                    .block(block)
+                    .render(popup, buf);
+            }
+        }
+    }
+
+    /// Render the (one or two) element inputs plus a running summary + hint for
+    /// the wizard's repeatable element step.
+    fn render_element_inputs(draft: &NewKeyDraft, area: Rect, buf: &mut Buffer) {
+        let count = draft.item_count();
+        let hint = if draft.kind.is_pair() {
+            format!("{count} added   Tab: switch field   Enter: add   Ctrl+S: finish   Esc: cancel")
+        } else if matches!(draft.kind, NewKind::String) {
+            "Enter: create   Esc: cancel".to_string()
+        } else {
+            format!("{count} added   Enter: add   Ctrl+S: finish   Esc: cancel")
+        };
+
+        if let Some(input_b) = draft.input_b.as_ref() {
+            let popup = Self::centered_popup(area, 7, buf);
+            let [a_area, b_area, hint_area] = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .areas(popup);
+            let (title_a, title_b) = draft.kind.pair_titles();
+            let a_active = draft.active == ActiveField::A;
+            render_focused_input(&draft.input_a, title_a, a_active, a_area, buf);
+            render_focused_input(input_b, title_b, !a_active, b_area, buf);
+            Self::render_wizard_hint(&hint, hint_area, buf);
+        } else {
+            let popup = Self::centered_popup(area, 5, buf);
+            let [a_area, hint_area] =
+                Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(popup);
+            draft.input_a.render(a_area, buf);
+            Self::render_wizard_hint(&hint, hint_area, buf);
+        }
+    }
+
+    /// Render the add-item overlay for the focused collection.
+    fn render_add_item_overlay(state: &KeySpace, area: Rect, buf: &mut Buffer) {
+        let Some(draft) = state.add_item.as_ref() else {
+            return;
+        };
+        let cfg = config::get();
+
+        if let Some(notice) = draft.notice.as_ref() {
+            let popup = Self::centered_popup(area, 5, buf);
+            let block = Block::default()
+                .title(" Notice ")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(cfg.colors.base04)
+                .bg(cfg.colors.base00)
+                .fg(cfg.colors.base05);
+            let lines = vec![
+                Line::from(notice.as_str()).alignment(Alignment::Center),
+                Line::from(""),
+                Line::styled("Any key: back", cfg.colors.base03).alignment(Alignment::Center),
+            ];
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(block)
+                .render(popup, buf);
+            return;
+        }
+
+        let hint = format!(
+            "Add to {key}   {keys}Enter: add   Esc: cancel",
+            key = draft.key,
+            keys = if draft.input_b.is_some() {
+                "Tab: switch field   "
+            } else {
+                ""
+            },
+        );
+
+        if let Some(input_b) = draft.input_b.as_ref() {
+            let popup = Self::centered_popup(area, 7, buf);
+            let [a_area, b_area, hint_area] = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .areas(popup);
+            let (title_a, title_b) = add_item_pair_titles(draft.kind);
+            let a_active = draft.active == ActiveField::A;
+            render_focused_input(&draft.input_a, title_a, a_active, a_area, buf);
+            render_focused_input(input_b, title_b, !a_active, b_area, buf);
+            Self::render_wizard_hint(&hint, hint_area, buf);
+        } else {
+            let popup = Self::centered_popup(area, 5, buf);
+            let [a_area, hint_area] =
+                Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(popup);
+            draft.input_a.render(a_area, buf);
+            Self::render_wizard_hint(&hint, hint_area, buf);
+        }
+    }
+
+    fn render_wizard_hint(hint: &str, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        Paragraph::new(Line::styled(hint, cfg.colors.base03))
+            .alignment(Alignment::Center)
+            .render(area, buf);
     }
 
     fn render_key_view(state: &mut KeySpace, area: Rect, buf: &mut Buffer) {
@@ -628,6 +1450,10 @@ impl KeySpaceWidget {
 
 const HIGHLIGHT_SYMBOL: &str = " >> ";
 
+/// Height of the type-selector popup: 5 radio rows + 2 borders + blank + hint.
+/// (`NewKind::ALL` has 5 entries.)
+const NEW_KIND_POPUP_HEIGHT: u16 = 9;
+
 impl StatefulWidget for KeySpaceWidget {
     type State = KeySpace;
 
@@ -768,6 +1594,14 @@ impl StatefulWidget for KeySpaceWidget {
 
         if state.is_overlay_open() {
             Self::render_action_overlay(state, area, buf);
+        }
+
+        if state.is_wizard_active() {
+            Self::render_new_key_overlay(state, area, buf);
+        }
+
+        if state.is_add_item_active() {
+            Self::render_add_item_overlay(state, area, buf);
         }
     }
 }

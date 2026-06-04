@@ -19,4 +19,6 @@ pub enum Command {
     DeleteKey,
     SetTtl,
     EditValue,
+    AddKey,
+    AddItem,
 }

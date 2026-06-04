@@ -50,6 +50,14 @@ pub struct App {
     /// selected once the post-write keyspace refresh lands, so the cursor stays
     /// put instead of snapping back to the top.
     reselect_key: Option<String>,
+    /// After an in-collection add-item, the value-table row to restore focus to
+    /// once the (now larger) collection value reloads, so the user stays inside
+    /// the collection instead of bouncing back to the key list.
+    restore_value_row: Option<usize>,
+    /// Armed by `load_new_keys` after the post-add-item refresh re-requests the
+    /// value, so the *final* value load (not an earlier racing one) restores
+    /// value focus.
+    restore_value_pending: bool,
 
     should_quit: bool,
     last_tick_key_events: Vec<KeyEvent>,
@@ -90,6 +98,8 @@ impl App {
             error_message: None,
             help_opened_at: None,
             reselect_key: None,
+            restore_value_row: None,
+            restore_value_pending: false,
             last_tick_key_events: Vec::new(),
             tx,
             rx,
@@ -174,6 +184,33 @@ impl App {
             return None;
         }
 
+        // The add-key wizard owns ALL keys except Esc (which cancels the whole
+        // flow). Enter/Tab/j/k and text drive its multi-step machine internally;
+        // after each key we check whether it asked to finalize.
+        if self.keyspace.is_wizard_active() {
+            if is_cancel {
+                return Some(Action::DiscardKeyspacePopup);
+            }
+            self.keyspace.handle_wizard_key(key);
+            if self.keyspace.wizard_wants_finalize() {
+                return Some(Action::ConfirmKeyspacePopup);
+            }
+            return None;
+        }
+
+        // The in-collection add-item overlay: Enter confirms, Esc cancels, the
+        // rest is input (incl. Tab to switch fields).
+        if self.keyspace.is_add_item_active() {
+            if is_confirm {
+                return Some(Action::ConfirmKeyspacePopup);
+            }
+            if is_cancel {
+                return Some(Action::DiscardKeyspacePopup);
+            }
+            self.keyspace.handle_add_item_key(key);
+            return None;
+        }
+
         // Enter/Esc act on whatever modal layer is open before falling back to
         // the configured bindings (where Enter is `EnterValue`).
         if self.keyspace.is_popup() || self.keyspace.is_overlay_open() {
@@ -241,6 +278,8 @@ impl App {
             Action::RequestDeleteKey => self.request_delete_key(),
             Action::RequestSetTtl => self.request_set_ttl(),
             Action::RequestEditValue => self.request_edit_value(),
+            Action::RequestAddKey => self.request_add_key(),
+            Action::RequestAddItem => self.request_add_item(),
             Action::Help => self.toggle_help(),
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::Refresh => {}
@@ -264,7 +303,7 @@ impl StatefulWidget for AppWidget {
         let cfg = config::get();
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
-        let [main, footer] = Layout::vertical([Constraint::Percentage(100), Constraint::Length(4)])
+        let [main, footer] = Layout::vertical([Constraint::Percentage(100), Constraint::Length(5)])
             .flex(Flex::Center)
             .margin(1)
             .areas(area);
@@ -301,7 +340,7 @@ impl App {
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let entries: [(Command, &str); 14] = [
+        let entries: [(Command, &str); 16] = [
             (Command::ScrollDown, "Scroll down"),
             (Command::ScrollUp, "Scroll up"),
             (Command::LoadNextPage, "Next page"),
@@ -310,6 +349,8 @@ impl App {
             (Command::SetPattern, "Set filter pattern"),
             (Command::DeletePattern, "Delete filter pattern"),
             (Command::EnterValue, "Enter value / confirm"),
+            (Command::AddKey, "Add new key"),
+            (Command::AddItem, "Add item (in collection)"),
             (Command::EditValue, "Edit value (string)"),
             (Command::DeleteKey, "Delete key"),
             (Command::SetTtl, "Set TTL"),
@@ -452,6 +493,19 @@ impl App {
             return;
         }
 
+        // The add-key wizard / add-item overlays cancel as a whole on Esc. (Their
+        // internal multi-step back-out is handled inside the widget for non-Esc
+        // keys; one Esc dismisses the whole flow.)
+        if self.keyspace.is_wizard_active() {
+            self.keyspace.close_new_key();
+            return;
+        }
+
+        if self.keyspace.is_add_item_active() {
+            self.keyspace.close_add_item();
+            return;
+        }
+
         if self.keyspace.is_value_focused() {
             self.keyspace.exit_value_focus();
             return;
@@ -464,14 +518,54 @@ impl App {
         self.keyspace.exit_popup();
     }
 
-    /// Enter confirms whichever modal is open: an action overlay
-    /// (delete/edit/TTL) takes precedence over the filter popup.
+    /// Enter confirms whichever modal is open. Precedence: add-key wizard
+    /// finalize → add-item overlay → action overlay (delete/edit/TTL) → filter
+    /// popup.
     fn confirm_popup(&mut self) {
+        if self.keyspace.is_wizard_active() {
+            self.confirm_new_key();
+            return;
+        }
+        if self.keyspace.is_add_item_active() {
+            self.confirm_add_item();
+            return;
+        }
         if self.keyspace.is_overlay_open() {
             self.confirm_action_overlay();
             return;
         }
         self.set_keyspace_filter();
+    }
+
+    /// Finalize the add-key wizard into a `CreateKey` event. Keeps the cursor on
+    /// the new key via `reselect_key`. Existence is validated in the storage
+    /// layer (surfacing as an `Action::Error` if the key already exists).
+    fn confirm_new_key(&mut self) {
+        let Some((key, spec)) = self.keyspace.take_new_key_request() else {
+            // Nothing valid supplied; leave the wizard closed.
+            self.keyspace.close_new_key();
+            return;
+        };
+        self.reselect_key = Some(key.clone());
+        self.send_redis_event(RedisEvent::CreateKey { key, spec });
+    }
+
+    /// Finalize the in-collection add-item overlay into an `AddItem` event. On
+    /// invalid input the widget keeps the overlay open with a notice, so a
+    /// `None` here simply means "stay open".
+    ///
+    /// To keep the user inside the collection after the post-write refresh,
+    /// remember the focused key (so the cursor stays put) and the value-table
+    /// row (so focus is restored once the larger value reloads).
+    fn confirm_add_item(&mut self) {
+        // Capture focus state *before* taking the request (which closes the
+        // overlay but leaves value focus intact).
+        let row = self.keyspace.value_selected_row().unwrap_or(0);
+        if let Some((key, item)) = self.keyspace.take_add_item_request() {
+            self.reselect_key = Some(key.clone());
+            self.restore_value_row = Some(row);
+            self.send_redis_event(RedisEvent::AddItem { key, item });
+        }
     }
 
     /// Translate the confirmed action overlay into a Redis write event.
@@ -523,6 +617,23 @@ impl App {
     fn request_edit_value(&mut self) {
         if self.keyspace.selected_key().is_some() {
             self.keyspace.open_edit_value();
+        }
+    }
+
+    /// `a`: open the add-key wizard. Available from the key list at any time.
+    fn request_add_key(&mut self) {
+        self.keyspace.open_new_key();
+    }
+
+    /// `i`: append an item to the focused collection. No-op unless the user has
+    /// drilled into a collection value (`is_value_focused()`), so it can't fire
+    /// from the key list.
+    fn request_add_item(&mut self) {
+        if !self.keyspace.is_value_focused() {
+            return;
+        }
+        if let Some((key, r_type)) = self.keyspace.selected_key() {
+            self.keyspace.open_add_item(key, r_type);
         }
     }
 
@@ -584,7 +695,15 @@ impl App {
         // reload its (now updated) value instead of snapping back to the top.
         if let Some(key) = self.reselect_key.take() {
             if self.keyspace.select_key_by_name(&key) {
+                // If an add-item is in flight, arm the focus restore for the
+                // value load this re-request triggers (the final one).
+                if self.restore_value_row.is_some() {
+                    self.restore_value_pending = true;
+                }
                 action::try_send_action(&self.tx, Action::RequestSelectedValue);
+            } else {
+                // Key vanished (e.g. filtered out); drop the pending restore.
+                self.restore_value_row = None;
             }
         }
     }
@@ -601,6 +720,18 @@ impl App {
     fn load_selected_value(&mut self) {
         let value = self.state.selected_value.lock().clone();
         self.keyspace.set_selected_value(value);
+
+        // After an add-item, re-enter the collection at the row the user was on
+        // (clamped to the new length) so adding doesn't bounce focus to the key
+        // list. `restore_value_row` is armed by `load_new_keys` only once the
+        // post-write keyspace refresh (which clears focus) has already run, so
+        // this fires on the *final* value load and isn't undone afterwards.
+        if self.restore_value_pending {
+            self.restore_value_pending = false;
+            if let Some(row) = self.restore_value_row.take() {
+                self.keyspace.restore_value_focus(row);
+            }
+        }
     }
 
     fn load_keyspace(&self) {

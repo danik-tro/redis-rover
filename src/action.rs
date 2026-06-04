@@ -30,6 +30,8 @@ pub enum Action {
     RequestDeleteKey,
     RequestSetTtl,
     RequestEditValue,
+    RequestAddKey,
+    RequestAddItem,
 }
 
 impl Action {

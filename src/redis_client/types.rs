@@ -68,6 +68,28 @@ pub enum KeyValue {
     Unknown,
 }
 
+/// The element payload appended to an existing collection via the in-collection
+/// add-item command (`i`). The variant must match the focused key's type.
+#[derive(Debug, Clone)]
+pub enum KeyItem {
+    ListValue(String),
+    SetMember(String),
+    HashField { field: String, value: String },
+    ZsetMember { member: String, score: f64 },
+}
+
+/// A fully-specified new key to create, produced by the add-key wizard. Carries
+/// the type and at least one seed element (Redis cannot store an empty
+/// collection). JSON is intentionally excluded — the wizard cannot create it.
+#[derive(Debug, Clone)]
+pub enum NewKeySpec {
+    String(String),
+    List(Vec<String>),
+    Set(Vec<String>),
+    Hash(Vec<(String, String)>),
+    Zset(Vec<(String, f64)>),
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyMeta {
     pub key: String,
