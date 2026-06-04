@@ -155,6 +155,34 @@ impl EventHandler {
 
     async fn handle(&mut self, event: RedisEvent) {
         match event {
+            RedisEvent::SetString { key, value } => {
+                match self.storage.set_string(&key, &value).await {
+                    Ok(()) => {
+                        // Re-fetch the value so the detail view reflects the edit,
+                        // and refresh the keyspace so the size column updates.
+                        self.action_hook(Action::RequestSelectedValue);
+                        self.action_hook(Action::RefreshSpace);
+                    }
+                    Err(err) => {
+                        log::error!("SetString failed for {key}: {err:?}");
+                        self.action_hook(Action::Error(format!("Failed to set {key}: {err}")));
+                    }
+                }
+            }
+            RedisEvent::DeleteKey { key } => match self.storage.delete_key(&key).await {
+                Ok(()) => self.action_hook(Action::RefreshSpace),
+                Err(err) => {
+                    log::error!("DeleteKey failed for {key}: {err:?}");
+                    self.action_hook(Action::Error(format!("Failed to delete {key}: {err}")));
+                }
+            },
+            RedisEvent::SetTtl { key, secs } => match self.storage.set_ttl(&key, secs).await {
+                Ok(()) => self.action_hook(Action::RefreshSpace),
+                Err(err) => {
+                    log::error!("SetTtl failed for {key}: {err:?}");
+                    self.action_hook(Action::Error(format!("Failed to set TTL on {key}: {err}")));
+                }
+            },
             RedisEvent::FetchValue { key, r_type } => {
                 match self.storage.fetch_value(&key, r_type).await {
                     Ok(value) => {

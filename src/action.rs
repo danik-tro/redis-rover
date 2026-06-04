@@ -26,6 +26,10 @@ pub enum Action {
     DeleteKeyspaceFilter,
     ConfirmKeyspacePopup,
     DiscardKeyspacePopup,
+    EnterValue,
+    RequestDeleteKey,
+    RequestSetTtl,
+    RequestEditValue,
 }
 
 impl Action {

@@ -25,7 +25,7 @@ use crate::{
     tui,
     widgets::{
         info::{Info, InfoWidget},
-        keyspace::{KeySpace, KeySpaceWidget},
+        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest},
     },
 };
 
@@ -46,6 +46,10 @@ pub struct App {
     /// When the `?` help overlay was opened. `None` means it's hidden. The
     /// overlay auto-dismisses after [`HELP_TIMEOUT`] or on the next command.
     help_opened_at: Option<Instant>,
+    /// After a non-destructive edit (value/TTL), the name of the key to keep
+    /// selected once the post-write keyspace refresh lands, so the cursor stays
+    /// put instead of snapping back to the top.
+    reselect_key: Option<String>,
 
     should_quit: bool,
     last_tick_key_events: Vec<KeyEvent>,
@@ -85,6 +89,7 @@ impl App {
             previous_mode: None,
             error_message: None,
             help_opened_at: None,
+            reselect_key: None,
             last_tick_key_events: Vec::new(),
             tx,
             rx,
@@ -152,9 +157,32 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
-        if self.keyspace.is_popup() && (key.code != KeyCode::Enter && key.code != KeyCode::Esc) {
+        let is_confirm = key.code == KeyCode::Enter;
+        let is_cancel = key.code == KeyCode::Esc;
+
+        // While the filter popup is open, raw keys feed its text-area; only
+        // Enter (confirm) and Esc (cancel) escape to the dispatcher.
+        if self.keyspace.is_popup() && !is_confirm && !is_cancel {
             self.keyspace.handle_key(key);
             return None;
+        }
+
+        // While a text-input action overlay (edit / TTL) is open, raw keys feed
+        // it; Enter confirms, Esc cancels.
+        if self.keyspace.is_input_active() && !is_confirm && !is_cancel {
+            self.keyspace.handle_overlay_key(key);
+            return None;
+        }
+
+        // Enter/Esc act on whatever modal layer is open before falling back to
+        // the configured bindings (where Enter is `EnterValue`).
+        if self.keyspace.is_popup() || self.keyspace.is_overlay_open() {
+            if is_confirm {
+                return Some(Action::ConfirmKeyspacePopup);
+            }
+            if is_cancel {
+                return Some(Action::DiscardKeyspacePopup);
+            }
         }
 
         self.handle_keybindings(key)
@@ -207,8 +235,12 @@ impl App {
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
             Action::DiscardKeyspacePopup => self.close_popup(),
-            Action::ConfirmKeyspacePopup => self.set_keyspace_filter(),
+            Action::ConfirmKeyspacePopup => self.confirm_popup(),
             Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
+            Action::EnterValue => self.enter_value(),
+            Action::RequestDeleteKey => self.request_delete_key(),
+            Action::RequestSetTtl => self.request_set_ttl(),
+            Action::RequestEditValue => self.request_edit_value(),
             Action::Help => self.toggle_help(),
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::Refresh => {}
@@ -269,7 +301,7 @@ impl App {
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let entries: [(Command, &str); 11] = [
+        let entries: [(Command, &str); 14] = [
             (Command::ScrollDown, "Scroll down"),
             (Command::ScrollUp, "Scroll up"),
             (Command::LoadNextPage, "Next page"),
@@ -277,7 +309,10 @@ impl App {
             (Command::RefreshSpace, "Refresh keyspace"),
             (Command::SetPattern, "Set filter pattern"),
             (Command::DeletePattern, "Delete filter pattern"),
-            (Command::EnterPopup, "Confirm popup"),
+            (Command::EnterValue, "Enter value / confirm"),
+            (Command::EditValue, "Edit value (string)"),
+            (Command::DeleteKey, "Delete key"),
+            (Command::SetTtl, "Set TTL"),
             (Command::ClosePopup, "Close popup / overlay"),
             (Command::ToggleHelp, "Toggle this help"),
             (Command::Quit, "Quit"),
@@ -403,10 +438,22 @@ impl App {
         }
     }
 
+    /// Esc backs out one modal layer at a time, in precedence order:
+    /// help overlay → action overlay (delete/edit/TTL/notice) → value focus →
+    /// filter popup.
     fn close_popup(&mut self) {
-        // Esc dismisses the help overlay first if it's open.
         if self.help_is_open() {
             self.help_opened_at = None;
+            return;
+        }
+
+        if self.keyspace.is_overlay_open() {
+            self.keyspace.close_overlay();
+            return;
+        }
+
+        if self.keyspace.is_value_focused() {
+            self.keyspace.exit_value_focus();
             return;
         }
 
@@ -415,6 +462,74 @@ impl App {
         }
 
         self.keyspace.exit_popup();
+    }
+
+    /// Enter confirms whichever modal is open: an action overlay
+    /// (delete/edit/TTL) takes precedence over the filter popup.
+    fn confirm_popup(&mut self) {
+        if self.keyspace.is_overlay_open() {
+            self.confirm_action_overlay();
+            return;
+        }
+        self.set_keyspace_filter();
+    }
+
+    /// Translate the confirmed action overlay into a Redis write event.
+    fn confirm_action_overlay(&mut self) {
+        let Some(request) = self.keyspace.take_overlay_request() else {
+            // Notice-only overlay: nothing to do, it's already been dismissed.
+            return;
+        };
+        let Some((key, _)) = self.keyspace.selected_key() else {
+            return;
+        };
+
+        let event = match request {
+            OverlayRequest::Delete => {
+                // The key is going away; let the refresh land on whatever fills
+                // its place (default top-of-page) rather than reselecting it.
+                self.reselect_key = None;
+                RedisEvent::DeleteKey { key }
+            }
+            OverlayRequest::SetString(value) => {
+                // Non-destructive: keep the cursor on this key after the refresh.
+                self.reselect_key = Some(key.clone());
+                RedisEvent::SetString { key, value }
+            }
+            OverlayRequest::SetTtl(secs) => {
+                self.reselect_key = Some(key.clone());
+                RedisEvent::SetTtl { key, secs }
+            }
+        };
+        self.send_redis_event(event);
+    }
+
+    fn enter_value(&mut self) {
+        self.keyspace.enter_value();
+    }
+
+    fn request_delete_key(&mut self) {
+        if self.keyspace.selected_key().is_some() {
+            self.keyspace.open_delete_confirm();
+        }
+    }
+
+    fn request_set_ttl(&mut self) {
+        if self.keyspace.selected_key().is_some() {
+            self.keyspace.open_set_ttl();
+        }
+    }
+
+    fn request_edit_value(&mut self) {
+        if self.keyspace.selected_key().is_some() {
+            self.keyspace.open_edit_value();
+        }
+    }
+
+    fn send_redis_event(&self, event: RedisEvent) {
+        if let Err(err) = self.redis_tx.send(event) {
+            log::error!("Failed to send redis event: {err:?}");
+        }
     }
 
     fn set_keyspace_filter(&mut self) {
@@ -464,6 +579,14 @@ impl App {
     fn load_new_keys(&mut self) {
         self.keyspace.set_keys(self.state.keys.lock().clone());
         self.keyspace.clear_selected_value();
+
+        // After a non-destructive edit, keep the cursor on the edited key and
+        // reload its (now updated) value instead of snapping back to the top.
+        if let Some(key) = self.reselect_key.take() {
+            if self.keyspace.select_key_by_name(&key) {
+                action::try_send_action(&self.tx, Action::RequestSelectedValue);
+            }
+        }
     }
 
     fn request_selected_value(&self) {
@@ -494,18 +617,30 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        if self.mode == Mode::KeySpace {
-            self.keyspace.scroll_next();
-            self.keyspace.clear_selected_value();
-            action::try_send_action(&self.tx, Action::RequestSelectedValue);
+        if self.mode != Mode::KeySpace {
+            return;
         }
+        // When focus is in the value pane, `j`/`k` scroll the value's rows in
+        // place — the selected key (and its loaded value) must not change.
+        if self.keyspace.is_value_focused() {
+            self.keyspace.scroll_next();
+            return;
+        }
+        self.keyspace.scroll_next();
+        self.keyspace.clear_selected_value();
+        action::try_send_action(&self.tx, Action::RequestSelectedValue);
     }
 
     fn scroll_up(&mut self) {
-        if self.mode == Mode::KeySpace {
-            self.keyspace.scroll_previous();
-            self.keyspace.clear_selected_value();
-            action::try_send_action(&self.tx, Action::RequestSelectedValue);
+        if self.mode != Mode::KeySpace {
+            return;
         }
+        if self.keyspace.is_value_focused() {
+            self.keyspace.scroll_previous();
+            return;
+        }
+        self.keyspace.scroll_previous();
+        self.keyspace.clear_selected_value();
+        action::try_send_action(&self.tx, Action::RequestSelectedValue);
     }
 }

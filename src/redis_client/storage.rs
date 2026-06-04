@@ -2,7 +2,7 @@ use redis::aio::ConnectionManager;
 use redis::FromRedisValue;
 
 use super::{
-    client::fetch_value,
+    client::{self, fetch_value},
     types::{KeyMeta, KeyValue, KeysList, RedisType},
 };
 
@@ -119,5 +119,43 @@ impl Storage {
         r_type: RedisType,
     ) -> Result<KeyValue, Box<dyn std::error::Error + Sync + Send>> {
         fetch_value(self.manager.clone(), key, r_type).await
+    }
+
+    /// Overwrite a STRING key. Delegates to [`client::set_string`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
+    pub async fn set_string(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::set_string(self.manager.clone(), key, value).await
+    }
+
+    /// Delete a key. Delegates to [`client::delete_key`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
+    pub async fn delete_key(
+        &self,
+        key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::delete_key(self.manager.clone(), key).await
+    }
+
+    /// Set or clear a key's TTL. Delegates to [`client::set_ttl`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
+    pub async fn set_ttl(
+        &self,
+        key: &str,
+        secs: i64,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::set_ttl(self.manager.clone(), key, secs).await
     }
 }

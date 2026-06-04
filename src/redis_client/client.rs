@@ -77,3 +77,50 @@ pub async fn fetch_value(
         RedisType::Json | RedisType::Unknown => Ok(KeyValue::Unknown),
     }
 }
+
+/// Overwrite a key with a plain string value (`SET`).
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn set_string(
+    mut manager: ConnectionManager,
+    key: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _: () = manager.set(key, value).await?;
+    Ok(())
+}
+
+/// Delete a key (`DEL`). Type-agnostic — works on any value type.
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn delete_key(
+    mut manager: ConnectionManager,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _: () = manager.del(key).await?;
+    Ok(())
+}
+
+/// Set a key-level TTL in seconds (`EXPIRE`). A non-positive `secs` clears the
+/// TTL instead (`PERSIST`), making the key permanent. TTL is key-level in Redis
+/// and applies to every value type.
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn set_ttl(
+    mut manager: ConnectionManager,
+    key: &str,
+    secs: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if secs > 0 {
+        let _: () = manager.expire(key, secs).await?;
+    } else {
+        let _: () = manager.persist(key).await?;
+    }
+    Ok(())
+}

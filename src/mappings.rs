@@ -15,6 +15,10 @@ impl From<Command> for Action {
             Command::DeletePattern => Self::DeleteKeyspaceFilter,
             Command::EnterPopup => Self::ConfirmKeyspacePopup,
             Command::ToggleHelp => Self::Help,
+            Command::EnterValue => Self::EnterValue,
+            Command::DeleteKey => Self::RequestDeleteKey,
+            Command::SetTtl => Self::RequestSetTtl,
+            Command::EditValue => Self::RequestEditValue,
         }
     }
 }

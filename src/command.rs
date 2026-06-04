@@ -15,4 +15,8 @@ pub enum Command {
     ClosePopup,
     EnterPopup,
     ToggleHelp,
+    EnterValue,
+    DeleteKey,
+    SetTtl,
+    EditValue,
 }
