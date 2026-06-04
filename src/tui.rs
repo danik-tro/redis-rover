@@ -185,20 +185,26 @@ impl Tui {
         });
     }
 
-    pub fn stop(&self) {
+    /// Gracefully stops the event task: signals cancellation and awaits the
+    /// task, falling back to `abort()` if it doesn't finish promptly. Must be
+    /// called from an async context (the main shutdown path). The `Drop` /
+    /// panic path uses [`Tui::force_stop`] instead, since it can't await.
+    pub async fn stop(&mut self) -> Result<()> {
         self.cancel();
-        let mut counter = 0;
-        while !self.event_task.is_finished() {
-            std::thread::sleep(Duration::from_millis(1));
-            counter += 1;
-            if counter > 50 {
+        match tokio::time::timeout(Duration::from_millis(50), &mut self.event_task).await {
+            Ok(_) => {}
+            Err(_) => {
                 self.event_task.abort();
             }
-            if counter > 100 {
-                log::error!("Failed to abort task in 100 milliseconds for unknown reason");
-                break;
-            }
         }
+        Ok(())
+    }
+
+    /// Best-effort, non-blocking stop for sync teardown (`Drop`, panic handler):
+    /// signals cancellation and aborts the event task without awaiting.
+    fn force_stop(&self) {
+        self.cancel();
+        self.event_task.abort();
     }
 
     /// Enter the alternate screen, enable raw mode, and spawn the
@@ -226,7 +232,7 @@ impl Tui {
     ///
     /// Returns an error if a crossterm terminal command fails.
     pub fn exit(&mut self) -> Result<()> {
-        self.stop();
+        self.force_stop();
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
             if self.paste {
@@ -266,6 +272,8 @@ impl DerefMut for Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
-        self.exit().unwrap();
+        if let Err(err) = self.exit() {
+            log::error!("Tui::exit failed during drop: {err:?}");
+        }
     }
 }

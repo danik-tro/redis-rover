@@ -1,9 +1,10 @@
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result};
+use redis::{ConnectionInfo, IntoConnectionInfo};
 
-use crate::utils::{inject_token, version};
+use crate::utils::version;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version = version(), about)]
 pub struct Cli {
     #[arg(
@@ -29,29 +30,51 @@ pub struct Cli {
         long,
         value_name = "URL",
         help = "Redis connection URL (e.g. redis://localhost:6379)",
-        default_value = "redis://localhost:6379"
+        default_value = "redis://localhost:6379",
+        value_parser = parse_redis_url,
     )]
     pub url: String,
 
     #[arg(
         long,
-        help = "Prompt for an auth token securely (input is hidden). The token is appended to the URL as the password."
+        help = "Prompt for an auth token securely (input is hidden). The token is used as the connection password."
     )]
     pub token: bool,
 }
 
+/// Validates a Redis URL at parse time so a malformed `--url` fails fast with a
+/// descriptive error instead of a generic "something went wrong" later. Returns
+/// the original string unchanged on success.
+fn parse_redis_url(s: &str) -> Result<String, String> {
+    s.into_connection_info()
+        .map(|_| s.to_string())
+        .map_err(|e| format!("invalid Redis URL: {e}"))
+}
+
 impl Cli {
-    /// Returns the final Redis URL, prompting for a token if --token was passed.
-    /// The prompt runs before the TUI is initialised so the terminal is still in
-    /// normal mode and the password can be entered safely.
-    pub fn redis_url(&self) -> Result<String> {
+    /// Builds typed [`ConnectionInfo`] from the parsed args, prompting for a
+    /// token if `--token` was passed.
+    ///
+    /// The prompt runs before the TUI is initialised so the terminal is still
+    /// in normal mode and the password can be entered safely. The token is set
+    /// on the typed `redis` settings, whose `Debug` impl redacts the password —
+    /// so it never leaks into logs or panic dumps (unlike embedding it in the
+    /// URL string).
+    pub fn connection_info(&self) -> Result<ConnectionInfo> {
+        let conn_info = self
+            .url
+            .as_str()
+            .into_connection_info()
+            .map_err(|e| eyre!("Invalid Redis URL: {e}"))?;
+
         if !self.token {
-            return Ok(self.url.clone());
+            return Ok(conn_info);
         }
 
         let token = rpassword::prompt_password("Redis auth token: ")
             .map_err(|e| eyre!("Failed to read token: {e}"))?;
+        let redis = conn_info.redis_settings().clone().set_password(token);
 
-        inject_token(&self.url, &token)
+        Ok(conn_info.set_redis_settings(redis))
     }
 }

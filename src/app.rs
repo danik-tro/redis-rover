@@ -1,4 +1,4 @@
-use crate::{config, redis_client::event::RedisEvent, state::SharedState};
+use crate::{config, mode::PopupMode, redis_client::event::RedisEvent, state::SharedState};
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -11,12 +11,12 @@ use ratatui::{
 };
 use tokio::sync::{
     broadcast,
-    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    mpsc::{self, Receiver, Sender},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    action::Action,
+    action::{self, Action},
     mode::Mode,
     tui,
     widgets::{
@@ -35,12 +35,13 @@ pub struct App {
 
     mode: Mode,
     previous_mode: Option<Mode>,
+    error_message: Option<String>,
 
     should_quit: bool,
     last_tick_key_events: Vec<KeyEvent>,
 
-    tx: mpsc::UnboundedSender<Action>,
-    rx: mpsc::UnboundedReceiver<Action>,
+    tx: mpsc::Sender<Action>,
+    rx: mpsc::Receiver<Action>,
 
     redis_tx: broadcast::Sender<RedisEvent>,
     summary: Info,
@@ -50,8 +51,8 @@ pub struct App {
 impl App {
     pub fn new(
         state: SharedState,
-        tx: UnboundedSender<Action>,
-        rx: UnboundedReceiver<Action>,
+        tx: Sender<Action>,
+        rx: Receiver<Action>,
         redis_tx: broadcast::Sender<RedisEvent>,
         tick_rate: f64,
         frame_rate: f64,
@@ -72,6 +73,7 @@ impl App {
             should_quit: false,
             mode,
             previous_mode: None,
+            error_message: None,
             last_tick_key_events: Vec::new(),
             tx,
             rx,
@@ -94,24 +96,22 @@ impl App {
         // tui.mouse(true);
         tui.enter()?;
 
-        self.tx.send(Action::LoadKeySpace)?;
-
         loop {
             // TODO: refactor with async_channel crate
             // replace with select multiplex
             if let Some(e) = tui.next().await {
                 if let Some(action) = self.handle_event(&e) {
-                    let _ = self.tx.send(action);
+                    action::try_send_action(&self.tx, action);
                 }
             }
 
             while let Ok(action) = self.rx.try_recv() {
                 if let Some(next) = self.handle_action(&action, &mut tui)? {
-                    let _ = self.tx.send(next);
+                    action::try_send_action(&self.tx, next);
                 }
             }
             if self.should_quit {
-                tui.stop();
+                tui.stop().await?;
                 break;
             }
         }
@@ -121,13 +121,16 @@ impl App {
 
     fn resize(&mut self, tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
         tui.resize(Rect::new(0, 0, w, h))?;
-        self.tx.send(Action::Render)?;
+        action::try_send_action(&self.tx, Action::Render);
 
         Ok(())
     }
 
     fn handle_event(&mut self, e: &tui::Event) -> Option<Action> {
         match e {
+            // Emitted once when the event task starts: trigger the initial
+            // keyspace load so the screen is populated without a manual action.
+            tui::Event::Init => Some(Action::LoadKeySpace),
             tui::Event::Quit => Some(Action::Quit),
             tui::Event::Tick => Some(Action::Tick),
             tui::Event::Render => Some(Action::Render),
@@ -185,6 +188,7 @@ impl App {
             Action::DiscardKeyspacePopup => self.close_popup(),
             Action::ConfirmKeyspacePopup => self.set_keyspace_filter(),
             Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
+            Action::Error(ref msg) => self.show_error_popup(msg),
             _ => {}
         }
 
@@ -235,6 +239,11 @@ impl App {
         if let Some(ref mut m) = self.previous_mode.or(Some(Mode::KeySpace)) {
             std::mem::swap(&mut self.mode, m);
         }
+    }
+
+    fn show_error_popup(&mut self, msg: &str) {
+        self.error_message = Some(msg.to_owned());
+        self.mode = Mode::Popup(PopupMode::Error);
     }
 
     fn enter_filter_popup(&mut self) {
@@ -329,7 +338,7 @@ impl App {
         if self.mode == Mode::KeySpace {
             self.keyspace.scroll_next();
             self.keyspace.clear_selected_value();
-            let _ = self.tx.send(Action::RequestSelectedValue);
+            action::try_send_action(&self.tx, Action::RequestSelectedValue);
         }
     }
 
@@ -337,7 +346,7 @@ impl App {
         if self.mode == Mode::KeySpace {
             self.keyspace.scroll_previous();
             self.keyspace.clear_selected_value();
-            let _ = self.tx.send(Action::RequestSelectedValue);
+            action::try_send_action(&self.tx, Action::RequestSelectedValue);
         }
     }
 }

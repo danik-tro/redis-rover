@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use tokio::{
-    sync::broadcast::{self, Sender},
-    sync::mpsc::UnboundedSender,
+    sync::broadcast::{self, Sender as BroadcastSender},
+    sync::mpsc::Sender as ActionSender,
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -20,18 +20,20 @@ pub struct Runner {
 
     state: SharedState,
     info_task: JoinHandle<()>,
+    state_task: JoinHandle<()>,
 
-    action_tx: UnboundedSender<Action>,
-    tx: Sender<RedisEvent>,
+    action_tx: ActionSender<Action>,
+    tx: BroadcastSender<RedisEvent>,
 }
 
 impl Runner {
     pub fn new(
         manager: ConnectionManager,
         state: SharedState,
-        action_tx: UnboundedSender<Action>,
+        action_tx: ActionSender<Action>,
     ) -> Self {
         let info_task = tokio::spawn(async {});
+        let state_task = tokio::spawn(async {});
         let cancelation_token = CancellationToken::new();
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -41,6 +43,7 @@ impl Runner {
             manager,
             state,
             info_task,
+            state_task,
             action_tx,
             tx,
         }
@@ -52,13 +55,36 @@ impl Runner {
         self
     }
 
-    pub fn tx(&self) -> Sender<RedisEvent> {
+    pub fn tx(&self) -> BroadcastSender<RedisEvent> {
         self.tx.clone()
     }
 
     pub fn start(&mut self) {
         self.launch_refresh_info_task();
         self.launch_refresh_state_task();
+    }
+
+    /// Cancels the background tasks and awaits their completion so in-flight
+    /// `INFO` / `SCAN` / `MEMORY USAGE` requests don't keep running on a process
+    /// that's exiting. Falls back to `abort()` if a task doesn't stop within the
+    /// timeout.
+    pub async fn shutdown(self) {
+        self.cancelation_token.cancel();
+
+        let info_abort = self.info_task.abort_handle();
+        let state_abort = self.state_task.abort_handle();
+
+        let timeout = Duration::from_secs(2);
+        if tokio::time::timeout(timeout, async {
+            let _ = tokio::join!(self.info_task, self.state_task);
+        })
+        .await
+        .is_err()
+        {
+            log::warn!("Redis background tasks did not stop within {timeout:?}; aborting");
+            info_abort.abort();
+            state_abort.abort();
+        }
     }
 
     fn launch_refresh_state_task(&mut self) {
@@ -70,7 +96,7 @@ impl Runner {
         let state = self.state.clone();
         let storage = Storage::new(manager);
 
-        tokio::spawn(async move {
+        self.state_task = tokio::spawn(async move {
             let mut event_handler = EventHandler::new(state, action_tx, storage);
 
             loop {
@@ -118,12 +144,12 @@ impl Runner {
 
 pub struct EventHandler {
     state: SharedState,
-    tx: UnboundedSender<Action>,
+    tx: ActionSender<Action>,
     storage: Storage,
 }
 
 impl EventHandler {
-    fn new(state: SharedState, tx: UnboundedSender<Action>, storage: Storage) -> Self {
+    fn new(state: SharedState, tx: ActionSender<Action>, storage: Storage) -> Self {
         Self { state, tx, storage }
     }
 
@@ -171,8 +197,9 @@ impl EventHandler {
                         _ = std::mem::take(&mut *store);
                         self.action_hook(Action::LoadKeysIntoKeySpace);
                     }
-                    Err(_) => {
-                        todo!("TODO: implement error popup")
+                    Err(err) => {
+                        log::error!("FetchKeys failed: {err:?}");
+                        self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
                     }
                 }
             }
@@ -180,8 +207,6 @@ impl EventHandler {
     }
 
     fn action_hook(&self, action: Action) {
-        if let Err(err) = self.tx.send(action) {
-            log::debug!("failed to send action hook: {err:?}");
-        }
+        crate::action::try_send_action(&self.tx, action);
     }
 }
