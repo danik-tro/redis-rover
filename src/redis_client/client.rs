@@ -4,9 +4,13 @@ use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use super::types::{KeyItem, KeyValue, NewKeySpec, RedisInfo, RedisType};
+use super::types::{ItemDelete, ItemEdit, KeyItem, KeyValue, NewKeySpec, RedisInfo, RedisType};
 
 const VALUE_PREVIEW_LIMIT: isize = 100;
+
+/// Sentinel used to delete a LIST element by index (Redis has no delete-by-index):
+/// overwrite the slot with this marker via `LSET`, then remove it with `LREM`.
+const LIST_DELETE_SENTINEL: &str = "__rrover_deleted__\u{0}";
 
 /// Run `INFO` against Redis and parse the response into [`RedisInfo`].
 ///
@@ -196,6 +200,74 @@ pub async fn add_item(
         }
         KeyItem::ZsetMember { member, score } => {
             let _: () = manager.zadd(key, member, *score).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Edit a single collection element in place. Edits change the element's
+/// value/score only (the identity is fixed) except [`ItemEdit::SetReplace`],
+/// which replaces a member and is rejected if the new member already exists.
+///
+/// # Errors
+///
+/// Returns an error if the new SET member already exists, or if the underlying
+/// Redis command fails.
+pub async fn edit_item(
+    mut manager: ConnectionManager,
+    key: &str,
+    edit: &ItemEdit,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match edit {
+        ItemEdit::ListSet { index, value } => {
+            let index = isize::try_from(*index)?;
+            let _: () = manager.lset(key, index, value).await?;
+        }
+        ItemEdit::SetReplace { old, new } => {
+            if old != new {
+                let exists: bool = manager.sismember(key, new).await?;
+                if exists {
+                    return Err(format!("Member '{new}' already exists").into());
+                }
+                let _: () = manager.srem(key, old).await?;
+                let _: () = manager.sadd(key, new).await?;
+            }
+        }
+        ItemEdit::HashSet { field, value } => {
+            let _: () = manager.hset(key, field, value).await?;
+        }
+        ItemEdit::ZsetScore { member, score } => {
+            let _: () = manager.zadd(key, member, *score).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete a single collection element. LIST elements are removed by index via
+/// the `LSET` sentinel + `LREM` trick (Redis has no delete-by-index).
+///
+/// # Errors
+///
+/// Returns an error if the underlying Redis command fails.
+pub async fn delete_item(
+    mut manager: ConnectionManager,
+    key: &str,
+    delete: &ItemDelete,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match delete {
+        ItemDelete::ListIndex(index) => {
+            let index = isize::try_from(*index)?;
+            let _: () = manager.lset(key, index, LIST_DELETE_SENTINEL).await?;
+            let _: () = manager.lrem(key, 1, LIST_DELETE_SENTINEL).await?;
+        }
+        ItemDelete::SetMember(member) => {
+            let _: () = manager.srem(key, member).await?;
+        }
+        ItemDelete::HashField(field) => {
+            let _: () = manager.hdel(key, field).await?;
+        }
+        ItemDelete::ZsetMember(member) => {
+            let _: () = manager.zrem(key, member).await?;
         }
     }
     Ok(())

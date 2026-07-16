@@ -1,4 +1,4 @@
-use super::types::{KeyItem, NewKeySpec, RedisType};
+use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec, RedisType};
 
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
@@ -28,5 +28,15 @@ pub enum RedisEvent {
     AddItem {
         key: String,
         item: KeyItem,
+    },
+    /// Edit a single collection element in place (in-collection `e`).
+    EditItem {
+        key: String,
+        edit: ItemEdit,
+    },
+    /// Delete a single collection element (in-collection `d`).
+    DeleteItem {
+        key: String,
+        delete: ItemDelete,
     },
 }

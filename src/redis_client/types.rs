@@ -78,6 +78,38 @@ pub enum KeyItem {
     ZsetMember { member: String, score: f64 },
 }
 
+/// An in-place edit of a single collection element, produced by the edit-item
+/// overlay (`e` inside a value). Edits change value/score only — never the
+/// element's identity — except SET, whose member *is* its value (a guarded
+/// replace).
+#[derive(Debug, Clone)]
+pub enum ItemEdit {
+    /// `LSET key index value` — replace the LIST element at `index`.
+    ListSet { index: usize, value: String },
+    /// `SREM old` + `SADD new` — replace a SET member. Rejected if `new` already
+    /// exists (no silent clobber).
+    SetReplace { old: String, new: String },
+    /// `HSET key field value` — set a HASH field's value (field fixed).
+    HashSet { field: String, value: String },
+    /// `ZADD key score member` — set a ZSET member's score (member fixed).
+    ZsetScore { member: String, score: f64 },
+}
+
+/// Deletion of a single collection element, produced by the delete-item confirm
+/// (`d` inside a value). Removes exactly the selected element, not the key.
+#[derive(Debug, Clone)]
+pub enum ItemDelete {
+    /// Delete the LIST element at `index` (Redis has no delete-by-index, so this
+    /// uses the `LSET` tombstone + `LREM` trick).
+    ListIndex(usize),
+    /// `SREM key member`.
+    SetMember(String),
+    /// `HDEL key field`.
+    HashField(String),
+    /// `ZREM key member`.
+    ZsetMember(String),
+}
+
 /// A fully-specified new key to create, produced by the add-key wizard. Carries
 /// the type and at least one seed element (Redis cannot store an empty
 /// collection). JSON is intentionally excluded — the wizard cannot create it.

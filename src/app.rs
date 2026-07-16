@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use crate::{config, mode::PopupMode, redis_client::event::RedisEvent, state::SharedState};
+use crate::{
+    config, mode::PopupMode, redis_client::event::RedisEvent, redis_client::types::RedisType,
+    state::SharedState,
+};
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use ratatui::prelude::Rect;
@@ -211,6 +214,19 @@ impl App {
             return None;
         }
 
+        // The in-collection edit-item overlay: Enter saves, Esc cancels, the
+        // rest is input.
+        if self.keyspace.is_edit_item_active() {
+            if is_confirm {
+                return Some(Action::ConfirmKeyspacePopup);
+            }
+            if is_cancel {
+                return Some(Action::DiscardKeyspacePopup);
+            }
+            self.keyspace.handle_edit_item_key(key);
+            return None;
+        }
+
         // Enter/Esc act on whatever modal layer is open before falling back to
         // the configured bindings (where Enter is `EnterValue`).
         if self.keyspace.is_popup() || self.keyspace.is_overlay_open() {
@@ -351,8 +367,8 @@ impl App {
             (Command::EnterValue, "Enter value / confirm"),
             (Command::AddKey, "Add new key"),
             (Command::AddItem, "Add item (in collection)"),
-            (Command::EditValue, "Edit value (string)"),
-            (Command::DeleteKey, "Delete key"),
+            (Command::EditValue, "Edit value / item (drill in first)"),
+            (Command::DeleteKey, "Delete key / item (in value)"),
             (Command::SetTtl, "Set TTL"),
             (Command::ClosePopup, "Close popup / overlay"),
             (Command::ToggleHelp, "Toggle this help"),
@@ -506,6 +522,11 @@ impl App {
             return;
         }
 
+        if self.keyspace.is_edit_item_active() {
+            self.keyspace.close_edit_item();
+            return;
+        }
+
         if self.keyspace.is_value_focused() {
             self.keyspace.exit_value_focus();
             return;
@@ -528,6 +549,10 @@ impl App {
         }
         if self.keyspace.is_add_item_active() {
             self.confirm_add_item();
+            return;
+        }
+        if self.keyspace.is_edit_item_active() {
+            self.confirm_edit_item();
             return;
         }
         if self.keyspace.is_overlay_open() {
@@ -568,8 +593,24 @@ impl App {
         }
     }
 
+    /// Finalize the in-collection edit-item overlay into an `EditItem` event.
+    /// On invalid input the widget keeps the overlay open with a notice, so a
+    /// `None` here simply means "stay open". Keeps the user inside the collection
+    /// on the same row after the post-write refresh, like [`Self::confirm_add_item`].
+    fn confirm_edit_item(&mut self) {
+        let row = self.keyspace.value_selected_row().unwrap_or(0);
+        if let Some((key, edit)) = self.keyspace.take_edit_item_request() {
+            self.reselect_key = Some(key.clone());
+            self.restore_value_row = Some(row);
+            self.send_redis_event(RedisEvent::EditItem { key, edit });
+        }
+    }
+
     /// Translate the confirmed action overlay into a Redis write event.
     fn confirm_action_overlay(&mut self) {
+        // Capture the value-table row before taking the request (delete-item
+        // leaves value focus intact so the user can be restored to it).
+        let row = self.keyspace.value_selected_row().unwrap_or(0);
         let Some(request) = self.keyspace.take_overlay_request() else {
             // Notice-only overlay: nothing to do, it's already been dismissed.
             return;
@@ -584,6 +625,13 @@ impl App {
                 // its place (default top-of-page) rather than reselecting it.
                 self.reselect_key = None;
                 RedisEvent::DeleteKey { key }
+            }
+            OverlayRequest::DeleteItem(delete) => {
+                // The key survives; keep the user inside the collection on the
+                // same (clamped) row after the post-delete refresh.
+                self.reselect_key = Some(key.clone());
+                self.restore_value_row = Some(row);
+                RedisEvent::DeleteItem { key, delete }
             }
             OverlayRequest::SetString(value) => {
                 // Non-destructive: keep the cursor on this key after the refresh.
@@ -602,8 +650,15 @@ impl App {
         self.keyspace.enter_value();
     }
 
+    /// `d`: delete. From the key list this deletes the whole selected key; while
+    /// drilled into a collection value it deletes only the selected element.
     fn request_delete_key(&mut self) {
-        if self.keyspace.selected_key().is_some() {
+        if self.keyspace.selected_key().is_none() {
+            return;
+        }
+        if self.keyspace.is_value_focused() {
+            self.keyspace.open_delete_item_confirm();
+        } else {
             self.keyspace.open_delete_confirm();
         }
     }
@@ -614,9 +669,27 @@ impl App {
         }
     }
 
+    /// `e`: edit. STRING opens the whole-value editor. For a collection, the
+    /// first `e` drills into the value (so the user sees the elements) and the
+    /// second `e` — now value-focused — edits the selected element.
     fn request_edit_value(&mut self) {
-        if self.keyspace.selected_key().is_some() {
-            self.keyspace.open_edit_value();
+        let Some((key, r_type)) = self.keyspace.selected_key() else {
+            return;
+        };
+        match r_type {
+            RedisType::List | RedisType::Set | RedisType::Hash | RedisType::Zset => {
+                if self.keyspace.is_value_focused() {
+                    self.keyspace.open_edit_item(key);
+                } else {
+                    // Drill in first; a second `e` edits the selected element.
+                    self.keyspace.enter_value();
+                }
+            }
+            // STRING edits the whole value; JSON/Unknown fall through to the
+            // editor (which shows a notice for non-STRING scalars).
+            RedisType::String | RedisType::Json | RedisType::Unknown => {
+                self.keyspace.open_edit_value();
+            }
         }
     }
 

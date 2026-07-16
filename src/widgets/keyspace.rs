@@ -14,7 +14,9 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     config,
-    redis_client::types::{KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType},
+    redis_client::types::{
+        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType,
+    },
 };
 
 enum KeySpacePopupMode {
@@ -39,6 +41,11 @@ enum Focus {
 enum OverlayKind {
     /// Confirm deletion of the selected key.
     ConfirmDelete,
+    /// Confirm deletion of a single collection element (label + resolved target).
+    ConfirmDeleteItem {
+        label: String,
+        target: SelectedElement,
+    },
     /// Edit the selected STRING value (text input).
     EditValue,
     /// Enter a key-level TTL in seconds (text input).
@@ -240,6 +247,51 @@ struct AddItemDraft {
     notice: Option<String>,
 }
 
+/// The concrete collection element the value-table cursor points at, resolved
+/// from the loaded `selected_value` snapshot so it matches what the user sees
+/// (important for HASH, whose map order is not stable across reloads).
+#[derive(Clone)]
+enum SelectedElement {
+    ListIndex { index: usize, value: String },
+    SetMember(String),
+    HashField { field: String, value: String },
+    ZsetMember { member: String, score: f64 },
+}
+
+impl SelectedElement {
+    /// One-line human label for the element, used in the delete-item confirm.
+    fn label(&self) -> String {
+        match self {
+            SelectedElement::ListIndex { index, value } => format!("[{index}] {value}"),
+            SelectedElement::SetMember(member) | SelectedElement::ZsetMember { member, .. } => {
+                member.clone()
+            }
+            SelectedElement::HashField { field, .. } => field.clone(),
+        }
+    }
+
+    /// Translate the element into its deletion request.
+    fn into_delete(self) -> ItemDelete {
+        match self {
+            SelectedElement::ListIndex { index, .. } => ItemDelete::ListIndex(index),
+            SelectedElement::SetMember(member) => ItemDelete::SetMember(member),
+            SelectedElement::HashField { field, .. } => ItemDelete::HashField(field),
+            SelectedElement::ZsetMember { member, .. } => ItemDelete::ZsetMember(member),
+        }
+    }
+}
+
+/// Draft state for the in-collection edit-item overlay (`e` inside a value).
+/// Scoped to one resolved element; edits its value/score only (SET replaces the
+/// member). The `target` snapshot is captured at open time so confirming builds
+/// the right request even if the underlying value later reloads.
+struct EditItemDraft {
+    key: String,
+    target: SelectedElement,
+    input: TextArea<'static>,
+    notice: Option<String>,
+}
+
 pub struct KeySpace {
     table: TableState,
     value_table: TableState,
@@ -253,6 +305,7 @@ pub struct KeySpace {
     action_overlay: Option<ActionOverlay>,
     new_key: Option<NewKeyDraft>,
     add_item: Option<AddItemDraft>,
+    edit_item: Option<EditItemDraft>,
 }
 
 impl KeySpace {
@@ -270,6 +323,7 @@ impl KeySpace {
             action_overlay: None,
             new_key: None,
             add_item: None,
+            edit_item: None,
         }
     }
 
@@ -453,6 +507,39 @@ impl KeySpace {
         }
     }
 
+    /// Resolve the value-table cursor to the concrete element it points at,
+    /// reading the exact `selected_value` snapshot the user is looking at (so
+    /// HASH — whose map order is unstable across reloads — resolves correctly).
+    /// `None` unless value-focused with a selected navigable row.
+    fn selected_element(&self) -> Option<SelectedElement> {
+        if !self.is_value_focused() {
+            return None;
+        }
+        let row = self.value_table.selected()?;
+        match self.selected_value.as_ref()? {
+            KeyValue::List(items) => items.get(row).map(|v| SelectedElement::ListIndex {
+                index: row,
+                value: v.clone(),
+            }),
+            KeyValue::Set(members) => members
+                .iter()
+                .nth(row)
+                .map(|m| SelectedElement::SetMember(m.clone())),
+            KeyValue::Hash(map) => map
+                .iter()
+                .nth(row)
+                .map(|(f, v)| SelectedElement::HashField {
+                    field: f.clone(),
+                    value: v.clone(),
+                }),
+            KeyValue::Zset(items) => items.get(row).map(|(m, s)| SelectedElement::ZsetMember {
+                member: m.clone(),
+                score: *s,
+            }),
+            KeyValue::String(_) | KeyValue::Json(_) | KeyValue::Unknown => None,
+        }
+    }
+
     /// Re-enter value focus at `row` (clamped to the reloaded value's row count)
     /// after a refresh, so adding an item keeps the user inside the collection
     /// instead of bouncing back to the key list. No-op if the value is no longer
@@ -491,6 +578,21 @@ impl KeySpace {
     pub fn open_delete_confirm(&mut self) {
         self.action_overlay = Some(ActionOverlay {
             kind: OverlayKind::ConfirmDelete,
+            text_area: None,
+        });
+    }
+
+    /// Open a delete-confirmation prompt for the selected collection element.
+    /// No-op unless a navigable element is currently focused.
+    pub fn open_delete_item_confirm(&mut self) {
+        let Some(target) = self.selected_element() else {
+            return;
+        };
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::ConfirmDeleteItem {
+                label: target.label(),
+                target,
+            },
             text_area: None,
         });
     }
@@ -538,6 +640,9 @@ impl KeySpace {
         let overlay = self.action_overlay.take()?;
         match overlay.kind {
             OverlayKind::ConfirmDelete => Some(OverlayRequest::Delete),
+            OverlayKind::ConfirmDeleteItem { target, .. } => {
+                Some(OverlayRequest::DeleteItem(target.into_delete()))
+            }
             OverlayKind::EditValue => {
                 let value = overlay
                     .text_area
@@ -920,11 +1025,97 @@ impl KeySpace {
         self.add_item = None;
         Some((key, item))
     }
+
+    // --- In-collection edit-item (`e` inside a value) ---
+
+    pub fn is_edit_item_active(&self) -> bool {
+        self.edit_item.is_some()
+    }
+
+    /// Open the edit-item overlay for the currently focused collection element.
+    /// Seeds the input with the editable field (value/score/member) and remembers
+    /// the resolved identity. No-op unless a navigable element is focused.
+    pub fn open_edit_item(&mut self, key: String) {
+        let Some(target) = self.selected_element() else {
+            return;
+        };
+        let (title, seed) = match &target {
+            SelectedElement::ListIndex { index, value } => {
+                (format!("Value [#{index}]"), value.clone())
+            }
+            SelectedElement::SetMember(member) => ("Member".to_string(), member.clone()),
+            SelectedElement::HashField { field, value } => {
+                (format!("Value (field: {field})"), value.clone())
+            }
+            SelectedElement::ZsetMember { member, score } => {
+                (format!("Score (member: {member})"), score.to_string())
+            }
+        };
+        let input = build_input_text_area(&title, "Enter value", Some(&seed));
+        self.edit_item = Some(EditItemDraft {
+            key,
+            target,
+            input,
+            notice: None,
+        });
+    }
+
+    pub fn close_edit_item(&mut self) {
+        self.edit_item = None;
+    }
+
+    /// Feed a raw key into the edit-item input (single field). A pending notice is
+    /// dismissed on the next key. (`Enter`/`Esc` are routed by `App`.)
+    pub fn handle_edit_item_key(&mut self, key: KeyEvent) {
+        let Some(draft) = self.edit_item.as_mut() else {
+            return;
+        };
+        if draft.notice.is_some() {
+            draft.notice = None;
+            return;
+        }
+        draft.input.input(key);
+    }
+
+    /// Consume the edit-item overlay into a `(key, edit)` request. Returns `None`
+    /// on invalid input (unparsable ZSET score), leaving a notice for the user.
+    pub fn take_edit_item_request(&mut self) -> Option<(String, ItemEdit)> {
+        let draft = self.edit_item.as_mut()?;
+        let text = input_text(&draft.input);
+        let edit = match &draft.target {
+            SelectedElement::ListIndex { index, .. } => ItemEdit::ListSet {
+                index: *index,
+                value: text,
+            },
+            SelectedElement::SetMember(old) => ItemEdit::SetReplace {
+                old: old.clone(),
+                new: text,
+            },
+            SelectedElement::HashField { field, .. } => ItemEdit::HashSet {
+                field: field.clone(),
+                value: text,
+            },
+            SelectedElement::ZsetMember { member, .. } => {
+                let Ok(score) = text.trim().parse::<f64>() else {
+                    draft.notice = Some("Score must be a number.".to_string());
+                    return None;
+                };
+                ItemEdit::ZsetScore {
+                    member: member.clone(),
+                    score,
+                }
+            }
+        };
+        let key = draft.key.clone();
+        self.edit_item = None;
+        Some((key, edit))
+    }
 }
 
 /// A confirmed action overlay, ready for `App` to translate into a `RedisEvent`.
 pub enum OverlayRequest {
     Delete,
+    DeleteItem(ItemDelete),
     SetString(String),
     SetTtl(i64),
 }
@@ -1064,12 +1255,21 @@ impl KeySpaceWidget {
             return;
         }
 
+        let delete_item_body;
         let (title, body, hint): (&str, &str, &str) = match &overlay.kind {
             OverlayKind::ConfirmDelete => (
                 " Delete key ",
                 "Delete the selected key?",
                 "Enter: confirm   Esc: cancel",
             ),
+            OverlayKind::ConfirmDeleteItem { label, .. } => {
+                delete_item_body = format!("Delete item: {label}?");
+                (
+                    " Delete item ",
+                    delete_item_body.as_str(),
+                    "Enter: confirm   Esc: cancel",
+                )
+            }
             OverlayKind::Notice(msg) => (" Notice ", msg.as_str(), "Esc: dismiss"),
             // The input kinds are handled above; unreachable here.
             OverlayKind::EditValue | OverlayKind::SetTtl => return,
@@ -1293,6 +1493,46 @@ impl KeySpaceWidget {
             draft.input_a.render(a_area, buf);
             Self::render_wizard_hint(&hint, hint_area, buf);
         }
+    }
+
+    /// Render the edit-item overlay for the focused collection element.
+    fn render_edit_item_overlay(state: &KeySpace, area: Rect, buf: &mut Buffer) {
+        let Some(draft) = state.edit_item.as_ref() else {
+            return;
+        };
+        let cfg = config::get();
+
+        if let Some(notice) = draft.notice.as_ref() {
+            let popup = Self::centered_popup(area, 5, buf);
+            let block = Block::default()
+                .title(" Notice ")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(cfg.colors.base04)
+                .bg(cfg.colors.base00)
+                .fg(cfg.colors.base05);
+            let lines = vec![
+                Line::from(notice.as_str()).alignment(Alignment::Center),
+                Line::from(""),
+                Line::styled("Any key: back", cfg.colors.base03).alignment(Alignment::Center),
+            ];
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(block)
+                .render(popup, buf);
+            return;
+        }
+
+        let popup = Self::centered_popup(area, 5, buf);
+        let [input_area, hint_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).areas(popup);
+        draft.input.render(input_area, buf);
+        Self::render_wizard_hint(
+            &format!("Edit {key}   Enter: save   Esc: cancel", key = draft.key),
+            hint_area,
+            buf,
+        );
     }
 
     fn render_wizard_hint(hint: &str, area: Rect, buf: &mut Buffer) {
@@ -1602,6 +1842,10 @@ impl StatefulWidget for KeySpaceWidget {
 
         if state.is_add_item_active() {
             Self::render_add_item_overlay(state, area, buf);
+        }
+
+        if state.is_edit_item_active() {
+            Self::render_edit_item_overlay(state, area, buf);
         }
     }
 }

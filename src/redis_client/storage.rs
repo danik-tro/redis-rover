@@ -3,7 +3,7 @@ use redis::FromRedisValue;
 
 use super::{
     client::{self, fetch_value},
-    types::{KeyItem, KeyMeta, KeyValue, KeysList, NewKeySpec, RedisType},
+    types::{ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeysList, NewKeySpec, RedisType},
 };
 
 pub struct FetchKeysWithMeta<'a> {
@@ -189,5 +189,33 @@ impl Storage {
         item: &KeyItem,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         client::add_item(self.manager.clone(), key, item).await
+    }
+
+    /// Edit a single collection element in place. Delegates to
+    /// [`client::edit_item`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edit is rejected (e.g. duplicate SET member) or
+    /// the underlying Redis command fails.
+    pub async fn edit_item(
+        &self,
+        key: &str,
+        edit: &ItemEdit,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::edit_item(self.manager.clone(), key, edit).await
+    }
+
+    /// Delete a single collection element. Delegates to [`client::delete_item`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis command fails.
+    pub async fn delete_item(
+        &self,
+        key: &str,
+        delete: &ItemDelete,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        client::delete_item(self.manager.clone(), key, delete).await
     }
 }

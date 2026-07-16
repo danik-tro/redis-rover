@@ -153,6 +153,7 @@ impl EventHandler {
         Self { state, tx, storage }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, event: RedisEvent) {
         match event {
             RedisEvent::SetString { key, value } => {
@@ -205,6 +206,36 @@ impl EventHandler {
                     self.action_hook(Action::Error(format!("Failed to add item to {key}: {err}")));
                 }
             },
+            RedisEvent::EditItem { key, edit } => {
+                match self.storage.edit_item(&key, &edit).await {
+                    Ok(()) => {
+                        // Re-fetch the value so the detail table reflects the
+                        // edit; refresh the keyspace so the size column updates.
+                        self.action_hook(Action::RequestSelectedValue);
+                        self.action_hook(Action::RefreshSpace);
+                    }
+                    Err(err) => {
+                        log::error!("EditItem failed for {key}: {err:?}");
+                        self.action_hook(Action::Error(format!(
+                            "Failed to edit item in {key}: {err}"
+                        )));
+                    }
+                }
+            }
+            RedisEvent::DeleteItem { key, delete } => {
+                match self.storage.delete_item(&key, &delete).await {
+                    Ok(()) => {
+                        self.action_hook(Action::RequestSelectedValue);
+                        self.action_hook(Action::RefreshSpace);
+                    }
+                    Err(err) => {
+                        log::error!("DeleteItem failed for {key}: {err:?}");
+                        self.action_hook(Action::Error(format!(
+                            "Failed to delete item from {key}: {err}"
+                        )));
+                    }
+                }
+            }
             RedisEvent::FetchValue { key, r_type } => {
                 match self.storage.fetch_value(&key, r_type).await {
                     Ok(value) => {

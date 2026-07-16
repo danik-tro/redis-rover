@@ -95,7 +95,7 @@ impl StatefulWidget for InfoWidget {
         // One-line key-hint legend (#41) so the common actions are discoverable
         // without opening the full `?` help overlay.
         Paragraph::new(Line::styled(
-            "a add  i add-item  e edit  d del  t ttl  ⏎ open  f filter  ? help",
+            "a add  i add-item  e edit(item)  d del(item)  t ttl  ⏎ open  f filter  ? help",
             cfg.colors.base04,
         ))
         .alignment(Alignment::Center)
