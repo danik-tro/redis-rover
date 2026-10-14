@@ -16,12 +16,11 @@ const LIST_DELETE_SENTINEL: &str = "__rrover_deleted__\u{0}";
 ///
 /// # Errors
 ///
-/// Returns an error if the command fails or the response cannot be parsed.
-// TODO: should be a better solution to handle this.
+/// Returns an error if the command fails.
 pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
     let info: String = redis::cmd("INFO").query_async(manager).await?;
 
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
 
     for c in info.split_terminator('\n') {
         if c.starts_with('#') || c.is_empty() {
@@ -37,7 +36,7 @@ pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
         map.insert(header, value.trim());
     }
 
-    Ok(serde_json::from_value(serde_json::json!(map))?)
+    Ok(RedisInfo::from(map))
 }
 
 /// Fetch the value behind a key, bounded to the first

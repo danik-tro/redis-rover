@@ -51,9 +51,15 @@ async fn tokio_main(args: Cli) -> Result<()> {
     let mut watcher = Runner::new(manager.clone(), state.clone(), tx.clone())
         .cancelation_token(cancellation_token.clone());
 
-    let mut app = App::new(state, tx, rx, watcher.tx(),
+    let mut app = App::new(
+        state,
+        tx,
+        rx,
+        watcher.tx(),
         target,
-        args.tick_rate, args.frame_rate);
+        args.tick_rate,
+        args.frame_rate,
+    );
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;

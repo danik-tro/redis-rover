@@ -6,29 +6,45 @@ use ratatui::{
     style::Stylize,
     text::{Span, Text},
 };
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommonInfo {
     pub os: String,
-    #[serde(rename(deserialize = "redis_version"))]
     pub version: String,
-    #[serde(rename(deserialize = "used_memory_human"))]
     pub memory: String,
-    #[serde(rename(deserialize = "total_system_memory_human"))]
     pub total_memory: String,
-    #[serde(rename(deserialize = "used_cpu_sys"))]
     pub cpu: String,
-    #[serde(rename(deserialize = "connected_clients"))]
     pub clients: String,
-    #[serde(rename(deserialize = "maxclients"))]
     pub max_clients: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Build from the `field -> value` pairs of an `INFO` reply. Missing fields
+/// become empty strings so a partial reply still renders.
+impl From<HashMap<&str, &str>> for CommonInfo {
+    fn from(map: HashMap<&str, &str>) -> Self {
+        let get = |field: &str| map.get(field).copied().unwrap_or_default().to_string();
+        Self {
+            os: get("os"),
+            version: get("redis_version"),
+            memory: get("used_memory_human"),
+            total_memory: get("total_system_memory_human"),
+            cpu: get("used_cpu_sys"),
+            clients: get("connected_clients"),
+            max_clients: get("maxclients"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisInfo {
-    #[serde(flatten)]
     pub common: CommonInfo,
+}
+
+impl From<HashMap<&str, &str>> for RedisInfo {
+    fn from(map: HashMap<&str, &str>) -> Self {
+        Self {
+            common: CommonInfo::from(map),
+        }
+    }
 }
 
 impl RedisInfo {
@@ -241,5 +257,50 @@ impl Default for KeyspaceState {
             next_cursor: None,
             cursor_stack: VecDeque::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_info_from_map_reads_all_fields() {
+        let map = HashMap::from([
+            ("os", "Linux 6.1"),
+            ("redis_version", "7.2.4"),
+            ("used_memory_human", "1.5M"),
+            ("total_system_memory_human", "16G"),
+            ("used_cpu_sys", "0.42"),
+            ("connected_clients", "3"),
+            ("maxclients", "10000"),
+            ("uptime_in_seconds", "120"),
+        ]);
+
+        let info = RedisInfo::from(map);
+
+        assert_eq!(
+            info.common,
+            CommonInfo {
+                os: "Linux 6.1".into(),
+                version: "7.2.4".into(),
+                memory: "1.5M".into(),
+                total_memory: "16G".into(),
+                cpu: "0.42".into(),
+                clients: "3".into(),
+                max_clients: "10000".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn redis_info_from_map_defaults_missing_fields() {
+        let map = HashMap::from([("redis_version", "7.2.4")]);
+
+        let info = RedisInfo::from(map);
+
+        assert_eq!(info.common.version, "7.2.4");
+        assert_eq!(info.common.os, "");
+        assert_eq!(info.common.max_clients, "");
     }
 }

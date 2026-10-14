@@ -124,8 +124,17 @@ impl App {
             .cancelation_token(cancellation_token.clone());
 
         // tui.mouse(true);
-        tui.enter()?;
+        // `Tui` has no `Drop` teardown: always shut down explicitly, even when
+        // entering or the loop fails, so the terminal is restored.
+        let result = match tui.enter() {
+            Ok(()) => self.event_loop(&mut tui).await,
+            Err(err) => Err(err),
+        };
+        let shutdown = tui.shutdown().await;
+        result.and(shutdown)
+    }
 
+    async fn event_loop(&mut self, tui: &mut tui::Tui) -> Result<()> {
         loop {
             // TODO: refactor with async_channel crate
             // replace with select multiplex
@@ -136,17 +145,14 @@ impl App {
             }
 
             while let Ok(action) = self.rx.try_recv() {
-                if let Some(next) = self.handle_action(&action, &mut tui)? {
+                if let Some(next) = self.handle_action(&action, tui)? {
                     action::try_send_action(&self.tx, next);
                 }
             }
             if self.should_quit {
-                tui.stop().await?;
-                break;
+                return Ok(());
             }
         }
-        tui.exit()?;
-        Ok(())
     }
 
     fn resize(&mut self, tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
@@ -768,7 +774,8 @@ impl App {
             .lock()
             .next_cursor
             .is_some_and(|c| c != 0);
-        self.keyspace.set_keys(self.state.keys.lock().clone(), has_more);
+        self.keyspace
+            .set_keys(self.state.keys.lock().clone(), has_more);
         self.keyspace.clear_selected_value();
 
         // After a non-destructive edit, keep the cursor on the edited key and

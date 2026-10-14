@@ -1,5 +1,5 @@
 use redis::aio::ConnectionManager;
-use redis::FromRedisValue;
+use redis::{FromRedisValue, ScanOptions};
 
 use super::{
     client::{self, fetch_value},
@@ -43,10 +43,12 @@ impl<'a> FetchKeysWithMeta<'a> {
     pub async fn execute(mut self) -> Result<KeysList, Box<dyn std::error::Error + Sync + Send>> {
         let cursor = self.cursor.unwrap_or_default();
         let pattern = self.pattern.unwrap_or("*");
+        // Single SCAN step rather than `AsyncCommands::scan_match`: the latter
+        // always restarts at cursor 0 and drains the whole keyspace, which
+        // doesn't fit cursor-based paging.
         let (cursor, keys): (usize, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
-            .arg("MATCH")
-            .arg(pattern)
+            .arg(ScanOptions::default().with_pattern(pattern))
             .query_async(&mut self.manager)
             .await?;
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::LazyLock};
 
 use color_eyre::eyre::Result;
 use directories::ProjectDirs;
@@ -17,28 +17,20 @@ const VERSION_MESSAGE: &str = concat!(
     ")"
 );
 
-// TODO: get rid of the lazy_static. Replace with a native OnceLock/OnceCell
-#[allow(clippy::ref_option)]
-mod statics {
-    use super::PathBuf;
-    use lazy_static::lazy_static;
-
-    lazy_static! {
-        pub static ref PROJECT_NAME: String = env!("CARGO_CRATE_NAME").to_uppercase();
-        pub static ref DATA_FOLDER: Option<PathBuf> =
-            std::env::var(format!("{}_DATA", PROJECT_NAME.as_str()))
-                .ok()
-                .map(PathBuf::from);
-        pub static ref CONFIG_FOLDER: Option<PathBuf> =
-            std::env::var(format!("{}_CONFIG", PROJECT_NAME.as_str()))
-                .ok()
-                .map(PathBuf::from);
-        pub static ref LOG_ENV: String = format!("{}_LOGLEVEL", PROJECT_NAME.as_str());
-        pub static ref LOG_FILE: String = format!("{}.log", env!("CARGO_PKG_NAME"));
-    }
-}
-
-pub use statics::{CONFIG_FOLDER, DATA_FOLDER, LOG_ENV, LOG_FILE};
+static PROJECT_NAME: LazyLock<String> = LazyLock::new(|| env!("CARGO_CRATE_NAME").to_uppercase());
+pub static DATA_FOLDER: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    std::env::var(format!("{}_DATA", PROJECT_NAME.as_str()))
+        .ok()
+        .map(PathBuf::from)
+});
+pub static CONFIG_FOLDER: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    std::env::var(format!("{}_CONFIG", PROJECT_NAME.as_str()))
+        .ok()
+        .map(PathBuf::from)
+});
+pub static LOG_ENV: LazyLock<String> =
+    LazyLock::new(|| format!("{}_LOGLEVEL", PROJECT_NAME.as_str()));
+pub static LOG_FILE: LazyLock<String> = LazyLock::new(|| format!("{}.log", env!("CARGO_PKG_NAME")));
 
 fn project_directory() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "kdheepak", env!("CARGO_PKG_NAME"))
@@ -62,10 +54,8 @@ pub fn initialize_panic_handler() -> Result<()> {
         .into_hooks();
     eyre_hook.install()?;
     std::panic::set_hook(Box::new(move |panic_info| {
-        if let Ok(mut t) = crate::tui::Tui::new() {
-            if let Err(r) = t.exit() {
-                error!("Unable to exit Terminal: {r:?}");
-            }
+        if let Err(r) = crate::tui::restore() {
+            error!("Unable to exit Terminal: {r:?}");
         }
 
         #[cfg(not(debug_assertions))]

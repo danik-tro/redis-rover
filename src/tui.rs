@@ -29,6 +29,28 @@ pub fn io() -> IO {
     std::io::stdout()
 }
 
+/// Leave the alternate screen and disable raw mode. Needs neither a [`Tui`]
+/// instance nor a Tokio runtime, so it is safe to call from the panic hook.
+/// Mouse capture and bracketed paste are disabled unconditionally (a no-op
+/// when they were never enabled).
+///
+/// # Errors
+///
+/// Returns an error if a crossterm terminal command fails.
+pub fn restore() -> Result<()> {
+    if crossterm::terminal::is_raw_mode_enabled()? {
+        crossterm::execute!(
+            io(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            cursor::Show
+        )?;
+        crossterm::terminal::disable_raw_mode()?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {
     Init,
@@ -187,8 +209,8 @@ impl Tui {
 
     /// Gracefully stops the event task: signals cancellation and awaits the
     /// task, falling back to `abort()` if it doesn't finish promptly. Must be
-    /// called from an async context (the main shutdown path). The `Drop` /
-    /// panic path uses [`Tui::force_stop`] instead, since it can't await.
+    /// called from an async context (the main shutdown path); sync callers
+    /// use [`Tui::exit`], which goes through [`Tui::force_stop`].
     pub async fn stop(&mut self) -> Result<()> {
         self.cancel();
         match tokio::time::timeout(Duration::from_millis(50), &mut self.event_task).await {
@@ -200,7 +222,7 @@ impl Tui {
         Ok(())
     }
 
-    /// Best-effort, non-blocking stop for sync teardown (`Drop`, panic handler):
+    /// Best-effort, non-blocking stop for sync teardown ([`Tui::exit`]):
     /// signals cancellation and aborts the event task without awaiting.
     fn force_stop(&self) {
         self.cancel();
@@ -226,7 +248,8 @@ impl Tui {
         Ok(())
     }
 
-    /// Tear down the alternate screen and disable raw mode.
+    /// Synchronously stop the event task, then restore the terminal.
+    /// Prefer [`Tui::shutdown`] from async code.
     ///
     /// # Errors
     ///
@@ -235,16 +258,20 @@ impl Tui {
         self.force_stop();
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
-            if self.paste {
-                crossterm::execute!(io(), DisableBracketedPaste)?;
-            }
-            if self.mouse {
-                crossterm::execute!(io(), DisableMouseCapture)?;
-            }
-            crossterm::execute!(io(), LeaveAlternateScreen, cursor::Show)?;
-            crossterm::terminal::disable_raw_mode()?;
         }
-        Ok(())
+        restore()
+    }
+
+    /// Graceful teardown for the main shutdown path: awaits the event task,
+    /// then restores the terminal. There is no `Drop` impl — callers must
+    /// invoke this (or [`Tui::exit`]) explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a crossterm terminal command fails.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.stop().await?;
+        self.exit()
     }
 
     pub fn cancel(&self) {
@@ -267,13 +294,5 @@ impl Deref for Tui {
 impl DerefMut for Tui {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.terminal
-    }
-}
-
-impl Drop for Tui {
-    fn drop(&mut self) {
-        if let Err(err) = self.exit() {
-            log::error!("Tui::exit failed during drop: {err:?}");
-        }
     }
 }
