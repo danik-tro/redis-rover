@@ -7,17 +7,50 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{command::Command, mode::Mode};
 
+/// Outcome of matching the buffered key sequence against the bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyResolution {
+    /// The sequence is bound to a command.
+    Command(Command),
+    /// The sequence is a strict prefix of a longer chord; wait for more keys.
+    Pending,
+    /// Nothing is bound to the sequence or starts with it.
+    NoMatch,
+}
+
 #[derive(Clone, Debug, Default, Deref, DerefMut)]
 pub struct KeyBindings(pub HashMap<Mode, HashMap<Vec<KeyEvent>, Command>>);
 
 impl KeyBindings {
-    pub fn event_to_command(&self, mode: Mode, key_events: &[KeyEvent]) -> Option<Command> {
+    /// Resolve a buffered key sequence against the bindings of `mode`, falling
+    /// back to [`Mode::Common`].
+    ///
+    /// An exact match wins immediately, even if it is also the prefix of a
+    /// longer chord (so binding both `g` and `gg` makes `gg` unreachable).
+    pub fn resolve(&self, mode: Mode, key_events: &[KeyEvent]) -> KeyResolution {
         if key_events.is_empty() {
-            None
-        } else if let Some(Some(command)) = self.0.get(&mode).map(|kb| kb.get(key_events)) {
-            Some(*command)
+            return KeyResolution::NoMatch;
+        }
+
+        let modes = [mode, Mode::Common];
+        let lookup = |m: &Mode| self.0.get(m);
+
+        if let Some(command) = modes
+            .iter()
+            .filter_map(lookup)
+            .find_map(|kb| kb.get(key_events))
+        {
+            return KeyResolution::Command(*command);
+        }
+
+        let is_prefix = modes.iter().filter_map(lookup).any(|kb| {
+            kb.keys()
+                .any(|seq| seq.len() > key_events.len() && seq.starts_with(key_events))
+        });
+        if is_prefix {
+            KeyResolution::Pending
         } else {
-            self.event_to_command(mode, &key_events[1..])
+            KeyResolution::NoMatch
         }
     }
 
@@ -326,6 +359,76 @@ mod tests {
         assert_eq!(
             parse_key_event("AlT-eNtEr").unwrap(),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+        );
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    fn bindings() -> KeyBindings {
+        KeyBindings(HashMap::from([
+            (
+                Mode::KeySpace,
+                HashMap::from([
+                    (vec![key('j')], Command::ScrollDown),
+                    (vec![key('k')], Command::ScrollUp),
+                    (vec![key('g'), key('r')], Command::RefreshSpace),
+                ]),
+            ),
+            (
+                Mode::Common,
+                HashMap::from([(
+                    vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+                    Command::Quit,
+                )]),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn resolve_single_key() {
+        assert_eq!(
+            bindings().resolve(Mode::KeySpace, &[key('j')]),
+            KeyResolution::Command(Command::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn resolve_chord_prefix_is_pending_then_matches() {
+        let kb = bindings();
+        assert_eq!(
+            kb.resolve(Mode::KeySpace, &[key('g')]),
+            KeyResolution::Pending
+        );
+        assert_eq!(
+            kb.resolve(Mode::KeySpace, &[key('g'), key('r')]),
+            KeyResolution::Command(Command::RefreshSpace)
+        );
+    }
+
+    #[test]
+    fn resolve_unbound_sequence_is_no_match() {
+        let kb = bindings();
+        assert_eq!(
+            kb.resolve(Mode::KeySpace, &[key('j'), key('k')]),
+            KeyResolution::NoMatch
+        );
+        assert_eq!(
+            kb.resolve(Mode::KeySpace, &[key('g'), key('j')]),
+            KeyResolution::NoMatch
+        );
+        assert_eq!(kb.resolve(Mode::KeySpace, &[]), KeyResolution::NoMatch);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_common() {
+        assert_eq!(
+            bindings().resolve(
+                Mode::KeySpace,
+                &[KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)]
+            ),
+            KeyResolution::Command(Command::Quit)
         );
     }
 }

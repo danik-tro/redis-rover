@@ -18,6 +18,9 @@ pub enum Action {
     LoadKeySpace,
     RefreshSpace,
     LoadKeysIntoKeySpace,
+    /// A keyspace fetch ended without new keys (failed, or superseded by a
+    /// newer fetch). Only clears the loading indicator.
+    KeysLoadAborted,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
     LoadNextPage,

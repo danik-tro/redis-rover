@@ -15,9 +15,61 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     config,
     redis_client::types::{
-        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType,
+        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, NewKeySpec, RedisType,
     },
 };
+
+/// Snapshot of the paging state shown in the Filters box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageInfo {
+    /// Current page, 0-based.
+    pub page: usize,
+    /// Position of the page's first key among the keys found so far, 0-based.
+    pub start: usize,
+    /// One past the page's last key.
+    pub end: usize,
+    /// Keys the SCAN sweep has found so far.
+    pub known_total: usize,
+    /// The sweep reached the end, so `known_total` is the full match count.
+    pub complete: bool,
+    pub page_size: usize,
+    /// Raw cursor of the next SCAN step (debug detail).
+    pub scan_cursor: usize,
+    pub pattern: Option<String>,
+}
+
+impl From<&KeyspaceState> for PageInfo {
+    fn from(state: &KeyspaceState) -> Self {
+        let range = state.page_range();
+        Self {
+            page: state.page,
+            start: range.start,
+            end: range.end,
+            known_total: state.scanned.len(),
+            complete: state.sweep_done,
+            page_size: state.page_size,
+            scan_cursor: state.sweep_cursor,
+            pattern: state.pattern.clone(),
+        }
+    }
+}
+
+impl PageInfo {
+    /// `Page 3 · 21–30 of 57+` (`+` while the sweep is unfinished).
+    fn summary(&self) -> String {
+        let page = self.page + 1;
+        let more = if self.complete { "" } else { "+" };
+        if self.start == self.end {
+            return format!("Page {page} · No keys");
+        }
+        format!(
+            "Page {page} · {}–{} of {}{more}",
+            self.start + 1,
+            self.end,
+            self.known_total
+        )
+    }
+}
 
 enum KeySpacePopupMode {
     FilterPattern,
@@ -342,10 +394,9 @@ pub struct KeySpace {
     /// False until the first SCAN result lands, so an empty table can show
     /// "Loading…" rather than "No keys".
     loaded: bool,
-    /// The last SCAN returned a non-zero cursor, i.e. more pages may follow.
-    has_more: bool,
-    cursor: Option<usize>,
-    pattern: Option<String>,
+    /// A keyspace fetch is in flight.
+    loading: bool,
+    page: PageInfo,
     mode: KeySpaceMode,
     text_area: Option<TextArea<'static>>,
     selected_value: Option<KeyValue>,
@@ -361,11 +412,10 @@ impl KeySpace {
         Self {
             keys,
             loaded: false,
-            has_more: false,
+            loading: false,
+            page: PageInfo::from(&KeyspaceState::default()),
             table: TableState::default(),
             value_table: TableState::default(),
-            cursor: None,
-            pattern: None,
             mode: KeySpaceMode::Normal,
             text_area: None,
             selected_value: None,
@@ -443,15 +493,17 @@ impl KeySpace {
         self.table.select(None);
     }
 
-    pub fn update_filters(&mut self, pattern: Option<String>, cursor: Option<usize>) {
-        self.cursor = cursor;
-        self.pattern = pattern;
+    pub fn set_page_info(&mut self, page: PageInfo) {
+        self.page = page;
     }
 
-    pub fn set_keys(&mut self, keys: Vec<KeyMeta>, has_more: bool) {
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
+    }
+
+    pub fn set_keys(&mut self, keys: Vec<KeyMeta>) {
         _ = std::mem::replace(&mut self.keys, keys);
         self.loaded = true;
-        self.has_more = has_more;
     }
 
     pub fn scroll_next(&mut self) {
@@ -1592,9 +1644,9 @@ impl KeySpaceWidget {
     /// "pattern matched nothing" and "empty database", with the keys to recover.
     fn render_empty_keys(state: &KeySpace, area: Rect, buf: &mut Buffer) {
         let cfg = config::get();
-        let mut lines = if !state.loaded {
+        let lines = if !state.loaded || state.loading {
             vec![Line::from("Loading keys…")]
-        } else if let Some(pattern) = state.pattern.as_deref() {
+        } else if let Some(pattern) = state.page.pattern.as_deref() {
             vec![
                 Line::from(format!("No keys match `{pattern}`")).bold(),
                 Line::from("l clear filter · f change filter"),
@@ -1605,11 +1657,8 @@ impl KeySpaceWidget {
                 Line::from("a add key · r refresh"),
             ]
         };
-        // SCAN can legitimately return an empty batch with a non-zero cursor, so
-        // an empty page isn't conclusive while more pages remain.
-        if state.loaded && state.has_more {
-            lines.push(Line::from("n next page — SCAN may return empty pages"));
-        }
+        // No "next page" hint: paging slices one deduplicated SCAN sweep, so a
+        // page is only empty once the sweep has ended with no keys at all.
 
         let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let [centered] = Layout::vertical([Constraint::Length(height)])
@@ -1794,13 +1843,25 @@ impl StatefulWidget for KeySpaceWidget {
             (cfg.colors.base05, cfg.colors.base03)
         };
 
+        let page_summary = if state.loaded {
+            state.page.summary()
+        } else {
+            format!("Page {} · loading…", state.page.page + 1)
+        };
         let space_block = Block::new()
             .bg(cfg.colors.base00)
             .fg(cfg.colors.base04)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(keys_border)
             .borders(Borders::all())
-            .title("Keys");
+            .title(if state.loading {
+                " Keys · loading… "
+            } else {
+                "Keys"
+            })
+            // Paging status lives on the bottom border, out of the Filters box.
+            .title_bottom(Line::from(format!(" {} ", page_summary)).left_aligned())
+            .title_bottom(Line::from(format!(" {}/page ", state.page.page_size)).right_aligned());
 
         let table_area = space_block.inner(t_area);
         space_block.render(t_area, buf);
@@ -1818,10 +1879,11 @@ impl StatefulWidget for KeySpaceWidget {
             })
             .render(view_area, buf);
 
-        let [filter_area, table_area] = Layout::vertical([Constraint::Min(2), Constraint::Fill(3)])
-            .flex(ratatui::layout::Flex::Center)
-            .margin(1)
-            .areas(table_area);
+        let [filter_area, table_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Fill(1)])
+                .flex(ratatui::layout::Flex::Center)
+                .margin(1)
+                .areas(table_area);
 
         let filters_block = Block::new()
             .bg(cfg.colors.base00)
@@ -1833,36 +1895,22 @@ impl StatefulWidget for KeySpaceWidget {
         let filters_inner = filters_block.inner(filter_area);
         filters_block.render(filter_area, buf);
 
-        let [cursor_size_are, pattern_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
-                .flex(ratatui::layout::Flex::Center)
-                .areas(filters_inner);
-
-        let [cursor_area, size_area] = Layout::horizontal([Constraint::Min(1), Constraint::Min(1)])
-            .flex(ratatui::layout::Flex::Center)
-            .areas(cursor_size_are);
-
-        Paragraph::new(format!(
-            "Cursor: {cursor}",
-            cursor = state.cursor.unwrap_or_default()
-        ))
-        .bold()
-        .alignment(Alignment::Left)
-        .render(cursor_area, buf);
-
-        Paragraph::new("Size: 10")
-            .bold()
-            .alignment(Alignment::Right)
-            .render(size_area, buf);
+        let [pattern_area, cursor_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(12)]).areas(filters_inner);
 
         Paragraph::new(format!(
             "Pattern: {pattern}",
-            pattern = state.pattern.as_deref().unwrap_or("*")
+            pattern = state.page.pattern.as_deref().unwrap_or("*")
         ))
         .bold()
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true })
         .render(pattern_area, buf);
+
+        // Raw SCAN cursor: secondary/debug detail, kept dim.
+        Paragraph::new(format!("cursor {}", state.page.scan_cursor))
+            .fg(cfg.colors.base03)
+            .alignment(Alignment::Right)
+            .render(cursor_area, buf);
 
         let widths = [
             Constraint::Percentage(20),
@@ -1936,7 +1984,30 @@ impl StatefulWidget for KeySpaceWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_input_text_area, format_ttl, format_ttl_detail, KeySpace};
+    use super::{build_input_text_area, format_ttl, format_ttl_detail, KeySpace, PageInfo};
+
+    #[test]
+    fn page_summary() {
+        let mut page = PageInfo {
+            page: 2,
+            start: 20,
+            end: 30,
+            known_total: 57,
+            complete: false,
+            page_size: 10,
+            ..PageInfo::default()
+        };
+        assert_eq!(page.summary(), "Page 3 · 21–30 of 57+");
+
+        page.complete = true;
+        assert_eq!(page.summary(), "Page 3 · 21–30 of 57");
+
+        let empty = PageInfo {
+            complete: true,
+            ..PageInfo::default()
+        };
+        assert_eq!(empty.summary(), "Page 1 · No keys");
+    }
 
     #[test]
     fn ttl_sentinels() {

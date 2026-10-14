@@ -3,62 +3,64 @@ use redis::{FromRedisValue, ScanOptions};
 
 use super::{
     client::{self, fetch_value},
-    types::{ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeysList, NewKeySpec, RedisType},
+    types::{ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType},
 };
 
-pub struct FetchKeysWithMeta<'a> {
+#[derive(Clone)]
+pub struct Storage {
     manager: ConnectionManager,
-    cursor: Option<usize>,
-    pattern: Option<&'a str>,
 }
 
-impl<'a> FetchKeysWithMeta<'a> {
+impl Storage {
     pub fn new(manager: ConnectionManager) -> Self {
-        Self {
-            manager,
-            cursor: None,
-            pattern: None,
-        }
+        Self { manager }
     }
 
-    #[must_use]
-    pub fn cursor(mut self, cursor: Option<usize>) -> Self {
-        self.cursor = cursor;
-        self
-    }
-
-    #[must_use]
-    pub fn pattern(mut self, pattern: Option<&'a str>) -> Self {
-        self.pattern = pattern;
-        self
-    }
-
-    /// Run a single SCAN followed by a TYPE / MEMORY USAGE / TTL
-    /// pipeline for every key in the batch.
+    /// Run a single `SCAN cursor MATCH pattern COUNT count` step and return the
+    /// next cursor plus the keys in this batch (possibly empty, possibly
+    /// repeating keys from earlier batches).
+    ///
+    /// A single step rather than `AsyncCommands::scan_match`: the latter always
+    /// restarts at cursor 0 and drains the whole keyspace, while the sweep only
+    /// advances as far as the current page needs.
     ///
     /// # Errors
     ///
-    /// Returns an error if SCAN fails, the pipeline fails, or any
-    /// pipeline reply has an unexpected shape.
-    pub async fn execute(mut self) -> Result<KeysList, Box<dyn std::error::Error + Sync + Send>> {
-        let cursor = self.cursor.unwrap_or_default();
-        let pattern = self.pattern.unwrap_or("*");
-        // Single SCAN step rather than `AsyncCommands::scan_match`: the latter
-        // always restarts at cursor 0 and drains the whole keyspace, which
-        // doesn't fit cursor-based paging.
-        let (cursor, keys): (usize, Vec<String>) = redis::cmd("SCAN")
+    /// Returns an error if SCAN fails or replies with an unexpected shape.
+    pub async fn scan_batch(
+        &self,
+        cursor: usize,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(usize, Vec<String>), Box<dyn std::error::Error + Sync + Send>> {
+        let mut manager = self.manager.clone();
+        let options = ScanOptions::default()
+            .with_pattern(pattern.unwrap_or("*"))
+            .with_count(count);
+        let batch = redis::cmd("SCAN")
             .arg(cursor)
-            .arg(ScanOptions::default().with_pattern(pattern))
-            .query_async(&mut self.manager)
+            .arg(options)
+            .query_async(&mut manager)
             .await?;
+        Ok(batch)
+    }
 
+    /// Fetch TYPE / MEMORY USAGE / TTL for every key in a single pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline fails or any reply has an unexpected
+    /// shape.
+    pub async fn fetch_meta(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<KeyMeta>, Box<dyn std::error::Error + Sync + Send>> {
         if keys.is_empty() {
-            return Ok(KeysList::Empty);
+            return Ok(Vec::new());
         }
 
-        // Single pipeline: TYPE / MEMORY USAGE / TTL for each key in the batch.
         let mut pipe = redis::pipe();
-        for key in &keys {
+        for key in keys {
             pipe.cmd("TYPE")
                 .arg(key)
                 .cmd("MEMORY")
@@ -67,7 +69,8 @@ impl<'a> FetchKeysWithMeta<'a> {
                 .cmd("TTL")
                 .arg(key);
         }
-        let raw: Vec<redis::Value> = pipe.query_async(&mut self.manager).await?;
+        let mut manager = self.manager.clone();
+        let raw: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
 
         let mut metas = Vec::with_capacity(keys.len());
         let mut iter = raw.into_iter();
@@ -81,7 +84,7 @@ impl<'a> FetchKeysWithMeta<'a> {
             let ttl = isize::from_redis_value(ttl_val)?;
 
             metas.push(KeyMeta {
-                key,
+                key: key.clone(),
                 r_type: RedisType::from(r_type),
                 size: size.unwrap_or_default(),
                 ttl,
@@ -89,25 +92,7 @@ impl<'a> FetchKeysWithMeta<'a> {
             });
         }
 
-        Ok(KeysList::Keys {
-            cursor,
-            keys: metas,
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct Storage {
-    manager: ConnectionManager,
-}
-
-impl Storage {
-    pub fn new(manager: ConnectionManager) -> Self {
-        Self { manager }
-    }
-
-    pub fn fetch_keys_with_meta(&self) -> FetchKeysWithMeta<'_> {
-        FetchKeysWithMeta::new(self.manager.clone())
+        Ok(metas)
     }
 
     /// Fetch the value for a key. Delegates to [`fetch_value`].

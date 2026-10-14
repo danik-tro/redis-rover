@@ -10,7 +10,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{action::Action, state::SharedState};
 
-use super::{client, event::RedisEvent, storage::Storage, types::KeysList};
+use super::{
+    client,
+    event::RedisEvent,
+    storage::Storage,
+    types::{KeyMeta, KeyspaceState},
+};
+
+type FetchError = Box<dyn std::error::Error + Sync + Send>;
 
 const BROADCAST_CAPACITY: usize = 50;
 
@@ -262,43 +269,60 @@ impl EventHandler {
                 }
             }
             RedisEvent::FetchKeys => {
-                let (cursor, pattern) = {
-                    let state = self.state.keyspace_state.lock();
+                // Work on a snapshot so the lock isn't held across `.await`.
+                let snapshot = self.state.keyspace_state.lock().clone();
+                let generation = snapshot.generation;
 
-                    (state.cursor, state.pattern.clone())
-                };
-
-                let keys = self
-                    .storage
-                    .fetch_keys_with_meta()
-                    .cursor(cursor)
-                    .pattern(pattern.as_deref())
-                    .execute()
-                    .await;
-
-                match keys {
-                    Ok(KeysList::Keys { cursor, keys }) => {
+                match self.fetch_page(snapshot).await {
+                    Ok((sweep, keys)) => {
                         {
                             let mut state = self.state.keyspace_state.lock();
-                            state.set_next_cursor(cursor);
+                            if state.generation != generation {
+                                // The user paged / filtered / refreshed meanwhile;
+                                // a newer FetchKeys is already queued.
+                                drop(state);
+                                self.action_hook(Action::KeysLoadAborted);
+                                return;
+                            }
+                            state.apply_sweep(sweep);
+                            *self.state.keys.lock() = keys;
                         }
-
-                        let mut store = self.state.keys.lock();
-                        _ = std::mem::replace(&mut *store, keys);
-                        self.action_hook(Action::LoadKeysIntoKeySpace);
-                    }
-                    Ok(KeysList::Empty) => {
-                        let mut store = self.state.keys.lock();
-                        _ = std::mem::take(&mut *store);
                         self.action_hook(Action::LoadKeysIntoKeySpace);
                     }
                     Err(err) => {
                         log::error!("FetchKeys failed: {err:?}");
                         self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
+                        self.action_hook(Action::KeysLoadAborted);
                     }
                 }
             }
         }
+    }
+
+    /// Advance the SCAN sweep until it covers the current page (or ends), then
+    /// fetch metadata for just that page's keys.
+    async fn fetch_page(
+        &self,
+        mut sweep: KeyspaceState,
+    ) -> Result<(KeyspaceState, Vec<KeyMeta>), FetchError> {
+        while sweep.needs_scan() {
+            let (cursor, batch) = self
+                .storage
+                .scan_batch(
+                    sweep.sweep_cursor,
+                    sweep.pattern.as_deref(),
+                    sweep.scan_count,
+                )
+                .await?;
+            sweep.merge_batch(cursor, batch);
+        }
+        sweep.clamp_page();
+
+        let keys = self
+            .storage
+            .fetch_meta(&sweep.scanned[sweep.page_range()])
+            .await?;
+        Ok((sweep, keys))
     }
 
     fn action_hook(&self, action: Action) {

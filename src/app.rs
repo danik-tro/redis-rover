@@ -24,11 +24,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     action::{self, Action},
     command::Command,
+    keybindings::KeyResolution,
     mode::Mode,
     tui,
     widgets::{
         info::{Info, InfoWidget},
-        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest},
+        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo},
     },
 };
 
@@ -36,6 +37,8 @@ pub struct AppWidget;
 
 /// How long the `?` help overlay stays up before auto-dismissing.
 const HELP_TIMEOUT: Duration = Duration::from_secs(7);
+/// How long a partially typed key chord waits for its next key.
+const CHORD_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct App {
     state: SharedState,
@@ -63,7 +66,13 @@ pub struct App {
     restore_value_pending: bool,
 
     should_quit: bool,
-    last_tick_key_events: Vec<KeyEvent>,
+    /// Keys of a partially typed chord (a strict prefix of some binding).
+    pending_keys: Vec<KeyEvent>,
+    /// When the last key went into `pending_keys`, for [`CHORD_TIMEOUT`].
+    last_key_at: Option<Instant>,
+    /// `FetchKeys` requests sent but not yet answered; drives the loading
+    /// indicator.
+    keys_in_flight: usize,
 
     tx: mpsc::Sender<Action>,
     rx: mpsc::Receiver<Action>,
@@ -104,7 +113,9 @@ impl App {
             reselect_key: None,
             restore_value_row: None,
             restore_value_pending: false,
-            last_tick_key_events: Vec::new(),
+            pending_keys: Vec::new(),
+            last_key_at: None,
+            keys_in_flight: 0,
             tx,
             rx,
             redis_tx,
@@ -256,17 +267,39 @@ impl App {
             }
         }
 
-        self.last_tick_key_events.push(key);
+        self.pending_keys.push(key);
+        self.last_key_at = Some(Instant::now());
 
-        config::get()
-            .keybindings
-            .event_to_command(self.mode, &self.last_tick_key_events)
-            .or_else(|| {
-                config::get()
-                    .keybindings
-                    .event_to_command(Mode::Common, &self.last_tick_key_events)
-            })
-            .map(Into::into)
+        let keybindings = &config::get().keybindings;
+        let mut resolution = keybindings.resolve(self.mode, &self.pending_keys);
+        if resolution == KeyResolution::NoMatch && self.pending_keys.len() > 1 {
+            // The new key broke a pending chord: start over from that key alone.
+            self.pending_keys = vec![key];
+            resolution = keybindings.resolve(self.mode, &self.pending_keys);
+        }
+
+        match resolution {
+            KeyResolution::Command(command) => {
+                self.pending_keys.clear();
+                Some(command.into())
+            }
+            KeyResolution::Pending => None,
+            KeyResolution::NoMatch => {
+                self.pending_keys.clear();
+                None
+            }
+        }
+    }
+
+    /// Drop a partially typed chord once it has waited [`CHORD_TIMEOUT`].
+    fn expire_pending_chord(&mut self) {
+        if self
+            .last_key_at
+            .is_some_and(|at| at.elapsed() >= CHORD_TIMEOUT)
+        {
+            self.pending_keys.clear();
+            self.last_key_at = None;
+        }
     }
 
     fn handle_action(&mut self, action: &Action, tui: &mut tui::Tui) -> Result<Option<Action>> {
@@ -275,16 +308,18 @@ impl App {
         }
         self.maybe_dismiss_help(action);
         match *action {
-            Action::Tick => {
-                self.last_tick_key_events.drain(..);
-            }
+            Action::Tick => self.expire_pending_chord(),
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => self.resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
-            Action::LoadKeysIntoKeySpace => self.load_new_keys(),
+            Action::LoadKeysIntoKeySpace => {
+                self.finish_keys_fetch();
+                self.load_new_keys();
+            }
+            Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(),
             Action::ScrollDown => self.scroll_down(),
@@ -490,7 +525,10 @@ impl App {
             // `DiscardKeyspacePopup` (Esc) is handled by `close_popup`, which
             // already gives the help overlay precedence — leave it alone here so
             // a single Esc doesn't also dismiss an underlying keyspace popup.
-            Action::Help | Action::Render | Action::DiscardKeyspacePopup => {}
+            Action::Help
+            | Action::Render
+            | Action::DiscardKeyspacePopup
+            | Action::KeysLoadAborted => {}
             Action::Tick => {
                 if opened_at.elapsed() >= HELP_TIMEOUT {
                     self.help_opened_at = None;
@@ -726,54 +764,33 @@ impl App {
             return;
         }
 
-        {
-            let pattern = self.keyspace.confirm_filter_pattern();
-            let mut state = self.state.keyspace_state.lock();
-            state.set_pattern(pattern.clone());
-
-            self.keyspace.update_filters(pattern, None);
-        }
-        self.refresh_space();
+        let pattern = self.keyspace.confirm_filter_pattern();
+        self.state.keyspace_state.lock().set_pattern(pattern);
+        self.fetch_keys();
     }
 
     fn delete_keyspace_filter(&mut self) {
-        {
-            let mut state = self.state.keyspace_state.lock();
-            state.delete_pattern();
-            self.keyspace.update_filters(None, None);
-        }
-        self.refresh_space();
+        self.state.keyspace_state.lock().delete_pattern();
+        self.fetch_keys();
     }
 
     fn load_next_page(&mut self) {
-        {
-            let mut state = self.state.keyspace_state.lock();
-            state.update_cursor();
-            self.keyspace
-                .update_filters(state.pattern.clone(), state.cursor);
+        // Paging reuses the sweep: no rescan, only the new page's metadata.
+        if self.state.keyspace_state.lock().next_page() {
+            self.fetch_keys();
         }
-        self.refresh_space();
     }
 
     fn load_previous_page(&mut self) {
-        {
-            let mut state = self.state.keyspace_state.lock();
-            state.set_previous_cursor();
-            self.keyspace
-                .update_filters(state.pattern.clone(), state.cursor);
+        if self.state.keyspace_state.lock().previous_page() {
+            self.fetch_keys();
         }
-        self.refresh_space();
     }
 
     fn load_new_keys(&mut self) {
-        let has_more = self
-            .state
-            .keyspace_state
-            .lock()
-            .next_cursor
-            .is_some_and(|c| c != 0);
-        self.keyspace
-            .set_keys(self.state.keys.lock().clone(), has_more);
+        let page_info = PageInfo::from(&*self.state.keyspace_state.lock());
+        self.keyspace.set_page_info(page_info);
+        self.keyspace.set_keys(self.state.keys.lock().clone());
         self.keyspace.clear_selected_value();
 
         // After a non-destructive edit, keep the cursor on the edited key and
@@ -819,17 +836,30 @@ impl App {
         }
     }
 
-    fn load_keyspace(&self) {
-        if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys) {
-            log::error!("Failed to send redis event: {err:?}");
-        }
+    fn load_keyspace(&mut self) {
+        self.fetch_keys();
     }
 
+    /// Re-run the SCAN sweep (picking up writes) while staying on the current
+    /// page.
     fn refresh_space(&mut self) {
+        self.state.keyspace_state.lock().rescan();
+        self.fetch_keys();
+    }
+
+    fn fetch_keys(&mut self) {
         self.keyspace.refresh();
         if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys) {
             log::error!("Failed to send redis event: {err:?}");
+            return;
         }
+        self.keys_in_flight += 1;
+        self.keyspace.set_loading(true);
+    }
+
+    fn finish_keys_fetch(&mut self) {
+        self.keys_in_flight = self.keys_in_flight.saturating_sub(1);
+        self.keyspace.set_loading(self.keys_in_flight > 0);
     }
 
     fn scroll_down(&mut self) {

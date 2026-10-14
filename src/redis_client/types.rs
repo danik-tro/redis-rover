@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::{borrow::Cow, collections::HashSet};
 
 use crate::config;
@@ -148,11 +148,6 @@ pub struct KeyMeta {
     pub value: KeyValue,
 }
 
-pub enum KeysList {
-    Empty,
-    Keys { cursor: usize, keys: Vec<KeyMeta> },
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum RedisType {
     Set,
@@ -203,59 +198,155 @@ where
     }
 }
 
+/// Default number of keys shown per page.
+pub const DEFAULT_PAGE_SIZE: usize = 10;
+/// Default `SCAN ... COUNT` hint. Larger than the page size so a selective
+/// `MATCH` pattern on a big keyspace needs fewer round trips per page.
+pub const DEFAULT_SCAN_COUNT: usize = 100;
+
+/// Keyspace browsing state: pattern plus client-side paging over a single
+/// `SCAN` sweep.
+///
+/// Paging is done client-side rather than with a stack of raw SCAN cursors:
+/// cursors aren't stable across writes (rehashing can move keys between
+/// buckets), so walking back through remembered cursors could skip or repeat
+/// keys, and a single SCAN step may return zero or duplicate keys. Instead the
+/// sweep accumulates the (deduplicated) key names it has seen so far, and a page
+/// is just a `page_size` slice of that list — back-navigation is exact and every
+/// page but the last is full. The sweep only advances as far as the current page
+/// needs, so memory is bounded by how far the user has paged.
 #[derive(Debug, Clone)]
 pub struct KeyspaceState {
-    pub cursor: Option<usize>,
-    pub next_cursor: Option<usize>,
     pub pattern: Option<String>,
-    #[allow(dead_code)]
-    pub count: usize,
-    pub cursor_stack: VecDeque<usize>,
+    /// Keys shown per page.
+    pub page_size: usize,
+    /// `COUNT` hint sent with every `SCAN` step.
+    pub scan_count: usize,
+    /// Current page, 0-based.
+    pub page: usize,
+    /// Key names discovered so far, in SCAN order, deduplicated.
+    pub scanned: Vec<String>,
+    seen: HashSet<String>,
+    /// Cursor for the next `SCAN` step of the sweep.
+    pub sweep_cursor: usize,
+    /// The sweep reached the end (SCAN returned cursor 0).
+    pub sweep_done: bool,
+    /// Bumped on every page / pattern / rescan change, so the background
+    /// fetcher can drop results computed for a state the user already left.
+    pub generation: u64,
 }
 
 impl KeyspaceState {
-    pub fn set_next_cursor(&mut self, cursor: usize) {
-        self.next_cursor = Some(cursor);
+    /// Range of `scanned` covered by the current page (clamped to what's known).
+    pub fn page_range(&self) -> std::ops::Range<usize> {
+        let start = (self.page * self.page_size).min(self.scanned.len());
+        let end = (start + self.page_size).min(self.scanned.len());
+        start..end
     }
 
-    pub fn update_cursor(&mut self) {
-        if self.next_cursor == Some(0) {
-            return;
-        }
-
-        if let Some(cursor) = self.cursor.take() {
-            self.cursor_stack.push_back(cursor);
-        }
-        self.cursor = self.next_cursor.take();
+    /// Number of key names the sweep must have found to fill the current page.
+    pub fn keys_needed(&self) -> usize {
+        (self.page + 1) * self.page_size
     }
 
-    pub fn set_previous_cursor(&mut self) {
-        self.cursor = self.cursor_stack.pop_back();
+    /// The sweep still needs to `SCAN` further to fill the current page.
+    pub fn needs_scan(&self) -> bool {
+        !self.sweep_done && self.scanned.len() < self.keys_needed()
+    }
+
+    pub fn has_next_page(&self) -> bool {
+        self.scanned.len() > self.page_range().end || !self.sweep_done
+    }
+
+    pub fn has_previous_page(&self) -> bool {
+        self.page > 0
+    }
+
+    /// Advance one page. Returns `false` (and changes nothing) on the last page.
+    pub fn next_page(&mut self) -> bool {
+        if !self.has_next_page() {
+            return false;
+        }
+        self.page += 1;
+        self.generation += 1;
+        true
+    }
+
+    /// Go back one page. Returns `false` (and changes nothing) on the first page.
+    pub fn previous_page(&mut self) -> bool {
+        if !self.has_previous_page() {
+            return false;
+        }
+        self.page -= 1;
+        self.generation += 1;
+        true
+    }
+
+    /// Restart the sweep from scratch, keeping the current page, so writes
+    /// (new / deleted keys) are picked up without jumping back to page 1.
+    pub fn rescan(&mut self) {
+        self.scanned.clear();
+        self.seen.clear();
+        self.sweep_cursor = 0;
+        self.sweep_done = false;
+        self.generation += 1;
     }
 
     pub fn set_pattern(&mut self, pattern: Option<String>) {
         self.pattern = pattern;
-        self.cursor_stack.clear();
-        self.next_cursor = None;
-        self.cursor = None;
+        self.page = 0;
+        self.rescan();
     }
 
     pub fn delete_pattern(&mut self) {
-        self.pattern = None;
-        self.cursor_stack.clear();
-        self.next_cursor = None;
-        self.cursor = None;
+        self.set_pattern(None);
+    }
+
+    /// Merge one `SCAN` step into the sweep, skipping keys already seen (SCAN
+    /// may return a key more than once). A returned cursor of 0 ends the sweep.
+    pub fn merge_batch(&mut self, cursor: usize, keys: Vec<String>) {
+        for key in keys {
+            if self.seen.insert(key.clone()) {
+                self.scanned.push(key);
+            }
+        }
+        self.sweep_cursor = cursor;
+        self.sweep_done = cursor == 0;
+    }
+
+    /// If the finished sweep doesn't reach the current page (keys were deleted
+    /// since the user paged there), fall back to the last non-empty page.
+    pub fn clamp_page(&mut self) {
+        if !self.sweep_done || self.page_size == 0 {
+            return;
+        }
+        let last_page = self.scanned.len().saturating_sub(1) / self.page_size;
+        self.page = self.page.min(last_page);
+    }
+
+    /// Copy the sweep progress (and the possibly clamped page, but not the
+    /// pattern / generation) from a working copy the background fetcher advanced.
+    pub fn apply_sweep(&mut self, other: KeyspaceState) {
+        self.page = other.page;
+        self.scanned = other.scanned;
+        self.seen = other.seen;
+        self.sweep_cursor = other.sweep_cursor;
+        self.sweep_done = other.sweep_done;
     }
 }
 
 impl Default for KeyspaceState {
     fn default() -> Self {
         Self {
-            count: 10,
             pattern: None,
-            cursor: None,
-            next_cursor: None,
-            cursor_stack: VecDeque::new(),
+            page_size: DEFAULT_PAGE_SIZE,
+            scan_count: DEFAULT_SCAN_COUNT,
+            page: 0,
+            scanned: Vec::new(),
+            seen: HashSet::new(),
+            sweep_cursor: 0,
+            sweep_done: false,
+            generation: 0,
         }
     }
 }
@@ -302,5 +393,105 @@ mod tests {
         assert_eq!(info.common.version, "7.2.4");
         assert_eq!(info.common.os, "");
         assert_eq!(info.common.max_clients, "");
+    }
+
+    fn keys(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("k{i}")).collect()
+    }
+
+    fn state_with(page_size: usize) -> KeyspaceState {
+        KeyspaceState {
+            page_size,
+            ..KeyspaceState::default()
+        }
+    }
+
+    #[test]
+    fn page_range_slices_scanned_keys() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..25));
+
+        assert_eq!(state.page_range(), 0..10);
+        assert!(state.next_page());
+        assert_eq!(state.page_range(), 10..20);
+        assert!(state.next_page());
+        assert_eq!(state.page_range(), 20..25);
+        assert!(!state.has_next_page());
+        assert!(!state.next_page());
+        assert_eq!(state.page, 2);
+    }
+
+    #[test]
+    fn previous_page_stops_at_first() {
+        let mut state = state_with(10);
+        assert!(!state.previous_page());
+        state.merge_batch(5, keys(0..10));
+        assert!(state.next_page());
+        assert!(state.previous_page());
+        assert_eq!(state.page, 0);
+    }
+
+    #[test]
+    fn unfinished_sweep_has_next_page() {
+        let mut state = state_with(10);
+        state.merge_batch(42, keys(0..10));
+        assert!(!state.needs_scan());
+        assert!(state.has_next_page());
+        assert!(state.next_page());
+        assert!(state.needs_scan());
+        assert_eq!(state.keys_needed(), 20);
+    }
+
+    #[test]
+    fn merge_batch_dedups_and_tracks_cursor() {
+        let mut state = state_with(10);
+        state.merge_batch(7, vec!["a".into(), "b".into()]);
+        state.merge_batch(0, vec!["b".into(), "c".into(), "a".into()]);
+
+        assert_eq!(state.scanned, vec!["a", "b", "c"]);
+        assert!(state.sweep_done);
+        assert_eq!(state.sweep_cursor, 0);
+    }
+
+    #[test]
+    fn rescan_keeps_page_and_set_pattern_resets_it() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..30));
+        state.next_page();
+        let generation = state.generation;
+
+        state.rescan();
+        assert_eq!(state.page, 1);
+        assert!(state.scanned.is_empty());
+        assert!(!state.sweep_done);
+        assert!(state.generation > generation);
+
+        state.set_pattern(Some("k1*".into()));
+        assert_eq!(state.page, 0);
+        assert_eq!(state.pattern.as_deref(), Some("k1*"));
+    }
+
+    #[test]
+    fn clamp_page_falls_back_after_deletes() {
+        let mut state = state_with(10);
+        state.page = 3;
+        state.merge_batch(0, keys(0..15));
+        state.clamp_page();
+        assert_eq!(state.page, 1);
+
+        let mut empty = state_with(10);
+        empty.page = 2;
+        empty.merge_batch(0, Vec::new());
+        empty.clamp_page();
+        assert_eq!(empty.page, 0);
+    }
+
+    #[test]
+    fn clamp_page_ignores_unfinished_sweep() {
+        let mut state = state_with(10);
+        state.page = 3;
+        state.merge_batch(9, keys(0..15));
+        state.clamp_page();
+        assert_eq!(state.page, 3);
     }
 }
