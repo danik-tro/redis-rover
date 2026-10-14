@@ -49,7 +49,7 @@ async fn tokio_main(args: Cli) -> Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     let mut watcher = Runner::new(manager.clone(), state.clone(), tx.clone())
-        .cancelation_token(cancellation_token.clone());
+        .cancellation_token(cancellation_token.clone());
 
     let mut app = App::new(
         state,

@@ -122,7 +122,7 @@ impl Tui {
     }
 
     #[must_use]
-    pub fn cancelation_token(mut self, token: CancellationToken) -> Self {
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
     }
@@ -145,7 +145,7 @@ impl Tui {
         let tick_delay = std::time::Duration::from_secs_f64(1.0 / self.tick_rate);
         let render_delay = std::time::Duration::from_secs_f64(1.0 / self.frame_rate);
 
-        let tui_cancelation_token = self.cancellation_token.clone();
+        let tui_cancellation_token = self.cancellation_token.clone();
 
         let event_tx = self.event_tx.clone();
 
@@ -161,7 +161,7 @@ impl Tui {
                 let render_delay = render_interval.tick();
                 let crossterm_event = reader.next().fuse();
                 tokio::select! {
-                  () = tui_cancelation_token.cancelled() => {
+                  () = tui_cancellation_token.cancelled() => {
                     break;
                   }
                   maybe_event = crossterm_event => {

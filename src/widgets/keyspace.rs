@@ -422,20 +422,14 @@ impl KeySpace {
         self.text_area = Some(build_input_text_area("Pattern", "Enter pattern", None));
     }
 
+    /// Close the filter popup and return the entered pattern. An empty input
+    /// means "no filter" and yields `None`, so callers never see `Some("")`.
     pub fn confirm_filter_pattern(&mut self) -> Option<String> {
-        let pattern = if let Some(text_area) = self.text_area.take() {
-            let line = text_area.lines()[0].clone();
-
-            if line.is_empty() {
-                self.pattern = None;
-            } else {
-                self.pattern = Some(line.clone());
-            }
-
-            Some(line)
-        } else {
-            None
-        };
+        let pattern = self
+            .text_area
+            .take()
+            .map(|text_area| text_area.lines()[0].clone())
+            .filter(|line| !line.is_empty());
 
         self.exit_popup();
         pattern
@@ -1942,7 +1936,7 @@ impl StatefulWidget for KeySpaceWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_ttl, format_ttl_detail};
+    use super::{build_input_text_area, format_ttl, format_ttl_detail, KeySpace};
 
     #[test]
     fn ttl_sentinels() {
@@ -1967,5 +1961,24 @@ mod tests {
     fn ttl_detail_includes_raw_seconds() {
         assert_eq!(format_ttl_detail(5400), "1h 30m (5400s)");
         assert_eq!(format_ttl_detail(45), "45s (45s)");
+    }
+
+    #[test]
+    fn empty_filter_pattern_is_none() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.enter_filter_pattern();
+        assert_eq!(keyspace.confirm_filter_pattern(), None);
+    }
+
+    #[test]
+    fn non_empty_filter_pattern_is_some() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.enter_filter_pattern();
+        keyspace.text_area = Some(build_input_text_area(
+            "Pattern",
+            "Enter pattern",
+            Some("foo*"),
+        ));
+        assert_eq!(keyspace.confirm_filter_pattern(), Some("foo*".to_owned()));
     }
 }

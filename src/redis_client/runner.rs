@@ -15,7 +15,7 @@ use super::{client, event::RedisEvent, storage::Storage, types::KeysList};
 const BROADCAST_CAPACITY: usize = 50;
 
 pub struct Runner {
-    cancelation_token: CancellationToken,
+    cancellation_token: CancellationToken,
     manager: ConnectionManager,
 
     state: SharedState,
@@ -34,12 +34,12 @@ impl Runner {
     ) -> Self {
         let info_task = tokio::spawn(async {});
         let state_task = tokio::spawn(async {});
-        let cancelation_token = CancellationToken::new();
+        let cancellation_token = CancellationToken::new();
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
 
         Self {
-            cancelation_token,
+            cancellation_token,
             manager,
             state,
             info_task,
@@ -50,8 +50,8 @@ impl Runner {
     }
 
     #[must_use]
-    pub fn cancelation_token(mut self, token: CancellationToken) -> Self {
-        self.cancelation_token = token;
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
         self
     }
 
@@ -69,7 +69,7 @@ impl Runner {
     /// that's exiting. Falls back to `abort()` if a task doesn't stop within the
     /// timeout.
     pub async fn shutdown(self) {
-        self.cancelation_token.cancel();
+        self.cancellation_token.cancel();
 
         let info_abort = self.info_task.abort_handle();
         let state_abort = self.state_task.abort_handle();
@@ -89,7 +89,7 @@ impl Runner {
 
     fn launch_refresh_state_task(&mut self) {
         let manager = self.manager.clone();
-        let cancelation_token = self.cancelation_token.clone();
+        let cancellation_token = self.cancellation_token.clone();
 
         let action_tx = self.action_tx.clone();
         let mut rx = self.tx.subscribe();
@@ -104,7 +104,7 @@ impl Runner {
                     Ok(event) = rx.recv() => {
                         event_handler.handle(event).await;
                     },
-                    () = cancelation_token.cancelled() => {
+                    () = cancellation_token.cancelled() => {
                         break;
                     },
                 }
@@ -116,10 +116,14 @@ impl Runner {
         let tick: Duration = std::time::Duration::from_secs_f64(2.0);
         let info = self.state.info.clone();
         let mut manager = self.manager.clone();
-        let cancelation_token = self.cancelation_token.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        let action_tx = self.action_tx.clone();
 
         self.info_task = tokio::spawn(async move {
             let mut refresh_interval = tokio::time::interval(tick);
+            // Report only the first failure of an outage; INFO is polled every
+            // tick, so reporting each one would re-open the popup every 2s.
+            let mut info_failing = false;
 
             loop {
                 tokio::select! {
@@ -127,13 +131,23 @@ impl Runner {
                         let info_res = client::redis_info(&mut manager).await;
 
                         match info_res {
-                            Ok(redis_info) => *info.lock() = Some(redis_info),
-                            Err(_err) => {
-                                // TODO: show the popup
+                            Ok(redis_info) => {
+                                *info.lock() = Some(redis_info);
+                                info_failing = false;
+                            },
+                            Err(err) => {
+                                log::error!("Failed to fetch INFO: {err}");
+                                if !info_failing {
+                                    info_failing = true;
+                                    crate::action::try_send_action(
+                                        &action_tx,
+                                        Action::Error(format!("Failed to fetch INFO: {err}")),
+                                    );
+                                }
                             },
                         }
                     },
-                    () = cancelation_token.cancelled() => {
+                    () = cancellation_token.cancelled() => {
                         break;
                     }
                 }

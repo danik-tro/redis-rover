@@ -121,7 +121,7 @@ impl App {
         let mut tui = tui::Tui::new()?
             .tick_rate(self.tick_rate)
             .frame_rate(self.frame_rate)
-            .cancelation_token(cancellation_token.clone());
+            .cancellation_token(cancellation_token.clone());
 
         // tui.mouse(true);
         // `Tui` has no `Drop` teardown: always shut down explicitly, even when
@@ -157,8 +157,6 @@ impl App {
 
     fn resize(&mut self, tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
         tui.resize(Rect::new(0, 0, w, h))?;
-        action::try_send_action(&self.tx, Action::Render);
-
         Ok(())
     }
 
