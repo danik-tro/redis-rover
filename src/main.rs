@@ -42,6 +42,7 @@ async fn tokio_main(args: Cli) -> Result<()> {
     let state = SharedState::default();
 
     let conn_info = args.connection_info()?;
+    let target = cli::connection_label(&conn_info);
     let client = redis::Client::open(conn_info).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let manager: ConnectionManager = ConnectionManager::new(client)
         .await
@@ -50,7 +51,9 @@ async fn tokio_main(args: Cli) -> Result<()> {
     let mut watcher = Runner::new(manager.clone(), state.clone(), tx.clone())
         .cancelation_token(cancellation_token.clone());
 
-    let mut app = App::new(state, tx, rx, watcher.tx(), args.tick_rate, args.frame_rate);
+    let mut app = App::new(state, tx, rx, watcher.tx(),
+        target,
+        args.tick_rate, args.frame_rate);
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;

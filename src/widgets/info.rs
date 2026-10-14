@@ -12,11 +12,13 @@ use crate::{config, redis_client::types::RedisInfo};
 
 pub struct Info {
     info: Arc<Mutex<Option<RedisInfo>>>,
+    /// Credential-free connection target, e.g. `redis://localhost:6379/0`.
+    target: String,
 }
 
 impl Info {
-    pub fn new(info: Arc<Mutex<Option<RedisInfo>>>) -> Self {
-        Self { info }
+    pub fn new(info: Arc<Mutex<Option<RedisInfo>>>, target: String) -> Self {
+        Self { info, target }
     }
 }
 
@@ -31,7 +33,7 @@ impl StatefulWidget for InfoWidget {
             .fg(cfg.colors.base04)
             .bg(cfg.colors.base00)
             .borders(Borders::ALL)
-            .title("Info")
+            .title(format!(" Info · {} ", state.target))
             .title_alignment(Alignment::Left)
             .title_top(Line::from(" ? Help ").right_aligned())
             .border_type(BorderType::Rounded)

@@ -23,6 +23,49 @@ enum KeySpacePopupMode {
     FilterPattern,
 }
 
+/// Redis `TTL` sentinel for a key that exists but has no expiry.
+const TTL_NO_EXPIRY: isize = -1;
+
+/// Compact TTL for the table column: `∞` for no expiry, `—` for a missing key,
+/// otherwise the two most significant units (`45s`, `1h 30m`, `2d 4h`).
+fn format_ttl(ttl: isize) -> String {
+    match ttl {
+        TTL_NO_EXPIRY => "∞".into(),
+        t if t < 0 => "—".into(),
+        t => format_duration(t.unsigned_abs()),
+    }
+}
+
+/// Detail-pane TTL: spelled-out sentinels, and the raw seconds alongside the
+/// humanized duration (`1h 30m (5400s)`).
+fn format_ttl_detail(ttl: isize) -> String {
+    match ttl {
+        TTL_NO_EXPIRY => "No expiry".into(),
+        t if t < 0 => "Missing".into(),
+        t => format!("{} ({t}s)", format_duration(t.unsigned_abs())),
+    }
+}
+
+fn format_duration(secs: usize) -> String {
+    if secs == 0 {
+        return "0s".into();
+    }
+    let units = [
+        (secs / 86_400, "d"),
+        (secs % 86_400 / 3_600, "h"),
+        (secs % 3_600 / 60, "m"),
+        (secs % 60, "s"),
+    ];
+    units
+        .iter()
+        .skip_while(|(n, _)| *n == 0)
+        .take(2)
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 enum KeySpaceMode {
     Normal,
     Popup(KeySpacePopupMode),
@@ -296,6 +339,11 @@ pub struct KeySpace {
     table: TableState,
     value_table: TableState,
     keys: Vec<KeyMeta>,
+    /// False until the first SCAN result lands, so an empty table can show
+    /// "Loading…" rather than "No keys".
+    loaded: bool,
+    /// The last SCAN returned a non-zero cursor, i.e. more pages may follow.
+    has_more: bool,
     cursor: Option<usize>,
     pattern: Option<String>,
     mode: KeySpaceMode,
@@ -312,6 +360,8 @@ impl KeySpace {
     pub fn new(keys: Vec<KeyMeta>) -> Self {
         Self {
             keys,
+            loaded: false,
+            has_more: false,
             table: TableState::default(),
             value_table: TableState::default(),
             cursor: None,
@@ -404,8 +454,10 @@ impl KeySpace {
         self.pattern = pattern;
     }
 
-    pub fn set_keys(&mut self, keys: Vec<KeyMeta>) {
+    pub fn set_keys(&mut self, keys: Vec<KeyMeta>, has_more: bool) {
         _ = std::mem::replace(&mut self.keys, keys);
+        self.loaded = true;
+        self.has_more = has_more;
     }
 
     pub fn scroll_next(&mut self) {
@@ -1542,6 +1594,40 @@ impl KeySpaceWidget {
             .render(area, buf);
     }
 
+    /// Placeholder for an empty key table (#40): distinguishes "still loading",
+    /// "pattern matched nothing" and "empty database", with the keys to recover.
+    fn render_empty_keys(state: &KeySpace, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let mut lines = if !state.loaded {
+            vec![Line::from("Loading keys…")]
+        } else if let Some(pattern) = state.pattern.as_deref() {
+            vec![
+                Line::from(format!("No keys match `{pattern}`")).bold(),
+                Line::from("l clear filter · f change filter"),
+            ]
+        } else {
+            vec![
+                Line::from("No keys in this database").bold(),
+                Line::from("a add key · r refresh"),
+            ]
+        };
+        // SCAN can legitimately return an empty batch with a non-zero cursor, so
+        // an empty page isn't conclusive while more pages remain.
+        if state.loaded && state.has_more {
+            lines.push(Line::from("n next page — SCAN may return empty pages"));
+        }
+
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let [centered] = Layout::vertical([Constraint::Length(height)])
+            .flex(ratatui::layout::Flex::Center)
+            .areas(area);
+        Paragraph::new(lines)
+            .fg(cfg.colors.base03)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(centered, buf);
+    }
+
     fn render_key_view(state: &mut KeySpace, area: Rect, buf: &mut Buffer) {
         let Some(selected_index) = state.table.selected() else {
             return;
@@ -1567,7 +1653,7 @@ impl KeySpaceWidget {
             "Key: {key}\nType: {ty:?}\nTTL: {ttl}\nSize: {size}",
             key = key.key,
             ty = key.r_type,
-            ttl = key.ttl,
+            ttl = format_ttl_detail(key.ttl),
             size = Byte::from_u128(key.size)
                 .unwrap_or_default()
                 .get_appropriate_unit(UnitType::Binary)
@@ -1791,7 +1877,7 @@ impl StatefulWidget for KeySpaceWidget {
             Constraint::Percentage(25),
         ];
         let header: Row<'_> =
-            Row::new(["Type", "Key", "TTL(s)", "Size"].map(|h| Cell::from(h.bold())))
+            Row::new(["Type", "Key", "TTL", "Size"].map(|h| Cell::from(h.bold())))
                 .top_margin(1)
                 .bottom_margin(1)
                 .fg(cfg.colors.base04)
@@ -1802,7 +1888,7 @@ impl StatefulWidget for KeySpaceWidget {
             Row::new([
                 Cell::from(badge),
                 Cell::from(meta.key.as_str()),
-                Cell::from(meta.ttl.to_string()),
+                Cell::from(format_ttl(meta.ttl)),
                 Cell::from(format!(
                     "{:.2}",
                     Byte::from_u128(meta.size)
@@ -1824,7 +1910,11 @@ impl StatefulWidget for KeySpaceWidget {
             .highlight_style(cfg.colors.base05)
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, table_area, buf, &mut state.table);
+        if state.keys.is_empty() {
+            Self::render_empty_keys(state, table_area, buf);
+        } else {
+            StatefulWidget::render(table, table_area, buf, &mut state.table);
+        }
 
         Self::render_key_view(state, view_area, buf);
 
@@ -1847,5 +1937,35 @@ impl StatefulWidget for KeySpaceWidget {
         if state.is_edit_item_active() {
             Self::render_edit_item_overlay(state, area, buf);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_ttl, format_ttl_detail};
+
+    #[test]
+    fn ttl_sentinels() {
+        assert_eq!(format_ttl(-1), "∞");
+        assert_eq!(format_ttl(-2), "—");
+        assert_eq!(format_ttl_detail(-1), "No expiry");
+        assert_eq!(format_ttl_detail(-2), "Missing");
+    }
+
+    #[test]
+    fn ttl_durations() {
+        assert_eq!(format_ttl(0), "0s");
+        assert_eq!(format_ttl(45), "45s");
+        assert_eq!(format_ttl(60), "1m");
+        assert_eq!(format_ttl(3600), "1h");
+        assert_eq!(format_ttl(5400), "1h 30m");
+        assert_eq!(format_ttl(3601), "1h");
+        assert_eq!(format_ttl(90_061), "1d 1h");
+    }
+
+    #[test]
+    fn ttl_detail_includes_raw_seconds() {
+        assert_eq!(format_ttl_detail(5400), "1h 30m (5400s)");
+        assert_eq!(format_ttl_detail(45), "45s (45s)");
     }
 }

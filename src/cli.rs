@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result};
-use redis::{ConnectionInfo, IntoConnectionInfo};
+use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 
 use crate::utils::version;
 
@@ -51,6 +51,20 @@ fn parse_redis_url(s: &str) -> Result<String, String> {
         .map_err(|e| format!("invalid Redis URL: {e}"))
 }
 
+/// Human-readable connection target for display, e.g. `redis://localhost:6379/0`.
+/// Built from the parsed address (never the raw `--url`), so credentials
+/// embedded in the URL are never shown.
+pub fn connection_label(info: &ConnectionInfo) -> String {
+    let addr = match info.addr() {
+        ConnectionAddr::Tcp(host, port) => format!("redis://{host}:{port}"),
+        ConnectionAddr::TcpTls { host, port, .. } => format!("rediss://{host}:{port}"),
+        ConnectionAddr::Unix(path) => format!("unix://{}", path.display()),
+        #[allow(unreachable_patterns)]
+        other => other.to_string(),
+    };
+    format!("{addr}/{}", info.redis_settings().db())
+}
+
 impl Cli {
     /// Builds typed [`ConnectionInfo`] from the parsed args, prompting for a
     /// token if `--token` was passed.
@@ -76,5 +90,31 @@ impl Cli {
         let redis = conn_info.redis_settings().clone().set_password(token);
 
         Ok(conn_info.set_redis_settings(redis))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redis::IntoConnectionInfo;
+
+    use super::connection_label;
+
+    #[test]
+    fn label_includes_host_port_and_db() {
+        let info = "redis://localhost:6379".into_connection_info().unwrap();
+        assert_eq!(connection_label(&info), "redis://localhost:6379/0");
+
+        let info = "redis://example.com:6380/3".into_connection_info().unwrap();
+        assert_eq!(connection_label(&info), "redis://example.com:6380/3");
+    }
+
+    #[test]
+    fn label_never_contains_credentials() {
+        let info = "redis://user:s3cret@localhost:6379/1"
+            .into_connection_info()
+            .unwrap();
+        let label = connection_label(&info);
+        assert_eq!(label, "redis://localhost:6379/1");
+        assert!(!label.contains("s3cret"));
     }
 }

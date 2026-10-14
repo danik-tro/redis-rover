@@ -79,6 +79,7 @@ impl App {
         tx: Sender<Action>,
         rx: Receiver<Action>,
         redis_tx: broadcast::Sender<RedisEvent>,
+        target: String,
         tick_rate: f64,
         frame_rate: f64,
     ) -> Self {
@@ -86,7 +87,7 @@ impl App {
 
         let mode = Mode::KeySpace;
 
-        let summary = Info::new(state.info.clone());
+        let summary = Info::new(state.info.clone(), target);
         let keyspace = KeySpace::new(Vec::new());
 
         Self {
@@ -761,7 +762,13 @@ impl App {
     }
 
     fn load_new_keys(&mut self) {
-        self.keyspace.set_keys(self.state.keys.lock().clone());
+        let has_more = self
+            .state
+            .keyspace_state
+            .lock()
+            .next_cursor
+            .is_some_and(|c| c != 0);
+        self.keyspace.set_keys(self.state.keys.lock().clone(), has_more);
         self.keyspace.clear_selected_value();
 
         // After a non-destructive edit, keep the cursor on the edited key and
