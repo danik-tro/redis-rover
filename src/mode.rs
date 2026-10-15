@@ -12,5 +12,6 @@ pub enum Mode {
     Common,
     #[default]
     KeySpace,
+    Dashboard,
     Popup(PopupMode),
 }

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
+use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{ItemDelete, ItemEdit, KeyItem, KeyValue, NewKeySpec, RedisInfo, RedisType};
 
 const VALUE_PREVIEW_LIMIT: isize = 100;
@@ -12,31 +13,54 @@ const VALUE_PREVIEW_LIMIT: isize = 100;
 /// overwrite the slot with this marker via `LSET`, then remove it with `LREM`.
 const LIST_DELETE_SENTINEL: &str = "__rrover_deleted__\u{0}";
 
-/// Run `INFO` against Redis and parse the response into [`RedisInfo`].
-///
-/// # Errors
-///
-/// Returns an error if the command fails.
-pub async fn redis_info(manager: &mut ConnectionManager) -> Result<RedisInfo> {
-    let info: String = redis::cmd("INFO").query_async(manager).await?;
-
+/// Parse the text of an `INFO` reply into a `field -> value` map. Section
+/// headers (`# Server`) and lines without a `:` are skipped; values are trimmed.
+pub fn parse_info(raw: &str) -> HashMap<&str, &str> {
     let mut map = HashMap::new();
 
-    for c in info.split_terminator('\n') {
+    for c in raw.split_terminator('\n') {
         if c.starts_with('#') || c.is_empty() {
             continue;
         }
 
-        let pair_op = c.split_once(':');
-
-        let Some((header, value)) = pair_op else {
+        let Some((header, value)) = c.split_once(':') else {
             continue;
         };
 
         map.insert(header, value.trim());
     }
 
-    Ok(RedisInfo::from(map))
+    map
+}
+
+/// Run `INFO` once and build both the footer view and the numeric snapshot.
+///
+/// # Errors
+///
+/// Returns an error if the command fails.
+pub async fn redis_info_with_snapshot(
+    manager: &mut ConnectionManager,
+) -> Result<(RedisInfo, InfoSnapshot)> {
+    let raw: String = redis::cmd("INFO").query_async(manager).await?;
+    let taken_at = Instant::now();
+    let map = parse_info(&raw);
+    let snapshot = InfoSnapshot::from_map(&map, taken_at);
+
+    Ok((RedisInfo::from(map), snapshot))
+}
+
+/// Run `CLUSTER INFO` and summarise the reply.
+///
+/// # Errors
+///
+/// Returns an error if the command fails (e.g. cluster mode is disabled).
+pub async fn cluster_info(manager: &mut ConnectionManager) -> Result<ClusterSummary> {
+    let raw: String = redis::cmd("CLUSTER")
+        .arg("INFO")
+        .query_async(manager)
+        .await?;
+
+    Ok(parse_cluster_info(&raw))
 }
 
 /// Fetch the value behind a key, bounded to the first

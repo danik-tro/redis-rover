@@ -17,6 +17,7 @@ use crate::{
     redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, NewKeySpec, RedisType,
     },
+    utils::format_duration,
 };
 
 /// Snapshot of the paging state shown in the Filters box.
@@ -96,26 +97,6 @@ fn format_ttl_detail(ttl: isize) -> String {
         t if t < 0 => "Missing".into(),
         t => format!("{} ({t}s)", format_duration(t.unsigned_abs())),
     }
-}
-
-fn format_duration(secs: usize) -> String {
-    if secs == 0 {
-        return "0s".into();
-    }
-    let units = [
-        (secs / 86_400, "d"),
-        (secs % 86_400 / 3_600, "h"),
-        (secs % 3_600 / 60, "m"),
-        (secs % 60, "s"),
-    ];
-    units
-        .iter()
-        .skip_while(|(n, _)| *n == 0)
-        .take(2)
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, unit)| format!("{n}{unit}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 enum KeySpaceMode {

@@ -339,7 +339,7 @@ mod tests {
                 KeyCode::Char('a'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT
             )),
-            "ctrl-alt-a".to_string()
+            "Ctrl-Alt-a".to_string()
         );
     }
 
@@ -374,6 +374,14 @@ mod tests {
                     (vec![key('j')], Command::ScrollDown),
                     (vec![key('k')], Command::ScrollUp),
                     (vec![key('g'), key('r')], Command::RefreshSpace),
+                ]),
+            ),
+            (
+                Mode::Dashboard,
+                HashMap::from([
+                    (vec![key('m')], Command::ToggleDashboard),
+                    (vec![key(' ')], Command::ToggleMetricsPause),
+                    (vec![key('r')], Command::ResetMetrics),
                 ]),
             ),
             (
@@ -419,6 +427,33 @@ mod tests {
             KeyResolution::NoMatch
         );
         assert_eq!(kb.resolve(Mode::KeySpace, &[]), KeyResolution::NoMatch);
+    }
+
+    #[test]
+    fn resolve_dashboard_mode() {
+        let kb = bindings();
+        assert_eq!(
+            kb.resolve(
+                Mode::Dashboard,
+                &[KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())]
+            ),
+            KeyResolution::Command(Command::ToggleDashboard)
+        );
+        assert_eq!(
+            kb.resolve(Mode::Dashboard, &[key(' ')]),
+            KeyResolution::Command(Command::ToggleMetricsPause)
+        );
+        assert_eq!(
+            kb.resolve(Mode::Dashboard, &[key('r')]),
+            KeyResolution::Command(Command::ResetMetrics)
+        );
+        assert_eq!(
+            kb.resolve(
+                Mode::Dashboard,
+                &[KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)]
+            ),
+            KeyResolution::Command(Command::Quit)
+        );
     }
 
     #[test]

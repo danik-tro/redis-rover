@@ -20,6 +20,12 @@ impl From<Command> for Action {
             Command::EditValue => Self::RequestEditValue,
             Command::AddKey => Self::RequestAddKey,
             Command::AddItem => Self::RequestAddItem,
+            Command::ToggleDashboard => Self::ToggleDashboard,
+            Command::ToggleMetricsPause => Self::ToggleMetricsPause,
+            Command::ResetMetrics => Self::ResetMetrics,
+            Command::NextChart => Self::NextChart,
+            Command::PrevChart => Self::PrevChart,
+            Command::ToggleAllCharts => Self::ToggleAllCharts,
         }
     }
 }

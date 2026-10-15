@@ -35,6 +35,12 @@ pub enum Action {
     RequestEditValue,
     RequestAddKey,
     RequestAddItem,
+    ToggleDashboard,
+    ToggleMetricsPause,
+    ResetMetrics,
+    NextChart,
+    PrevChart,
+    ToggleAllCharts,
 }
 
 impl Action {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::OnceLock};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::OnceLock, time::Duration};
 
 use color_eyre::eyre::Result;
 use derive_deref::{Deref, DerefMut};
@@ -36,6 +36,39 @@ pub struct Config {
     pub colors: Base16Palette,
     #[serde(default)]
     pub keyspace: KeyspacePalette,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+/// Settings for the live-metrics dashboard.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// Sampling interval in milliseconds; see [`DashboardConfig::interval`].
+    pub interval_ms: u64,
+    /// Number of samples kept per series; see [`DashboardConfig::history`].
+    pub history: usize,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: 1000,
+            history: 300,
+        }
+    }
+}
+
+impl DashboardConfig {
+    /// Sampling interval, clamped to 250 ms..=10 s.
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms.clamp(250, 10_000))
+    }
+
+    /// History length in samples, clamped to 30..=3600.
+    pub fn history(&self) -> usize {
+        self.history.clamp(30, 3600)
+    }
 }
 
 impl Config {
@@ -367,6 +400,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dashboard_config_defaults_and_clamps() {
+        let d = DashboardConfig::default();
+        assert_eq!(d.interval_ms, 1000);
+        assert_eq!(d.history, 300);
+        assert_eq!(d.interval(), Duration::from_millis(1000));
+        assert_eq!(d.history(), 300);
+
+        let c = DashboardConfig {
+            interval_ms: 1,
+            history: 99_999,
+        };
+        assert_eq!(c.interval(), Duration::from_millis(250));
+        assert_eq!(c.history(), 3600);
+
+        let c = DashboardConfig {
+            interval_ms: 1_000_000,
+            history: 1,
+        };
+        assert_eq!(c.interval(), Duration::from_millis(10_000));
+        assert_eq!(c.history(), 30);
+
+        let cfg: Config = json5::from_str("{ keybindings: {} }").unwrap();
+        assert_eq!(cfg.dashboard.interval_ms, 1000);
+        assert_eq!(cfg.dashboard.history, 300);
+    }
+
+    #[test]
     fn test_parse_style_default() {
         let style = parse_style("");
         assert_eq!(style, Style::default());
@@ -418,9 +478,9 @@ mod tests {
         let c = Config::new()?;
         assert_eq!(
             c.keybindings
-                .get(&Mode::KeySpace)
+                .get(&Mode::Common)
                 .unwrap()
-                .get(&parse_key_sequence("<q>").unwrap_or_default())
+                .get(&parse_key_sequence("<Ctrl-c>").unwrap_or_default())
                 .unwrap(),
             &Command::Quit
         );
