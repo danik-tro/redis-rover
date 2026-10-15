@@ -248,12 +248,12 @@ pub struct KeyspacePalette {
 impl Default for KeyspacePalette {
     fn default() -> Self {
         Self {
-            string: Color::from_str("#600CC0").unwrap(),
-            set: Color::from_str("#F08A10").unwrap(),
-            zset: Color::from_str("#D62DFF").unwrap(),
-            json: Color::from_str("#324466").unwrap(),
-            hash: Color::from_str("#5861FF").unwrap(),
-            list: Color::from_str("#620faa").unwrap(),
+            string: Color::from_str("#00f769").unwrap(),
+            set: Color::from_str("#ebff87").unwrap(),
+            zset: Color::from_str("#ea51b2").unwrap(),
+            json: Color::from_str("#b45bcf").unwrap(),
+            hash: Color::from_str("#62d6e8").unwrap(),
+            list: Color::from_str("#ffb86c").unwrap(),
             unknown: Color::from_str("#f71638").unwrap(),
         }
     }

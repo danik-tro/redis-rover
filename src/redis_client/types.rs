@@ -168,17 +168,19 @@ impl RedisType {
 }
 
 impl From<RedisType> for Text<'_> {
+    /// Fixed-width, lowercase type label in the type's palette color.
     fn from(value: RedisType) -> Self {
         let palette = &config::get().keyspace;
-        match value {
-            RedisType::String => Span::raw(" STRING ").bg(palette.string).into(),
-            RedisType::Json => Span::raw(" JSON ").bg(palette.json).into(),
-            RedisType::List => Span::raw(" LIST ").bg(palette.list).into(),
-            RedisType::Set => Span::raw(" SET ").bg(palette.set).into(),
-            RedisType::Zset => Span::raw(" ZSET ").bg(palette.zset).into(),
-            RedisType::Hash => Span::raw(" HASH ").bg(palette.hash).into(),
-            RedisType::Unknown => Span::raw(" ? ").bg(palette.unknown).into(),
-        }
+        let (label, color) = match value {
+            RedisType::String => ("str", palette.string),
+            RedisType::Json => ("json", palette.json),
+            RedisType::List => ("list", palette.list),
+            RedisType::Set => ("set", palette.set),
+            RedisType::Zset => ("zset", palette.zset),
+            RedisType::Hash => ("hash", palette.hash),
+            RedisType::Unknown => ("?", palette.unknown),
+        };
+        Span::raw(label).fg(color).bold().into()
     }
 }
 

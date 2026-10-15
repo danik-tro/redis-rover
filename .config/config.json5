@@ -55,12 +55,12 @@
     "base0f": "#00f769",
   },
   "keyspace": {
-    "string": "#600CC0",
-    "hash": "#5861FF",
-    "list": "#620faa",
-    "zset": "#D62DFF",
-    "set": "#F08A10",
-    "json": "#324466",
+    "string": "#00f769",
+    "hash": "#62d6e8",
+    "list": "#ffb86c",
+    "zset": "#ea51b2",
+    "set": "#ebff87",
+    "json": "#b45bcf",
     "unknown": "#f71638",
   }
 }
