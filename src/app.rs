@@ -194,7 +194,7 @@ impl App {
         }
     }
 
-    fn resize(&mut self, tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
+    fn resize(tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
         tui.resize(Rect::new(0, 0, w, h))?;
         Ok(())
     }
@@ -358,7 +358,7 @@ impl App {
         match *action {
             Action::Tick => self.expire_pending_chord(),
             Action::Quit => self.should_quit = true,
-            Action::Resize(w, h) => self.resize(tui, (w, h))?,
+            Action::Resize(w, h) => Self::resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),

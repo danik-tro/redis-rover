@@ -84,8 +84,13 @@ impl Metric {
     }
 
     fn step(self, delta: isize) -> Self {
-        let n = Self::ALL.len() as isize;
-        Self::ALL[(self.index() as isize + delta).rem_euclid(n) as usize]
+        let n = Self::ALL.len();
+        let i = self.index();
+        Self::ALL[if delta >= 0 {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
     }
 }
 
@@ -208,7 +213,7 @@ fn empty_state(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
 }
 
 /// Draw the panel frame and return its inner area.
-fn panel(title: String, area: Rect, buf: &mut Buffer) -> Rect {
+fn panel(title: &str, area: Rect, buf: &mut Buffer) -> Rect {
     let cfg = config::get();
     let block = Block::default()
         .title(format!(" {title} "))
@@ -274,7 +279,7 @@ fn render_ops(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
     let peak = h.ops.tail(n).fold(0.0_f64, f64::max);
     let last = h.ops.last().map_or("n/a".into(), fmt_compact);
     let inner = panel(
-        format!("Ops/sec  {last}  (peak {})", fmt_compact(peak)),
+        &format!("Ops/sec  {last}  (peak {})", fmt_compact(peak)),
         area,
         buf,
     );
@@ -303,7 +308,7 @@ fn render_memory(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
         (Some(u), None) => format!("Memory  {}", fmt_bytes(u as u64)),
         _ => "Memory".into(),
     };
-    let inner = panel(title, area, buf);
+    let inner = panel(&title, area, buf);
     let Some(used) = used else {
         return empty_state(h, inner, buf);
     };
@@ -346,7 +351,7 @@ fn render_network(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
     let n = usize::from(area.width.saturating_sub(2)) * 2;
     let rate = |v: Option<f64>| v.map_or("n/a".into(), fmt_rate_bytes);
     let inner = panel(
-        format!(
+        &format!(
             "Network  in {}  out {}",
             rate(h.net_in.last()),
             rate(h.net_out.last())
@@ -384,7 +389,7 @@ fn render_cpu(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
         .cpu_pct
         .last()
         .map_or("n/a".into(), |v| format!("{v:.1} %"));
-    let inner = panel(format!("CPU  {last}"), area, buf);
+    let inner = panel(&format!("CPU  {last}"), area, buf);
     if h.cpu_pct.is_empty() {
         return empty_state(h, inner, buf);
     }
@@ -397,7 +402,7 @@ fn render_hit_rate(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
     let lifetime = h.latest.as_ref().and_then(|s| s.hit_rate_lifetime);
     let pct = |v: Option<f64>| v.map_or("n/a".into(), fmt_pct);
     let inner = panel(
-        format!("Hit rate  {} (lifetime {})", pct(windowed), pct(lifetime)),
+        &format!("Hit rate  {} (lifetime {})", pct(windowed), pct(lifetime)),
         area,
         buf,
     );
@@ -425,7 +430,7 @@ fn render_clients(h: &MetricsHistory, area: Rect, buf: &mut Buffer) {
     let num = |v: Option<u64>| v.map_or("n/a".into(), |v| v.to_string());
     let connected = h.clients.last().map(|v| v as u64);
     let inner = panel(
-        format!(
+        &format!(
             "Clients  {}/{} · blocked {}",
             num(connected),
             num(snap.and_then(|s| s.maxclients)),
@@ -636,7 +641,7 @@ fn render_compact(h: &MetricsHistory, paused: bool, area: Rect, buf: &mut Buffer
             break;
         }
         let y = rows_area.y + dy;
-        let [l, v, s] = Layout::horizontal([
+        let [label_area, val_area, spark_area] = Layout::horizontal([
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Fill(1),
@@ -646,9 +651,9 @@ fn render_compact(h: &MetricsHistory, paused: bool, area: Rect, buf: &mut Buffer
             height: 1,
             ..rows_area
         });
-        Paragraph::new(label).render(l, buf);
-        Paragraph::new(val(value)).render(v, buf);
-        spark(&data, floor, color, s, buf);
+        Paragraph::new(label).render(label_area, buf);
+        Paragraph::new(val(value)).render(val_area, buf);
+        spark(&data, floor, color, spark_area, buf);
     }
     render_tiles(h, paused, tiles, buf);
 }
@@ -760,6 +765,7 @@ fn y_range(spec: &Spec) -> (f64, f64) {
 }
 
 /// The selected metric as one large chart with axes and a stats footer.
+#[allow(clippy::too_many_lines)]
 fn render_single(h: &MetricsHistory, selected: Metric, paused: bool, area: Rect, buf: &mut Buffer) {
     let cfg = config::get();
     let c = &cfg.colors;
@@ -892,12 +898,11 @@ impl StatefulWidget for DashboardWidget {
         // Paused: draw the frozen copy. Live: one short lock, then draw from
         // the clone.
         let live;
-        let h = match &state.frozen {
-            Some(f) => f,
-            None => {
-                live = state.metrics.lock().window(usize::from(area.width) * 2);
-                &live
-            }
+        let h = if let Some(f) = &state.frozen {
+            f
+        } else {
+            live = state.metrics.lock().window(usize::from(area.width) * 2);
+            &live
         };
         let paused = state.is_paused();
 
@@ -966,7 +971,10 @@ mod tests {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         StatefulWidget::render(DashboardWidget, area, &mut buf, d);
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     #[test]
@@ -975,7 +983,11 @@ mod tests {
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
         render_tiles(&h, false, area, &mut buf);
-        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(text.contains("up "));
         assert!(!text.contains("cluster:"));
         assert!(!text.contains("evicted"));
@@ -1002,7 +1014,7 @@ mod tests {
         }
         assert_eq!(chart_points(&s, 2), vec![(0.0, 0.5), (1.0, 0.25)]);
         assert_eq!(spark_data(&s, 10, 100.0), vec![10, 50, 25]);
-        assert_eq!(visible_max(&[&Series::new(3)], 3), 1.0);
+        assert!((visible_max(&[&Series::new(3)], 3) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

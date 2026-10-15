@@ -16,6 +16,7 @@ use crate::{
     redis_client::{metrics::MetricsHistory, types::RedisInfo},
 };
 
+#[allow(clippy::struct_field_names)]
 pub struct Info {
     info: Arc<Mutex<Option<RedisInfo>>>,
     /// Credential-free connection target, e.g. `redis://localhost:6379/0`.

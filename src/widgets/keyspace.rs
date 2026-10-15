@@ -1841,7 +1841,7 @@ impl StatefulWidget for KeySpaceWidget {
                 "Keys"
             })
             // Paging status lives on the bottom border, out of the Filters box.
-            .title_bottom(Line::from(format!(" {} ", page_summary)).left_aligned())
+            .title_bottom(Line::from(format!(" {page_summary} ")).left_aligned())
             .title_bottom(Line::from(format!(" {}/page ", state.page.page_size)).right_aligned());
 
         let table_area = space_block.inner(t_area);

@@ -46,7 +46,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.93.1
+          - 1.97.1
 
     steps:
       - name: Checkout sources
@@ -68,7 +68,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.93.1
+          - 1.97.1
 
     steps:
       - name: Checkout sources
@@ -90,7 +90,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.93.1
+          - 1.97.1
 
     steps:
       - name: Checkout sources
@@ -111,7 +111,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - 1.93.1
+          - 1.97.1
 
     steps:
       - name: Checkout sources

@@ -404,7 +404,7 @@ mod tests {
         let d = DashboardConfig::default();
         assert_eq!(d.interval_ms, 1000);
         assert_eq!(d.history, 300);
-        assert_eq!(d.interval(), Duration::from_millis(1000));
+        assert_eq!(d.interval(), Duration::from_secs(1));
         assert_eq!(d.history(), 300);
 
         let c = DashboardConfig {
@@ -418,7 +418,7 @@ mod tests {
             interval_ms: 1_000_000,
             history: 1,
         };
-        assert_eq!(c.interval(), Duration::from_millis(10_000));
+        assert_eq!(c.interval(), Duration::from_secs(10));
         assert_eq!(c.history(), 30);
 
         let cfg: Config = json5::from_str("{ keybindings: {} }").unwrap();
