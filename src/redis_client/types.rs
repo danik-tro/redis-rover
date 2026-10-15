@@ -12,7 +12,6 @@ pub struct CommonInfo {
     pub version: String,
     pub memory: String,
     pub total_memory: String,
-    pub cpu: String,
     pub clients: String,
     pub max_clients: String,
 }
@@ -27,7 +26,6 @@ impl From<HashMap<&str, &str>> for CommonInfo {
             version: get("redis_version"),
             memory: get("used_memory_human"),
             total_memory: get("total_system_memory_human"),
-            cpu: get("used_cpu_sys"),
             clients: get("connected_clients"),
             max_clients: get("maxclients"),
         }
@@ -54,10 +52,6 @@ impl RedisInfo {
 
     pub fn os(&self) -> String {
         format!("OS: {}", self.common.os)
-    }
-
-    pub fn cpu(&self) -> String {
-        format!("CPU: {}", self.common.cpu)
     }
 
     pub fn memory(&self) -> String {
@@ -362,7 +356,6 @@ mod tests {
             ("redis_version", "7.2.4"),
             ("used_memory_human", "1.5M"),
             ("total_system_memory_human", "16G"),
-            ("used_cpu_sys", "0.42"),
             ("connected_clients", "3"),
             ("maxclients", "10000"),
             ("uptime_in_seconds", "120"),
@@ -377,7 +370,6 @@ mod tests {
                 version: "7.2.4".into(),
                 memory: "1.5M".into(),
                 total_memory: "16G".into(),
-                cpu: "0.42".into(),
                 clients: "3".into(),
                 max_clients: "10000".into(),
             }

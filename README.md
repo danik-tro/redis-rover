@@ -13,6 +13,7 @@ A Redis terminal-ui client written in rust 🦀
 - Browse and filter Redis keys with type-colored badges
 - Paginate through large keyspaces via SCAN
 - Live Redis server info in the footer
+- Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients charts, pause/reset, cluster node count
 - Fully configurable key bindings, colors, and styles via a config file (JSON5, YAML, TOML, INI)
 
 ---

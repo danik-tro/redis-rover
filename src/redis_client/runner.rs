@@ -5,10 +5,11 @@ use tokio::{
     sync::broadcast::{self, Sender as BroadcastSender},
     sync::mpsc::Sender as ActionSender,
     task::JoinHandle,
+    time::MissedTickBehavior,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{action::Action, state::SharedState};
+use crate::{action::Action, config, state::SharedState};
 
 use super::{
     client,
@@ -120,30 +121,52 @@ impl Runner {
     }
 
     fn launch_refresh_info_task(&mut self) {
-        let tick: Duration = std::time::Duration::from_secs_f64(2.0);
+        let tick: Duration = config::get().dashboard.interval();
         let info = self.state.info.clone();
+        let metrics = self.state.metrics.clone();
         let mut manager = self.manager.clone();
         let cancellation_token = self.cancellation_token.clone();
         let action_tx = self.action_tx.clone();
 
         self.info_task = tokio::spawn(async move {
             let mut refresh_interval = tokio::time::interval(tick);
+            refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             // Report only the first failure of an outage; INFO is polled every
-            // tick, so reporting each one would re-open the popup every 2s.
+            // tick, so reporting each one would re-open the popup every tick.
             let mut info_failing = false;
+            // Counts successful samples; CLUSTER INFO is polled every 5th one.
+            let mut tick_no: u64 = 0;
 
             loop {
                 tokio::select! {
                     _ = refresh_interval.tick() => {
-                        let info_res = client::redis_info(&mut manager).await;
+                        let info_res = client::redis_info_with_snapshot(&mut manager).await;
 
                         match info_res {
-                            Ok(redis_info) => {
+                            Ok((redis_info, snapshot)) => {
+                                let cluster_enabled = snapshot.cluster_enabled;
                                 *info.lock() = Some(redis_info);
                                 info_failing = false;
+                                tick_no += 1;
+                                {
+                                    let mut m = metrics.lock();
+                                    m.record(snapshot);
+                                    if !cluster_enabled {
+                                        m.set_cluster(None);
+                                    }
+                                }
+
+                                if cluster_enabled && tick_no % 5 == 1 {
+                                    // No lock is held across this await.
+                                    match client::cluster_info(&mut manager).await {
+                                        Ok(c) => metrics.lock().set_cluster(Some(c)),
+                                        Err(err) => log::warn!("Failed to fetch CLUSTER INFO: {err}"),
+                                    }
+                                }
                             },
                             Err(err) => {
                                 log::error!("Failed to fetch INFO: {err}");
+                                metrics.lock().mark_unavailable();
                                 if !info_failing {
                                     info_failing = true;
                                     crate::action::try_send_action(

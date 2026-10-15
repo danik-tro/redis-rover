@@ -28,7 +28,8 @@ use crate::{
     mode::Mode,
     tui,
     widgets::{
-        info::{Info, InfoWidget},
+        dashboard::{Dashboard, DashboardWidget},
+        info::{build_hint, Info, InfoWidget},
         keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo},
     },
 };
@@ -80,7 +81,30 @@ pub struct App {
     redis_tx: broadcast::Sender<RedisEvent>,
     summary: Info,
     keyspace: KeySpace,
+    dashboard: Dashboard,
 }
+
+/// Footer hint entries for the keyspace view, in display order.
+const KEYSPACE_HINT_ENTRIES: &[(Command, &str)] = &[
+    (Command::AddKey, "add"),
+    (Command::AddItem, "add-item"),
+    (Command::EditValue, "edit"),
+    (Command::DeleteKey, "del"),
+    (Command::SetTtl, "ttl"),
+    (Command::EnterValue, "open"),
+    (Command::SetPattern, "filter"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// Footer hint entries for the dashboard view, in display order.
+const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
+    (Command::ToggleDashboard, "back"),
+    (Command::ToggleMetricsPause, "pause"),
+    (Command::ResetMetrics, "reset"),
+    (Command::NextChart, "chart"),
+    (Command::ToggleAllCharts, "all"),
+    (Command::ToggleHelp, "help"),
+];
 
 impl App {
     pub fn new(
@@ -96,13 +120,15 @@ impl App {
 
         let mode = Mode::KeySpace;
 
-        let summary = Info::new(state.info.clone(), target);
+        let summary = Info::new(state.info.clone(), state.metrics.clone(), target);
         let keyspace = KeySpace::new(Vec::new());
+        let dashboard = Dashboard::new(state.metrics.clone());
 
-        Self {
+        let mut app = Self {
             state,
             summary,
             keyspace,
+            dashboard,
             tick_rate,
             frame_rate,
             should_quit: false,
@@ -119,7 +145,9 @@ impl App {
             tx,
             rx,
             redis_tx,
-        }
+        };
+        app.sync_hint();
+        app
     }
 
     /// Run the main event loop until quit.
@@ -166,7 +194,7 @@ impl App {
         }
     }
 
-    fn resize(&mut self, tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
+    fn resize(tui: &mut tui::Tui, (w, h): (u16, u16)) -> Result<()> {
         tui.resize(Rect::new(0, 0, w, h))?;
         Ok(())
     }
@@ -188,6 +216,26 @@ impl App {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         let is_confirm = key.code == KeyCode::Enter;
         let is_cancel = key.code == KeyCode::Esc;
+
+        // The error popup is modal: Esc/Enter dismiss it, and only global
+        // bindings (e.g. Ctrl-c) pass through.
+        if self.mode == Mode::Popup(PopupMode::Error) {
+            if is_confirm || is_cancel {
+                return Some(Action::PreviousMode);
+            }
+            return self.handle_keybindings(key);
+        }
+
+        // Keep a half-open keyspace overlay from swallowing dashboard keys.
+        if self.mode == Mode::Dashboard {
+            // Esc backs out of the help overlay first; any other key (`m`)
+            // goes through as a real command.
+            if is_cancel && self.help_is_open() {
+                self.help_opened_at = None;
+                return None;
+            }
+            return self.handle_keybindings(key);
+        }
 
         // While the filter popup is open, raw keys feed its text-area; only
         // Enter (confirm) and Esc (cancel) escape to the dispatcher.
@@ -310,9 +358,18 @@ impl App {
         match *action {
             Action::Tick => self.expire_pending_chord(),
             Action::Quit => self.should_quit = true,
-            Action::Resize(w, h) => self.resize(tui, (w, h))?,
+            Action::Resize(w, h) => Self::resize(tui, (w, h))?,
             Action::Render => self.draw(tui)?,
             Action::PreviousMode => self.switch_to_previous_mode(),
+            Action::ToggleDashboard => self.toggle_dashboard(),
+            Action::NextChart => self.dashboard.next_chart(),
+            Action::PrevChart => self.dashboard.prev_chart(),
+            Action::ToggleAllCharts => self.dashboard.toggle_all(),
+            Action::ToggleMetricsPause => self.dashboard.toggle_pause(),
+            Action::ResetMetrics => {
+                self.state.metrics.lock().reset();
+                self.dashboard.unpause();
+            }
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
             Action::LoadKeysIntoKeySpace => {
@@ -368,7 +425,11 @@ impl StatefulWidget for AppWidget {
         state.render_main_block(main, buf);
 
         if state.help_is_open() {
-            App::render_help_overlay(area, buf);
+            let mode = match state.mode {
+                Mode::Popup(_) => state.previous_mode.unwrap_or(Mode::KeySpace),
+                m => m,
+            };
+            App::render_help_overlay(area, buf, mode);
         }
     }
 }
@@ -376,9 +437,72 @@ impl StatefulWidget for AppWidget {
 /// Render logic
 impl App {
     fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
-        if self.mode == Mode::KeySpace {
-            self.render_key_space(area, buf);
+        let mode = match self.mode {
+            Mode::Popup(_) => self.previous_mode.unwrap_or(Mode::KeySpace),
+            m => m,
+        };
+        match mode {
+            Mode::KeySpace => self.render_key_space(area, buf),
+            Mode::Dashboard => {
+                StatefulWidget::render(DashboardWidget, area, buf, &mut self.dashboard);
+            }
+            Mode::Common | Mode::Popup(_) => {}
         }
+        if self.mode == Mode::Popup(PopupMode::Error) {
+            self.render_error_popup(area, buf);
+        }
+    }
+
+    /// Centered bordered box with the current error message.
+    fn render_error_popup(&self, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let msg = self.error_message.as_deref().unwrap_or_default();
+        let footer = "Esc/Enter to close";
+
+        let text_w = msg
+            .lines()
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+            .max(footer.len());
+        #[allow(clippy::cast_possible_truncation)]
+        let popup_w = ((text_w as u16).saturating_add(4)).max(20).min(area.width);
+        #[allow(clippy::cast_possible_truncation)]
+        let popup_h = ((msg.lines().count() as u16).saturating_add(4)).min(area.height);
+
+        let [_, popup_area, _] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(popup_h),
+            Constraint::Fill(1),
+        ])
+        .flex(Flex::Center)
+        .areas(area);
+        let [_, popup_area, _] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(popup_w),
+            Constraint::Fill(1),
+        ])
+        .flex(Flex::Center)
+        .areas(popup_area);
+
+        let block = Block::default()
+            .title(" Error ")
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(cfg.colors.base08)
+            .bg(cfg.colors.base00)
+            .fg(cfg.colors.base05);
+
+        let mut lines: Vec<Line> = msg.lines().map(Line::from).collect();
+        lines.push(Line::from(""));
+        lines.push(Line::styled(footer, cfg.colors.base04));
+
+        Clear.render(popup_area, buf);
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(block)
+            .render(popup_area, buf);
     }
 
     fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
@@ -389,36 +513,55 @@ impl App {
     /// the key sequence(s) bound to it. The box grows ("extends") to fit its
     /// content — both width and height are derived from the rows — and is
     /// clamped to the available area.
-    fn render_help_overlay(area: Rect, buf: &mut Buffer) {
+    fn render_help_overlay(area: Rect, buf: &mut Buffer, mode: Mode) {
         let cfg = config::get();
         let keybindings = &cfg.keybindings;
 
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let entries: [(Command, &str); 16] = [
-            (Command::ScrollDown, "Scroll down"),
-            (Command::ScrollUp, "Scroll up"),
-            (Command::LoadNextPage, "Next page"),
-            (Command::LoadPreviousPage, "Previous page"),
-            (Command::RefreshSpace, "Refresh keyspace"),
-            (Command::SetPattern, "Set filter pattern"),
-            (Command::DeletePattern, "Delete filter pattern"),
-            (Command::EnterValue, "Enter value / confirm"),
-            (Command::AddKey, "Add new key"),
-            (Command::AddItem, "Add item (in collection)"),
-            (Command::EditValue, "Edit value / item (drill in first)"),
-            (Command::DeleteKey, "Delete key / item (in value)"),
-            (Command::SetTtl, "Set TTL"),
-            (Command::ClosePopup, "Close popup / overlay"),
-            (Command::ToggleHelp, "Toggle this help"),
-            (Command::Quit, "Quit"),
-        ];
+        let entries: &[(Command, &str)] = if mode == Mode::Dashboard {
+            &[
+                (Command::ToggleDashboard, "Back to keyspace"),
+                (Command::ToggleMetricsPause, "Pause / resume view"),
+                (Command::ResetMetrics, "Reset history"),
+                (Command::NextChart, "Next chart"),
+                (Command::PrevChart, "Previous chart"),
+                (Command::ToggleAllCharts, "Toggle all charts"),
+                (Command::ToggleHelp, "Toggle this help"),
+                (Command::Quit, "Quit"),
+            ]
+        } else {
+            &[
+                (Command::ScrollDown, "Scroll down"),
+                (Command::ScrollUp, "Scroll up"),
+                (Command::LoadNextPage, "Next page"),
+                (Command::LoadPreviousPage, "Previous page"),
+                (Command::RefreshSpace, "Refresh keyspace"),
+                (Command::SetPattern, "Set filter pattern"),
+                (Command::DeletePattern, "Delete filter pattern"),
+                (Command::EnterValue, "Enter value / confirm"),
+                (Command::AddKey, "Add new key"),
+                (Command::AddItem, "Add item (in collection)"),
+                (Command::EditValue, "Edit value / item (drill in first)"),
+                (Command::DeleteKey, "Delete key / item (in value)"),
+                (Command::SetTtl, "Set TTL"),
+                (Command::ToggleDashboard, "Open metrics dashboard"),
+                (Command::ClosePopup, "Close popup / overlay"),
+                (Command::ToggleHelp, "Toggle this help"),
+                (Command::Quit, "Quit"),
+            ]
+        };
+        let lookup_mode = if mode == Mode::Dashboard {
+            Mode::Dashboard
+        } else {
+            Mode::KeySpace
+        };
 
         let rows: Vec<(String, String)> = entries
             .iter()
             .map(|(command, label)| {
-                let mut binds = keybindings.get_config_for_command(Mode::KeySpace, *command);
+                let mut binds = keybindings.get_config_for_command(lookup_mode, *command);
                 binds.extend(keybindings.get_config_for_command(Mode::Common, *command));
                 let keys = if binds.is_empty() {
                     "—".to_string()
@@ -486,14 +629,41 @@ impl App {
 /// Handling events logic
 impl App {
     fn switch_to_previous_mode(&mut self) {
-        if let Some(ref mut m) = self.previous_mode.or(Some(Mode::KeySpace)) {
-            std::mem::swap(&mut self.mode, m);
+        self.mode = self.previous_mode.take().unwrap_or(Mode::KeySpace);
+        self.sync_hint();
+        if !matches!(self.mode, Mode::Popup(_)) {
+            self.error_message = None;
         }
+    }
+
+    fn toggle_dashboard(&mut self) {
+        match self.mode {
+            Mode::Dashboard => self.switch_to_previous_mode(),
+            Mode::KeySpace => {
+                self.previous_mode = Some(self.mode);
+                self.mode = Mode::Dashboard;
+                self.sync_hint();
+            }
+            _ => {}
+        }
+    }
+
+    /// Point the footer hint at the current mode.
+    fn sync_hint(&mut self) {
+        let (mode, entries) = if self.mode == Mode::Dashboard {
+            (Mode::Dashboard, DASHBOARD_HINT_ENTRIES)
+        } else {
+            (Mode::KeySpace, KEYSPACE_HINT_ENTRIES)
+        };
+        self.summary.hint = build_hint(&config::get().keybindings, mode, entries);
     }
 
     fn show_error_popup(&mut self, msg: &str) {
         self.error_message = Some(msg.to_owned());
-        self.mode = Mode::Popup(PopupMode::Error);
+        if !matches!(self.mode, Mode::Popup(_)) {
+            self.previous_mode = Some(self.mode);
+            self.mode = Mode::Popup(PopupMode::Error);
+        }
     }
 
     fn enter_filter_popup(&mut self) {

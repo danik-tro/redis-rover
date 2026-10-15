@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::LazyLock};
 
+use byte_unit::{Byte, UnitType};
 use color_eyre::eyre::Result;
 use directories::ProjectDirs;
 use tracing::error;
@@ -187,4 +188,89 @@ Authors: {author}
 Config directory: {config_dir_path}
 Data directory: {data_dir_path}"
     )
+}
+
+/// Format a duration in seconds as at most two units, e.g. `3d 4h`, `5m 2s`.
+pub fn format_duration(secs: usize) -> String {
+    if secs == 0 {
+        return "0s".into();
+    }
+    let units = [
+        (secs / 86_400, "d"),
+        (secs % 86_400 / 3_600, "h"),
+        (secs % 3_600 / 60, "m"),
+        (secs % 60, "s"),
+    ];
+    units
+        .iter()
+        .skip_while(|(n, _)| *n == 0)
+        .take(2)
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Compact count: `123`, `12.4k`, `1.2M`, `3.0G`.
+pub fn fmt_compact(v: f64) -> String {
+    let a = v.abs();
+    if a < 1_000.0 {
+        format!("{v:.0}")
+    } else if a < 1_000_000.0 {
+        format!("{:.1}k", v / 1_000.0)
+    } else if a < 1_000_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else {
+        format!("{:.1}G", v / 1_000_000_000.0)
+    }
+}
+
+/// Binary-unit byte size, e.g. `1.5 MiB`.
+pub fn fmt_bytes(v: u64) -> String {
+    let adjusted = Byte::from_u64(v).get_appropriate_unit(UnitType::Binary);
+    format!("{adjusted:.1}")
+}
+
+/// Byte throughput, e.g. `8.4 MiB/s`.
+pub fn fmt_rate_bytes(bps: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bytes = bps.max(0.0).round() as u64;
+    format!("{}/s", fmt_bytes(bytes))
+}
+
+/// Ratio `0.0..=1.0` as a percentage, e.g. `98.2 %`.
+pub fn fmt_pct(ratio: f64) -> String {
+    format!("{:.1} %", ratio * 100.0)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn compact() {
+        assert_eq!(fmt_compact(123.0), "123");
+        assert_eq!(fmt_compact(12_400.0), "12.4k");
+        assert_eq!(fmt_compact(1_200_000.0), "1.2M");
+        assert_eq!(fmt_compact(3_000_000_000.0), "3.0G");
+    }
+
+    #[test]
+    fn bytes() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(fmt_bytes(1_565_498_352), "1.5 GiB");
+    }
+
+    #[test]
+    fn rate_bytes() {
+        assert_eq!(fmt_rate_bytes(1024.0 * 1024.0 * 8.5), "8.5 MiB/s");
+        assert_eq!(fmt_rate_bytes(-5.0), "0 B/s");
+    }
+
+    #[test]
+    fn pct() {
+        assert_eq!(fmt_pct(0.982), "98.2 %");
+        assert_eq!(fmt_pct(0.0), "0.0 %");
+    }
 }

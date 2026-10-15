@@ -20,4 +20,10 @@ pub enum Command {
     EditValue,
     AddKey,
     AddItem,
+    ToggleDashboard,
+    ToggleMetricsPause,
+    ResetMetrics,
+    NextChart,
+    PrevChart,
+    ToggleAllCharts,
 }
