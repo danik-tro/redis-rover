@@ -23,6 +23,8 @@ pub enum Action {
     KeysLoadAborted,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
+    /// A value fetch failed. Only clears the value's loading indicator.
+    ValueLoadFailed,
     LoadNextPage,
     LoadPreviousPage,
     SetKeyspaceFilter,

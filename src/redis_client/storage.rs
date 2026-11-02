@@ -2,8 +2,11 @@ use redis::aio::ConnectionManager;
 use redis::{FromRedisValue, ScanOptions};
 
 use super::{
-    client::{self, fetch_value},
-    types::{ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, NewKeySpec, RedisType},
+    client,
+    types::{
+        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
+        ValueState,
+    },
 };
 
 #[derive(Clone)]
@@ -95,17 +98,17 @@ impl Storage {
         Ok(metas)
     }
 
-    /// Fetch the value for a key. Delegates to [`fetch_value`].
+    /// Fetch the current page of the selected value. Delegates to
+    /// [`client::fetch_value_page`].
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying Redis command fails.
-    pub async fn fetch_value(
+    pub async fn fetch_value_page(
         &self,
-        key: &str,
-        r_type: RedisType,
-    ) -> Result<KeyValue, Box<dyn std::error::Error + Sync + Send>> {
-        fetch_value(self.manager.clone(), key, r_type).await
+        state: ValueState,
+    ) -> Result<(ValueState, LoadedValue), Box<dyn std::error::Error + Sync + Send>> {
+        client::fetch_value_page(self.manager.clone(), state).await
     }
 
     /// Overwrite a STRING key. Delegates to [`client::set_string`].

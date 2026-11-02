@@ -190,11 +190,20 @@ pub struct EventHandler {
     state: SharedState,
     tx: ActionSender<Action>,
     storage: Storage,
+    /// `ValueState::generation` of the last value fetch started. Queued
+    /// `FetchValue` events all read the latest state, so after the first one the
+    /// rest would refetch the same page.
+    last_value_generation: Option<u64>,
 }
 
 impl EventHandler {
     fn new(state: SharedState, tx: ActionSender<Action>, storage: Storage) -> Self {
-        Self { state, tx, storage }
+        Self {
+            state,
+            tx,
+            storage,
+            last_value_generation: None,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -280,17 +289,7 @@ impl EventHandler {
                     }
                 }
             }
-            RedisEvent::FetchValue { key, r_type } => {
-                match self.storage.fetch_value(&key, r_type).await {
-                    Ok(value) => {
-                        *self.state.selected_value.lock() = Some(value);
-                        self.action_hook(Action::LoadSelectedValueIntoView);
-                    }
-                    Err(err) => {
-                        log::error!("FetchValue failed for {key}: {err:?}");
-                    }
-                }
-            }
+            RedisEvent::FetchValue => self.fetch_value().await,
             RedisEvent::FetchKeys => {
                 // Work on a snapshot so the lock isn't held across `.await`.
                 let snapshot = self.state.keyspace_state.lock().clone();
@@ -317,6 +316,44 @@ impl EventHandler {
                         self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
                         self.action_hook(Action::KeysLoadAborted);
                     }
+                }
+            }
+        }
+    }
+
+    /// Fetch the selected value's current page. Works on a snapshot so the lock
+    /// isn't held across `.await`, and drops the result if the user moved to
+    /// another key / page meanwhile (a newer `FetchValue` is then queued).
+    async fn fetch_value(&mut self) {
+        let snapshot = self.state.value_state.lock().clone();
+        let Some(key) = snapshot.key.clone() else {
+            return;
+        };
+        let generation = snapshot.generation;
+        if self.last_value_generation == Some(generation) {
+            return;
+        }
+        self.last_value_generation = Some(generation);
+
+        match self.storage.fetch_value_page(snapshot).await {
+            Ok((swept, loaded)) => {
+                {
+                    let mut state = self.state.value_state.lock();
+                    if state.generation != generation {
+                        return;
+                    }
+                    state.apply(swept);
+                    *self.state.selected_value.lock() = Some(loaded);
+                }
+                self.action_hook(Action::LoadSelectedValueIntoView);
+            }
+            Err(err) => {
+                log::error!("FetchValue failed for {key}: {err:?}");
+                if self.state.value_state.lock().generation == generation {
+                    self.action_hook(Action::ValueLoadFailed);
+                    self.action_hook(Action::Error(format!(
+                        "Failed to load value of {key}: {err}"
+                    )));
                 }
             }
         }

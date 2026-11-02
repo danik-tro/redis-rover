@@ -15,7 +15,8 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     config,
     redis_client::types::{
-        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, NewKeySpec, RedisType,
+        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
+        RedisType, STRING_PREVIEW_BYTES,
     },
     utils::format_duration,
 };
@@ -111,6 +112,17 @@ enum KeySpaceMode {
 enum Focus {
     Keys,
     Value,
+}
+
+/// Result of a `j` / `k` move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollOutcome {
+    /// The cursor moved (or stayed put) within what's loaded.
+    Moved,
+    /// `j` on the last row of a value page that has a next page.
+    PastEnd,
+    /// `k` on the first row of a value page that has a previous page.
+    PastStart,
 }
 
 /// The kind of modal action prompt currently overlaid on the keyspace.
@@ -324,8 +336,8 @@ struct AddItemDraft {
 }
 
 /// The concrete collection element the value-table cursor points at, resolved
-/// from the loaded `selected_value` snapshot so it matches what the user sees
-/// (important for HASH, whose map order is not stable across reloads).
+/// from the loaded `selected_value` page so it matches what the user sees. A
+/// LIST `index` is absolute (page start + row), as `LSET` expects.
 #[derive(Clone)]
 enum SelectedElement {
     ListIndex { index: usize, value: String },
@@ -380,7 +392,10 @@ pub struct KeySpace {
     page: PageInfo,
     mode: KeySpaceMode,
     text_area: Option<TextArea<'static>>,
-    selected_value: Option<KeyValue>,
+    selected_value: Option<LoadedValue>,
+    /// A new page of the current value is being fetched; the old page stays on
+    /// screen meanwhile.
+    value_loading: bool,
     focus: Focus,
     action_overlay: Option<ActionOverlay>,
     new_key: Option<NewKeyDraft>,
@@ -400,6 +415,7 @@ impl KeySpace {
             mode: KeySpaceMode::Normal,
             text_area: None,
             selected_value: None,
+            value_loading: false,
             focus: Focus::Keys,
             action_overlay: None,
             new_key: None,
@@ -426,12 +442,37 @@ impl KeySpace {
         }
     }
 
-    pub fn set_selected_value(&mut self, value: Option<KeyValue>) {
+    pub fn set_selected_value(&mut self, value: Option<LoadedValue>) {
         self.selected_value = value;
+        self.value_loading = false;
+        // A reloaded page may be shorter; keep the cursor on a real row.
+        if self.is_value_focused() {
+            match self.value_row_count() {
+                0 => self.exit_value_focus(),
+                len => {
+                    let row = self.value_table.selected().unwrap_or(0).min(len - 1);
+                    self.value_table.select(Some(row));
+                }
+            }
+        }
+    }
+
+    pub fn is_value_loading(&self) -> bool {
+        self.value_loading
+    }
+
+    pub fn clear_value_loading(&mut self) {
+        self.value_loading = false;
+    }
+
+    /// Mark that another page of the current value is being fetched.
+    pub fn set_value_loading(&mut self) {
+        self.value_loading = true;
     }
 
     pub fn clear_selected_value(&mut self) {
         self.selected_value = None;
+        self.value_loading = false;
         // The detail-view selection belongs to the previously selected key;
         // reset it (and drop value focus) so the new value starts fresh.
         self.value_table.select(None);
@@ -487,18 +528,19 @@ impl KeySpace {
         self.loaded = true;
     }
 
-    pub fn scroll_next(&mut self) {
+    pub fn scroll_next(&mut self) -> ScrollOutcome {
         match self.focus {
             Focus::Keys => {
                 let wrap_index = self.keys.len().max(1);
                 let next = self.table.selected().map_or(0, |i| (i + 1) % wrap_index);
                 self.scroll_to(next);
+                ScrollOutcome::Moved
             }
             Focus::Value => self.scroll_value(true),
         }
     }
 
-    pub fn scroll_previous(&mut self) {
+    pub fn scroll_previous(&mut self) -> ScrollOutcome {
         match self.focus {
             Focus::Keys => {
                 let last: usize = self.keys.len().saturating_sub(1);
@@ -508,6 +550,7 @@ impl KeySpace {
                     .selected()
                     .map_or(last, |i: usize| (i + last) % wrap_index);
                 self.scroll_to(previous);
+                ScrollOutcome::Moved
             }
             Focus::Value => self.scroll_value(false),
         }
@@ -521,32 +564,55 @@ impl KeySpace {
         }
     }
 
-    /// Move the detail-view selection within the currently loaded collection
-    /// value, wrapping at the ends. No-op when the value has no rows.
-    fn scroll_value(&mut self, forward: bool) {
+    /// Move the detail-view selection within the loaded value page.
+    ///
+    /// A single-page value wraps at the ends, as before. A paged value instead
+    /// reports the edge (`PastEnd` / `PastStart`) when another page exists that
+    /// way, so the caller can turn the page; on the very first / last row it
+    /// stays put.
+    fn scroll_value(&mut self, forward: bool) -> ScrollOutcome {
         let len = self.value_row_count();
         if len == 0 {
             self.value_table.select(None);
-            return;
+            return ScrollOutcome::Moved;
         }
+        let page = self
+            .selected_value
+            .as_ref()
+            .map(|loaded| loaded.page)
+            .unwrap_or_default();
         let next = match (self.value_table.selected(), forward) {
+            (Some(i), true) if i + 1 >= len && page.is_paged() => {
+                return if page.has_next {
+                    ScrollOutcome::PastEnd
+                } else {
+                    ScrollOutcome::Moved
+                };
+            }
+            (Some(0), false) if page.is_paged() => {
+                return if page.has_prev {
+                    ScrollOutcome::PastStart
+                } else {
+                    ScrollOutcome::Moved
+                };
+            }
             (Some(i), true) => (i + 1) % len,
             (Some(i), false) => (i + len - 1) % len,
             (None, true) => 0,
             (None, false) => len - 1,
         };
         self.value_table.select(Some(next));
+        ScrollOutcome::Moved
     }
 
     /// Number of rows the loaded value renders as a table. Scalar/absent values
     /// have no navigable rows.
     fn value_row_count(&self) -> usize {
-        match self.selected_value.as_ref() {
-            Some(KeyValue::List(items)) => items.len(),
-            Some(KeyValue::Set(members)) => members.len(),
+        match self.selected_value.as_ref().map(|loaded| &loaded.value) {
+            Some(KeyValue::List(items) | KeyValue::Set(items)) => items.len(),
             Some(KeyValue::Hash(entries)) => entries.len(),
             Some(KeyValue::Zset(entries)) => entries.len(),
-            Some(KeyValue::String(_) | KeyValue::Json(_) | KeyValue::Unknown) | None => 0,
+            Some(KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown) | None => 0,
         }
     }
 
@@ -587,35 +653,31 @@ impl KeySpace {
     }
 
     /// Resolve the value-table cursor to the concrete element it points at,
-    /// reading the exact `selected_value` snapshot the user is looking at (so
-    /// HASH — whose map order is unstable across reloads — resolves correctly).
-    /// `None` unless value-focused with a selected navigable row.
+    /// reading the exact page the user is looking at. `None` unless
+    /// value-focused with a selected navigable row.
     fn selected_element(&self) -> Option<SelectedElement> {
         if !self.is_value_focused() {
             return None;
         }
         let row = self.value_table.selected()?;
-        match self.selected_value.as_ref()? {
+        let loaded = self.selected_value.as_ref()?;
+        match &loaded.value {
             KeyValue::List(items) => items.get(row).map(|v| SelectedElement::ListIndex {
-                index: row,
+                index: loaded.page.start + row,
                 value: v.clone(),
             }),
             KeyValue::Set(members) => members
-                .iter()
-                .nth(row)
+                .get(row)
                 .map(|m| SelectedElement::SetMember(m.clone())),
-            KeyValue::Hash(map) => map
-                .iter()
-                .nth(row)
-                .map(|(f, v)| SelectedElement::HashField {
-                    field: f.clone(),
-                    value: v.clone(),
-                }),
+            KeyValue::Hash(entries) => entries.get(row).map(|(f, v)| SelectedElement::HashField {
+                field: f.clone(),
+                value: v.clone(),
+            }),
             KeyValue::Zset(items) => items.get(row).map(|(m, s)| SelectedElement::ZsetMember {
                 member: m.clone(),
                 score: *s,
             }),
-            KeyValue::String(_) | KeyValue::Json(_) | KeyValue::Unknown => None,
+            KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => None,
         }
     }
 
@@ -688,11 +750,18 @@ impl KeySpace {
         });
     }
 
-    /// Open the value editor. STRING values pre-fill the editor; any other type
-    /// opens a read-only "temporarily unsupported" notice instead.
+    /// Open the value editor. STRING values pre-fill the editor; a truncated
+    /// STRING or any other type opens a read-only notice instead, so a cut-off
+    /// preview is never written back.
     pub fn open_edit_value(&mut self) {
-        match self.selected_value.as_ref() {
-            Some(KeyValue::String(s)) => {
+        match self.selected_value.as_ref().map(|loaded| &loaded.value) {
+            Some(value) if value.is_truncated() => {
+                self.action_overlay = Some(ActionOverlay {
+                    kind: OverlayKind::Notice("Value too large to edit here.".to_string()),
+                    text_area: None,
+                });
+            }
+            Some(KeyValue::String { value: s, .. }) => {
                 self.action_overlay = Some(ActionOverlay {
                     kind: OverlayKind::EditValue,
                     text_area: Some(build_input_text_area("Edit value", "Enter value", Some(s))),
@@ -1713,17 +1782,29 @@ impl KeySpaceWidget {
             .render(key_meta_area, buf);
         render_rule(rule_area, buf);
 
-        let Some(loaded_value) = state.selected_value.as_ref() else {
+        let Some(loaded) = state.selected_value.as_ref() else {
             Self::render_placeholder(vec![Line::from("Loading…")], view_area, buf);
             return;
         };
 
-        Self::render_value(loaded_value, view_area, buf, &mut state.value_table);
+        let view_area = match value_footer(loaded, state.value_loading) {
+            Some(footer) => {
+                let [value_area, footer_area] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(view_area);
+                Paragraph::new(Line::from(footer).fg(cfg.colors.base03))
+                    .alignment(Alignment::Right)
+                    .render(footer_area, buf);
+                value_area
+            }
+            None => view_area,
+        };
+
+        Self::render_value(&loaded.value, view_area, buf, &mut state.value_table);
     }
 
     fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, table_state: &mut TableState) {
         match value {
-            KeyValue::String(s) => {
+            KeyValue::String { value: s, .. } => {
                 let cfg = config::get();
                 Paragraph::new(vec![
                     Line::from("Value").fg(cfg.colors.base03).bold(),
@@ -1735,13 +1816,9 @@ impl KeySpaceWidget {
             KeyValue::List(items) => {
                 Self::render_single_column_table("Item", items, area, buf, table_state);
             }
-            KeyValue::Set(members) => Self::render_single_column_table(
-                "Member",
-                members.iter().cloned().collect::<Vec<_>>().as_slice(),
-                area,
-                buf,
-                table_state,
-            ),
+            KeyValue::Set(members) => {
+                Self::render_single_column_table("Member", members, area, buf, table_state);
+            }
             KeyValue::Hash(entries) => {
                 let pairs: Vec<(String, String)> = entries
                     .iter()
@@ -1818,6 +1895,66 @@ impl KeySpaceWidget {
         StatefulWidget::render(table, area, buf, table_state);
         render_header_rule(area, buf);
     }
+}
+
+/// One-line paging / truncation summary shown under the value, e.g.
+/// `Items 101–200 of 12,345 · n/p page`. `None` when there's nothing to say
+/// (an untruncated STRING, an empty collection, an unsupported type).
+fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String> {
+    let noun = match &loaded.value {
+        KeyValue::String { value, total_len } => {
+            if !loaded.value.is_truncated() {
+                return None;
+            }
+            let shown = format_bytes(value.len().min(STRING_PREVIEW_BYTES));
+            let total = format_bytes(*total_len);
+            return Some(format!("Showing first {shown} of {total}"));
+        }
+        KeyValue::List(_) => "Items",
+        KeyValue::Hash(_) => "Fields",
+        KeyValue::Set(_) | KeyValue::Zset(_) => "Members",
+        KeyValue::Json(_) | KeyValue::Unknown => return None,
+    };
+    let page = loaded.page;
+    if page.len == 0 {
+        return None;
+    }
+    let mut footer = format!(
+        "{noun} {}–{}",
+        group_thousands(page.start + 1),
+        group_thousands(page.start + page.len)
+    );
+    if let Some(total) = page.total {
+        footer.push_str(" of ");
+        footer.push_str(&group_thousands(total));
+    }
+    if page.is_paged() {
+        footer.push_str(" · n/p page");
+    }
+    if loading {
+        footer.push_str(" · loading…");
+    }
+    Some(footer)
+}
+
+/// `1234567` → `1,234,567`.
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Human byte size, matching the Size field (`64.00 KiB`).
+fn format_bytes(n: usize) -> String {
+    let byte =
+        Byte::from_u64(u64::try_from(n).unwrap_or(u64::MAX)).get_appropriate_unit(UnitType::Binary);
+    format!("{byte:.2}")
 }
 
 /// Width of the type column: fits the longest label (`json`, `hash`, …).
@@ -2041,7 +2178,148 @@ impl StatefulWidget for KeySpaceWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_input_text_area, format_ttl, format_ttl_detail, KeySpace, PageInfo};
+    use super::{
+        build_input_text_area, format_ttl, format_ttl_detail, group_thousands, value_footer,
+        KeySpace, PageInfo, ScrollOutcome, SelectedElement,
+    };
+    use crate::redis_client::types::{KeyValue, LoadedValue, ValuePageInfo};
+
+    fn list_page(rows: usize, start: usize, has_prev: bool, has_next: bool) -> LoadedValue {
+        LoadedValue {
+            value: KeyValue::List((0..rows).map(|i| format!("v{}", start + i)).collect()),
+            page: ValuePageInfo {
+                start,
+                len: rows,
+                total: Some(1000),
+                has_next,
+                has_prev,
+            },
+        }
+    }
+
+    fn focused(value: LoadedValue) -> KeySpace {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.set_selected_value(Some(value));
+        keyspace.enter_value();
+        keyspace
+    }
+
+    #[test]
+    fn single_page_value_wraps() {
+        let mut keyspace = focused(list_page(3, 0, false, false));
+        assert_eq!(keyspace.scroll_previous(), ScrollOutcome::Moved);
+        assert_eq!(keyspace.value_table.selected(), Some(2));
+        assert_eq!(keyspace.scroll_next(), ScrollOutcome::Moved);
+        assert_eq!(keyspace.value_table.selected(), Some(0));
+    }
+
+    #[test]
+    fn paged_value_reports_edges() {
+        let mut keyspace = focused(list_page(3, 100, true, true));
+        assert_eq!(keyspace.scroll_previous(), ScrollOutcome::PastStart);
+        assert_eq!(keyspace.value_table.selected(), Some(0));
+        keyspace.scroll_next();
+        keyspace.scroll_next();
+        assert_eq!(keyspace.scroll_next(), ScrollOutcome::PastEnd);
+        assert_eq!(keyspace.value_table.selected(), Some(2));
+    }
+
+    #[test]
+    fn last_page_stays_put_at_end() {
+        let mut keyspace = focused(list_page(2, 100, true, false));
+        keyspace.scroll_next();
+        assert_eq!(keyspace.scroll_next(), ScrollOutcome::Moved);
+        assert_eq!(keyspace.value_table.selected(), Some(1));
+    }
+
+    #[test]
+    fn list_element_index_is_absolute() {
+        let mut keyspace = focused(list_page(3, 200, true, true));
+        keyspace.scroll_next();
+        match keyspace.selected_element() {
+            Some(SelectedElement::ListIndex { index, value }) => {
+                assert_eq!(index, 201);
+                assert_eq!(value, "v201");
+            }
+            _ => panic!("expected a list element"),
+        }
+    }
+
+    #[test]
+    fn hash_element_follows_page_order() {
+        let mut keyspace = focused(LoadedValue {
+            value: KeyValue::Hash(vec![("b".into(), "2".into()), ("a".into(), "1".into())]),
+            page: ValuePageInfo::default(),
+        });
+        keyspace.scroll_next();
+        match keyspace.selected_element() {
+            Some(SelectedElement::HashField { field, .. }) => assert_eq!(field, "a"),
+            _ => panic!("expected a hash field"),
+        }
+    }
+
+    #[test]
+    fn shorter_reload_clamps_value_cursor() {
+        let mut keyspace = focused(list_page(5, 0, false, false));
+        keyspace.scroll_previous();
+        keyspace.set_selected_value(Some(list_page(2, 0, false, false)));
+        assert_eq!(keyspace.value_table.selected(), Some(1));
+    }
+
+    #[test]
+    fn value_footer_text() {
+        let page = list_page(100, 100, true, true);
+        assert_eq!(
+            value_footer(&page, false).as_deref(),
+            Some("Items 101–200 of 1,000 · n/p page")
+        );
+        assert_eq!(
+            value_footer(&page, true).as_deref(),
+            Some("Items 101–200 of 1,000 · n/p page · loading…")
+        );
+
+        let small = LoadedValue {
+            value: KeyValue::Set(vec!["a".into()]),
+            page: ValuePageInfo {
+                len: 1,
+                total: Some(1),
+                ..ValuePageInfo::default()
+            },
+        };
+        assert_eq!(
+            value_footer(&small, false).as_deref(),
+            Some("Members 1–1 of 1")
+        );
+
+        let full = LoadedValue {
+            value: KeyValue::String {
+                value: "abc".into(),
+                total_len: 3,
+            },
+            page: ValuePageInfo::default(),
+        };
+        assert_eq!(value_footer(&full, false), None);
+
+        let cut = LoadedValue {
+            value: KeyValue::String {
+                value: "x".repeat(1024),
+                total_len: 2048,
+            },
+            page: ValuePageInfo::default(),
+        };
+        assert_eq!(
+            value_footer(&cut, false).as_deref(),
+            Some("Showing first 1.00 KiB of 2.00 KiB")
+        );
+    }
+
+    #[test]
+    fn thousands_grouping() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
 
     #[test]
     fn page_summary() {

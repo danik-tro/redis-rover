@@ -30,7 +30,7 @@ use crate::{
     widgets::{
         dashboard::{Dashboard, DashboardWidget},
         info::{build_hint, Info, InfoWidget},
-        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo},
+        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome},
     },
 };
 
@@ -65,6 +65,9 @@ pub struct App {
     /// value, so the *final* value load (not an earlier racing one) restores
     /// value focus.
     restore_value_pending: bool,
+    /// After turning a value page with `j` / `k` / `n` / `p`, the row to select
+    /// once the new page loads (`usize::MAX` = last row; clamped).
+    page_turn_row: Option<usize>,
 
     should_quit: bool,
     /// Keys of a partially typed chord (a strict prefix of some binding).
@@ -139,6 +142,7 @@ impl App {
             reselect_key: None,
             restore_value_row: None,
             restore_value_pending: false,
+            page_turn_row: None,
             pending_keys: Vec::new(),
             last_key_at: None,
             keys_in_flight: 0,
@@ -379,6 +383,7 @@ impl App {
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(),
+            Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
             Action::LoadNextPage => self.load_next_page(),
@@ -535,8 +540,11 @@ impl App {
             &[
                 (Command::ScrollDown, "Scroll down"),
                 (Command::ScrollUp, "Scroll up"),
-                (Command::LoadNextPage, "Next page"),
-                (Command::LoadPreviousPage, "Previous page"),
+                (Command::LoadNextPage, "Next page (keys or open value)"),
+                (
+                    Command::LoadPreviousPage,
+                    "Previous page (keys or open value)",
+                ),
                 (Command::RefreshSpace, "Refresh keyspace"),
                 (Command::SetPattern, "Set filter pattern"),
                 (Command::DeletePattern, "Delete filter pattern"),
@@ -698,7 +706,8 @@ impl App {
             Action::Help
             | Action::Render
             | Action::DiscardKeyspacePopup
-            | Action::KeysLoadAborted => {}
+            | Action::KeysLoadAborted
+            | Action::ValueLoadFailed => {}
             Action::Tick => {
                 if opened_at.elapsed() >= HELP_TIMEOUT {
                     self.help_opened_at = None;
@@ -944,16 +953,49 @@ impl App {
         self.fetch_keys();
     }
 
+    /// `n`: next page of the value when drilled into one, else of the keyspace.
     fn load_next_page(&mut self) {
+        if self.keyspace.is_value_focused() {
+            self.turn_value_page(true, 0);
+            return;
+        }
         // Paging reuses the sweep: no rescan, only the new page's metadata.
         if self.state.keyspace_state.lock().next_page() {
             self.fetch_keys();
         }
     }
 
+    /// `p`: previous page of the value when drilled into one, else of the
+    /// keyspace.
     fn load_previous_page(&mut self) {
+        if self.keyspace.is_value_focused() {
+            self.turn_value_page(false, 0);
+            return;
+        }
         if self.state.keyspace_state.lock().previous_page() {
             self.fetch_keys();
+        }
+    }
+
+    /// Move the selected value one page forward / back and fetch it, selecting
+    /// `row` once it lands. Ignored while a page is already loading, so holding
+    /// `j` can't skip pages the user never saw.
+    fn turn_value_page(&mut self, forward: bool, row: usize) {
+        if self.keyspace.is_value_loading() {
+            return;
+        }
+        let moved = {
+            let mut value_state = self.state.value_state.lock();
+            if forward {
+                value_state.next_page()
+            } else {
+                value_state.previous_page()
+            }
+        };
+        if moved {
+            self.page_turn_row = Some(row);
+            self.keyspace.set_value_loading();
+            self.send_redis_event(RedisEvent::FetchValue);
         }
     }
 
@@ -980,18 +1022,27 @@ impl App {
         }
     }
 
-    fn request_selected_value(&self) {
+    /// Fetch the selected key's value. Re-requesting the same key (e.g. after a
+    /// write) keeps its current page; a different key starts at page 1.
+    fn request_selected_value(&mut self) {
         let Some((key, r_type)) = self.keyspace.selected_key() else {
             return;
         };
-        if let Err(err) = self.redis_tx.send(RedisEvent::FetchValue { key, r_type }) {
-            log::error!("Failed to send FetchValue: {err:?}");
-        }
+        self.state.value_state.lock().select(&key, r_type);
+        self.page_turn_row = None;
+        self.keyspace.set_value_loading();
+        self.send_redis_event(RedisEvent::FetchValue);
     }
 
     fn load_selected_value(&mut self) {
         let value = self.state.selected_value.lock().clone();
         self.keyspace.set_selected_value(value);
+
+        if let Some(row) = self.page_turn_row.take() {
+            if self.keyspace.is_value_focused() {
+                self.keyspace.restore_value_focus(row);
+            }
+        }
 
         // After an add-item, re-enter the collection at the row the user was on
         // (clamped to the new length) so adding doesn't bounce focus to the key
@@ -1039,7 +1090,10 @@ impl App {
         // When focus is in the value pane, `j`/`k` scroll the value's rows in
         // place — the selected key (and its loaded value) must not change.
         if self.keyspace.is_value_focused() {
-            self.keyspace.scroll_next();
+            // On the last row of a value page, `j` turns to the next page.
+            if self.keyspace.scroll_next() == ScrollOutcome::PastEnd {
+                self.turn_value_page(true, 0);
+            }
             return;
         }
         self.keyspace.scroll_next();
@@ -1052,7 +1106,11 @@ impl App {
             return;
         }
         if self.keyspace.is_value_focused() {
-            self.keyspace.scroll_previous();
+            // On the first row of a value page, `k` turns back and lands on the
+            // previous page's last row.
+            if self.keyspace.scroll_previous() == ScrollOutcome::PastStart {
+                self.turn_value_page(false, usize::MAX);
+            }
             return;
         }
         self.keyspace.scroll_previous();

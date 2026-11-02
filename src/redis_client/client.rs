@@ -5,9 +5,10 @@ use color_eyre::eyre::Result;
 use redis::{aio::ConnectionManager, AsyncCommands};
 
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
-use super::types::{ItemDelete, ItemEdit, KeyItem, KeyValue, NewKeySpec, RedisInfo, RedisType};
-
-const VALUE_PREVIEW_LIMIT: isize = 100;
+use super::types::{
+    ItemDelete, ItemEdit, KeyItem, KeyValue, LoadedValue, NewKeySpec, RedisInfo, RedisType,
+    ValuePageInfo, ValueState, STRING_PREVIEW_BYTES,
+};
 
 /// Sentinel used to delete a LIST element by index (Redis has no delete-by-index):
 /// overwrite the slot with this marker via `LSET`, then remove it with `LREM`.
@@ -63,46 +64,212 @@ pub async fn cluster_info(manager: &mut ConnectionManager) -> Result<ClusterSumm
     Ok(parse_cluster_info(&raw))
 }
 
-/// Fetch the value behind a key, bounded to the first
-/// [`VALUE_PREVIEW_LIMIT`] items for collection types.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Fetch the current page of the selected key's value, as described by
+/// `state`. Every command is bounded: STRING reads at most
+/// [`STRING_PREVIEW_BYTES`], LIST / ZSET read one `page_size` window, and HASH /
+/// SET advance an `HSCAN` / `SSCAN` sweep only as far as the page needs.
+///
+/// Returns the advanced state (page possibly clamped if the collection shrank)
+/// together with the loaded page.
 ///
 /// # Errors
 ///
-/// Returns an error if any of the underlying Redis commands fails.
-pub async fn fetch_value(
+/// Returns an error if no key is selected or any Redis command fails.
+pub async fn fetch_value_page(
     mut manager: ConnectionManager,
-    key: &str,
-    r_type: RedisType,
-) -> Result<KeyValue, Box<dyn std::error::Error + Send + Sync>> {
-    match r_type {
+    mut state: ValueState,
+) -> Result<(ValueState, LoadedValue), BoxError> {
+    let key = state.key.clone().ok_or("no key selected")?;
+    let manager = &mut manager;
+
+    let value = match state.r_type {
         RedisType::String => {
-            let value: String = manager.get(key).await?;
-            Ok(KeyValue::String(value))
+            let (value, total_len) =
+                fetch_string_preview(manager, &key, STRING_PREVIEW_BYTES).await?;
+            state.total = None;
+            return Ok((
+                state,
+                LoadedValue {
+                    value: KeyValue::String { value, total_len },
+                    page: ValuePageInfo::default(),
+                },
+            ));
         }
         RedisType::List => {
-            let value: Vec<String> = manager.lrange(key, 0, VALUE_PREVIEW_LIMIT - 1).await?;
-            Ok(KeyValue::List(value))
-        }
-        RedisType::Set => {
-            let members: Vec<String> = redis::cmd("SRANDMEMBER")
-                .arg(key)
-                .arg(VALUE_PREVIEW_LIMIT)
-                .query_async(&mut manager)
-                .await?;
-            Ok(KeyValue::Set(members.into_iter().collect()))
-        }
-        RedisType::Hash => {
-            let value: HashMap<String, String> = manager.hgetall(key).await?;
-            Ok(KeyValue::Hash(value))
+            let mut items = fetch_list_window(manager, &key, &mut state).await?;
+            if refetch_after_clamp(&mut state) {
+                items = fetch_list_window(manager, &key, &mut state).await?;
+            }
+            KeyValue::List(items)
         }
         RedisType::Zset => {
-            let value: Vec<(String, f64)> = manager
-                .zrange_withscores(key, 0, VALUE_PREVIEW_LIMIT - 1)
-                .await?;
-            Ok(KeyValue::Zset(value))
+            let mut items = fetch_zset_window(manager, &key, &mut state).await?;
+            if refetch_after_clamp(&mut state) {
+                items = fetch_zset_window(manager, &key, &mut state).await?;
+            }
+            KeyValue::Zset(items)
         }
-        RedisType::Json | RedisType::Unknown => Ok(KeyValue::Unknown),
+        RedisType::Hash | RedisType::Set => {
+            let is_hash = state.r_type == RedisType::Hash;
+            let len_cmd = if is_hash { "HLEN" } else { "SCARD" };
+            let total: usize = redis::cmd(len_cmd).arg(&key).query_async(manager).await?;
+            state.total = Some(total);
+
+            while state.needs_scan() {
+                let (cursor, batch) = scan_step(manager, &key, is_hash, &state).await?;
+                if is_hash {
+                    state.sweep.merge_fields(cursor, pair_up(batch));
+                } else {
+                    state.sweep.merge_members(cursor, batch);
+                }
+            }
+            state.clamp_page();
+
+            let range = state.page_range();
+            let names = &state.sweep.names[range.clone()];
+            if is_hash {
+                let values = &state.sweep.values[range];
+                KeyValue::Hash(names.iter().cloned().zip(values.iter().cloned()).collect())
+            } else {
+                KeyValue::Set(names.to_vec())
+            }
+        }
+        RedisType::Json | RedisType::Unknown => KeyValue::Unknown,
+    };
+
+    let len = match &value {
+        KeyValue::List(items) | KeyValue::Set(items) => items.len(),
+        KeyValue::Hash(entries) => entries.len(),
+        KeyValue::Zset(entries) => entries.len(),
+        KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => 0,
+    };
+    let page = state.page_info(len);
+    Ok((state, LoadedValue { value, page }))
+}
+
+/// Clamp an index-paged state to the (just fetched) collection length.
+/// Returns `true` if the page moved, meaning the window must be fetched again.
+fn refetch_after_clamp(state: &mut ValueState) -> bool {
+    let before = state.page;
+    state.clamp_page();
+    state.page != before
+}
+
+/// `start` / `stop` (inclusive) arguments for the current page window.
+fn window_bounds(state: &ValueState) -> Result<(isize, isize), BoxError> {
+    let start = isize::try_from(state.page_start())?;
+    let len = isize::try_from(state.page_size.max(1))?;
+    Ok((start, start + len - 1))
+}
+
+/// `LLEN` + `LRANGE` for the current page, in one pipeline. Stores the length
+/// in `state.total`.
+async fn fetch_list_window(
+    manager: &mut ConnectionManager,
+    key: &str,
+    state: &mut ValueState,
+) -> Result<Vec<String>, BoxError> {
+    let (start, stop) = window_bounds(state)?;
+    let (total, items): (usize, Vec<String>) = redis::pipe()
+        .cmd("LLEN")
+        .arg(key)
+        .cmd("LRANGE")
+        .arg(key)
+        .arg(start)
+        .arg(stop)
+        .query_async(manager)
+        .await?;
+    state.total = Some(total);
+    Ok(items)
+}
+
+/// `ZCARD` + `ZRANGE … WITHSCORES` for the current page, in one pipeline.
+/// Stores the length in `state.total`.
+async fn fetch_zset_window(
+    manager: &mut ConnectionManager,
+    key: &str,
+    state: &mut ValueState,
+) -> Result<Vec<(String, f64)>, BoxError> {
+    let (start, stop) = window_bounds(state)?;
+    let (total, items): (usize, Vec<(String, f64)>) = redis::pipe()
+        .cmd("ZCARD")
+        .arg(key)
+        .cmd("ZRANGE")
+        .arg(key)
+        .arg(start)
+        .arg(stop)
+        .arg("WITHSCORES")
+        .query_async(manager)
+        .await?;
+    state.total = Some(total);
+    Ok(items)
+}
+
+/// One `HSCAN` / `SSCAN key cursor COUNT n` step. HSCAN replies with a flat
+/// `field, value, …` list; pair it up with [`pair_up`].
+async fn scan_step(
+    manager: &mut ConnectionManager,
+    key: &str,
+    is_hash: bool,
+    state: &ValueState,
+) -> Result<(u64, Vec<String>), BoxError> {
+    let reply = redis::cmd(if is_hash { "HSCAN" } else { "SSCAN" })
+        .arg(key)
+        .arg(state.sweep.cursor)
+        .arg("COUNT")
+        .arg(state.scan_count)
+        .query_async(manager)
+        .await?;
+    Ok(reply)
+}
+
+/// Turn a flat `field, value, field, value` list into pairs. A trailing odd
+/// element (never sent by Redis) is dropped.
+fn pair_up(flat: Vec<String>) -> Vec<(String, String)> {
+    let mut iter = flat.into_iter();
+    let mut pairs = Vec::with_capacity(iter.len() / 2);
+    while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
+        pairs.push((field, value));
     }
+    pairs
+}
+
+/// `STRLEN` + `GETRANGE 0 max-1` in one pipeline. Returns the decoded preview
+/// and the full length in bytes.
+async fn fetch_string_preview(
+    manager: &mut ConnectionManager,
+    key: &str,
+    max: usize,
+) -> Result<(String, usize), BoxError> {
+    let (total, bytes): (usize, Vec<u8>) = redis::pipe()
+        .cmd("STRLEN")
+        .arg(key)
+        .cmd("GETRANGE")
+        .arg(key)
+        .arg(0)
+        .arg(max.saturating_sub(1))
+        .query_async(manager)
+        .await?;
+    let truncated = bytes.len() < total;
+    Ok((decode_preview(&bytes, truncated), total))
+}
+
+/// Decode a value preview as UTF-8. When the preview was cut short, a
+/// multi-byte character split at the end is dropped instead of shown as `�`.
+/// Other invalid bytes are replaced with `�`.
+fn decode_preview(bytes: &[u8], truncated: bool) -> String {
+    let mut end = bytes.len();
+    if truncated {
+        if let Err(err) = std::str::from_utf8(bytes) {
+            // `error_len() == None` means the input ended mid-character.
+            if err.error_len().is_none() {
+                end = err.valid_up_to();
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Overwrite a key with a plain string value (`SET`).
@@ -294,4 +461,155 @@ pub async fn delete_item(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_preview, fetch_value_page, pair_up};
+    use crate::redis_client::types::{KeyValue, RedisType, ValueState};
+
+    #[test]
+    fn pair_up_splits_flat_reply() {
+        let flat = vec![
+            "f1".into(),
+            "1".into(),
+            "f2".into(),
+            "2".into(),
+            "odd".into(),
+        ];
+        assert_eq!(
+            pair_up(flat),
+            vec![("f1".into(), "1".into()), ("f2".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn decode_preview_drops_split_trailing_char() {
+        // "aé" is [0x61, 0xC3, 0xA9]; cutting after 2 bytes splits the "é".
+        let bytes = "aé".as_bytes();
+        assert_eq!(decode_preview(&bytes[..2], true), "a");
+        assert_eq!(decode_preview(bytes, false), "aé");
+    }
+
+    #[test]
+    fn decode_preview_replaces_invalid_bytes() {
+        assert_eq!(decode_preview(&[0x61, 0xFF, 0x62], false), "a\u{FFFD}b");
+        // Invalid byte in the middle of a truncated preview is still replaced.
+        assert_eq!(decode_preview(&[0xFF, 0x61], true), "\u{FFFD}a");
+    }
+
+    /// Live checks against a seeded Redis. Run with
+    /// `RROVER_TEST_URL=redis://localhost:6390 cargo test -- --ignored`
+    /// after seeding `big:hash` (200k fields), `big:list` / `big:set` /
+    /// `big:zset` (50k each), `big:str` (5 MB), `str:utf8` ("éa" × 30000) and
+    /// `small:hash` (3 fields).
+    async fn manager() -> redis::aio::ConnectionManager {
+        let url = std::env::var("RROVER_TEST_URL").expect("RROVER_TEST_URL not set");
+        redis::Client::open(url)
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap()
+    }
+
+    fn state(key: &str, r_type: RedisType) -> ValueState {
+        let mut state = ValueState::default();
+        state.select(key, r_type);
+        state
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
+    async fn live_hash_pages_with_hscan() {
+        let (mut st, loaded) =
+            fetch_value_page(manager().await, state("big:hash", RedisType::Hash))
+                .await
+                .unwrap();
+        let KeyValue::Hash(first) = loaded.value else {
+            panic!()
+        };
+        assert_eq!(first.len(), 100);
+        assert_eq!(loaded.page.total, Some(200_000));
+        assert!(loaded.page.has_next);
+
+        st.next_page();
+        let (_, loaded) = fetch_value_page(manager().await, st).await.unwrap();
+        let KeyValue::Hash(second) = loaded.value else {
+            panic!()
+        };
+        assert_eq!(second.len(), 100);
+        assert_eq!(loaded.page.start, 100);
+        assert!(second.iter().all(|row| !first.contains(row)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
+    async fn live_list_zset_set_windows() {
+        let mut list = state("big:list", RedisType::List);
+        list.page = 3;
+        let (_, loaded) = fetch_value_page(manager().await, list).await.unwrap();
+        let KeyValue::List(items) = loaded.value else {
+            panic!()
+        };
+        assert_eq!(items.first().map(String::as_str), Some("v301"));
+        assert_eq!(items.len(), 100);
+        assert_eq!(loaded.page.total, Some(50_000));
+
+        let mut zset = state("big:zset", RedisType::Zset);
+        zset.page = 1;
+        let (_, loaded) = fetch_value_page(manager().await, zset).await.unwrap();
+        let KeyValue::Zset(items) = loaded.value else {
+            panic!()
+        };
+        assert_eq!(items.first(), Some(&("m101".to_string(), 101.0)));
+
+        let (_, loaded) = fetch_value_page(manager().await, state("big:set", RedisType::Set))
+            .await
+            .unwrap();
+        let KeyValue::Set(members) = loaded.value else {
+            panic!()
+        };
+        assert_eq!(members.len(), 100);
+        assert_eq!(loaded.page.total, Some(50_000));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
+    async fn live_page_past_end_is_clamped() {
+        let mut list = state("big:list", RedisType::List);
+        list.page = 600;
+        let (st, loaded) = fetch_value_page(manager().await, list).await.unwrap();
+        assert_eq!(st.page, 499);
+        assert_eq!(loaded.page.len, 100);
+        assert!(!loaded.page.has_next);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
+    async fn live_small_hash_and_strings() {
+        let (_, loaded) = fetch_value_page(manager().await, state("small:hash", RedisType::Hash))
+            .await
+            .unwrap();
+        assert_eq!(loaded.page.len, 3);
+        assert!(!loaded.page.is_paged());
+
+        let (_, loaded) = fetch_value_page(manager().await, state("big:str", RedisType::String))
+            .await
+            .unwrap();
+        let KeyValue::String { value, total_len } = &loaded.value else {
+            panic!()
+        };
+        assert_eq!((value.len(), *total_len), (64 * 1024, 5_000_000));
+        assert!(loaded.value.is_truncated());
+
+        let (_, loaded) = fetch_value_page(manager().await, state("str:utf8", RedisType::String))
+            .await
+            .unwrap();
+        let KeyValue::String { value, total_len } = &loaded.value else {
+            panic!()
+        };
+        assert_eq!(*total_len, 90_000);
+        assert_eq!(value.len(), 64 * 1024 - 1, "split 'é' dropped");
+        assert!(!value.contains('\u{FFFD}'));
+    }
 }

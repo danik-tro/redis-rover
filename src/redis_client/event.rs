@@ -1,12 +1,11 @@
-use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec, RedisType};
+use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec};
 
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
     FetchKeys,
-    FetchValue {
-        key: String,
-        r_type: RedisType,
-    },
+    /// Fetch the page of the selected value described by
+    /// `SharedState::value_state`.
+    FetchValue,
     SetString {
         key: String,
         value: String,
