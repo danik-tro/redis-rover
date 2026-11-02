@@ -41,9 +41,12 @@ async fn tokio_main(args: Cli) -> Result<()> {
 
     let state = SharedState::default();
 
-    let conn_info = args.connection_info()?;
-    let target = cli::connection_label(&conn_info);
-    let client = redis::Client::open(conn_info).map_err(|e| color_eyre::eyre::eyre!(e))?;
+    // rustls needs a process-wide crypto provider. This errors only if one is
+    // already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let client = args.client()?;
+    let target = cli::connection_label(client.get_connection_info());
     let manager: ConnectionManager = ConnectionManager::new(client)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;

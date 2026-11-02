@@ -36,7 +36,42 @@ cargo install redis-rover
 rrover
 ```
 
-Connects to Redis at `localhost:6379` by default.
+Connects to Redis at `localhost:6379` by default. Use `-u/--url` to pick a server and `--token` to type a password without it showing up in your shell history.
+
+### TLS
+
+Use a `rediss://` URL to connect over TLS. Server certificates are checked against the bundled Mozilla root certificates, so most managed services need no extra flags.
+
+```bash
+# Public CA (ElastiCache, Upstash, Azure, ...)
+rrover -u rediss://my-cache.example.com:6379 --token
+
+# Private CA
+rrover -u rediss://redis.internal:6379 --tls-ca ca.pem
+
+# Mutual TLS (client certificate)
+rrover -u rediss://redis.internal:6379 --tls-ca ca.pem --tls-cert client.crt --tls-key client.key
+
+# Skip certificate checks (local or dev servers only)
+rrover -u rediss://localhost:6379 --insecure
+```
+
+| Flag | Meaning |
+|---|---|
+| `--tls-ca <PATH>` | PEM CA bundle used to verify the server. Replaces the bundled root certificates. |
+| `--tls-cert <PATH>` / `--tls-key <PATH>` | PEM client certificate and private key for mutual TLS. Must be given together. |
+| `--insecure` | Do not verify the server certificate. Cannot be combined with `--tls-ca`. |
+
+The TLS flags only work with `rediss://` URLs.
+
+| Provider | URL | Extra flags |
+|---|---|---|
+| AWS ElastiCache / MemoryDB (in-transit encryption) | `rediss://<endpoint>:6379` with `--token`, or `rediss://<user>:<password>@<endpoint>:6379` for ACL users | none |
+| Upstash | `rediss://default:<password>@<name>.upstash.io:6379` | none |
+| Azure Cache for Redis | `rediss://:<access-key>@<name>.redis.cache.windows.net:6380` | none |
+| Redis Cloud | `rediss://default:<password>@<host>:<port>` | `--tls-ca redis_ca.pem`, and `--tls-cert`/`--tls-key` if mutual TLS is on |
+| GCP Memorystore | `rediss://<ip>:6378` | `--tls-ca server-ca.pem` |
+| Self-hosted with a self-signed certificate | `rediss://<host>:<port>` | `--tls-ca ca.pem` |
 
 ---
 

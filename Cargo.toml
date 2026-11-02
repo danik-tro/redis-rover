@@ -42,7 +42,17 @@ tracing = "0.1.40"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "serde"] }
 
-redis = { version = "1.2.1", default-features = false, features = ["aio", "tokio-comp", "connection-manager"]}
+redis = { version = "1.6", default-features = false, features = [
+    "aio",
+    "tokio-comp",
+    "connection-manager",
+    "tokio-rustls-comp",
+    "tls-rustls",
+    "tls-rustls-webpki-roots",
+    "tls-rustls-insecure",
+]}
+# redis pulls rustls without a crypto backend; pick `ring` here so TLS works.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 byte-unit = { version = "5.2.0", features = ["serde", "byte"], default-features = false}
 tui-textarea = "0.6.1"
 rpassword = "7.5.2"
