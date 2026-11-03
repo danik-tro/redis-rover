@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 use byte_unit::{Byte, UnitType};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -13,6 +16,7 @@ use ratatui::{
     },
 };
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     config,
@@ -2596,6 +2600,28 @@ fn format_bytes_u128(n: u128) -> String {
     format!("{byte:.2}")
 }
 
+/// Cuts `s` to `max` display columns, ending in `…` when it was longer.
+fn truncate_to_width(s: &str, max: usize) -> Cow<'_, str> {
+    if s.width() <= max {
+        return Cow::Borrowed(s);
+    }
+    let Some(budget) = max.checked_sub(1) else {
+        return Cow::Borrowed("");
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    Cow::Owned(out)
+}
+
 /// Width of the type column: fits the longest label (`json`, `hash`, …).
 #[allow(clippy::cast_possible_truncation)]
 const TYPE_COLUMN_WIDTH: u16 = TYPE_BADGE_WIDTH as u16;
@@ -2761,17 +2787,36 @@ impl StatefulWidget for KeySpaceWidget {
         .fg(cfg.colors.base03)
         .bold();
 
-        let rows = state.keys.iter().map(|meta| {
+        // The Key column is `Fill`: measure it the way the table will, so long
+        // names can end in `…` instead of being clipped silently.
+        let highlight_width = u16::try_from(highlight_symbol().width()).unwrap_or(u16::MAX);
+        let key_width = usize::from(
+            Layout::horizontal(widths).spacing(1).split(Rect {
+                width: table_area.width.saturating_sub(highlight_width),
+                ..table_area
+            })[1]
+                .width,
+        );
+
+        // Cell fg beats the row highlight, so the selected row needs a
+        // brighter "dim" or `∞` / `—` / size vanish into its background.
+        let selected = state.table.selected();
+        let rows = state.keys.iter().enumerate().map(|(i, meta)| {
             let badge: ratatui::text::Text = (&meta.r_type).into();
+            let dim = if selected == Some(i) {
+                cfg.colors.base05
+            } else {
+                cfg.colors.base03
+            };
             // Keys with a real expiry stand out; `∞` / `—` stay dim.
             let ttl_color = if meta.ttl >= 0 {
                 cfg.colors.base0b
             } else {
-                cfg.colors.base03
+                dim
             };
             Row::new([
                 Cell::from(badge),
-                Cell::from(meta.key.as_str()).fg(cfg.colors.base05),
+                Cell::from(truncate_to_width(&meta.key, key_width)).fg(cfg.colors.base05),
                 Cell::from(Line::from(format_ttl(meta.ttl)).right_aligned()).fg(ttl_color),
                 Cell::from(
                     Line::from(format!(
@@ -2782,7 +2827,7 @@ impl StatefulWidget for KeySpaceWidget {
                     ))
                     .right_aligned(),
                 )
-                .fg(cfg.colors.base03),
+                .fg(dim),
             ])
         });
         let table: Table<'_> = Table::new(rows, widths)
@@ -3332,5 +3377,81 @@ mod tests {
         keyspace.cluster_mode = true;
         render_text(&mut keyspace);
         assert_eq!(keyspace.visible_rows(), 13);
+    }
+
+    #[test]
+    fn truncate_to_width_marks_cut_names() {
+        use super::truncate_to_width;
+        use std::borrow::Cow;
+        use unicode_width::UnicodeWidthStr;
+
+        assert!(matches!(
+            truncate_to_width("short", 10),
+            Cow::Borrowed("short")
+        ));
+        assert_eq!(truncate_to_width("exact", 5), "exact");
+        assert_eq!(
+            truncate_to_width("app:config:feature_flags", 18),
+            "app:config:featur…"
+        );
+        // Wide chars: count columns, not bytes or chars.
+        let cut = truncate_to_width("キーキーキー", 6);
+        assert_eq!(cut, "キー…");
+        assert!(cut.width() <= 6);
+        assert_eq!(truncate_to_width("キーキー", 4), "キ…");
+        assert_eq!(truncate_to_width("abc", 1), "…");
+        assert_eq!(truncate_to_width("abc", 0), "");
+    }
+
+    /// One key per row; the first is selected.
+    fn keys_pane(keys: &[(&str, isize)]) -> (KeySpace, Buffer) {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.set_keys(
+            keys.iter()
+                .map(|&(key, ttl)| KeyMeta {
+                    key: key.into(),
+                    r_type: RedisType::String,
+                    size: 148,
+                    ttl,
+                    value: KeyValue::Unknown,
+                })
+                .collect(),
+        );
+        keyspace.table.select(Some(0));
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        StatefulWidget::render(super::KeySpaceWidget, area, &mut buf, &mut keyspace);
+        (keyspace, buf)
+    }
+
+    /// Text of the Keys pane (left 35%) on row `y`.
+    fn keys_pane_row(buf: &Buffer, y: u16) -> String {
+        (0..42).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn long_key_names_end_in_ellipsis() {
+        let long = "app:config:feature_flags:with:a:very:long:suffix";
+        let (_, buf) = keys_pane(&[(long, -1)]);
+        let rows: Vec<String> = (0..20).map(|y| keys_pane_row(&buf, y)).collect();
+        let row = rows
+            .iter()
+            .find(|r| r.contains("app:"))
+            .expect("key row rendered");
+        assert!(row.contains('…'), "no ellipsis in {row:?}");
+        assert!(!row.contains(long));
+    }
+
+    #[test]
+    fn selected_row_dim_cells_stay_readable() {
+        let cfg = crate::config::get();
+        let (_, buf) = keys_pane(&[("user:1043", super::TTL_NO_EXPIRY), ("user:1044", -1)]);
+        let infinity_fgs: Vec<_> = (0..20)
+            .flat_map(|y| (0..42).map(move |x| (x, y)))
+            .filter(|&pos| buf[pos].symbol() == "∞")
+            .map(|pos| buf[pos].fg)
+            .collect();
+        // First row is selected (readable), second is not (dim).
+        assert_eq!(infinity_fgs, vec![cfg.colors.base05, cfg.colors.base03]);
     }
 }

@@ -2494,6 +2494,7 @@ dependencies = [
  "tracing-error",
  "tracing-subscriber",
  "tui-textarea",
+ "unicode-width 0.2.2",
  "vergen",
 ]
 

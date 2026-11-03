@@ -69,6 +69,7 @@ tui-textarea = "0.6.1"
 rpassword = "7.5.2"
 arboard = { version = "3.7.0", default-features = false }
 base64 = "0.22"
+unicode-width = "0.2"
 
 [build-dependencies]
 vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]}
