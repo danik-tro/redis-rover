@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use byte_unit::{Byte, UnitType};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -15,8 +17,8 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     config,
     redis_client::types::{
-        ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
-        RedisType, STRING_PREVIEW_BYTES, TYPE_BADGE_WIDTH,
+        zset_entry_json, ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState,
+        LoadedValue, NewKeySpec, RedisType, STRING_PREVIEW_BYTES, TYPE_BADGE_WIDTH,
     },
     utils::format_duration,
 };
@@ -77,6 +79,61 @@ enum KeySpacePopupMode {
     FilterPattern,
 }
 
+/// How long the filter text must stay unchanged before its matches are counted.
+const FILTER_COUNT_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Live match count shown under the filter input (#24).
+#[derive(Debug, Clone)]
+struct FilterPreview {
+    /// When the filter text last changed.
+    edited_at: Instant,
+    /// The pattern of the last count request, if any.
+    requested: Option<String>,
+    /// The last count received: pattern, count, sweep finished.
+    result: Option<(String, usize, bool)>,
+}
+
+impl FilterPreview {
+    fn new(now: Instant) -> Self {
+        Self {
+            edited_at: now,
+            requested: None,
+            result: None,
+        }
+    }
+
+    /// The pattern to count now, if any: the first one right away, later ones
+    /// once the text has been idle for [`FILTER_COUNT_DEBOUNCE`].
+    fn request(&mut self, text: &str, now: Instant) -> Option<String> {
+        if self.requested.as_deref() == Some(text) {
+            return None;
+        }
+        let idle = now.saturating_duration_since(self.edited_at) >= FILTER_COUNT_DEBOUNCE;
+        if self.requested.is_some() && !idle {
+            return None;
+        }
+        self.requested = Some(text.to_owned());
+        Some(text.to_owned())
+    }
+
+    /// Status line for `text`: the count if it's for this exact text, else
+    /// `counting…`.
+    fn status(&self, text: &str) -> String {
+        match &self.result {
+            Some((pattern, count, complete)) if pattern == text => {
+                let noun = if *count == 1 { "match" } else { "matches" };
+                let count = group_thousands(*count);
+                if *complete {
+                    format!("{count} {noun}")
+                } else {
+                    format!("≥ {count} {noun} (partial scan)")
+                }
+            }
+            _ => "counting…".to_owned(),
+        }
+    }
+}
+
 /// Redis `TTL` sentinel for a key that exists but has no expiry.
 const TTL_NO_EXPIRY: isize = -1;
 
@@ -107,11 +164,182 @@ enum KeySpaceMode {
 
 /// Which pane keyboard navigation drives. `Keys` is the default left-hand key
 /// list; `Value` is the detail-view table entered via `EnterValue` so `j`/`k`
-/// scroll a collection's rows.
+/// scroll a collection's rows; `Text` scrolls a STRING / JSON value's lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Keys,
     Value,
+    Text,
+}
+
+/// Scroll state of a STRING / JSON value in the detail view (#30). The
+/// limits are measured by the last render.
+#[derive(Debug, Clone, Copy)]
+struct TextView {
+    /// First shown row.
+    top: usize,
+    /// First shown column (only when `wrap` is off).
+    left: usize,
+    wrap: bool,
+    /// Rows the text area showed on the last render.
+    height: usize,
+    max_top: usize,
+    max_left: usize,
+}
+
+impl Default for TextView {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            left: 0,
+            wrap: true,
+            height: 0,
+            max_top: 0,
+            max_left: 0,
+        }
+    }
+}
+
+/// Columns one `←` / `→` press pans a text value.
+const TEXT_PAN_STEP: usize = 8;
+
+/// The selected STRING / JSON value as display lines, built once per load.
+struct TextCache {
+    lines: Vec<Line<'static>>,
+    /// The value is JSON (a `RedisJSON` document, or a STRING that parses).
+    json: bool,
+}
+
+impl TextCache {
+    /// Lines for a text value; `None` for collections / unsupported types.
+    fn build(value: &KeyValue) -> Option<Self> {
+        match value {
+            KeyValue::String { value: text, .. } => {
+                let parsed = if value.is_truncated() {
+                    None
+                } else {
+                    parse_json_text(text)
+                };
+                Some(match parsed {
+                    Some(json) => Self {
+                        lines: json_lines(&json),
+                        json: true,
+                    },
+                    None => Self {
+                        lines: plain_lines(text),
+                        json: false,
+                    },
+                })
+            }
+            KeyValue::Json(json) => Some(Self {
+                lines: json_lines(json),
+                json: true,
+            }),
+            KeyValue::List(_)
+            | KeyValue::Set(_)
+            | KeyValue::Hash(_)
+            | KeyValue::Zset(_)
+            | KeyValue::Unknown => None,
+        }
+    }
+}
+
+/// Parse a STRING value as JSON if it looks like an object or array.
+fn parse_json_text(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    serde_json::from_str(text).ok()
+}
+
+/// A plain STRING value, one display line per text line.
+fn plain_lines(text: &str) -> Vec<Line<'static>> {
+    let color = config::get().colors.base05;
+    let mut lines: Vec<Line<'static>> = text
+        .lines()
+        .map(|line| Line::from(line.to_owned()).fg(color))
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
+}
+
+/// Pretty-print `value` with 2-space indents and syntax colors.
+fn json_lines(value: &serde_json::Value) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    push_json(value, 0, Vec::new(), "", &mut out);
+    out
+}
+
+/// Append the lines of `value` at `depth`. `prefix` goes before the value on
+/// its first line (an object key), `comma` after it on its last line.
+fn push_json(
+    value: &serde_json::Value,
+    depth: usize,
+    prefix: Vec<Span<'static>>,
+    comma: &'static str,
+    out: &mut Vec<Line<'static>>,
+) {
+    use serde_json::Value;
+
+    let colors = &config::get().colors;
+    let punct = |text: &'static str| Span::from(text).fg(colors.base05);
+    let line = |spans: Vec<Span<'static>>| {
+        let mut all = vec![Span::raw("  ".repeat(depth))];
+        all.extend(spans);
+        Line::from(all)
+    };
+    let (open, close) = match value {
+        Value::Array(items) if !items.is_empty() => ("[", "]"),
+        Value::Object(map) if !map.is_empty() => ("{", "}"),
+        scalar => {
+            let mut spans = prefix;
+            spans.push(json_scalar(scalar));
+            spans.push(punct(comma));
+            out.push(line(spans));
+            return;
+        }
+    };
+
+    let mut first = prefix;
+    first.push(punct(open));
+    out.push(line(first));
+    match value {
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let comma = if i + 1 < items.len() { "," } else { "" };
+                push_json(item, depth + 1, Vec::new(), comma, out);
+            }
+        }
+        Value::Object(map) => {
+            for (i, (key, item)) in map.iter().enumerate() {
+                let comma = if i + 1 < map.len() { "," } else { "" };
+                let key = vec![
+                    Span::from(Value::String(key.clone()).to_string()).fg(colors.base0d),
+                    punct(": "),
+                ];
+                push_json(item, depth + 1, key, comma, out);
+            }
+        }
+        _ => {}
+    }
+    out.push(line(vec![punct(close), punct(comma)]));
+}
+
+/// One JSON scalar (or empty array / object), colored by kind.
+fn json_scalar(value: &serde_json::Value) -> Span<'static> {
+    use serde_json::Value;
+
+    let colors = &config::get().colors;
+    let color = match value {
+        Value::String(_) => colors.base0b,
+        Value::Number(_) => colors.base09,
+        Value::Bool(_) | Value::Null => colors.base0e,
+        Value::Array(_) | Value::Object(_) => colors.base05,
+    };
+    Span::from(value.to_string()).fg(color)
 }
 
 /// Result of a `j` / `k` move.
@@ -138,6 +366,12 @@ enum OverlayKind {
     EditValue,
     /// Enter a key-level TTL in seconds (text input).
     SetTtl,
+    /// Confirm copying a large value (#27): fetching it whole may be slow.
+    ConfirmYank {
+        key: String,
+        r_type: RedisType,
+        size: u128,
+    },
     /// A read-only notice (e.g. editing a non-STRING type is unsupported).
     Notice(String),
 }
@@ -394,7 +628,13 @@ pub struct KeySpace {
     page: PageInfo,
     mode: KeySpaceMode,
     text_area: Option<TextArea<'static>>,
+    /// Live match count for the open filter popup.
+    filter_preview: Option<FilterPreview>,
     selected_value: Option<LoadedValue>,
+    /// Display lines of the selected value when it's a STRING / JSON.
+    text_cache: Option<TextCache>,
+    /// Scroll state of that text.
+    text_view: TextView,
     /// A new page of the current value is being fetched; the old page stays on
     /// screen meanwhile.
     value_loading: bool,
@@ -406,7 +646,16 @@ pub struct KeySpace {
     /// Connected server runs in cluster mode: SCAN only sees this node, so a
     /// warning banner is shown above the table.
     pub cluster_mode: bool,
+    /// Key rows that fit in the table on the last render (0 before the first
+    /// render). The app sizes keyspace pages to it.
+    visible_rows: usize,
+    /// Short non-modal message (e.g. "Copied …") and when it expires
+    /// (`None` = until replaced).
+    toast: Option<(String, Option<Instant>)>,
 }
+
+/// How long a toast stays up.
+const TOAST_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Banner shown above the key table in cluster mode.
 const CLUSTER_BANNER: &str = "⚠ cluster: SCAN sees only this node";
@@ -422,7 +671,10 @@ impl KeySpace {
             value_table: TableState::default(),
             mode: KeySpaceMode::Normal,
             text_area: None,
+            filter_preview: None,
             selected_value: None,
+            text_cache: None,
+            text_view: TextView::default(),
             value_loading: false,
             focus: Focus::Keys,
             action_overlay: None,
@@ -430,7 +682,86 @@ impl KeySpace {
             add_item: None,
             edit_item: None,
             cluster_mode: false,
+            visible_rows: 0,
+            toast: None,
         }
+    }
+
+    /// Show a toast for [`TOAST_TIMEOUT`], or until replaced if `sticky`.
+    pub fn show_toast(&mut self, msg: impl Into<String>, sticky: bool) {
+        let expires = (!sticky).then(|| Instant::now() + TOAST_TIMEOUT);
+        self.toast = Some((msg.into(), expires));
+    }
+
+    /// Drop the toast once it has expired.
+    pub fn expire_toast(&mut self, now: Instant) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, expires)| expires.is_some_and(|at| now >= at))
+        {
+            self.toast = None;
+        }
+    }
+
+    /// Size (`MEMORY USAGE`) of the selected key, if any.
+    pub fn selected_size(&self) -> Option<u128> {
+        let meta = self.keys.get(self.table.selected()?)?;
+        Some(meta.size)
+    }
+
+    /// Text to copy for the selected collection element (#27), when focus is
+    /// inside a collection: the LIST item / SET member, the HASH field's
+    /// value, or a ZSET `{"rank","member","score"}` JSON object.
+    pub fn selected_element_text(&self) -> Option<String> {
+        let row = self.value_table.selected()?;
+        let start = self.selected_value.as_ref()?.page.start;
+        Some(match self.selected_element()? {
+            SelectedElement::ListIndex { value, .. } | SelectedElement::HashField { value, .. } => {
+                value
+            }
+            SelectedElement::SetMember(member) => member,
+            SelectedElement::ZsetMember { member, score } => {
+                zset_entry_json(start + row, &member, score)
+            }
+        })
+    }
+
+    /// Text to copy for the selected key's loaded value, if it holds the whole
+    /// value: a STRING that isn't truncated, a JSON document, or a collection
+    /// that fits on one page. `None` means the value must be fetched whole.
+    pub fn loaded_value_text(&self) -> Option<String> {
+        let loaded = self.selected_value.as_ref()?;
+        let whole = match &loaded.value {
+            KeyValue::String { .. } => !loaded.value.is_truncated(),
+            KeyValue::Json(_) => true,
+            KeyValue::List(_) | KeyValue::Set(_) | KeyValue::Hash(_) | KeyValue::Zset(_) => {
+                !loaded.page.is_paged()
+            }
+            KeyValue::Unknown => false,
+        };
+        if !whole {
+            return None;
+        }
+        loaded.value.to_clipboard_text()
+    }
+
+    /// Ask before copying `key`, whose value is `size` bytes.
+    pub fn open_yank_confirm(&mut self, key: String, r_type: RedisType, size: u128) {
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::ConfirmYank { key, r_type, size },
+            text_area: None,
+        });
+    }
+
+    /// Key rows that fit in the table, as measured by the last render.
+    pub fn visible_rows(&self) -> usize {
+        self.visible_rows
+    }
+
+    /// Row of the selected key within the current page.
+    pub fn selected_row(&self) -> Option<usize> {
+        self.table.selected()
     }
 
     pub fn selected_key(&self) -> Option<(String, RedisType)> {
@@ -452,6 +783,12 @@ impl KeySpace {
     }
 
     pub fn set_selected_value(&mut self, value: Option<LoadedValue>) {
+        self.text_cache = value
+            .as_ref()
+            .and_then(|loaded| TextCache::build(&loaded.value));
+        if self.focus == Focus::Text && self.text_cache.is_none() {
+            self.focus = Focus::Keys;
+        }
         self.selected_value = value;
         self.value_loading = false;
         // A reloaded page may be shorter; keep the cursor on a real row.
@@ -481,6 +818,11 @@ impl KeySpace {
 
     pub fn clear_selected_value(&mut self) {
         self.selected_value = None;
+        self.text_cache = None;
+        self.text_view = TextView {
+            wrap: self.text_view.wrap,
+            ..TextView::default()
+        };
         self.value_loading = false;
         // The detail-view selection belongs to the previously selected key;
         // reset it (and drop value focus) so the new value starts fresh.
@@ -494,13 +836,39 @@ impl KeySpace {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if let Some(ref mut text_area) = self.text_area {
-            text_area.input(key);
+            if text_area.input(key) {
+                if let Some(preview) = self.filter_preview.as_mut() {
+                    preview.edited_at = Instant::now();
+                }
+            }
         }
     }
 
     pub fn enter_filter_pattern(&mut self) {
         self.mode = KeySpaceMode::Popup(KeySpacePopupMode::FilterPattern);
         self.text_area = Some(build_input_text_area("Pattern", "Enter pattern", None));
+        self.filter_preview = Some(FilterPreview::new(Instant::now()));
+    }
+
+    /// Current text of the filter input (empty when the popup is closed).
+    fn filter_text(&self) -> String {
+        self.text_area.as_ref().map(input_text).unwrap_or_default()
+    }
+
+    /// The pattern whose matches should be counted now, if any (debounced).
+    pub fn filter_count_request(&mut self, now: Instant) -> Option<String> {
+        if !self.is_popup() {
+            return None;
+        }
+        let text = self.filter_text();
+        self.filter_preview.as_mut()?.request(&text, now)
+    }
+
+    /// Store a match count from the runner. Ignored once the popup is closed.
+    pub fn set_filter_count(&mut self, pattern: String, count: usize, complete: bool) {
+        if let Some(preview) = self.filter_preview.as_mut() {
+            preview.result = Some((pattern, count, complete));
+        }
     }
 
     /// Close the filter popup and return the entered pattern. An empty input
@@ -518,6 +886,7 @@ impl KeySpace {
 
     pub fn exit_popup(&mut self) {
         self.mode = KeySpaceMode::Normal;
+        self.filter_preview = None;
     }
 
     pub fn refresh(&mut self) {
@@ -546,6 +915,10 @@ impl KeySpace {
                 ScrollOutcome::Moved
             }
             Focus::Value => self.scroll_value(true),
+            Focus::Text => {
+                self.scroll_text(true, 1);
+                ScrollOutcome::Moved
+            }
         }
     }
 
@@ -562,6 +935,10 @@ impl KeySpace {
                 ScrollOutcome::Moved
             }
             Focus::Value => self.scroll_value(false),
+            Focus::Text => {
+                self.scroll_text(false, 1);
+                ScrollOutcome::Moved
+            }
         }
     }
 
@@ -631,9 +1008,14 @@ impl KeySpace {
         self.value_row_count() > 0
     }
 
-    /// Drill focus into the value table so `j`/`k` scroll its rows. Only takes
-    /// effect for navigable collection values; scalar/empty values are ignored.
+    /// Drill focus into the value table so `j`/`k` scroll its rows, or into a
+    /// STRING / JSON value so they scroll its lines. Empty collections and
+    /// unsupported types are ignored.
     pub fn enter_value(&mut self) {
+        if self.text_cache.is_some() {
+            self.focus = Focus::Text;
+            return;
+        }
         if !self.value_is_navigable() {
             return;
         }
@@ -649,6 +1031,47 @@ impl KeySpace {
 
     pub fn is_value_focused(&self) -> bool {
         self.focus == Focus::Value
+    }
+
+    /// Focus is on a STRING / JSON value (`j`/`k` scroll its lines).
+    pub fn is_text_focused(&self) -> bool {
+        self.focus == Focus::Text
+    }
+
+    /// Scroll the focused text value `step` rows down (or up).
+    pub fn scroll_text(&mut self, down: bool, step: usize) {
+        let view = &mut self.text_view;
+        view.top = if down {
+            (view.top + step).min(view.max_top)
+        } else {
+            view.top.saturating_sub(step)
+        };
+    }
+
+    /// Scroll the focused text value by one screen.
+    pub fn scroll_text_page(&mut self, down: bool) {
+        let step = self.text_view.height.saturating_sub(1).max(1);
+        self.scroll_text(down, step);
+    }
+
+    /// Pan the focused text value sideways. Only with wrap off.
+    pub fn pan_text(&mut self, right: bool) {
+        let view = &mut self.text_view;
+        if view.wrap || !self.focus.eq(&Focus::Text) {
+            return;
+        }
+        view.left = if right {
+            (view.left + TEXT_PAN_STEP).min(view.max_left)
+        } else {
+            view.left.saturating_sub(TEXT_PAN_STEP)
+        };
+    }
+
+    /// Turn line wrapping of text values on / off.
+    pub fn toggle_wrap(&mut self) {
+        self.text_view.wrap = !self.text_view.wrap;
+        self.text_view.top = 0;
+        self.text_view.left = 0;
     }
 
     /// The currently selected row within the value table, if value-focused.
@@ -833,6 +1256,9 @@ impl KeySpace {
                 // Empty or unparsable / non-positive ⇒ clear the TTL (persist).
                 let secs = raw.trim().parse::<i64>().unwrap_or(0);
                 Some(OverlayRequest::SetTtl(secs))
+            }
+            OverlayKind::ConfirmYank { key, r_type, .. } => {
+                Some(OverlayRequest::Yank { key, r_type })
             }
             OverlayKind::Notice(_) => None,
         }
@@ -1292,6 +1718,11 @@ impl KeySpace {
 
 /// A confirmed action overlay, ready for `App` to translate into a `RedisEvent`.
 pub enum OverlayRequest {
+    /// Copy the whole value of `key` (a read, allowed in read-only mode).
+    Yank {
+        key: String,
+        r_type: RedisType,
+    },
     Delete,
     DeleteItem(ItemDelete),
     SetString(String),
@@ -1401,6 +1832,24 @@ impl KeySpaceWidget {
         if let Some(ref text_area) = state.text_area {
             text_area.render(popup_area, buf);
         }
+
+        // Live match count on the popup's bottom border.
+        if let Some(preview) = state.filter_preview.as_ref() {
+            if popup_area.height >= 3 && popup_area.width > 4 {
+                let status = Rect {
+                    x: popup_area.x + 2,
+                    y: popup_area.bottom() - 1,
+                    width: popup_area.width - 4,
+                    height: 1,
+                };
+                Paragraph::new(
+                    Line::from(format!(" {} ", preview.status(&state.filter_text())))
+                        .fg(config::get().colors.base0b),
+                )
+                .alignment(Alignment::Right)
+                .render(status, buf);
+            }
+        }
     }
 
     /// Render the active action overlay (delete-confirm, edit, TTL input, or a
@@ -1438,7 +1887,19 @@ impl KeySpaceWidget {
         }
 
         let delete_item_body;
+        let yank_body;
         let (title, body, hint): (&str, &str, &str) = match &overlay.kind {
+            OverlayKind::ConfirmYank { key, size, .. } => {
+                yank_body = format!(
+                    "{key} is ~{} (estimate). Copy it anyway?",
+                    format_bytes_u128(*size)
+                );
+                (
+                    " Copy large value ",
+                    yank_body.as_str(),
+                    "Enter: copy   Esc: cancel",
+                )
+            }
             OverlayKind::ConfirmDelete => (
                 " Delete key ",
                 "Delete the selected key?",
@@ -1476,6 +1937,35 @@ impl KeySpaceWidget {
             .wrap(Wrap { trim: true })
             .block(block)
             .render(popup_area, buf);
+    }
+
+    /// A one-line boxed message at the bottom-right of `area`.
+    fn render_toast(msg: &str, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let text_width = u16::try_from(Line::from(msg).width()).unwrap_or(u16::MAX);
+        let width = text_width
+            .saturating_add(4)
+            .min(area.width.saturating_sub(2));
+        if width < 5 || area.height < 5 {
+            return;
+        }
+        let toast = Rect {
+            x: area.right() - width - 1,
+            y: area.bottom() - 4,
+            width,
+            height: 3,
+        };
+        Clear.render(toast, buf);
+        Paragraph::new(Line::from(msg).fg(cfg.colors.base05))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(cfg.colors.base0b)
+                    .bg(cfg.colors.base00)
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
+            )
+            .render(toast, buf);
     }
 
     /// Center a popup of `height` rows in `area`, returning the inner Rect (after
@@ -1823,6 +2313,19 @@ impl KeySpaceWidget {
             return;
         };
 
+        if let Some(cache) = state.text_cache.as_ref() {
+            let footer = value_footer(loaded, state.value_loading);
+            Self::render_text_value(
+                cache,
+                footer,
+                state.focus == Focus::Text,
+                view_area,
+                buf,
+                &mut state.text_view,
+            );
+            return;
+        }
+
         let view_area = match value_footer(loaded, state.value_loading) {
             Some(footer) => {
                 let [value_area, footer_area] =
@@ -1838,17 +2341,82 @@ impl KeySpaceWidget {
         Self::render_value(&loaded.value, view_area, buf, &mut state.value_table);
     }
 
+    /// A STRING / JSON value: a header, the scrollable text, and a footer
+    /// with the shown line range, truncation note (`note`) and key hints.
+    fn render_text_value(
+        cache: &TextCache,
+        note: Option<String>,
+        focused: bool,
+        area: Rect,
+        buf: &mut Buffer,
+        view: &mut TextView,
+    ) {
+        let cfg = config::get();
+        let [header_area, body_area, footer_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
+        let header = if cache.json { "Value · JSON" } else { "Value" };
+        Paragraph::new(Line::from(header).fg(cfg.colors.base03).bold()).render(header_area, buf);
+
+        let height = usize::from(body_area.height);
+        let width = usize::from(body_area.width);
+        let paragraph = if view.wrap {
+            Paragraph::new(cache.lines.clone()).wrap(Wrap { trim: false })
+        } else {
+            Paragraph::new(cache.lines.clone())
+        };
+        let total = if view.wrap {
+            paragraph.line_count(body_area.width)
+        } else {
+            cache.lines.len()
+        };
+        view.height = height;
+        view.max_top = total.saturating_sub(height);
+        view.max_left = if view.wrap {
+            0
+        } else {
+            cache
+                .lines
+                .iter()
+                .map(Line::width)
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(width)
+        };
+        view.top = view.top.min(view.max_top);
+        view.left = view.left.min(view.max_left);
+
+        let to_u16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+        if view.wrap {
+            paragraph
+                .scroll((to_u16(view.top), 0))
+                .render(body_area, buf);
+        } else {
+            // Slice the rows first: `scroll` takes a `u16` offset.
+            let rows: Vec<Line<'static>> = cache
+                .lines
+                .iter()
+                .skip(view.top)
+                .take(height)
+                .cloned()
+                .collect();
+            Paragraph::new(rows)
+                .scroll((0, to_u16(view.left)))
+                .render(body_area, buf);
+        }
+
+        let footer = text_footer(note, view, total, focused);
+        Paragraph::new(Line::from(footer).fg(cfg.colors.base03))
+            .alignment(Alignment::Right)
+            .render(footer_area, buf);
+    }
+
     fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, table_state: &mut TableState) {
         match value {
-            KeyValue::String { value: s, .. } => {
-                let cfg = config::get();
-                Paragraph::new(vec![
-                    Line::from("Value").fg(cfg.colors.base03).bold(),
-                    Line::from(s.as_str()).fg(cfg.colors.base05),
-                ])
-                .wrap(Wrap { trim: false })
-                .render(area, buf);
-            }
             KeyValue::List(items) => {
                 Self::render_single_column_table("Item", items, area, buf, table_state);
             }
@@ -1869,11 +2437,14 @@ impl KeySpaceWidget {
                     .collect();
                 Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
             }
-            KeyValue::Json(_) | KeyValue::Unknown => Self::render_placeholder(
-                vec![Line::from("Viewer for this type isn't supported yet")],
-                area,
-                buf,
-            ),
+            // STRING / JSON go through `render_text_value`.
+            KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => {
+                Self::render_placeholder(
+                    vec![Line::from("Viewer for this type isn't supported yet")],
+                    area,
+                    buf,
+                );
+            }
         }
     }
 
@@ -1977,6 +2548,29 @@ fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String> {
     Some(footer)
 }
 
+/// Footer under a text value: truncation note, the shown line range, and the
+/// keys that work (`Enter to scroll` when there's more than fits).
+fn text_footer(note: Option<String>, view: &TextView, total: usize, focused: bool) -> String {
+    let mut parts: Vec<String> = note.into_iter().collect();
+    if total > view.height {
+        let last = (view.top + view.height).min(total);
+        parts.push(format!(
+            "lines {}–{} of {}",
+            group_thousands(view.top + 1),
+            group_thousands(last),
+            group_thousands(total)
+        ));
+    }
+    if focused {
+        let pan = if view.wrap { "" } else { " · ←/→ pan" };
+        let wrap = if view.wrap { "w no-wrap" } else { "w wrap" };
+        parts.push(format!("j/k scroll · n/p page{pan} · {wrap}"));
+    } else if total > view.height || view.max_left > 0 {
+        parts.push("Enter to scroll".to_owned());
+    }
+    parts.join(" · ")
+}
+
 /// `1234567` → `1,234,567`.
 fn group_thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -1991,9 +2585,14 @@ fn group_thousands(n: usize) -> String {
 }
 
 /// Human byte size, matching the Size field (`64.00 KiB`).
-fn format_bytes(n: usize) -> String {
-    let byte =
-        Byte::from_u64(u64::try_from(n).unwrap_or(u64::MAX)).get_appropriate_unit(UnitType::Binary);
+pub fn format_bytes(n: usize) -> String {
+    format_bytes_u128(u128::try_from(n).unwrap_or(u128::MAX))
+}
+
+fn format_bytes_u128(n: u128) -> String {
+    let byte = Byte::from_u128(n)
+        .unwrap_or_default()
+        .get_appropriate_unit(UnitType::Binary);
     format!("{byte:.2}")
 }
 
@@ -2050,7 +2649,7 @@ impl StatefulWidget for KeySpaceWidget {
 
         // Highlight whichever pane currently has keyboard focus so it's obvious
         // where `j`/`k` will move after `EnterValue`.
-        let value_focused = state.is_value_focused();
+        let value_focused = state.focus != Focus::Keys;
         let focused = Style::new().fg(cfg.colors.base0d);
         let unfocused = Style::new().fg(cfg.colors.base02);
         let (keys_border, values_border) = if value_focused {
@@ -2143,6 +2742,8 @@ impl StatefulWidget for KeySpaceWidget {
                 .render(banner_area, buf);
         }
         render_rule(rule_area, buf);
+        // Header + the rule row under it take two lines.
+        state.visible_rows = usize::from(table_area.height.saturating_sub(2)).max(1);
 
         let widths = [
             Constraint::Length(TYPE_COLUMN_WIDTH),
@@ -2219,6 +2820,10 @@ impl StatefulWidget for KeySpaceWidget {
         if state.is_edit_item_active() {
             Self::render_edit_item_overlay(state, area, buf);
         }
+
+        if let Some((msg, _)) = state.toast.as_ref() {
+            Self::render_toast(msg, area, buf);
+        }
     }
 }
 
@@ -2228,7 +2833,7 @@ mod tests {
         build_input_text_area, format_ttl, format_ttl_detail, group_thousands, value_footer,
         KeySpace, PageInfo, ScrollOutcome, SelectedElement,
     };
-    use crate::redis_client::types::{KeyValue, LoadedValue, ValuePageInfo};
+    use crate::redis_client::types::{KeyMeta, KeyValue, LoadedValue, RedisType, ValuePageInfo};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
 
     fn render_text(keyspace: &mut KeySpace) -> String {
@@ -2451,5 +3056,281 @@ mod tests {
             Some("foo*"),
         ));
         assert_eq!(keyspace.confirm_filter_pattern(), Some("foo*".to_owned()));
+    }
+
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn string_value(text: &str) -> LoadedValue {
+        LoadedValue {
+            value: KeyValue::String {
+                value: text.into(),
+                total_len: text.len(),
+            },
+            page: ValuePageInfo::default(),
+        }
+    }
+
+    /// A keyspace with one selected key whose loaded value is `value`.
+    fn with_value(r_type: RedisType, value: LoadedValue) -> KeySpace {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.set_keys(vec![KeyMeta {
+            key: "k".into(),
+            r_type,
+            size: 0,
+            ttl: -1,
+            value: KeyValue::Unknown,
+        }]);
+        keyspace.table.select(Some(0));
+        keyspace.set_selected_value(Some(value));
+        keyspace
+    }
+
+    #[test]
+    fn json_is_pretty_printed_in_order() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"z":1,"b":[true,null],"c":{},"s":"x\"y"}"#).unwrap();
+        let lines: Vec<String> = super::json_lines(&value).iter().map(line_text).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "{",
+                "  \"z\": 1,",
+                "  \"b\": [",
+                "    true,",
+                "    null",
+                "  ],",
+                "  \"c\": {},",
+                "  \"s\": \"x\\\"y\"",
+                "}",
+            ]
+        );
+    }
+
+    #[test]
+    fn string_json_detection() {
+        assert!(super::parse_json_text("  {\"a\": 1}").is_some());
+        assert!(super::parse_json_text("[1, 2]").is_some());
+        assert!(
+            super::parse_json_text("42").is_none(),
+            "only objects / arrays"
+        );
+        assert!(super::parse_json_text("{not json").is_none());
+
+        let json = super::TextCache::build(&string_value("{\"a\":1}").value).unwrap();
+        assert!(json.json);
+        assert_eq!(json.lines.len(), 3);
+
+        let truncated = KeyValue::String {
+            value: "{\"a\":1}".into(),
+            total_len: 100,
+        };
+        assert!(!super::TextCache::build(&truncated).unwrap().json);
+
+        let plain = super::TextCache::build(&string_value("a\nb").value).unwrap();
+        assert!(!plain.json);
+        assert_eq!(plain.lines.len(), 2);
+        assert!(super::TextCache::build(&KeyValue::List(Vec::new())).is_none());
+    }
+
+    #[test]
+    fn text_value_scrolls_and_clamps() {
+        let text = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut keyspace = with_value(RedisType::String, string_value(&text));
+        keyspace.enter_value();
+        assert!(keyspace.is_text_focused());
+        assert!(!keyspace.is_value_focused());
+
+        let screen = render_text(&mut keyspace);
+        assert!(screen.contains("line 0"));
+        assert!(screen.contains("of 100"));
+        assert!(screen.contains("j/k scroll"));
+
+        keyspace.scroll_next();
+        keyspace.scroll_text_page(true);
+        assert!(keyspace.text_view.top > 1);
+        for _ in 0..50 {
+            keyspace.scroll_text_page(true);
+        }
+        assert_eq!(keyspace.text_view.top, keyspace.text_view.max_top);
+        let screen = render_text(&mut keyspace);
+        assert!(screen.contains("line 99"));
+
+        keyspace.scroll_text(false, usize::MAX);
+        assert_eq!(keyspace.text_view.top, 0);
+    }
+
+    #[test]
+    fn text_value_pans_only_without_wrap() {
+        let long = "x".repeat(500);
+        let mut keyspace = with_value(RedisType::String, string_value(&long));
+        keyspace.enter_value();
+        render_text(&mut keyspace);
+        keyspace.pan_text(true);
+        assert_eq!(keyspace.text_view.left, 0, "wrap on: no panning");
+
+        keyspace.toggle_wrap();
+        render_text(&mut keyspace);
+        keyspace.pan_text(true);
+        assert_eq!(keyspace.text_view.left, super::TEXT_PAN_STEP);
+        for _ in 0..100 {
+            keyspace.pan_text(true);
+        }
+        assert_eq!(keyspace.text_view.left, keyspace.text_view.max_left);
+        keyspace.pan_text(false);
+        assert!(keyspace.text_view.left < keyspace.text_view.max_left);
+    }
+
+    #[test]
+    fn redis_json_value_renders_pretty() {
+        let doc = serde_json::json!({ "name": "Ann", "tags": ["a"] });
+        let loaded = LoadedValue {
+            value: KeyValue::Json(doc),
+            page: ValuePageInfo::default(),
+        };
+        let mut keyspace = with_value(RedisType::Json, loaded);
+        let screen = render_text(&mut keyspace);
+        assert!(screen.contains("Value · JSON"));
+        assert!(screen.contains("\"name\": \"Ann\","));
+    }
+
+    #[test]
+    fn yank_text_for_elements() {
+        let zset = LoadedValue {
+            value: KeyValue::Zset(vec![("a".into(), 1.0), ("bob".into(), 12.5)]),
+            page: ValuePageInfo {
+                start: 100,
+                len: 2,
+                total: Some(300),
+                has_next: true,
+                has_prev: true,
+            },
+        };
+        let mut keyspace = focused(zset);
+        keyspace.value_table.select(Some(1));
+        assert_eq!(
+            keyspace.selected_element_text().as_deref(),
+            Some(r#"{"rank":101,"member":"bob","score":12.5}"#)
+        );
+        assert_eq!(keyspace.loaded_value_text(), None, "paged: fetch it whole");
+
+        let hash = LoadedValue {
+            value: KeyValue::Hash(vec![("name".into(), "Ann".into())]),
+            page: ValuePageInfo::default(),
+        };
+        let keyspace = focused(hash);
+        assert_eq!(keyspace.selected_element_text().as_deref(), Some("Ann"));
+        assert_eq!(
+            keyspace.loaded_value_text().as_deref(),
+            Some("{\n  \"name\": \"Ann\"\n}")
+        );
+
+        let keyspace = focused(list_page(3, 0, false, false));
+        assert_eq!(keyspace.selected_element_text().as_deref(), Some("v0"));
+    }
+
+    #[test]
+    fn truncated_string_is_not_yanked_from_preview() {
+        let loaded = LoadedValue {
+            value: KeyValue::String {
+                value: "abc".into(),
+                total_len: 10,
+            },
+            page: ValuePageInfo::default(),
+        };
+        let keyspace = with_value(RedisType::String, loaded);
+        assert_eq!(keyspace.loaded_value_text(), None);
+        let keyspace = with_value(RedisType::String, string_value("abc"));
+        assert_eq!(keyspace.loaded_value_text().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn toast_expires() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.show_toast("Copied", false);
+        assert!(render_text(&mut keyspace).contains("Copied"));
+        keyspace.expire_toast(std::time::Instant::now());
+        assert!(keyspace.toast.is_some());
+        keyspace.expire_toast(std::time::Instant::now() + super::TOAST_TIMEOUT);
+        assert!(keyspace.toast.is_none());
+
+        keyspace.show_toast("Copying…", true);
+        keyspace.expire_toast(std::time::Instant::now() + super::TOAST_TIMEOUT * 10);
+        assert!(keyspace.toast.is_some(), "sticky until replaced");
+    }
+
+    #[test]
+    fn filter_count_is_debounced() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut preview = super::FilterPreview::new(start);
+        assert_eq!(
+            preview.request("", start).as_deref(),
+            Some(""),
+            "first one right away"
+        );
+        assert_eq!(preview.request("", start), None, "same text: no repeat");
+
+        preview.edited_at = start;
+        assert_eq!(
+            preview.request("us", start + Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            preview
+                .request("us", start + super::FILTER_COUNT_DEBOUNCE)
+                .as_deref(),
+            Some("us")
+        );
+    }
+
+    #[test]
+    fn filter_count_status() {
+        let mut preview = super::FilterPreview::new(std::time::Instant::now());
+        assert_eq!(preview.status("user:*"), "counting…");
+        preview.result = Some(("user:*".into(), 1234, true));
+        assert_eq!(preview.status("user:*"), "1,234 matches");
+        assert_eq!(
+            preview.status("user:1*"),
+            "counting…",
+            "stale result hidden"
+        );
+        preview.result = Some(("a".into(), 1, true));
+        assert_eq!(preview.status("a"), "1 match");
+        preview.result = Some(("a".into(), 5000, false));
+        assert_eq!(preview.status("a"), "≥ 5,000 matches (partial scan)");
+    }
+
+    #[test]
+    fn filter_popup_shows_count() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.enter_filter_pattern();
+        assert!(render_text(&mut keyspace).contains("counting…"));
+        keyspace.set_filter_count(String::new(), 42, true);
+        assert!(render_text(&mut keyspace).contains("42 matches"));
+        keyspace.exit_popup();
+        assert!(keyspace
+            .filter_count_request(std::time::Instant::now())
+            .is_none());
+    }
+
+    #[test]
+    fn visible_rows_follow_table_height() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        assert_eq!(keyspace.visible_rows(), 0);
+        render_text(&mut keyspace);
+        // 20 rows - 2 borders - filter - rule - header - header rule.
+        assert_eq!(keyspace.visible_rows(), 14);
+        keyspace.cluster_mode = true;
+        render_text(&mut keyspace);
+        assert_eq!(keyspace.visible_rows(), 13);
     }
 }

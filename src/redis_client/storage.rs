@@ -1,3 +1,8 @@
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+
 use redis::aio::ConnectionManager;
 use redis::{FromRedisValue, ScanOptions};
 
@@ -8,6 +13,10 @@ use super::{
         ValueState,
     },
 };
+
+/// `SCAN ... COUNT` hint for the match counter: bigger steps than browsing,
+/// since it walks the whole keyspace.
+const COUNT_SCAN_HINT: usize = 1000;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -46,6 +55,44 @@ impl Storage {
             .query_async(&mut manager)
             .await?;
         Ok(batch)
+    }
+
+    /// Count the keys matching `pattern` with a full `SCAN` sweep, stopping
+    /// early after `max_steps` steps or once `budget` has passed. Returns the
+    /// count and whether the sweep finished (if not, the count is a lower
+    /// bound). An empty or `*` pattern uses `DBSIZE`, which is exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SCAN` / `DBSIZE` fails.
+    pub async fn count_matches(
+        &self,
+        pattern: &str,
+        max_steps: usize,
+        budget: Duration,
+    ) -> Result<(usize, bool), Box<dyn std::error::Error + Sync + Send>> {
+        if pattern.is_empty() || pattern == "*" {
+            let mut manager = self.manager.clone();
+            let total: usize = redis::cmd("DBSIZE").query_async(&mut manager).await?;
+            return Ok((total, true));
+        }
+        let started = Instant::now();
+        let mut seen = HashSet::new();
+        let mut cursor = 0;
+        for _ in 0..max_steps {
+            let (next, batch) = self
+                .scan_batch(cursor, Some(pattern), COUNT_SCAN_HINT)
+                .await?;
+            seen.extend(batch);
+            if next == 0 {
+                return Ok((seen.len(), true));
+            }
+            cursor = next;
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        Ok((seen.len(), false))
     }
 
     /// Number of logical databases (`CONFIG GET databases`). `None` if the
@@ -130,6 +177,20 @@ impl Storage {
         state: ValueState,
     ) -> Result<(ValueState, LoadedValue), Box<dyn std::error::Error + Sync + Send>> {
         client::fetch_value_page(self.manager.clone(), state).await
+    }
+
+    /// Fetch a key's whole value for copying. Delegates to
+    /// [`client::fetch_full_value`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported types or if a Redis command fails.
+    pub async fn fetch_full_value(
+        &self,
+        key: &str,
+        r_type: &RedisType,
+    ) -> Result<KeyValue, Box<dyn std::error::Error + Sync + Send>> {
+        client::fetch_full_value(self.manager.clone(), key, r_type).await
     }
 
     /// Overwrite a STRING key. Delegates to [`client::set_string`].

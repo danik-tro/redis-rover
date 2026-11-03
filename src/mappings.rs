@@ -27,6 +27,11 @@ impl From<Command> for Action {
             Command::PrevChart => Self::PrevChart,
             Command::ToggleAllCharts => Self::ToggleAllCharts,
             Command::SelectDb => Self::OpenDbPicker,
+            Command::ScrollLeft => Self::ScrollLeft,
+            Command::ScrollRight => Self::ScrollRight,
+            Command::ToggleWrap => Self::ToggleWrap,
+            Command::YankValue => Self::YankValue,
+            Command::YankKey => Self::YankKey,
         }
     }
 }

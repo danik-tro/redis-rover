@@ -15,12 +15,17 @@ use super::{
     client,
     event::RedisEvent,
     storage::Storage,
-    types::{KeyMeta, KeyspaceState},
+    types::{KeyMeta, KeyspaceState, RedisType},
 };
 
 type FetchError = Box<dyn std::error::Error + Sync + Send>;
 
 const BROADCAST_CAPACITY: usize = 50;
+
+/// Most `SCAN` steps one filter match count may take (~200k keys at COUNT 1000).
+const COUNT_MAX_STEPS: usize = 200;
+/// Time budget for one filter match count.
+const COUNT_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a DB switch may take to open its new connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -217,6 +222,10 @@ pub struct EventHandler {
     /// `FetchValue` events all read the latest state, so after the first one the
     /// rest would refetch the same page.
     last_value_generation: Option<u64>,
+    /// The running filter match count, if any. A new request aborts it.
+    count_task: Option<JoinHandle<()>>,
+    /// The running full-value fetch for copying, if any. A new one aborts it.
+    yank_task: Option<JoinHandle<()>>,
 }
 
 impl EventHandler {
@@ -234,6 +243,8 @@ impl EventHandler {
             client,
             read_only,
             last_value_generation: None,
+            count_task: None,
+            yank_task: None,
         }
     }
 
@@ -259,6 +270,8 @@ impl EventHandler {
         }
         match event {
             RedisEvent::SelectDb(db) => self.select_db(db).await,
+            RedisEvent::CountMatches { pattern } => self.count_matches(pattern),
+            RedisEvent::FetchFullValue { key, r_type } => self.fetch_full_value(key, r_type),
             RedisEvent::SetString { key, value } => {
                 match self.storage.set_string(&key, &value).await {
                     Ok(()) => {
@@ -379,6 +392,10 @@ impl EventHandler {
     async fn select_db(&mut self, db: i64) {
         match self.connect_db(db).await {
             Ok(manager) => {
+                self.abort_count();
+                if let Some(task) = self.yank_task.take() {
+                    task.abort();
+                }
                 self.storage = Storage::new(manager);
                 *self.state.db.lock() = db;
                 self.state.keyspace_state.lock().reset_for_db();
@@ -394,6 +411,67 @@ impl EventHandler {
                 // Still on the old DB: put its keys back on screen.
                 self.action_hook(Action::LoadKeysIntoKeySpace);
             }
+        }
+    }
+
+    /// Start counting the keys that match `pattern` in a separate task, so the
+    /// event loop stays free. Replaces any count still running.
+    fn count_matches(&mut self, pattern: String) {
+        self.abort_count();
+        let storage = self.storage.clone();
+        let tx = self.tx.clone();
+        self.count_task = Some(tokio::spawn(async move {
+            match storage
+                .count_matches(&pattern, COUNT_MAX_STEPS, COUNT_BUDGET)
+                .await
+            {
+                Ok((count, complete)) => crate::action::try_send_action(
+                    &tx,
+                    Action::FilterMatchCount {
+                        pattern,
+                        count,
+                        complete,
+                    },
+                ),
+                // A preview only: log it rather than open an error popup.
+                Err(err) => log::warn!("Counting matches for {pattern:?} failed: {err}"),
+            }
+        }));
+    }
+
+    /// Fetch `key`'s whole value in a separate task and leave its clipboard
+    /// text in `SharedState::yank`, then send `YankReady` (or `YankFailed`).
+    fn fetch_full_value(&mut self, key: String, r_type: RedisType) {
+        if let Some(task) = self.yank_task.take() {
+            task.abort();
+        }
+        let storage = self.storage.clone();
+        let tx = self.tx.clone();
+        let slot = self.state.yank.clone();
+        self.yank_task = Some(tokio::spawn(async move {
+            let action = match storage.fetch_full_value(&key, &r_type).await {
+                Ok(value) => match value.to_clipboard_text() {
+                    Some(text) => {
+                        *slot.lock() = Some((key, text));
+                        Action::YankReady
+                    }
+                    None => Action::YankFailed(format!(
+                        "Copying {} values isn't supported yet",
+                        r_type.name()
+                    )),
+                },
+                Err(err) => {
+                    log::error!("FetchFullValue failed for {key}: {err:?}");
+                    Action::YankFailed(format!("Failed to copy {key}: {err}"))
+                }
+            };
+            crate::action::try_send_action(&tx, action);
+        }));
+    }
+
+    fn abort_count(&mut self) {
+        if let Some(task) = self.count_task.take() {
+            task.abort();
         }
     }
 

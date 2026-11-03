@@ -20,6 +20,11 @@
       "i": "AddItem",
       "s": "SelectDb",
       "m": "ToggleDashboard",
+      "<Left>": "ScrollLeft",
+      "<Right>": "ScrollRight",
+      "w": "ToggleWrap",
+      "y": "YankValue",
+      "<Shift-y>": "YankKey",
       "?": "ToggleHelp",
     },
     "Dashboard": {

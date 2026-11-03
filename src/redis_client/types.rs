@@ -107,7 +107,7 @@ pub enum KeyValue {
     Set(Vec<String>),
     Hash(Vec<(String, String)>),
     Zset(Vec<(String, f64)>), // Tuple of value and score
-    #[allow(dead_code)]
+    /// A `RedisJSON` document (`JSON.GET`).
     Json(serde_json::Value),
     Unknown,
 }
@@ -357,6 +357,21 @@ impl KeyspaceState {
         true
     }
 
+    /// Change how many keys a page shows (the table was resized). Lands on the
+    /// page that holds key number `anchor` (0-based, in sweep order), so the
+    /// user's place stays on screen. The sweep is reused; only the page's
+    /// metadata must be fetched again (bumps `generation`). Returns `false`
+    /// (and changes nothing) when the size is unchanged or zero.
+    pub fn set_page_size(&mut self, page_size: usize, anchor: usize) -> bool {
+        if page_size == 0 || page_size == self.page_size {
+            return false;
+        }
+        self.page_size = page_size;
+        self.page = anchor / page_size;
+        self.generation += 1;
+        true
+    }
+
     /// Restart the sweep from scratch, keeping the current page, so writes
     /// (new / deleted keys) are picked up without jumping back to page 1.
     pub fn rescan(&mut self) {
@@ -438,6 +453,49 @@ impl KeyValue {
     pub fn is_truncated(&self) -> bool {
         matches!(self, Self::String { value, total_len } if value.len() < *total_len)
     }
+
+    /// Text to copy for the whole value (#27): a STRING as stored, anything
+    /// else as pretty JSON. LIST / SET → array, HASH → object (scan order),
+    /// ZSET → `[{"member", "score"}]` by rank. `None` for unsupported types.
+    pub fn to_clipboard_text(&self) -> Option<String> {
+        use serde_json::{Map, Value};
+
+        let json = match self {
+            Self::String { value, .. } => return Some(value.clone()),
+            Self::Json(value) => value.clone(),
+            Self::List(items) | Self::Set(items) => {
+                Value::Array(items.iter().cloned().map(Value::String).collect())
+            }
+            Self::Hash(entries) => Value::Object(
+                entries
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Value::String(value.clone())))
+                    .collect::<Map<_, _>>(),
+            ),
+            Self::Zset(entries) => Value::Array(
+                entries
+                    .iter()
+                    .map(|(member, score)| {
+                        serde_json::json!({ "member": member, "score": score_json(*score) })
+                    })
+                    .collect(),
+            ),
+            Self::Unknown => return None,
+        };
+        serde_json::to_string_pretty(&json).ok()
+    }
+}
+
+/// One ZSET element as copied from inside the collection (#27):
+/// `{"rank":3,"member":"bob","score":12.5}`. `rank` is 0-based, as `ZRANK`.
+pub fn zset_entry_json(rank: usize, member: &str, score: f64) -> String {
+    serde_json::json!({ "rank": rank, "member": member, "score": score_json(score) }).to_string()
+}
+
+/// A ZSET score as JSON. `inf` / `-inf` have no JSON number, so they stay text.
+fn score_json(score: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(score)
+        .map_or_else(|| serde_json::Value::String(score.to_string()), Into::into)
 }
 
 /// Default number of collection elements shown per value page.
@@ -858,6 +916,40 @@ mod tests {
     }
 
     #[test]
+    fn set_page_size_keeps_anchor_on_screen() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..100));
+        state.next_page();
+        state.next_page();
+        // Key 23 is on page 2 (20..30).
+        let generation = state.generation;
+
+        assert!(state.set_page_size(7, 23));
+        assert_eq!(state.page, 3);
+        assert!(state.page_range().contains(&23));
+        assert!(state.generation > generation);
+
+        let generation = state.generation;
+        assert!(!state.set_page_size(7, 23), "same size is a no-op");
+        assert!(!state.set_page_size(0, 23), "zero is ignored");
+        assert_eq!(state.generation, generation);
+
+        assert!(state.set_page_size(40, 23));
+        assert_eq!(state.page, 0);
+        assert_eq!(state.page_range(), 0..40);
+    }
+
+    #[test]
+    fn set_page_size_past_end_clamps_once_swept() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..15));
+        assert!(state.set_page_size(4, 14));
+        assert_eq!(state.page, 3);
+        state.clamp_page();
+        assert_eq!(state.page_range(), 12..15);
+    }
+
+    #[test]
     fn clamp_page_ignores_unfinished_sweep() {
         let mut state = state_with(10);
         state.page = 3;
@@ -986,6 +1078,46 @@ mod tests {
         assert_eq!(long.badge_label(), "MBblo…");
         assert_eq!(long.name(), "MBbloom--");
         assert!(long.badge_label().chars().count() <= TYPE_BADGE_WIDTH);
+    }
+
+    #[test]
+    fn clipboard_text_per_type() {
+        let string = KeyValue::String {
+            value: "{\"a\":1}".into(),
+            total_len: 7,
+        };
+        assert_eq!(string.to_clipboard_text().unwrap(), "{\"a\":1}");
+
+        let list = KeyValue::List(vec!["a".into(), "b".into()]);
+        assert_eq!(list.to_clipboard_text().unwrap(), "[\n  \"a\",\n  \"b\"\n]");
+
+        let hash = KeyValue::Hash(vec![("z".into(), "1".into()), ("a".into(), "2".into())]);
+        assert_eq!(
+            hash.to_clipboard_text().unwrap(),
+            "{\n  \"z\": \"1\",\n  \"a\": \"2\"\n}",
+            "fields keep scan order"
+        );
+
+        let zset = KeyValue::Zset(vec![("bob".into(), 12.5), ("eve".into(), f64::INFINITY)]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&zset.to_clipboard_text().unwrap()).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "member": "bob", "score": 12.5 },
+                { "member": "eve", "score": "inf" }
+            ])
+        );
+
+        assert!(KeyValue::Unknown.to_clipboard_text().is_none());
+    }
+
+    #[test]
+    fn zset_entry_has_rank_member_score() {
+        assert_eq!(
+            zset_entry_json(3, "bob", 12.5),
+            r#"{"rank":3,"member":"bob","score":12.5}"#
+        );
     }
 
     #[test]

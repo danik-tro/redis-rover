@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     action::{self, Action},
+    clipboard::{Clipboard, Via},
     command::Command,
     keybindings::KeyResolution,
     mode::Mode,
@@ -31,7 +32,9 @@ use crate::{
         dashboard::{Dashboard, DashboardWidget},
         db_picker::{DbPicker, DbPickerWidget},
         info::{build_hint, Info, InfoWidget},
-        keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome},
+        keyspace::{
+            format_bytes, KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome,
+        },
     },
 };
 
@@ -39,6 +42,8 @@ pub struct AppWidget;
 
 /// How long the `?` help overlay stays up before auto-dismissing.
 const HELP_TIMEOUT: Duration = Duration::from_secs(7);
+/// Values above this size (`MEMORY USAGE`) ask before being copied whole.
+const YANK_WARN_BYTES: u128 = 10 * 1024 * 1024;
 /// How long a partially typed key chord waits for its next key.
 const CHORD_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -89,6 +94,7 @@ pub struct App {
     db_picker: DbPicker,
     /// `--read-only`: refuse writes before any input is asked for.
     read_only: bool,
+    clipboard: Clipboard,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -111,6 +117,7 @@ const KEYSPACE_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::DeleteKey, "del"),
     (Command::SetTtl, "ttl"),
     (Command::EnterValue, "open"),
+    (Command::YankValue, "yank"),
     (Command::SetPattern, "filter"),
     (Command::SelectDb, "db"),
     (Command::ToggleHelp, "help"),
@@ -156,6 +163,11 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::EditValue, "Edit value / item (drill in first)"),
     (Command::DeleteKey, "Delete key / item (in value)"),
     (Command::SetTtl, "Set TTL"),
+    (Command::YankValue, "Copy value / item"),
+    (Command::YankKey, "Copy key name"),
+    (Command::ToggleWrap, "Wrap text value on / off"),
+    (Command::ScrollLeft, "Pan text left (wrap off)"),
+    (Command::ScrollRight, "Pan text right (wrap off)"),
     (Command::SelectDb, "Switch database"),
     (Command::ToggleDashboard, "Open metrics dashboard"),
     (Command::ClosePopup, "Close popup / overlay"),
@@ -210,6 +222,7 @@ impl App {
             redis_tx,
             db_picker: DbPicker::default(),
             read_only: false,
+            clipboard: Clipboard::default(),
         };
         app.sync_hint();
         app
@@ -449,10 +462,17 @@ impl App {
         }
         self.maybe_dismiss_help(action);
         match *action {
-            Action::Tick => self.expire_pending_chord(),
+            Action::Tick => {
+                self.expire_pending_chord();
+                self.request_filter_count();
+                self.keyspace.expire_toast(Instant::now());
+            }
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => Self::resize(tui, (w, h))?,
-            Action::Render => self.draw(tui)?,
+            Action::Render => {
+                self.draw(tui)?;
+                self.sync_page_size();
+            }
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
             Action::NextChart => self.dashboard.next_chart(),
@@ -475,6 +495,13 @@ impl App {
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
+            Action::ScrollLeft => self.keyspace.pan_text(false),
+            Action::ScrollRight => self.keyspace.pan_text(true),
+            Action::ToggleWrap => self.keyspace.toggle_wrap(),
+            Action::YankValue => self.yank_value(),
+            Action::YankKey => self.yank_key(),
+            Action::YankReady => self.finish_yank(),
+            Action::YankFailed(ref msg) => self.keyspace.show_toast(msg.clone(), false),
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
@@ -494,6 +521,13 @@ impl App {
             }
             Action::Help => self.toggle_help(),
             Action::Error(ref msg) => self.show_error_popup(msg),
+            Action::FilterMatchCount {
+                ref pattern,
+                count,
+                complete,
+            } => self
+                .keyspace
+                .set_filter_count(pattern.clone(), count, complete),
             Action::Refresh => {}
         }
 
@@ -809,6 +843,15 @@ impl App {
 
     fn enter_filter_popup(&mut self) {
         self.keyspace.enter_filter_pattern();
+        self.request_filter_count();
+    }
+
+    /// Ask the runner to count the filter popup's matches once its text has
+    /// settled (#24).
+    fn request_filter_count(&mut self) {
+        if let Some(pattern) = self.keyspace.filter_count_request(Instant::now()) {
+            self.send_redis_event(RedisEvent::CountMatches { pattern });
+        }
     }
 
     fn toggle_help(&mut self) {
@@ -841,7 +884,10 @@ impl App {
             | Action::DiscardKeyspacePopup
             | Action::KeysLoadAborted
             | Action::DbSwitched
-            | Action::ValueLoadFailed => {}
+            | Action::ValueLoadFailed
+            | Action::FilterMatchCount { .. }
+            | Action::YankReady
+            | Action::YankFailed(_) => {}
             Action::Tick => {
                 if opened_at.elapsed() >= HELP_TIMEOUT {
                     self.help_opened_at = None;
@@ -883,7 +929,7 @@ impl App {
             return;
         }
 
-        if self.keyspace.is_value_focused() {
+        if self.keyspace.is_value_focused() || self.keyspace.is_text_focused() {
             self.keyspace.exit_value_focus();
             return;
         }
@@ -971,6 +1017,10 @@ impl App {
             // Notice-only overlay: nothing to do, it's already been dismissed.
             return;
         };
+        if let OverlayRequest::Yank { key, r_type } = request {
+            self.start_full_yank(key, r_type);
+            return;
+        }
         let Some((key, _)) = self.keyspace.selected_key() else {
             return;
         };
@@ -998,6 +1048,7 @@ impl App {
                 self.reselect_key = Some(key.clone());
                 RedisEvent::SetTtl { key, secs }
             }
+            OverlayRequest::Yank { .. } => return,
         };
         self.send_redis_event(event);
     }
@@ -1072,6 +1123,81 @@ impl App {
         }
     }
 
+    /// `y`: copy the selected element (inside a collection) or the selected
+    /// key's whole value (#27). A value that isn't fully loaded is fetched in
+    /// the background; above [`YANK_WARN_BYTES`] the user confirms first.
+    fn yank_value(&mut self) {
+        if self.mode != Mode::KeySpace {
+            return;
+        }
+        let Some((key, r_type)) = self.keyspace.selected_key() else {
+            return;
+        };
+        if self.keyspace.is_value_focused() {
+            if let Some(text) = self.keyspace.selected_element_text() {
+                self.copy_text(&text, &format!("item of {key}"));
+            }
+            return;
+        }
+        if let Some(text) = self.keyspace.loaded_value_text() {
+            self.copy_text(&text, &format!("value of {key}"));
+            return;
+        }
+        if matches!(r_type, RedisType::Stream | RedisType::Unknown(_)) {
+            self.keyspace.show_toast(
+                format!("Copying {} values isn't supported yet", r_type.name()),
+                false,
+            );
+            return;
+        }
+        match self.keyspace.selected_size() {
+            Some(size) if size > YANK_WARN_BYTES => {
+                self.keyspace.open_yank_confirm(key, r_type, size);
+            }
+            _ => self.start_full_yank(key, r_type),
+        }
+    }
+
+    /// Ask the runner for `key`'s whole value; `YankReady` copies it.
+    fn start_full_yank(&mut self, key: String, r_type: RedisType) {
+        self.keyspace.show_toast(format!("Copying {key}…"), true);
+        self.send_redis_event(RedisEvent::FetchFullValue { key, r_type });
+    }
+
+    /// The runner left a whole value in `SharedState::yank`: copy it.
+    fn finish_yank(&mut self) {
+        let Some((key, text)) = self.state.yank.lock().take() else {
+            return;
+        };
+        self.copy_text(&text, &format!("value of {key}"));
+    }
+
+    /// `Shift-y`: copy the selected key's name.
+    fn yank_key(&mut self) {
+        if self.mode != Mode::KeySpace {
+            return;
+        }
+        if let Some((key, _)) = self.keyspace.selected_key() {
+            self.copy_text(&key, &format!("key name {key}"));
+        }
+    }
+
+    /// Put `text` on the clipboard and confirm with a toast.
+    fn copy_text(&mut self, text: &str, what: &str) {
+        let msg = match self.clipboard.copy(text) {
+            Ok(via) => {
+                let how = if via == Via::Terminal {
+                    " via terminal (OSC 52)"
+                } else {
+                    ""
+                };
+                format!("Copied {what} ({}){how}", format_bytes(text.len()))
+            }
+            Err(err) => format!("Copy failed: {err}"),
+        };
+        self.keyspace.show_toast(msg, false);
+    }
+
     fn send_redis_event(&self, event: RedisEvent) {
         if let Err(err) = self.redis_tx.send(event) {
             log::error!("Failed to send redis event: {err:?}");
@@ -1095,6 +1221,10 @@ impl App {
 
     /// `n`: next page of the value when drilled into one, else of the keyspace.
     fn load_next_page(&mut self) {
+        if self.keyspace.is_text_focused() {
+            self.keyspace.scroll_text_page(true);
+            return;
+        }
         if self.keyspace.is_value_focused() {
             self.turn_value_page(true, 0);
             return;
@@ -1108,6 +1238,10 @@ impl App {
     /// `p`: previous page of the value when drilled into one, else of the
     /// keyspace.
     fn load_previous_page(&mut self) {
+        if self.keyspace.is_text_focused() {
+            self.keyspace.scroll_text_page(false);
+            return;
+        }
         if self.keyspace.is_value_focused() {
             self.turn_value_page(false, 0);
             return;
@@ -1197,6 +1331,32 @@ impl App {
         }
     }
 
+    /// Size keyspace pages to the rows the table can show (#45). Runs after
+    /// each draw, so a resize (or the cluster banner appearing) re-pages the
+    /// sweep. The selected key stays selected and on screen.
+    fn sync_page_size(&mut self) {
+        if self.mode == Mode::Dashboard {
+            return;
+        }
+        let rows = self.keyspace.visible_rows();
+        if rows == 0 {
+            return;
+        }
+        let changed = {
+            let mut keyspace_state = self.state.keyspace_state.lock();
+            let anchor =
+                keyspace_state.page_range().start + self.keyspace.selected_row().unwrap_or(0);
+            keyspace_state.set_page_size(rows, anchor)
+        };
+        if !changed {
+            return;
+        }
+        if let Some((key, _)) = self.keyspace.selected_key() {
+            self.reselect_key = Some(key);
+        }
+        self.fetch_keys();
+    }
+
     fn load_keyspace(&mut self) {
         self.fetch_keys();
     }
@@ -1229,6 +1389,10 @@ impl App {
         }
         // When focus is in the value pane, `j`/`k` scroll the value's rows in
         // place — the selected key (and its loaded value) must not change.
+        if self.keyspace.is_text_focused() {
+            self.keyspace.scroll_next();
+            return;
+        }
         if self.keyspace.is_value_focused() {
             // On the last row of a value page, `j` turns to the next page.
             if self.keyspace.scroll_next() == ScrollOutcome::PastEnd {
@@ -1243,6 +1407,10 @@ impl App {
 
     fn scroll_up(&mut self) {
         if self.mode != Mode::KeySpace {
+            return;
+        }
+        if self.keyspace.is_text_focused() {
+            self.keyspace.scroll_previous();
             return;
         }
         if self.keyspace.is_value_focused() {

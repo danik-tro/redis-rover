@@ -27,4 +27,9 @@ pub enum Command {
     PrevChart,
     ToggleAllCharts,
     SelectDb,
+    ScrollLeft,
+    ScrollRight,
+    ToggleWrap,
+    YankValue,
+    YankKey,
 }

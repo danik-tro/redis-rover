@@ -15,6 +15,19 @@ pub enum Action {
     PreviousMode,
     ScrollDown,
     ScrollUp,
+    /// Pan a focused text value left / right (wrap off).
+    ScrollLeft,
+    ScrollRight,
+    /// Toggle line wrapping of text values.
+    ToggleWrap,
+    /// Copy the selected value / element to the clipboard.
+    YankValue,
+    /// Copy the selected key name to the clipboard.
+    YankKey,
+    /// A full value fetched for `YankValue` is waiting in `SharedState::yank`.
+    YankReady,
+    /// Fetching a full value for `YankValue` failed.
+    YankFailed(String),
     LoadKeySpace,
     RefreshSpace,
     LoadKeysIntoKeySpace,
@@ -46,6 +59,13 @@ pub enum Action {
     OpenDbPicker,
     /// The runner connected to the newly selected DB; reload the keyspace.
     DbSwitched,
+    /// Live match count for the filter popup. `complete` is false when the
+    /// count stopped early (budget hit), so `count` is a lower bound.
+    FilterMatchCount {
+        pattern: String,
+        count: usize,
+        complete: bool,
+    },
 }
 
 impl Action {

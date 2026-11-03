@@ -7,8 +7,11 @@ use redis::{aio::ConnectionManager, AsyncCommands};
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{
     ItemDelete, ItemEdit, KeyItem, KeyValue, LoadedValue, NewKeySpec, RedisInfo, RedisType,
-    ValuePageInfo, ValueState, STRING_PREVIEW_BYTES,
+    ScanSweep, ValuePageInfo, ValueState, STRING_PREVIEW_BYTES,
 };
+
+/// Elements per command when fetching a whole collection for copying.
+const FULL_FETCH_CHUNK: usize = 1000;
 
 /// Sentinel used to delete a LIST element by index (Redis has no delete-by-index):
 /// overwrite the slot with this marker via `LSET`, then remove it with `LREM`.
@@ -97,6 +100,21 @@ pub async fn fetch_value_page(
                 },
             ));
         }
+        RedisType::Json => {
+            // RedisJSON: the whole document, as JSON text.
+            let raw: String = redis::cmd("JSON.GET")
+                .arg(&key)
+                .query_async(manager)
+                .await?;
+            state.total = None;
+            return Ok((
+                state,
+                LoadedValue {
+                    value: KeyValue::Json(serde_json::from_str(&raw)?),
+                    page: ValuePageInfo::default(),
+                },
+            ));
+        }
         RedisType::List => {
             let mut items = fetch_list_window(manager, &key, &mut state).await?;
             if refetch_after_clamp(&mut state) {
@@ -136,7 +154,7 @@ pub async fn fetch_value_page(
                 KeyValue::Set(names.to_vec())
             }
         }
-        RedisType::Json | RedisType::Stream | RedisType::Unknown(_) => KeyValue::Unknown,
+        RedisType::Stream | RedisType::Unknown(_) => KeyValue::Unknown,
     };
 
     let len = match &value {
@@ -147,6 +165,108 @@ pub async fn fetch_value_page(
     };
     let page = state.page_info(len);
     Ok((state, LoadedValue { value, page }))
+}
+
+/// Fetch a key's whole value, for copying it (#27). Collections are read in
+/// chunks of [`FULL_FETCH_CHUNK`] (`LRANGE` / `ZRANGE`, or a full `HSCAN` /
+/// `SSCAN` sweep), so no single reply is huge.
+///
+/// # Errors
+///
+/// Returns an error for STREAM / unknown types or if a Redis command fails.
+pub async fn fetch_full_value(
+    mut manager: ConnectionManager,
+    key: &str,
+    r_type: &RedisType,
+) -> Result<KeyValue, BoxError> {
+    let manager = &mut manager;
+    let value = match r_type {
+        RedisType::String => {
+            let bytes: Vec<u8> = redis::cmd("GET").arg(key).query_async(manager).await?;
+            let total_len = bytes.len();
+            KeyValue::String {
+                value: String::from_utf8_lossy(&bytes).into_owned(),
+                total_len,
+            }
+        }
+        RedisType::Json => {
+            let raw: String = redis::cmd("JSON.GET").arg(key).query_async(manager).await?;
+            KeyValue::Json(serde_json::from_str(&raw)?)
+        }
+        RedisType::List => {
+            let mut items = Vec::new();
+            loop {
+                let (start, stop) = chunk_bounds(items.len())?;
+                let chunk: Vec<String> = redis::cmd("LRANGE")
+                    .arg(key)
+                    .arg(start)
+                    .arg(stop)
+                    .query_async(manager)
+                    .await?;
+                let done = chunk.len() < FULL_FETCH_CHUNK;
+                items.extend(chunk);
+                if done {
+                    break KeyValue::List(items);
+                }
+            }
+        }
+        RedisType::Zset => {
+            let mut items = Vec::new();
+            loop {
+                let (start, stop) = chunk_bounds(items.len())?;
+                let chunk: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                    .arg(key)
+                    .arg(start)
+                    .arg(stop)
+                    .arg("WITHSCORES")
+                    .query_async(manager)
+                    .await?;
+                let done = chunk.len() < FULL_FETCH_CHUNK;
+                items.extend(chunk);
+                if done {
+                    break KeyValue::Zset(items);
+                }
+            }
+        }
+        RedisType::Hash | RedisType::Set => {
+            let is_hash = *r_type == RedisType::Hash;
+            let mut sweep = ScanSweep::default();
+            loop {
+                let (cursor, batch): (u64, Vec<String>) =
+                    redis::cmd(if is_hash { "HSCAN" } else { "SSCAN" })
+                        .arg(key)
+                        .arg(sweep.cursor)
+                        .arg("COUNT")
+                        .arg(FULL_FETCH_CHUNK)
+                        .query_async(manager)
+                        .await?;
+                if is_hash {
+                    sweep.merge_fields(cursor, pair_up(batch));
+                } else {
+                    sweep.merge_members(cursor, batch);
+                }
+                if sweep.done {
+                    break;
+                }
+            }
+            if is_hash {
+                KeyValue::Hash(sweep.names.into_iter().zip(sweep.values).collect())
+            } else {
+                KeyValue::Set(sweep.names)
+            }
+        }
+        RedisType::Stream | RedisType::Unknown(_) => {
+            return Err(format!("copying {} values isn't supported yet", r_type.name()).into());
+        }
+    };
+    Ok(value)
+}
+
+/// `start` / `stop` (inclusive) of the next [`FULL_FETCH_CHUNK`] elements.
+fn chunk_bounds(fetched: usize) -> Result<(isize, isize), BoxError> {
+    let start = isize::try_from(fetched)?;
+    let len = isize::try_from(FULL_FETCH_CHUNK)?;
+    Ok((start, start + len - 1))
 }
 
 /// Clamp an index-paged state to the (just fetched) collection length.
@@ -465,7 +585,7 @@ pub async fn delete_item(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_preview, fetch_value_page, pair_up};
+    use super::{decode_preview, fetch_full_value, fetch_value_page, pair_up};
     use crate::redis_client::types::{KeyValue, RedisType, ValueState};
 
     #[test]
@@ -571,6 +691,38 @@ mod tests {
         };
         assert_eq!(members.len(), 100);
         assert_eq!(loaded.page.total, Some(50_000));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
+    async fn live_full_value_fetches_every_chunk() {
+        let KeyValue::List(items) = fetch_full_value(manager().await, "big:list", &RedisType::List)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(items.len(), 50_000);
+
+        let KeyValue::Set(members) = fetch_full_value(manager().await, "big:set", &RedisType::Set)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(members.len(), 50_000);
+
+        let KeyValue::Zset(items) = fetch_full_value(manager().await, "big:zset", &RedisType::Zset)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(items.first(), Some(&("m1".to_string(), 1.0)));
+
+        assert!(fetch_full_value(manager().await, "s", &RedisType::Stream)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

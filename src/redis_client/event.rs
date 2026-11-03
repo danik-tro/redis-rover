@@ -1,4 +1,4 @@
-use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec};
+use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec, RedisType};
 
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
@@ -8,6 +8,17 @@ pub enum RedisEvent {
     /// Fetch the page of the selected value described by
     /// `SharedState::value_state`.
     FetchValue,
+    /// Count the keys matching `pattern` for the filter popup's live preview.
+    /// Runs in its own task; a newer request cancels the older one.
+    CountMatches {
+        pattern: String,
+    },
+    /// Fetch a key's whole value for copying (`y`). Runs in its own task and
+    /// leaves the text in `SharedState::yank`.
+    FetchFullValue {
+        key: String,
+        r_type: RedisType,
+    },
     SetString {
         key: String,
         value: String,
@@ -48,7 +59,11 @@ impl RedisEvent {
     /// No `_` arm on purpose: a new variant must pick a side.
     pub fn is_write(&self) -> bool {
         match self {
-            Self::FetchKeys | Self::FetchValue | Self::SelectDb(_) => false,
+            Self::FetchKeys
+            | Self::FetchValue
+            | Self::SelectDb(_)
+            | Self::CountMatches { .. }
+            | Self::FetchFullValue { .. } => false,
             Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::SetTtl { .. }
@@ -69,6 +84,15 @@ mod tests {
         assert!(!RedisEvent::FetchKeys.is_write());
         assert!(!RedisEvent::FetchValue.is_write());
         assert!(!RedisEvent::SelectDb(3).is_write());
+        assert!(!RedisEvent::CountMatches {
+            pattern: "user:*".into()
+        }
+        .is_write());
+        assert!(!RedisEvent::FetchFullValue {
+            key: "k".into(),
+            r_type: RedisType::Hash
+        }
+        .is_write());
         assert!(RedisEvent::DeleteKey { key: "k".into() }.is_write());
         assert!(RedisEvent::SetTtl {
             key: "k".into(),

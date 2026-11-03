@@ -490,4 +490,34 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn bundled_yank_and_wrap_bindings() -> Result<()> {
+        use crate::keybindings::KeyResolution;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let c = Config::new()?;
+        let resolve = |code, modifiers| {
+            c.keybindings
+                .resolve(Mode::KeySpace, &[KeyEvent::new(code, modifiers)])
+        };
+        assert_eq!(
+            resolve(KeyCode::Char('y'), KeyModifiers::empty()),
+            KeyResolution::Command(Command::YankValue)
+        );
+        // Terminals send Shift-y as an uppercase char with SHIFT set.
+        assert_eq!(
+            resolve(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            KeyResolution::Command(Command::YankKey)
+        );
+        assert_eq!(
+            resolve(KeyCode::Char('w'), KeyModifiers::empty()),
+            KeyResolution::Command(Command::ToggleWrap)
+        );
+        assert_eq!(
+            resolve(KeyCode::Right, KeyModifiers::empty()),
+            KeyResolution::Command(Command::ScrollRight)
+        );
+        Ok(())
+    }
 }

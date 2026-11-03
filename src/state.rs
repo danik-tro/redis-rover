@@ -23,6 +23,9 @@ pub struct SharedState {
     pub db: Arc<Mutex<i64>>,
     /// Number of logical databases (`CONFIG GET databases`, default 16).
     pub db_count: Arc<Mutex<usize>>,
+    /// A whole value fetched for copying: key name and the text to copy. Kept
+    /// out of `Action` so huge values never reach the action log.
+    pub yank: Arc<Mutex<Option<(String, String)>>>,
 }
 
 /// Redis's default `databases` setting.
@@ -41,6 +44,7 @@ impl Default for SharedState {
             ))),
             db: Arc::new(Mutex::new(0)),
             db_count: Arc::new(Mutex::new(DEFAULT_DB_COUNT)),
+            yank: Arc::new(Mutex::new(None)),
         }
     }
 }

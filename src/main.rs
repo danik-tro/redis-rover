@@ -1,6 +1,7 @@
 mod action;
 mod app;
 mod cli;
+mod clipboard;
 mod command;
 mod config;
 mod keybindings;
