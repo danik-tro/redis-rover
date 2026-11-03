@@ -1,20 +1,25 @@
 <h1 align="center">
-<img  src="assets/logo-github.png" />
+<img src="https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/logo-github.png" />
 </h1>
 
 # redis-rover
 
 A Redis terminal-ui client written in rust 🦀
 
-`redis-rover` (`rrover`) is a keyboard-driven TUI client for Redis. It lets you browse keyspaces, inspect key metadata, filter by pattern, and monitor server info — all from the terminal. Built with [ratatui](https://github.com/ratatui-org/ratatui) and powered by async I/O via Tokio.
+`redis-rover` (`rrover`) is a keyboard-driven TUI client for Redis. It lets you browse keyspaces, inspect and edit values, filter by pattern, and monitor server metrics — all from the terminal. Built with [ratatui](https://github.com/ratatui-org/ratatui) and powered by async I/O via Tokio.
+
+![rrover keyspace view](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/screenshot.png)
 
 **Features:**
 
-- Browse and filter Redis keys with type-colored badges
-- Paginate through large keyspaces via SCAN
-- Live Redis server info in the footer
-- Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients charts, pause/reset, cluster node count
-- Fully configurable key bindings, colors, and styles via a config file (JSON5, YAML, TOML, INI)
+- Browse and filter Redis keys with type-colored badges; module types (`json`, `stream`, `MBbloom--`, ...) show their real name
+- Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes)
+- View strings, lists, sets, hashes and sorted sets; add, edit and delete keys and items, with a confirm step on delete
+- Switch between logical databases (`s`) and see the key count of the current one
+- `--read-only` mode for browsing production safely
+- TLS (`rediss://`), including private CAs and mutual TLS
+- Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients charts, pause/reset, cluster summary
+- Fully configurable key bindings, colors, and styles via a config file (JSON5, JSON, YAML, TOML, INI)
 
 ---
 
@@ -23,8 +28,10 @@ A Redis terminal-ui client written in rust 🦀
 **From crates.io:**
 
 ```bash
-cargo install redis-rover
+cargo install redis-rover --locked
 ```
+
+Requires Rust 1.97 or newer.
 
 **Prebuilt binaries** for macOS (x86\_64, arm64), Linux (x86\_64, aarch64), and Windows are available on the [GitHub releases page](https://github.com/danik-tro/redis-rover/releases).
 
@@ -37,6 +44,30 @@ rrover
 ```
 
 Connects to Redis at `localhost:6379` by default. Use `-u/--url` to pick a server and `--token` to type a password without it showing up in your shell history.
+
+| Flag | Meaning |
+|---|---|
+| `-u, --url <URL>` | Redis URL. Default `redis://localhost:6379`. A path picks the starting DB, e.g. `redis://localhost:6379/3`. |
+| `--token` | Prompt for the password (input is hidden). |
+| `--read-only` | Block every write. See [Read-only mode](#read-only-mode). |
+| `--tls-ca`, `--tls-cert`, `--tls-key`, `--insecure` | TLS options. See [TLS](#tls). |
+| `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. |
+
+### Read-only mode
+
+```bash
+rrover -u rediss://prod-cache:6379 --token --read-only
+```
+
+With `--read-only`, every write is refused: add, edit, delete and TTL changes. The UI shows a notice instead of opening the edit form, the footer shows an `RO` badge and hides the write keys, and the background runner rejects any write that still gets through. Use it whenever you point `rrover` at production.
+
+### Databases
+
+Press `s` to open the DB picker. Move with `j`/`k` (or the arrow keys), or type the DB number, then press `Enter`. The footer shows the current DB and its key count, e.g. `db 3 · 120 keys`. You can also start on a DB with the URL path (`redis://host:6379/3`).
+
+### Cluster
+
+In cluster mode `rrover` connects to a single node. SCAN only sees that node's keys, so the key list is partial. A warning banner above the key table says so, and the footer key count reads `(this node)`. Cluster mode has only DB 0, so the DB picker is disabled. Full cluster browsing is planned after 0.1.0.
 
 ### TLS
 
@@ -75,11 +106,53 @@ The TLS flags only work with `rediss://` URLs.
 
 ---
 
+## Keybindings
+
+Press `?` in the app for the full list. Defaults:
+
+**Keyspace**
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Scroll down / up |
+| `n` / `p` | Next / previous page (of keys, or of the open value) |
+| `Enter` | Open the selected value / confirm |
+| `Esc` | Close popup / leave the value pane |
+| `f` / `l` | Set / clear the filter pattern (glob, e.g. `user:*`) |
+| `r` | Refresh keyspace |
+| `a` | Add a new key |
+| `i` | Add an item to the open collection |
+| `e` | Edit the value, or the selected item |
+| `d` | Delete the key, or the selected item (asks first) |
+| `t` | Set TTL |
+| `s` | Switch database |
+| `m` | Open the metrics dashboard |
+| `?` | Toggle help |
+| `Ctrl-c` | Quit |
+
+**Dashboard**
+
+| Key | Action |
+|---|---|
+| `m` / `Esc` | Back to the keyspace |
+| `Space` | Pause / resume |
+| `r` | Reset history |
+| `Tab` / `→` / `l` | Next chart |
+| `Shift-Tab` / `←` / `h` | Previous chart |
+| `a` | Show all charts |
+| `?` | Toggle help |
+
+### Configuration
+
+Key bindings, colors and styles can be overridden in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
+
+---
+
 ## Development
 
 **Prerequisites:**
 
-- Rust 1.91 (the toolchain is pinned via `rust-toolchain.toml` — `rustup` will pick it up automatically)
+- Rust 1.97 (the toolchain is pinned via `rust-toolchain.toml` — `rustup` will pick it up automatically)
 - A running Redis instance on `localhost:6379`
 
 **Common commands:**

@@ -11,9 +11,20 @@ homepage = "https://github.com/danik-tro/redis-rover"
 repository = "https://github.com/danik-tro/redis-rover"
 license = "MIT"
 description = "A Redis terminal-ui client written in rust 🦀"
-rust-version = "1.80"
+rust-version = "1.97"
 
 build = "build.rs"
+# Keep the crate small: no logo, no planning docs.
+include = [
+    "src/**/*",
+    ".config/config.json5",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [dependencies]
 better-panic = "0.3.0"
@@ -62,6 +73,9 @@ vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
+
+[profile.release]
+strip = true
 
 [[bin]]
 bench = false

@@ -380,6 +380,8 @@ struct EditItemDraft {
     notice: Option<String>,
 }
 
+// The bools are independent view flags, not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct KeySpace {
     table: TableState,
     value_table: TableState,
@@ -401,7 +403,13 @@ pub struct KeySpace {
     new_key: Option<NewKeyDraft>,
     add_item: Option<AddItemDraft>,
     edit_item: Option<EditItemDraft>,
+    /// Connected server runs in cluster mode: SCAN only sees this node, so a
+    /// warning banner is shown above the table.
+    pub cluster_mode: bool,
 }
+
+/// Banner shown above the key table in cluster mode.
+const CLUSTER_BANNER: &str = "⚠ cluster: SCAN sees only this node";
 
 impl KeySpace {
     pub fn new(keys: Vec<KeyMeta>) -> Self {
@@ -421,6 +429,7 @@ impl KeySpace {
             new_key: None,
             add_item: None,
             edit_item: None,
+            cluster_mode: false,
         }
     }
 
@@ -1973,7 +1982,7 @@ fn group_thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1998,7 +2007,7 @@ fn highlight_symbol() -> Span<'static> {
 }
 
 fn selected_row_style() -> Style {
-    Style::new().bg(config::get().colors.base01).bold()
+    Style::new().bg(config::get().colors.base02).bold()
 }
 
 /// Dim horizontal rule across `area`'s first row.
@@ -2111,8 +2120,9 @@ impl StatefulWidget for KeySpaceWidget {
             ))
             .render(view_area, buf);
 
-        let [filter_area, rule_area, table_area] = Layout::vertical([
+        let [filter_area, banner_area, rule_area, table_area] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(u16::from(state.cluster_mode)),
             Constraint::Length(1),
             Constraint::Fill(1),
         ])
@@ -2128,6 +2138,10 @@ impl StatefulWidget for KeySpaceWidget {
             pattern,
         ]))
         .render(filter_area, buf);
+        if state.cluster_mode {
+            Paragraph::new(Line::from(CLUSTER_BANNER).fg(cfg.colors.base0b).bold())
+                .render(banner_area, buf);
+        }
         render_rule(rule_area, buf);
 
         let widths = [
@@ -2215,6 +2229,25 @@ mod tests {
         KeySpace, PageInfo, ScrollOutcome, SelectedElement,
     };
     use crate::redis_client::types::{KeyValue, LoadedValue, ValuePageInfo};
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+
+    fn render_text(keyspace: &mut KeySpace) -> String {
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        StatefulWidget::render(super::KeySpaceWidget, area, &mut buf, keyspace);
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn cluster_banner_only_in_cluster_mode() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        assert!(!render_text(&mut keyspace).contains("cluster: SCAN"));
+        keyspace.cluster_mode = true;
+        assert!(render_text(&mut keyspace).contains(super::CLUSTER_BANNER));
+    }
 
     fn list_page(rows: usize, start: usize, has_prev: bool, has_next: bool) -> LoadedValue {
         LoadedValue {

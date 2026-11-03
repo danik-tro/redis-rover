@@ -830,7 +830,7 @@ fn render_single(h: &MetricsHistory, selected: Metric, paused: bool, area: Rect,
                 .data(p)
         })
         .collect();
-    let mid = (lo + hi) / 2.0;
+    let mid = f64::midpoint(lo, hi);
     Chart::new(datasets)
         .x_axis(
             Axis::default()

@@ -52,13 +52,15 @@ pub fn build_hint(keybindings: &KeyBindings, mode: Mode, entries: &[(Command, &s
         .join("  ")
 }
 
-/// `db 3 · 120 keys`, or `db 3` before the first `INFO` arrives.
-fn db_status(db: i64, info: Option<&RedisInfo>) -> String {
+/// `db 3 · 120 keys`, or `db 3` before the first `INFO` arrives. In cluster
+/// mode `INFO` only counts the connected node's keys, so that is spelled out.
+fn db_status(db: i64, info: Option<&RedisInfo>, cluster: bool) -> String {
     match info {
         Some(info) => {
             let keys = info.db_keys(db);
             let noun = if keys == 1 { "key" } else { "keys" };
-            format!("db {db} · {keys} {noun}")
+            let scope = if cluster { " (this node)" } else { "" };
+            format!("db {db} · {keys} {noun}{scope}")
         }
         None => format!("db {db}"),
     }
@@ -111,8 +113,17 @@ impl StatefulWidget for InfoWidget {
 
         let common_info = { state.info.lock().as_ref().map(Clone::clone) };
         let db = *state.db.lock();
-        let db_status = db_status(db, common_info.as_ref());
-        let cpu_pct = state.metrics.lock().latest.as_ref().and_then(|s| s.cpu_pct);
+        let (cpu_pct, cluster) = {
+            let metrics = state.metrics.lock();
+            (
+                metrics.latest.as_ref().and_then(|s| s.cpu_pct),
+                metrics
+                    .latest_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.cluster_enabled),
+            )
+        };
+        let db_status = db_status(db, common_info.as_ref(), cluster);
         let cpu = cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %"));
 
         // Reserve the last inner row for the always-on key-hint legend (#41).
@@ -192,10 +203,14 @@ mod tests {
         map.insert("db3", "keys=1,expires=0,avg_ttl=0");
         map.insert("db0", "keys=40,expires=0,avg_ttl=0");
         let info = RedisInfo::from(map);
-        assert_eq!(db_status(3, Some(&info)), "db 3 · 1 key");
-        assert_eq!(db_status(0, Some(&info)), "db 0 · 40 keys");
-        assert_eq!(db_status(5, Some(&info)), "db 5 · 0 keys");
-        assert_eq!(db_status(5, None), "db 5");
+        assert_eq!(db_status(3, Some(&info), false), "db 3 · 1 key");
+        assert_eq!(db_status(0, Some(&info), false), "db 0 · 40 keys");
+        assert_eq!(db_status(5, Some(&info), false), "db 5 · 0 keys");
+        assert_eq!(db_status(5, None, false), "db 5");
+        assert_eq!(
+            db_status(0, Some(&info), true),
+            "db 0 · 40 keys (this node)"
+        );
     }
 
     #[test]

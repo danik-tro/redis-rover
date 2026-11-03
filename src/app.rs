@@ -606,6 +606,7 @@ impl App {
     }
 
     fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
+        self.keyspace.cluster_mode = self.cluster_enabled();
         StatefulWidget::render(KeySpaceWidget, area, buf, &mut self.keyspace);
     }
 
@@ -745,19 +746,22 @@ impl App {
         self.read_only
     }
 
+    /// The latest `INFO` sample says the server runs in cluster mode.
+    fn cluster_enabled(&self) -> bool {
+        self.state
+            .metrics
+            .lock()
+            .latest_snapshot
+            .as_ref()
+            .is_some_and(|s| s.cluster_enabled)
+    }
+
     /// `s`: open the DB picker. Cluster mode only has db 0.
     fn open_db_picker(&mut self) {
         if self.mode != Mode::KeySpace {
             return;
         }
-        let cluster = self
-            .state
-            .metrics
-            .lock()
-            .latest_snapshot
-            .as_ref()
-            .is_some_and(|s| s.cluster_enabled);
-        if cluster {
+        if self.cluster_enabled() {
             self.keyspace.show_notice("Cluster mode only has db 0.");
             return;
         }
@@ -1252,5 +1256,43 @@ impl App {
         self.keyspace.scroll_previous();
         self.keyspace.clear_selected_value();
         action::try_send_action(&self.tx, Action::RequestSelectedValue);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        let (tx, rx) = mpsc::channel(8);
+        let (redis_tx, _) = broadcast::channel(8);
+        App::new(
+            SharedState::default(),
+            tx,
+            rx,
+            redis_tx,
+            "redis://localhost:6379".into(),
+            4.0,
+            30.0,
+        )
+    }
+
+    #[test]
+    fn error_popup_returns_to_the_screen_it_opened_on() {
+        let mut app = app();
+        assert_eq!(app.mode, Mode::KeySpace);
+
+        app.toggle_dashboard();
+        assert_eq!(app.mode, Mode::Dashboard);
+
+        app.show_error_popup("boom");
+        assert_eq!(app.mode, Mode::Popup(PopupMode::Error));
+
+        app.switch_to_previous_mode();
+        assert_eq!(app.mode, Mode::Dashboard);
+        assert!(app.error_message.is_none());
+
+        app.toggle_dashboard();
+        assert_eq!(app.mode, Mode::KeySpace);
     }
 }

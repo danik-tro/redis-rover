@@ -3,15 +3,27 @@ name: CD # Continuous Deployment
 on:
   push:
     tags:
-      - '[v]?[0-9]+.[0-9]+.[0-9]+'
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+  # Manual dry run: builds and uploads the archives as workflow artifacts,
+  # without creating a release or publishing to crates.io.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Keep in sync with rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.97"
+  BINARY_NAME: rrover
 
 jobs:
   publish:
-
-    name: Publishing for ${{ matrix.os }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -19,7 +31,6 @@ jobs:
             target: x86_64-apple-darwin
             architecture: x86_64
             binary-postfix: ""
-            binary-name: rtt
             use-cross: false
           - os: macos-latest
             os-name: macos
@@ -27,125 +38,117 @@ jobs:
             architecture: arm64
             binary-postfix: ""
             use-cross: false
-            binary-name: rtt
           - os: ubuntu-latest
             os-name: linux
             target: x86_64-unknown-linux-gnu
             architecture: x86_64
             binary-postfix: ""
             use-cross: false
-            binary-name: rtt
           - os: windows-latest
             os-name: windows
             target: x86_64-pc-windows-msvc
             architecture: x86_64
             binary-postfix: ".exe"
             use-cross: false
-            binary-name: rtt
           - os: ubuntu-latest
             os-name: linux
             target: aarch64-unknown-linux-gnu
             architecture: arm64
             binary-postfix: ""
             use-cross: true
-            binary-name: rtt
           - os: ubuntu-latest
             os-name: linux
             target: i686-unknown-linux-gnu
             architecture: i686
             binary-postfix: ""
             use-cross: true
-            binary-name: rtt
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # vergen reads `git describe` for the version string.
+          fetch-depth: 0
+
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
 
-          target: ${{ matrix.target }}
-
-          profile: minimal
-          override: true
       - uses: Swatinem/rust-cache@v2
-      - name: Cargo build
-        uses: actions-rs/cargo@v1
         with:
-          command: build
+          key: ${{ matrix.target }}
 
-          use-cross: ${{ matrix.use-cross }}
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
-          toolchain: stable
-
-          args: --release --target ${{ matrix.target }}
-
-
-      - name: install strip command
+      - name: Build
         shell: bash
         run: |
-
-          if [[ ${{ matrix.target }} == aarch64-unknown-linux-gnu ]]; then
-
-              sudo apt update
-              sudo apt-get install -y binutils-aarch64-linux-gnu
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            BUILD=cross
+          else
+            BUILD=cargo
           fi
-      - name: Packaging final binary
+          "$BUILD" build --release --locked --target ${{ matrix.target }}
+
+      # Debug symbols are stripped by `[profile.release] strip = true`.
+      - name: Package
+        id: package
         shell: bash
         run: |
-
           cd target/${{ matrix.target }}/release
 
+          BIN="${BINARY_NAME}${{ matrix.binary-postfix }}"
+          VERSION="${GITHUB_REF_NAME//\//-}"
+          RELEASE_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.os-name }}-${{ matrix.architecture }}"
 
-          ####### reduce binary size by removing debug symbols #######
+          tar czvf "$RELEASE_NAME.tar.gz" "$BIN"
 
-          BINARY_NAME=${{ matrix.binary-name }}${{ matrix.binary-postfix }}
-          if [[ ${{ matrix.target }} == aarch64-unknown-linux-gnu ]]; then
-
-            GCC_PREFIX="aarch64-linux-gnu-"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            certutil -hashfile "$RELEASE_NAME.tar.gz" sha256 | grep -E '[A-Fa-f0-9]{64}' > "$RELEASE_NAME.sha256"
           else
-            GCC_PREFIX=""
+            shasum -a 256 "$RELEASE_NAME.tar.gz" > "$RELEASE_NAME.sha256"
           fi
-          "$GCC_PREFIX"strip $BINARY_NAME
 
-          ########## create tar.gz ##########
+          echo "name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
-          RELEASE_NAME=${{ matrix.binary-name }}-${GITHUB_REF/refs\/tags\//}-${{ matrix.os-name }}-${{ matrix.architecture }}
+      - name: Upload artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.tar.gz
+            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.sha256
 
-          tar czvf $RELEASE_NAME.tar.gz $BINARY_NAME
-
-          ########## create sha256 ##########
-
-          if [[ ${{ runner.os }} == 'Windows' ]]; then
-
-            certutil -hashfile $RELEASE_NAME.tar.gz sha256 | grep -E [A-Fa-f0-9]{64} > $RELEASE_NAME.sha256
-          else
-            shasum -a 256 $RELEASE_NAME.tar.gz > $RELEASE_NAME.sha256
-          fi
-      - name: Releasing assets
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-
-            target/${{ matrix.target }}/release/${{ matrix.binary-name }}-*.tar.gz
-            target/${{ matrix.target }}/release/${{ matrix.binary-name }}-*.sha256
-
-        env:
-
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.tar.gz
+            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.sha256
 
   publish-cargo:
-    name: Publishing to Cargo
+    name: Publish to crates.io
+    needs: [publish]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish
+      - run: cargo publish --locked
         env:
-
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
