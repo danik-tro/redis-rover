@@ -62,6 +62,7 @@ async fn tokio_main(args: Cli) -> Result<()> {
         tx,
         rx,
         watcher.tx(),
+        watcher.pubsub_tx(),
         target,
         args.tick_rate,
         args.frame_rate,

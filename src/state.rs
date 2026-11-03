@@ -6,6 +6,7 @@ use crate::{
     config,
     redis_client::{
         metrics::MetricsHistory,
+        pubsub_store::PubSubStore,
         types::{KeyMeta, KeyspaceState, LoadedValue, RedisInfo, ValueState},
     },
 };
@@ -26,6 +27,8 @@ pub struct SharedState {
     /// A whole value fetched for copying: key name and the text to copy. Kept
     /// out of `Action` so huge values never reach the action log.
     pub yank: Arc<Mutex<Option<(String, String)>>>,
+    /// Pub/Sub subscriptions and their messages. Written by the Pub/Sub task.
+    pub pubsub: Arc<Mutex<PubSubStore>>,
 }
 
 /// Redis's default `databases` setting.
@@ -45,6 +48,7 @@ impl Default for SharedState {
             db: Arc::new(Mutex::new(0)),
             db_count: Arc::new(Mutex::new(DEFAULT_DB_COUNT)),
             yank: Arc::new(Mutex::new(None)),
+            pubsub: Arc::new(Mutex::new(PubSubStore::new(config::get().pubsub.limits()))),
         }
     }
 }

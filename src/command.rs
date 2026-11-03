@@ -32,4 +32,8 @@ pub enum Command {
     ToggleWrap,
     YankValue,
     YankKey,
+    TogglePubSub,
+    PubSubAdd,
+    PubSubRemove,
+    PubSubClear,
 }

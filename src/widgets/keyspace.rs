@@ -2601,7 +2601,7 @@ fn format_bytes_u128(n: u128) -> String {
 }
 
 /// Cuts `s` to `max` display columns, ending in `…` when it was longer.
-fn truncate_to_width(s: &str, max: usize) -> Cow<'_, str> {
+pub(crate) fn truncate_to_width(s: &str, max: usize) -> Cow<'_, str> {
     if s.width() <= max {
         return Cow::Borrowed(s);
     }

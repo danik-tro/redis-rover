@@ -1,6 +1,8 @@
 pub mod client;
 pub mod event;
 pub mod metrics;
+pub mod pubsub;
+pub mod pubsub_store;
 pub mod runner;
 pub mod storage;
 pub mod types;

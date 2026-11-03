@@ -3,7 +3,7 @@ use std::time::Duration;
 use redis::aio::ConnectionManager;
 use tokio::{
     sync::broadcast::{self, Sender as BroadcastSender},
-    sync::mpsc::Sender as ActionSender,
+    sync::mpsc::{self, Sender as ActionSender, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
     time::MissedTickBehavior,
 };
@@ -14,6 +14,7 @@ use crate::{action::Action, config, state::SharedState};
 use super::{
     client,
     event::RedisEvent,
+    pubsub::{self, PubSubCmd},
     storage::Storage,
     types::{KeyMeta, KeyspaceState, RedisType},
 };
@@ -41,6 +42,11 @@ pub struct Runner {
     state: SharedState,
     info_task: JoinHandle<()>,
     state_task: JoinHandle<()>,
+    /// Owns the dedicated Pub/Sub connection (opened on the first subscribe).
+    pubsub_task: JoinHandle<()>,
+    pubsub_tx: UnboundedSender<PubSubCmd>,
+    /// Taken by `start` when the Pub/Sub task is spawned.
+    pubsub_rx: Option<UnboundedReceiver<PubSubCmd>>,
 
     action_tx: ActionSender<Action>,
     tx: BroadcastSender<RedisEvent>,
@@ -55,6 +61,8 @@ impl Runner {
     ) -> Self {
         let info_task = tokio::spawn(async {});
         let state_task = tokio::spawn(async {});
+        let pubsub_task = tokio::spawn(async {});
+        let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -67,6 +75,9 @@ impl Runner {
             state,
             info_task,
             state_task,
+            pubsub_task,
+            pubsub_tx,
+            pubsub_rx: Some(pubsub_rx),
             action_tx,
             tx,
         }
@@ -89,9 +100,30 @@ impl Runner {
         self.tx.clone()
     }
 
+    /// Control channel of the Pub/Sub task.
+    pub fn pubsub_tx(&self) -> UnboundedSender<PubSubCmd> {
+        self.pubsub_tx.clone()
+    }
+
     pub fn start(&mut self) {
         self.launch_refresh_info_task();
         self.launch_refresh_state_task();
+        self.launch_pubsub_task();
+    }
+
+    /// Spawn the Pub/Sub task. It idles until the first subscribe, so no
+    /// connection is opened for users who never use the tab.
+    fn launch_pubsub_task(&mut self) {
+        let Some(cmd_rx) = self.pubsub_rx.take() else {
+            return;
+        };
+        self.pubsub_task = tokio::spawn(pubsub::run(
+            self.client.clone(),
+            self.state.pubsub.clone(),
+            cmd_rx,
+            self.action_tx.clone(),
+            self.cancellation_token.clone(),
+        ));
     }
 
     /// Cancels the background tasks and awaits their completion so in-flight
@@ -103,10 +135,11 @@ impl Runner {
 
         let info_abort = self.info_task.abort_handle();
         let state_abort = self.state_task.abort_handle();
+        let pubsub_abort = self.pubsub_task.abort_handle();
 
         let timeout = Duration::from_secs(2);
         if tokio::time::timeout(timeout, async {
-            let _ = tokio::join!(self.info_task, self.state_task);
+            let _ = tokio::join!(self.info_task, self.state_task, self.pubsub_task);
         })
         .await
         .is_err()
@@ -114,6 +147,7 @@ impl Runner {
             log::warn!("Redis background tasks did not stop within {timeout:?}; aborting");
             info_abort.abort();
             state_abort.abort();
+            pubsub_abort.abort();
         }
     }
 

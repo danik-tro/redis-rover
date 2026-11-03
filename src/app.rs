@@ -1,7 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    config, mode::PopupMode, redis_client::event::RedisEvent, redis_client::types::RedisType,
+    config,
+    mode::PopupMode,
+    redis_client::{
+        event::RedisEvent, pubsub::PubSubCmd, pubsub_store::ConnStatus, types::RedisType,
+    },
     state::SharedState,
 };
 use color_eyre::eyre::Result;
@@ -15,9 +19,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, StatefulWidget, Widget},
 };
+use unicode_width::UnicodeWidthStr;
+
 use tokio::sync::{
     broadcast,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver, Sender, UnboundedSender},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +41,7 @@ use crate::{
         keyspace::{
             format_bytes, KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome,
         },
+        pubsub::{PubSub, PubSubWidget},
     },
 };
 
@@ -92,6 +99,12 @@ pub struct App {
     keyspace: KeySpace,
     dashboard: Dashboard,
     db_picker: DbPicker,
+    pubsub: PubSub,
+    /// Control channel of the Pub/Sub task.
+    pubsub_tx: UnboundedSender<PubSubCmd>,
+    /// Where `b` / Esc in the Pub/Sub tab goes back to. Kept apart from
+    /// `previous_mode`, which an error popup inside the tab overwrites.
+    pubsub_return: Mode,
     /// `--read-only`: refuse writes before any input is asked for.
     read_only: bool,
     clipboard: Clipboard,
@@ -130,7 +143,30 @@ const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::ResetMetrics, "reset"),
     (Command::NextChart, "chart"),
     (Command::ToggleAllCharts, "all"),
+    (Command::TogglePubSub, "pubsub"),
     (Command::ToggleHelp, "help"),
+];
+
+/// Footer hint entries for the Pub/Sub tab, in display order.
+const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
+    (Command::TogglePubSub, "back"),
+    (Command::PubSubAdd, "add"),
+    (Command::PubSubRemove, "remove"),
+    (Command::PubSubClear, "clear"),
+    (Command::ScrollDown, "next"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// `?` help rows for the Pub/Sub tab, in display order.
+const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::TogglePubSub, "Back"),
+    (Command::ScrollDown, "Next subscription"),
+    (Command::ScrollUp, "Previous subscription"),
+    (Command::PubSubAdd, "Add subscription (channel or pattern)"),
+    (Command::PubSubRemove, "Unsubscribe and drop messages"),
+    (Command::PubSubClear, "Clear messages and stats"),
+    (Command::ToggleHelp, "Toggle this help"),
+    (Command::Quit, "Quit"),
 ];
 
 /// `?` help rows for the dashboard, in display order.
@@ -141,6 +177,7 @@ const DASHBOARD_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::NextChart, "Next chart"),
     (Command::PrevChart, "Previous chart"),
     (Command::ToggleAllCharts, "Toggle all charts"),
+    (Command::TogglePubSub, "Open Pub/Sub"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -170,17 +207,20 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::ScrollRight, "Pan text right (wrap off)"),
     (Command::SelectDb, "Switch database"),
     (Command::ToggleDashboard, "Open metrics dashboard"),
+    (Command::TogglePubSub, "Open Pub/Sub"),
     (Command::ClosePopup, "Close popup / overlay"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: SharedState,
         tx: Sender<Action>,
         rx: Receiver<Action>,
         redis_tx: broadcast::Sender<RedisEvent>,
+        pubsub_tx: UnboundedSender<PubSubCmd>,
         target: String,
         tick_rate: f64,
         frame_rate: f64,
@@ -197,6 +237,7 @@ impl App {
         );
         let keyspace = KeySpace::new(Vec::new());
         let dashboard = Dashboard::new(state.metrics.clone());
+        let pubsub = PubSub::new(state.pubsub.clone());
 
         let mut app = Self {
             state,
@@ -221,6 +262,9 @@ impl App {
             rx,
             redis_tx,
             db_picker: DbPicker::default(),
+            pubsub,
+            pubsub_tx,
+            pubsub_return: Mode::KeySpace,
             read_only: false,
             clipboard: Clipboard::default(),
         };
@@ -332,6 +376,10 @@ impl App {
             return None;
         }
 
+        if self.mode == Mode::PubSub {
+            return self.handle_pubsub_key(key);
+        }
+
         // Keep a half-open keyspace overlay from swallowing dashboard keys.
         if self.mode == Mode::Dashboard {
             // Esc backs out of the help overlay first; any other key (`m`)
@@ -409,6 +457,32 @@ impl App {
         }
 
         self.handle_keybindings(key)
+    }
+
+    /// Keys in the Pub/Sub tab. The add popup takes raw keys (Enter
+    /// subscribes, Esc cancels, Ctrl-c still quits); otherwise Esc closes the
+    /// help overlay first, then goes through the bindings.
+    fn handle_pubsub_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.pubsub.is_popup() {
+            match key.code {
+                KeyCode::Enter => self.confirm_add_subscription(),
+                KeyCode::Esc => self.pubsub.close_popup(),
+                _ if Self::is_quit_key(key) => return Some(Action::Quit),
+                _ => self.pubsub.handle_popup_key(key),
+            }
+            return None;
+        }
+        if key.code == KeyCode::Esc && self.help_is_open() {
+            self.help_opened_at = None;
+            return None;
+        }
+        self.handle_keybindings(key)
+    }
+
+    /// `key` alone is the global quit binding (Ctrl-c).
+    fn is_quit_key(key: KeyEvent) -> bool {
+        config::get().keybindings.resolve(Mode::Common, &[key])
+            == KeyResolution::Command(Command::Quit)
     }
 
     fn handle_keybindings(&mut self, mut key: KeyEvent) -> Option<Action> {
@@ -528,6 +602,12 @@ impl App {
             } => self
                 .keyspace
                 .set_filter_count(pattern.clone(), count, complete),
+            Action::TogglePubSub => self.toggle_pubsub(),
+            Action::PubSubAdd => self.pubsub.open_add(),
+            Action::PubSubRemove => self.remove_subscription(),
+            Action::PubSubClear => {
+                self.state.pubsub.lock().clear(self.pubsub.selected());
+            }
             Action::Refresh => {}
         }
 
@@ -568,6 +648,21 @@ impl StatefulWidget for AppWidget {
     }
 }
 
+/// Columns between a help label and its keys.
+const HELP_GAP: usize = 2;
+
+/// Widths of the `?` help rows: the label column (labels are padded to the
+/// longest one) and a whole row, label column + gap + the widest keys.
+fn help_columns(rows: &[(String, String)]) -> (usize, usize) {
+    let label_width = rows
+        .iter()
+        .map(|(label, _)| label.width())
+        .max()
+        .unwrap_or(0);
+    let keys_width = rows.iter().map(|(_, keys)| keys.width()).max().unwrap_or(0);
+    (label_width, label_width + HELP_GAP + keys_width)
+}
+
 /// Render logic
 impl App {
     fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
@@ -580,6 +675,7 @@ impl App {
             Mode::Dashboard => {
                 StatefulWidget::render(DashboardWidget, area, buf, &mut self.dashboard);
             }
+            Mode::PubSub => StatefulWidget::render(PubSubWidget, area, buf, &mut self.pubsub),
             Mode::Common | Mode::Popup(_) => {}
         }
         if self.mode == Mode::Popup(PopupMode::Error) {
@@ -655,15 +751,10 @@ impl App {
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let entries = if mode == Mode::Dashboard {
-            DASHBOARD_HELP_ENTRIES
-        } else {
-            KEYSPACE_HELP_ENTRIES
-        };
-        let lookup_mode = if mode == Mode::Dashboard {
-            Mode::Dashboard
-        } else {
-            Mode::KeySpace
+        let (lookup_mode, entries) = match mode {
+            Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HELP_ENTRIES),
+            Mode::PubSub => (Mode::PubSub, PUBSUB_HELP_ENTRIES),
+            _ => (Mode::KeySpace, KEYSPACE_HELP_ENTRIES),
         };
 
         let rows: Vec<(String, String)> = entries
@@ -680,19 +771,17 @@ impl App {
             })
             .collect();
 
-        // "Extend" the box to its content: longest "label    keys" line plus
-        // borders and padding, clamped to the available area.
-        let content_width = rows
-            .iter()
-            .map(|(label, keys)| label.len() + keys.len() + 4)
-            .max()
-            .unwrap_or(0);
+        // "Extend" the box to its content, clamped to the available area:
+        // borders (2) and one column of padding on each side (2).
         let title = " Help ";
-        let inner_width = content_width.max(title.len());
-        #[allow(clippy::cast_possible_truncation)]
-        let popup_w = (inner_width as u16 + 4).min(area.width);
-        #[allow(clippy::cast_possible_truncation)]
-        let popup_h = (rows.len() as u16 + 3).min(area.height);
+        let (label_width, content_width) = help_columns(&rows);
+        let inner_width = content_width.max(title.width());
+        let popup_w = u16::try_from(inner_width + 4)
+            .unwrap_or(u16::MAX)
+            .min(area.width);
+        let popup_h = u16::try_from(rows.len() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.height);
 
         let [_, popup_area, _] = Layout::vertical([
             Constraint::Fill(1),
@@ -716,14 +805,15 @@ impl App {
             .border_type(BorderType::Rounded)
             .border_style(cfg.colors.base04)
             .bg(cfg.colors.base00)
-            .fg(cfg.colors.base05);
+            .fg(cfg.colors.base05)
+            .padding(ratatui::widgets::Padding::horizontal(1));
 
-        let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
         let lines: Vec<Line> = rows
             .iter()
             .map(|(label, keys)| {
+                let pad = label_width - label.width() + HELP_GAP;
                 Line::from(vec![
-                    Span::raw(format!("{label:<label_width$}  ")),
+                    Span::raw(format!("{label}{}", " ".repeat(pad))),
                     Span::styled(keys.clone(), cfg.colors.base04),
                 ])
             })
@@ -756,12 +846,65 @@ impl App {
         }
     }
 
+    /// `b`: open the Pub/Sub tab from the keyspace or dashboard; in the tab,
+    /// go back to where it was opened from.
+    fn toggle_pubsub(&mut self) {
+        match self.mode {
+            Mode::PubSub => {
+                self.pubsub.close_popup();
+                self.mode = self.pubsub_return;
+                self.sync_hint();
+            }
+            Mode::KeySpace | Mode::Dashboard => {
+                self.pubsub_return = self.mode;
+                self.mode = Mode::PubSub;
+                self.sync_hint();
+            }
+            Mode::Common | Mode::Popup(_) => {}
+        }
+    }
+
+    /// Enter in the add popup: record the subscription (the UI shows it right
+    /// away) and ask the task to subscribe. A duplicate only selects the
+    /// existing one, unless the connection is down: then it reconnects.
+    fn confirm_add_subscription(&mut self) {
+        let Some(target) = self.pubsub.take_add_request() else {
+            return;
+        };
+        let (index, added, disconnected) = {
+            let mut store = self.state.pubsub.lock();
+            let (index, added) = store.add(target.clone());
+            let disconnected = matches!(store.status, ConnStatus::Disconnected(_));
+            (index, added, disconnected)
+        };
+        self.pubsub.select(index);
+        if added || disconnected {
+            self.send_pubsub_cmd(PubSubCmd::Subscribe(target));
+        }
+    }
+
+    /// `d` in the tab: unsubscribe and drop the selected subscription.
+    fn remove_subscription(&mut self) {
+        let Some(target) = self.pubsub.selected_target() else {
+            return;
+        };
+        self.state.pubsub.lock().remove(&target);
+        self.pubsub.clamp_selection();
+        self.send_pubsub_cmd(PubSubCmd::Unsubscribe(target));
+    }
+
+    fn send_pubsub_cmd(&self, cmd: PubSubCmd) {
+        if let Err(err) = self.pubsub_tx.send(cmd) {
+            log::error!("Failed to send Pub/Sub command: {err:?}");
+        }
+    }
+
     /// Point the footer hint at the current mode.
     fn sync_hint(&mut self) {
-        let (mode, entries) = if self.mode == Mode::Dashboard {
-            (Mode::Dashboard, DASHBOARD_HINT_ENTRIES)
-        } else {
-            (Mode::KeySpace, KEYSPACE_HINT_ENTRIES)
+        let (mode, entries) = match self.mode {
+            Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HINT_ENTRIES),
+            Mode::PubSub => (Mode::PubSub, PUBSUB_HINT_ENTRIES),
+            _ => (Mode::KeySpace, KEYSPACE_HINT_ENTRIES),
         };
         let entries: Vec<(Command, &str)> = entries
             .iter()
@@ -1335,7 +1478,7 @@ impl App {
     /// each draw, so a resize (or the cluster banner appearing) re-pages the
     /// sweep. The selected key stays selected and on screen.
     fn sync_page_size(&mut self) {
-        if self.mode == Mode::Dashboard {
+        if matches!(self.mode, Mode::Dashboard | Mode::PubSub) {
             return;
         }
         let rows = self.keyspace.visible_rows();
@@ -1384,6 +1527,10 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
+        if self.mode == Mode::PubSub {
+            self.pubsub.select_next();
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -1406,6 +1553,10 @@ impl App {
     }
 
     fn scroll_up(&mut self) {
+        if self.mode == Mode::PubSub {
+            self.pubsub.select_prev();
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -1430,19 +1581,111 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redis_client::pubsub_store::Target;
 
     fn app() -> App {
+        app_with_pubsub().0
+    }
+
+    fn app_with_pubsub() -> (App, mpsc::UnboundedReceiver<PubSubCmd>) {
         let (tx, rx) = mpsc::channel(8);
         let (redis_tx, _) = broadcast::channel(8);
-        App::new(
+        let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
+        let app = App::new(
             SharedState::default(),
             tx,
             rx,
             redis_tx,
+            pubsub_tx,
             "redis://localhost:6379".into(),
             4.0,
             30.0,
-        )
+        );
+        (app, pubsub_rx)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn help_box_fits_short_labels_with_long_keys() {
+        let rows = vec![
+            ("Back".to_string(), "b, Esc".to_string()),
+            (
+                "Add subscription (channel or pattern)".to_string(),
+                "a".to_string(),
+            ),
+            ("Next".to_string(), "Down, j".to_string()),
+            ("Missing".to_string(), "—".to_string()),
+        ];
+        let (label, row) = help_columns(&rows);
+        assert_eq!(label, 37);
+        // The widest keys ("Down, j") sit after the longest label column.
+        assert_eq!(row, 37 + HELP_GAP + 7);
+    }
+
+    #[test]
+    fn help_overlay_shows_every_pubsub_binding_whole() {
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        App::render_help_overlay(area, &mut buf, Mode::PubSub);
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        // Key order within a row follows the keymap's hash order.
+        let back = text.lines().find(|l| l.contains("Back")).unwrap();
+        assert!(back.contains("Esc") && back.contains('b'), "{text}");
+        let next = text.lines().find(|l| l.contains("Next")).unwrap();
+        assert!(next.contains("Down") && next.contains('j'), "{text}");
+        for whole in ["Ctrl-c", "Clear messages and stats"] {
+            assert!(text.contains(whole), "{whole} missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn pubsub_tab_back_survives_an_error_popup() {
+        let mut app = app();
+        app.toggle_dashboard();
+        app.toggle_pubsub();
+        assert_eq!(app.mode, Mode::PubSub);
+
+        app.show_error_popup("Pub/Sub connection lost");
+        app.switch_to_previous_mode();
+        assert_eq!(app.mode, Mode::PubSub);
+
+        assert_eq!(
+            app.handle_key_event(key(KeyCode::Esc)),
+            Some(Action::TogglePubSub)
+        );
+        app.toggle_pubsub();
+        assert_eq!(app.mode, Mode::Dashboard);
+    }
+
+    #[test]
+    fn add_popup_subscribes_once_and_remove_unsubscribes() {
+        let (mut app, mut cmds) = app_with_pubsub();
+        app.toggle_pubsub();
+        for _ in 0..2 {
+            app.pubsub.open_add();
+            for c in "orders:*".chars() {
+                assert_eq!(app.handle_key_event(key(KeyCode::Char(c))), None);
+            }
+            assert_eq!(app.handle_key_event(key(KeyCode::Enter)), None);
+        }
+        let target = Target::Pattern("orders:*".into());
+        assert_eq!(cmds.try_recv(), Ok(PubSubCmd::Subscribe(target.clone())));
+        assert!(cmds.try_recv().is_err(), "duplicate must not resubscribe");
+        assert_eq!(app.state.pubsub.lock().subs.len(), 1);
+
+        app.remove_subscription();
+        assert_eq!(cmds.try_recv(), Ok(PubSubCmd::Unsubscribe(target)));
+        assert!(app.state.pubsub.lock().subs.is_empty());
     }
 
     #[test]

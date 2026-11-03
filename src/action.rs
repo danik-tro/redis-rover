@@ -66,6 +66,14 @@ pub enum Action {
         count: usize,
         complete: bool,
     },
+    /// Open / leave the Pub/Sub tab.
+    TogglePubSub,
+    /// Open the add-subscription popup.
+    PubSubAdd,
+    /// Unsubscribe the selected subscription and drop its messages.
+    PubSubRemove,
+    /// Clear the selected subscription's messages and stats.
+    PubSubClear,
 }
 
 impl Action {

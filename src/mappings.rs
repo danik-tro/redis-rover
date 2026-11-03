@@ -32,6 +32,10 @@ impl From<Command> for Action {
             Command::ToggleWrap => Self::ToggleWrap,
             Command::YankValue => Self::YankValue,
             Command::YankKey => Self::YankKey,
+            Command::TogglePubSub => Self::TogglePubSub,
+            Command::PubSubAdd => Self::PubSubAdd,
+            Command::PubSubRemove => Self::PubSubRemove,
+            Command::PubSubClear => Self::PubSubClear,
         }
     }
 }

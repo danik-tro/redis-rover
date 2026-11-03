@@ -38,6 +38,56 @@ pub struct Config {
     pub keyspace: KeyspacePalette,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    #[serde(default)]
+    pub pubsub: PubSubConfig,
+}
+
+/// Buffer limits of each Pub/Sub subscription.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct PubSubConfig {
+    /// Messages kept per subscription; see [`PubSubConfig::buffer_messages`].
+    pub buffer_messages: usize,
+    /// Payload bytes kept per subscription; see [`PubSubConfig::buffer_bytes`].
+    pub buffer_bytes: usize,
+    /// Payload bytes stored per message; see [`PubSubConfig::max_payload`].
+    pub max_payload: usize,
+}
+
+impl Default for PubSubConfig {
+    fn default() -> Self {
+        Self {
+            buffer_messages: 1000,
+            buffer_bytes: 8 * 1024 * 1024,
+            max_payload: 64 * 1024,
+        }
+    }
+}
+
+impl PubSubConfig {
+    /// Messages per subscription, clamped to 10..=100,000.
+    pub fn buffer_messages(&self) -> usize {
+        self.buffer_messages.clamp(10, 100_000)
+    }
+
+    /// Bytes per subscription, clamped to 64 KiB..=256 MiB.
+    pub fn buffer_bytes(&self) -> usize {
+        self.buffer_bytes.clamp(64 * 1024, 256 * 1024 * 1024)
+    }
+
+    /// Bytes stored per message, clamped to 1 KiB..=[`Self::buffer_bytes`], so
+    /// one message always fits in the buffer.
+    pub fn max_payload(&self) -> usize {
+        self.max_payload.clamp(1024, self.buffer_bytes())
+    }
+
+    pub fn limits(&self) -> crate::redis_client::pubsub_store::BufferLimits {
+        crate::redis_client::pubsub_store::BufferLimits {
+            messages: self.buffer_messages(),
+            bytes: self.buffer_bytes(),
+            payload: self.max_payload(),
+        }
+    }
 }
 
 /// Settings for the live-metrics dashboard.
@@ -428,6 +478,81 @@ mod tests {
         let cfg: Config = json5::from_str("{ keybindings: {} }").unwrap();
         assert_eq!(cfg.dashboard.interval_ms, 1000);
         assert_eq!(cfg.dashboard.history, 300);
+    }
+
+    #[test]
+    fn pubsub_config_defaults_and_clamps() {
+        let d = PubSubConfig::default();
+        assert_eq!(d.buffer_messages(), 1000);
+        assert_eq!(d.buffer_bytes(), 8 * 1024 * 1024);
+        assert_eq!(d.max_payload(), 64 * 1024);
+
+        let c = PubSubConfig {
+            buffer_messages: 1,
+            buffer_bytes: 1,
+            max_payload: 1,
+        };
+        assert_eq!(c.buffer_messages(), 10);
+        assert_eq!(c.buffer_bytes(), 64 * 1024);
+        assert_eq!(c.max_payload(), 1024);
+
+        let c = PubSubConfig {
+            buffer_messages: usize::MAX,
+            buffer_bytes: usize::MAX,
+            max_payload: usize::MAX,
+        };
+        assert_eq!(c.buffer_messages(), 100_000);
+        assert_eq!(c.buffer_bytes(), 256 * 1024 * 1024);
+        assert_eq!(c.max_payload(), 256 * 1024 * 1024);
+
+        // max_payload never exceeds the buffer.
+        let c = PubSubConfig {
+            buffer_messages: 100,
+            buffer_bytes: 100 * 1024,
+            max_payload: 1024 * 1024,
+        };
+        assert_eq!(c.max_payload(), 100 * 1024);
+
+        let cfg: Config =
+            json5::from_str("{ keybindings: {}, pubsub: { buffer_messages: 50 } }").unwrap();
+        assert_eq!(cfg.pubsub.buffer_messages(), 50);
+        assert_eq!(cfg.pubsub.max_payload(), 64 * 1024);
+    }
+
+    #[test]
+    fn bundled_pubsub_bindings() -> Result<()> {
+        use crate::keybindings::KeyResolution;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let c = Config::new()?;
+        let resolve = |mode, code| {
+            c.keybindings
+                .resolve(mode, &[KeyEvent::new(code, KeyModifiers::empty())])
+        };
+        for mode in [Mode::KeySpace, Mode::Dashboard, Mode::PubSub] {
+            assert_eq!(
+                resolve(mode, KeyCode::Char('b')),
+                KeyResolution::Command(Command::TogglePubSub),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Esc),
+            KeyResolution::Command(Command::TogglePubSub)
+        );
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Char('a')),
+            KeyResolution::Command(Command::PubSubAdd)
+        );
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Char('d')),
+            KeyResolution::Command(Command::PubSubRemove)
+        );
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Char('c')),
+            KeyResolution::Command(Command::PubSubClear)
+        );
+        Ok(())
     }
 
     #[test]

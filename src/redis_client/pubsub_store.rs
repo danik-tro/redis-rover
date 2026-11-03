@@ -1,0 +1,623 @@
+//! In-memory state of the Pub/Sub tab: subscriptions, their bounded message
+//! buffers and stats. Written by the Pub/Sub task, read by the UI.
+
+use std::{
+    collections::VecDeque,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/// Seconds kept by the per-second rate ring.
+const RATE_WINDOW_SECS: u32 = 60;
+const RATE_WINDOW: usize = RATE_WINDOW_SECS as usize;
+/// Bytes inspected by the binary-payload check.
+const BINARY_SNIFF: usize = 256;
+
+/// What a subscription listens to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// `SUBSCRIBE channel`
+    Channel(String),
+    /// `PSUBSCRIBE pattern`
+    Pattern(String),
+}
+
+impl Target {
+    /// Build a target of `kind` named `name`.
+    pub fn new(kind: TargetKind, name: String) -> Self {
+        match kind {
+            TargetKind::Channel => Self::Channel(name),
+            TargetKind::Pattern => Self::Pattern(name),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Channel(name) | Self::Pattern(name) => name,
+        }
+    }
+
+    pub fn is_pattern(&self) -> bool {
+        matches!(self, Self::Pattern(_))
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Channel(name) => f.write_str(name),
+            Self::Pattern(name) => write!(f, "{name} (pattern)"),
+        }
+    }
+}
+
+/// Kind of a [`Target`], as picked in the add-subscription popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Channel,
+    Pattern,
+}
+
+impl TargetKind {
+    #[must_use]
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Channel => Self::Pattern,
+            Self::Pattern => Self::Channel,
+        }
+    }
+}
+
+/// Glob characters (`*`, `?`, `[`) make the text a pattern by default.
+pub fn detect_kind(text: &str) -> TargetKind {
+    if text.contains(['*', '?', '[']) {
+        TargetKind::Pattern
+    } else {
+        TargetKind::Channel
+    }
+}
+
+/// A stored message payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payload {
+    /// Valid or mostly printable UTF-8 (decoded lossily).
+    Text(String),
+    /// Mostly non-printable bytes.
+    Binary(Vec<u8>),
+}
+
+impl Payload {
+    /// Decode `bytes`, keeping at most `max` bytes. Returns the payload and
+    /// whether it was cut.
+    pub fn from_bytes(bytes: &[u8], max: usize) -> (Self, bool) {
+        let truncated = bytes.len() > max;
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            let end = text.floor_char_boundary(max);
+            return (Self::Text(text[..end].to_owned()), truncated);
+        }
+        let cut = &bytes[..bytes.len().min(max)];
+        if looks_binary(bytes) {
+            (Self::Binary(cut.to_vec()), truncated)
+        } else {
+            (
+                Self::Text(String::from_utf8_lossy(cut).into_owned()),
+                truncated,
+            )
+        }
+    }
+
+    /// Stored size in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// More than 10 % of the first [`BINARY_SNIFF`] bytes are control bytes.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(BINARY_SNIFF)];
+    let odd = head
+        .iter()
+        .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7f)
+        .count();
+    odd * 10 > head.len()
+}
+
+/// One received message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubSubMessage {
+    /// Increases by one per message of a subscription, across evictions and
+    /// clears.
+    pub seq: u64,
+    pub received_at: SystemTime,
+    /// The concrete channel (differs from the pattern for `PSUBSCRIBE`).
+    pub channel: String,
+    pub payload: Payload,
+    /// Original payload size in bytes.
+    pub size: usize,
+    /// The payload was cut at `max_payload`.
+    pub truncated: bool,
+}
+
+/// Buffer limits of every subscription (from `PubSubConfig`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferLimits {
+    pub messages: usize,
+    pub bytes: usize,
+    /// Most payload bytes stored per message; `<= bytes`.
+    pub payload: usize,
+}
+
+/// Newest messages of a subscription, bounded by count and bytes.
+#[derive(Debug, Clone)]
+pub struct MessageBuffer {
+    items: VecDeque<PubSubMessage>,
+    /// Sum of stored payload sizes.
+    bytes: usize,
+    limits: BufferLimits,
+    next_seq: u64,
+}
+
+impl MessageBuffer {
+    pub fn new(limits: BufferLimits) -> Self {
+        Self {
+            items: VecDeque::new(),
+            bytes: 0,
+            limits,
+            next_seq: 1,
+        }
+    }
+
+    /// Store a message (payload cut at `max_payload`), then evict the oldest
+    /// ones until both limits hold.
+    pub fn push(&mut self, channel: &str, payload: &[u8], now: SystemTime) {
+        let (stored, truncated) = Payload::from_bytes(payload, self.limits.payload);
+        self.bytes += stored.len();
+        self.items.push_back(PubSubMessage {
+            seq: self.next_seq,
+            received_at: now,
+            channel: channel.to_owned(),
+            payload: stored,
+            size: payload.len(),
+            truncated,
+        });
+        self.next_seq += 1;
+
+        while self.items.len() > self.limits.messages || self.bytes > self.limits.bytes {
+            let Some(old) = self.items.pop_front() else {
+                break;
+            };
+            self.bytes -= old.payload.len();
+        }
+    }
+
+    /// Drop every message; sequence numbers keep counting.
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.bytes = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The newest `n` messages, oldest first.
+    pub fn last_n(&self, n: usize) -> impl Iterator<Item = &PubSubMessage> {
+        self.items.iter().skip(self.items.len().saturating_sub(n))
+    }
+}
+
+/// Counters of a subscription. Rates come from a ring of per-second counts.
+#[derive(Debug, Clone)]
+pub struct SubStats {
+    pub total: u64,
+    pub bytes: u64,
+    pub max_size: usize,
+    /// Per-second counts, indexed by unix second % 60.
+    buckets: [u32; RATE_WINDOW],
+    /// Unix second of the newest bucket written.
+    head: u64,
+    pub last_at: Option<SystemTime>,
+}
+
+impl Default for SubStats {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            bytes: 0,
+            max_size: 0,
+            buckets: [0; RATE_WINDOW],
+            head: 0,
+            last_at: None,
+        }
+    }
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn slot(sec: u64) -> usize {
+    (sec % RATE_WINDOW as u64) as usize
+}
+
+impl SubStats {
+    pub fn record(&mut self, size: usize, now: SystemTime) {
+        self.total += 1;
+        self.bytes += size as u64;
+        self.max_size = self.max_size.max(size);
+        self.last_at = Some(now);
+
+        let sec = unix_secs(now);
+        if sec > self.head {
+            // Zero the buckets of the seconds skipped since the last message.
+            let gap = (sec - self.head).min(RATE_WINDOW as u64);
+            for s in (sec + 1 - gap)..=sec {
+                self.buckets[slot(s)] = 0;
+            }
+            self.head = sec;
+        }
+        // A clock that went back counts into the newest bucket.
+        let i = slot(self.head);
+        self.buckets[i] = self.buckets[i].saturating_add(1);
+    }
+
+    /// Count of second `sec`, or 0 if it's outside the ring.
+    fn count_at(&self, sec: u64) -> u32 {
+        if sec > self.head || self.head - sec >= RATE_WINDOW as u64 {
+            0
+        } else {
+            self.buckets[slot(sec)]
+        }
+    }
+
+    /// Messages in the last complete second.
+    pub fn rate_1s(&self, now: SystemTime) -> u32 {
+        unix_secs(now)
+            .checked_sub(1)
+            .map_or(0, |sec| self.count_at(sec))
+    }
+
+    /// Average msg/s over the last 60 complete seconds.
+    pub fn rate_60s(&self, now: SystemTime) -> f64 {
+        let sec = unix_secs(now);
+        let sum: u32 = (1..=RATE_WINDOW as u64)
+            .filter_map(|back| sec.checked_sub(back))
+            .map(|s| self.count_at(s))
+            .sum();
+        f64::from(sum) / f64::from(RATE_WINDOW_SECS)
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// One subscription and what it has received.
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub target: Target,
+    pub buffer: MessageBuffer,
+    pub stats: SubStats,
+}
+
+impl Subscription {
+    fn matches(&self, channel: &str, pattern: Option<&str>) -> bool {
+        match (&self.target, pattern) {
+            (Target::Pattern(p), Some(pattern)) => p == pattern,
+            (Target::Channel(c), None) => c == channel,
+            _ => false,
+        }
+    }
+}
+
+/// State of the dedicated Pub/Sub connection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnStatus {
+    /// Nothing subscribed yet: no connection opened.
+    #[default]
+    NotStarted,
+    Connecting,
+    Connected,
+    Disconnected(String),
+}
+
+impl fmt::Display for ConnStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotStarted => f.write_str("not started"),
+            Self::Connecting => f.write_str("connecting"),
+            Self::Connected => f.write_str("connected"),
+            Self::Disconnected(_) => f.write_str("disconnected"),
+        }
+    }
+}
+
+/// Everything the Pub/Sub tab shows, shared between the task and the UI.
+#[derive(Debug, Clone)]
+pub struct PubSubStore {
+    /// In the order they were added.
+    pub subs: Vec<Subscription>,
+    pub status: ConnStatus,
+    limits: BufferLimits,
+}
+
+impl PubSubStore {
+    pub fn new(limits: BufferLimits) -> Self {
+        Self {
+            subs: Vec::new(),
+            status: ConnStatus::NotStarted,
+            limits,
+        }
+    }
+
+    pub fn position(&self, target: &Target) -> Option<usize> {
+        self.subs.iter().position(|s| &s.target == target)
+    }
+
+    /// Add a subscription. Returns its index and whether it is new (a
+    /// duplicate returns the existing one).
+    pub fn add(&mut self, target: Target) -> (usize, bool) {
+        if let Some(index) = self.position(&target) {
+            return (index, false);
+        }
+        self.subs.push(Subscription {
+            target,
+            buffer: MessageBuffer::new(self.limits),
+            stats: SubStats::default(),
+        });
+        (self.subs.len() - 1, true)
+    }
+
+    /// Remove a subscription with its buffer and stats.
+    pub fn remove(&mut self, target: &Target) -> bool {
+        let before = self.subs.len();
+        self.subs.retain(|s| &s.target != target);
+        self.subs.len() != before
+    }
+
+    /// Clear the buffer and stats of subscription `index`.
+    pub fn clear(&mut self, index: usize) {
+        if let Some(sub) = self.subs.get_mut(index) {
+            sub.buffer.clear();
+            sub.stats.reset();
+        }
+    }
+
+    pub fn targets(&self) -> Vec<Target> {
+        self.subs.iter().map(|s| s.target.clone()).collect()
+    }
+
+    /// Store a message: `pattern` set means it came from `PSUBSCRIBE pattern`.
+    /// Messages for a target that was removed meanwhile are dropped.
+    pub fn push(&mut self, channel: &str, pattern: Option<&str>, payload: &[u8], now: SystemTime) {
+        if let Some(sub) = self.subs.iter_mut().find(|s| s.matches(channel, pattern)) {
+            sub.buffer.push(channel, payload, now);
+            sub.stats.record(payload.len(), now);
+        }
+    }
+
+    /// Store a message received from Redis.
+    pub fn push_msg(&mut self, msg: &redis::Msg, now: SystemTime) {
+        let pattern: Option<String> = msg.get_pattern().ok().flatten();
+        self.push(
+            msg.get_channel_name(),
+            pattern.as_deref(),
+            msg.get_payload_bytes(),
+            now,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use pretty_assertions::assert_eq;
+    use redis::Value;
+
+    use super::*;
+
+    const LIMITS: BufferLimits = BufferLimits {
+        messages: 3,
+        bytes: 1024,
+        payload: 512,
+    };
+
+    fn at(sec: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000 + sec)
+    }
+
+    fn seqs(buf: &MessageBuffer) -> Vec<u64> {
+        buf.last_n(usize::MAX).map(|m| m.seq).collect()
+    }
+
+    #[test]
+    fn evicts_by_count() {
+        let mut buf = MessageBuffer::new(LIMITS);
+        for i in 0..5 {
+            buf.push("c", format!("m{i}").as_bytes(), at(0));
+        }
+        assert_eq!(buf.len(), 3);
+        assert_eq!(seqs(&buf), vec![3, 4, 5]);
+        assert_eq!(buf.bytes(), 6);
+    }
+
+    #[test]
+    fn evicts_by_bytes() {
+        let mut buf = MessageBuffer::new(BufferLimits {
+            messages: 100,
+            bytes: 10,
+            payload: 10,
+        });
+        buf.push("c", b"aaaa", at(0));
+        buf.push("c", b"bbbb", at(0));
+        assert_eq!(buf.len(), 2);
+        buf.push("c", b"cccc", at(0));
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.bytes(), 8);
+        assert_eq!(seqs(&buf), vec![2, 3]);
+    }
+
+    #[test]
+    fn cuts_payload_at_max_payload() {
+        let mut buf = MessageBuffer::new(BufferLimits {
+            messages: 10,
+            bytes: 100,
+            payload: 4,
+        });
+        buf.push("c", b"abcdefgh", at(0));
+        buf.push("c", b"abc", at(0));
+        let msgs: Vec<_> = buf.last_n(2).collect();
+        assert_eq!(msgs[0].payload, Payload::Text("abcd".into()));
+        assert_eq!(msgs[0].size, 8);
+        assert!(msgs[0].truncated);
+        assert_eq!(msgs[1].payload, Payload::Text("abc".into()));
+        assert!(!msgs[1].truncated);
+        assert_eq!(buf.bytes(), 7);
+    }
+
+    #[test]
+    fn cut_keeps_utf8_char_boundaries() {
+        // "é" is two bytes: cutting at 3 must not split the second one.
+        let (payload, truncated) = Payload::from_bytes("aéé".as_bytes(), 4);
+        assert_eq!(payload, Payload::Text("aé".into()));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn binary_detection() {
+        let (p, _) = Payload::from_bytes(&[0xff, 0x00, 0x01, 0x02, 0x8c], 64);
+        assert_eq!(p, Payload::Binary(vec![0xff, 0x00, 0x01, 0x02, 0x8c]));
+        // Invalid UTF-8 but mostly printable: lossy text.
+        let (p, _) = Payload::from_bytes(b"hello world\xff", 64);
+        assert_eq!(p, Payload::Text("hello world\u{fffd}".into()));
+        // Valid UTF-8 is always text.
+        let (p, _) = Payload::from_bytes(b"\x00\x01\x02", 64);
+        assert!(matches!(p, Payload::Text(_)));
+    }
+
+    #[test]
+    fn seq_keeps_increasing_across_evictions_and_clear() {
+        let mut buf = MessageBuffer::new(LIMITS);
+        for _ in 0..4 {
+            buf.push("c", b"x", at(0));
+        }
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.bytes(), 0);
+        buf.push("c", b"x", at(0));
+        assert_eq!(seqs(&buf), vec![5]);
+    }
+
+    #[test]
+    fn rate_buckets_over_synthetic_seconds() {
+        let mut stats = SubStats::default();
+        for _ in 0..5 {
+            stats.record(10, at(0));
+        }
+        for _ in 0..3 {
+            stats.record(20, at(1));
+        }
+        assert_eq!(stats.rate_1s(at(1)), 5, "second 1 isn't complete yet");
+        assert_eq!(stats.rate_1s(at(2)), 3);
+        assert_eq!(stats.rate_1s(at(3)), 0);
+        assert!((stats.rate_60s(at(2)) - 8.0 / 60.0).abs() < 1e-9);
+        assert_eq!(stats.total, 8);
+        assert_eq!(stats.bytes, 110);
+        assert_eq!(stats.max_size, 20);
+        assert_eq!(stats.last_at, Some(at(1)));
+
+        // 60 s later the old seconds are out of the window.
+        assert!(stats.rate_60s(at(62)).abs() < 1e-9);
+
+        // A gap zeroes stale buckets that share a slot with new seconds.
+        stats.record(1, at(60));
+        assert_eq!(stats.rate_1s(at(61)), 1);
+        assert_eq!(stats.count_at(0), 0);
+        assert!((stats.rate_60s(at(61)) - 4.0 / 60.0).abs() < 1e-9);
+
+        stats.reset();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.rate_1s(at(61)), 0);
+    }
+
+    #[test]
+    fn detects_pattern_vs_channel() {
+        assert_eq!(detect_kind("orders:new"), TargetKind::Channel);
+        assert_eq!(detect_kind("orders:*"), TargetKind::Pattern);
+        assert_eq!(detect_kind("h?llo"), TargetKind::Pattern);
+        assert_eq!(detect_kind("h[ae]llo"), TargetKind::Pattern);
+        assert_eq!(detect_kind(""), TargetKind::Channel);
+        assert_eq!(TargetKind::Channel.flipped(), TargetKind::Pattern);
+    }
+
+    #[test]
+    fn duplicate_add_returns_existing() {
+        let mut store = PubSubStore::new(LIMITS);
+        assert_eq!(store.add(Target::Channel("a".into())), (0, true));
+        assert_eq!(store.add(Target::Pattern("a".into())), (1, true));
+        assert_eq!(store.add(Target::Channel("a".into())), (0, false));
+        assert!(store.remove(&Target::Channel("a".into())));
+        assert!(!store.remove(&Target::Channel("a".into())));
+        assert_eq!(store.targets(), vec![Target::Pattern("a".into())]);
+    }
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn pmessage_keeps_the_concrete_channel() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Pattern("orders:*".into()));
+        store.add(Target::Channel("orders:new".into()));
+
+        let pmessage = redis::Msg::from_owned_value(Value::Array(vec![
+            bulk("pmessage"),
+            bulk("orders:*"),
+            bulk("orders:new"),
+            bulk(r#"{"id":1}"#),
+        ]))
+        .unwrap();
+        let message = redis::Msg::from_owned_value(Value::Array(vec![
+            bulk("message"),
+            bulk("orders:new"),
+            bulk(r#"{"id":1}"#),
+        ]))
+        .unwrap();
+        store.push_msg(&pmessage, at(0));
+        store.push_msg(&message, at(0));
+
+        // Each subscription gets its own copy.
+        for sub in &store.subs {
+            let msgs: Vec<_> = sub.buffer.last_n(10).collect();
+            assert_eq!(msgs.len(), 1, "{}", sub.target);
+            assert_eq!(msgs[0].channel, "orders:new");
+            assert_eq!(msgs[0].payload, Payload::Text(r#"{"id":1}"#.into()));
+        }
+    }
+
+    #[test]
+    fn clear_resets_buffer_and_stats() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Channel("c".into()));
+        store.push("c", None, b"x", at(0));
+        store.push("other", None, b"x", at(0));
+        assert_eq!(store.subs[0].stats.total, 1);
+        store.clear(0);
+        assert!(store.subs[0].buffer.is_empty());
+        assert_eq!(store.subs[0].stats.total, 0);
+    }
+}
