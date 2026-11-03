@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="redis-rover: a terminal UI for Redis">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14161c"/>
+      <stop offset="1" stop-color="#1d1218"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.22" cy="0.45" r="0.5">
+      <stop offset="0" stop-color="#dc382d" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#dc382d" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6b5e"/>
+      <stop offset="1" stop-color="#dc382d"/>
+    </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0H0V28" fill="none" stroke="#ffffff" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- background -->
+  <rect width="1280" height="420" rx="18" fill="url(#bg)"/>
+  <rect width="1280" height="420" rx="18" fill="url(#grid)"/>
+  <rect width="1280" height="420" rx="18" fill="url(#glow)"/>
+
+  <g font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">
+    <!-- left: name and tagline -->
+    <text x="72" y="150" font-size="22" fill="#8b8f9a" letter-spacing="1">$ rrover</text>
+    <text x="68" y="222" font-size="76" font-weight="700" fill="url(#title)" letter-spacing="-2">redis-rover</text>
+    <text x="72" y="272" font-size="24" fill="#e6e6e6">A terminal UI for Redis</text>
+    <text x="72" y="306" font-size="18" fill="#8b8f9a">browse · inspect · edit · monitor</text>
+
+    <!-- feature chips -->
+    <g font-size="14" font-weight="600">
+      <rect x="72" y="334" width="62" height="28" rx="14" fill="#dc382d" fill-opacity="0.15" stroke="#dc382d" stroke-opacity="0.5"/>
+      <text x="103" y="353" text-anchor="middle" fill="#ff8a7f">TLS</text>
+      <rect x="144" y="334" width="104" height="28" rx="14" fill="#dc382d" fill-opacity="0.15" stroke="#dc382d" stroke-opacity="0.5"/>
+      <text x="196" y="353" text-anchor="middle" fill="#ff8a7f">read-only</text>
+      <rect x="258" y="334" width="102" height="28" rx="14" fill="#dc382d" fill-opacity="0.15" stroke="#dc382d" stroke-opacity="0.5"/>
+      <text x="309" y="353" text-anchor="middle" fill="#ff8a7f">live stats</text>
+      <rect x="370" y="334" width="62" height="28" rx="14" fill="#dc382d" fill-opacity="0.15" stroke="#dc382d" stroke-opacity="0.5"/>
+      <text x="401" y="353" text-anchor="middle" fill="#ff8a7f">🦀</text>
+    </g>
+
+    <!-- right: terminal window -->
+    <g filter="url(#shadow)">
+      <rect x="640" y="52" width="576" height="316" rx="12" fill="#0f1115" stroke="#2a2e37"/>
+    </g>
+    <path d="M640 64a12 12 0 0 1 12-12h552a12 12 0 0 1 12 12v22H640z" fill="#1a1d24"/>
+    <circle cx="664" cy="69" r="6" fill="#ff5f57"/>
+    <circle cx="684" cy="69" r="6" fill="#febc2e"/>
+    <circle cx="704" cy="69" r="6" fill="#28c840"/>
+    <text x="928" y="74" font-size="13" text-anchor="middle" fill="#6b7080">rrover — redis://localhost:6379</text>
+
+    <!-- filter line -->
+    <text x="664" y="114" font-size="14" fill="#6b7080">filter</text>
+    <text x="722" y="114" font-size="14" fill="#e6e6e6">user:*</text>
+    <rect x="776" y="101" width="8" height="17" fill="#ff6b5e">
+      <animate attributeName="opacity" values="1;1;0;0" dur="1.1s" repeatCount="indefinite"/>
+    </rect>
+
+    <!-- table header -->
+    <g font-size="13" fill="#6b7080" font-weight="600">
+      <text x="664" y="146">TYPE</text>
+      <text x="748" y="146">KEY</text>
+      <text x="1050" y="146" text-anchor="end">SIZE</text>
+      <text x="1192" y="146" text-anchor="end">TTL</text>
+    </g>
+    <line x1="660" y1="156" x2="1196" y2="156" stroke="#2a2e37"/>
+
+    <!-- rows -->
+    <g font-size="14">
+      <!-- selected row -->
+      <rect x="656" y="164" width="544" height="28" rx="4" fill="#2a2e37"/>
+      <rect x="664" y="170" width="64" height="18" rx="4" fill="#61afef"/>
+      <text x="696" y="183" font-size="12" font-weight="700" text-anchor="middle" fill="#0f1115">hash</text>
+      <text x="748" y="184" fill="#ffffff" font-weight="700">user:1042</text>
+      <text x="1050" y="184" text-anchor="end" fill="#c8ccd4">1.2 KB</text>
+      <text x="1192" y="184" text-anchor="end" fill="#c8ccd4">∞</text>
+
+      <rect x="664" y="202" width="64" height="18" rx="4" fill="#98c379"/>
+      <text x="696" y="215" font-size="12" font-weight="700" text-anchor="middle" fill="#0f1115">string</text>
+      <text x="748" y="216" fill="#c8ccd4">user:1042:session</text>
+      <text x="1050" y="216" text-anchor="end" fill="#8b8f9a">312 B</text>
+      <text x="1192" y="216" text-anchor="end" fill="#8b8f9a">29m</text>
+
+      <rect x="664" y="234" width="64" height="18" rx="4" fill="#e5c07b"/>
+      <text x="696" y="247" font-size="12" font-weight="700" text-anchor="middle" fill="#0f1115">zset</text>
+      <text x="748" y="248" fill="#c8ccd4">user:leaderboard</text>
+      <text x="1050" y="248" text-anchor="end" fill="#8b8f9a">48 KB</text>
+      <text x="1192" y="248" text-anchor="end" fill="#8b8f9a">∞</text>
+
+      <rect x="664" y="266" width="64" height="18" rx="4" fill="#c678dd"/>
+      <text x="696" y="279" font-size="12" font-weight="700" text-anchor="middle" fill="#0f1115">list</text>
+      <text x="748" y="280" fill="#c8ccd4">user:1042:events</text>
+      <text x="1050" y="280" text-anchor="end" fill="#8b8f9a">9.8 KB</text>
+      <text x="1192" y="280" text-anchor="end" fill="#8b8f9a">7d</text>
+
+      <rect x="664" y="298" width="64" height="18" rx="4" fill="#56b6c2"/>
+      <text x="696" y="311" font-size="12" font-weight="700" text-anchor="middle" fill="#0f1115">json</text>
+      <text x="748" y="312" fill="#c8ccd4">user:1042:profile</text>
+      <text x="1050" y="312" text-anchor="end" fill="#8b8f9a">2.4 KB</text>
+      <text x="1192" y="312" text-anchor="end" fill="#8b8f9a">∞</text>
+    </g>
+
+    <!-- footer / status bar -->
+    <rect x="641" y="334" width="574" height="33" fill="#1a1d24"/>
+    <path d="M641 334h574v22a11 11 0 0 1-11 11H652a11 11 0 0 1-11-11z" fill="#1a1d24"/>
+    <g font-size="13">
+      <rect x="656" y="342" width="30" height="18" rx="4" fill="#dc382d"/>
+      <text x="671" y="355" font-weight="700" text-anchor="middle" fill="#ffffff">RO</text>
+      <text x="698" y="355" fill="#c8ccd4">db 0 · 18,402 keys</text>
+      <text x="1196" y="355" text-anchor="end" fill="#6b7080">f filter · s db · m stats · ? help</text>
+    </g>
+  </g>
+</svg>

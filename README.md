@@ -1,6 +1,6 @@
-<h1 align="center">
-<img src="https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/logo-github.png" />
-</h1>
+<p align="center">
+<img src="https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/banner.svg" alt="redis-rover: a terminal UI for Redis" width="100%" />
+</p>
 
 # redis-rover
 
