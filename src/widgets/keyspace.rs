@@ -15,7 +15,7 @@ use ratatui::{
         Table, TableState, Widget, Wrap,
     },
 };
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -381,7 +381,7 @@ enum OverlayKind {
 }
 
 /// A transient modal prompt rendered on top of the keyspace. Reuses
-/// `tui-textarea` for the kinds that take input ([`OverlayKind::EditValue`],
+/// `ratatui-textarea` for the kinds that take input ([`OverlayKind::EditValue`],
 /// [`OverlayKind::SetTtl`]).
 struct ActionOverlay {
     kind: OverlayKind,
@@ -2472,7 +2472,7 @@ impl KeySpaceWidget {
         let table = Table::new(rows, widths)
             .header(header)
             .highlight_symbol(highlight_symbol())
-            .highlight_style(selected_row_style())
+            .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(table, area, buf, table_state);
@@ -2504,7 +2504,7 @@ impl KeySpaceWidget {
             .header(header)
             .column_spacing(2)
             .highlight_symbol(highlight_symbol())
-            .highlight_style(selected_row_style())
+            .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(table, area, buf, table_state);
@@ -2834,7 +2834,7 @@ impl StatefulWidget for KeySpaceWidget {
             .header(header)
             .column_spacing(1)
             .highlight_symbol(highlight_symbol())
-            .highlight_style(selected_row_style())
+            .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
         if state.keys.is_empty() {
