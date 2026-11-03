@@ -47,12 +47,14 @@ async fn tokio_main(args: Cli) -> Result<()> {
 
     let client = args.client()?;
     let target = cli::connection_label(client.get_connection_info());
-    let manager: ConnectionManager = ConnectionManager::new(client)
+    *state.db.lock() = client.get_connection_info().redis_settings().db();
+    let manager: ConnectionManager = ConnectionManager::new(client.clone())
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
-    let mut watcher = Runner::new(manager.clone(), state.clone(), tx.clone())
-        .cancellation_token(cancellation_token.clone());
+    let mut watcher = Runner::new(client, manager.clone(), state.clone(), tx.clone())
+        .cancellation_token(cancellation_token.clone())
+        .read_only(args.read_only);
 
     let mut app = App::new(
         state,
@@ -62,7 +64,8 @@ async fn tokio_main(args: Cli) -> Result<()> {
         target,
         args.tick_rate,
         args.frame_rate,
-    );
+    )
+    .read_only(args.read_only);
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;

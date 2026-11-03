@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::{borrow::Cow, collections::HashSet};
 
 use crate::config;
@@ -35,17 +35,44 @@ impl From<HashMap<&str, &str>> for CommonInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisInfo {
     pub common: CommonInfo,
+    /// Key count per DB, from the `# Keyspace` section (`db3:keys=120,...`).
+    /// Empty DBs are not listed by Redis.
+    pub keyspace: BTreeMap<i64, u64>,
 }
 
 impl From<HashMap<&str, &str>> for RedisInfo {
     fn from(map: HashMap<&str, &str>) -> Self {
+        let keyspace = map
+            .iter()
+            .filter_map(|(field, value)| Some((parse_db_field(field)?, parse_db_keys(value)?)))
+            .collect();
         Self {
             common: CommonInfo::from(map),
+            keyspace,
         }
     }
 }
 
+/// `db3` → `3`.
+fn parse_db_field(field: &str) -> Option<i64> {
+    field.strip_prefix("db")?.parse().ok()
+}
+
+/// `keys=120,expires=4,avg_ttl=0` → `120`.
+fn parse_db_keys(value: &str) -> Option<u64> {
+    value
+        .split(',')
+        .find_map(|part| part.strip_prefix("keys="))?
+        .parse()
+        .ok()
+}
+
 impl RedisInfo {
+    /// Number of keys in `db` (0 if `INFO` doesn't list it).
+    pub fn db_keys(&self, db: i64) -> u64 {
+        self.keyspace.get(&db).copied().unwrap_or_default()
+    }
+
     pub fn redis_version(&self) -> String {
         format!("Redis version: {}", self.common.version)
     }
@@ -149,7 +176,7 @@ pub struct KeyMeta {
     pub value: KeyValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedisType {
     Set,
     List,
@@ -157,8 +184,14 @@ pub enum RedisType {
     Zset,
     Json,
     String,
-    Unknown,
+    Stream,
+    /// Any other `TYPE` reply (e.g. a module type such as `MBbloom--`), kept
+    /// verbatim so the UI can show the real name.
+    Unknown(String),
 }
+
+/// Width of the type badge, in characters.
+pub const TYPE_BADGE_WIDTH: usize = 6;
 
 impl RedisType {
     fn from_str(value: &str) -> Self {
@@ -167,27 +200,66 @@ impl RedisType {
             "hash" => Self::Hash,
             "set" => Self::Set,
             "zset" => Self::Zset,
-            "json" => Self::Json,
+            // RedisJSON reports its module type name.
+            "ReJSON-RL" | "json" => Self::Json,
             "list" => Self::List,
-            _ => Self::Unknown,
+            "stream" => Self::Stream,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
+    /// Full type name, as `TYPE` reports it (`ReJSON-RL` shows as `json`).
+    pub fn name(&self) -> &str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::Set => "set",
+            Self::Zset => "zset",
+            Self::Json => "json",
+            Self::List => "list",
+            Self::Stream => "stream",
+            Self::Unknown(name) if name.is_empty() => "?",
+            Self::Unknown(name) => name,
+        }
+    }
+
+    /// Short label for the type badge, at most [`TYPE_BADGE_WIDTH`] chars.
+    /// Long unknown names are cut and end with `…`.
+    pub fn badge_label(&self) -> Cow<'_, str> {
+        match self {
+            Self::String => Cow::Borrowed("str"),
+            Self::Unknown(_) => {
+                let name = self.name();
+                if name.chars().count() <= TYPE_BADGE_WIDTH {
+                    Cow::Borrowed(name)
+                } else {
+                    let cut: String = name.chars().take(TYPE_BADGE_WIDTH - 1).collect();
+                    Cow::Owned(format!("{cut}…"))
+                }
+            }
+            other => Cow::Borrowed(other.name()),
         }
     }
 }
 
-impl From<RedisType> for Text<'_> {
-    /// Fixed-width, lowercase type label in the type's palette color.
-    fn from(value: RedisType) -> Self {
+impl From<&RedisType> for Text<'_> {
+    /// Lowercase type label in the type's palette color.
+    fn from(value: &RedisType) -> Self {
         let palette = &config::get().keyspace;
-        let (label, color) = match value {
-            RedisType::String => ("str", palette.string),
-            RedisType::Json => ("json", palette.json),
-            RedisType::List => ("list", palette.list),
-            RedisType::Set => ("set", palette.set),
-            RedisType::Zset => ("zset", palette.zset),
-            RedisType::Hash => ("hash", palette.hash),
-            RedisType::Unknown => ("?", palette.unknown),
+        let color = match value {
+            RedisType::String => palette.string,
+            RedisType::Json => palette.json,
+            RedisType::List => palette.list,
+            RedisType::Set => palette.set,
+            RedisType::Zset => palette.zset,
+            RedisType::Hash => palette.hash,
+            RedisType::Stream => palette.stream,
+            RedisType::Unknown(_) => palette.unknown,
         };
-        Span::raw(label).fg(color).bold().into()
+        Span::raw(value.badge_label().into_owned())
+            .fg(color)
+            .bold()
+            .into()
     }
 }
 
@@ -293,6 +365,13 @@ impl KeyspaceState {
         self.sweep_cursor = 0;
         self.sweep_done = false;
         self.generation += 1;
+    }
+
+    /// Start over after a DB switch: keep the filter, go back to page 1 and
+    /// drop the old DB's sweep (bumps `generation`).
+    pub fn reset_for_db(&mut self) {
+        self.page = 0;
+        self.rescan();
     }
 
     pub fn set_pattern(&mut self, pattern: Option<String>) {
@@ -442,7 +521,7 @@ impl Default for ValueState {
     fn default() -> Self {
         Self {
             key: None,
-            r_type: RedisType::Unknown,
+            r_type: RedisType::Unknown(String::new()),
             page: 0,
             page_size: DEFAULT_VALUE_PAGE_SIZE,
             scan_count: DEFAULT_VALUE_SCAN_COUNT,
@@ -464,6 +543,15 @@ impl ValueState {
         }
         self.key = Some(key.to_owned());
         self.r_type = r_type;
+        self.page = 0;
+        self.total = None;
+        self.rescan();
+    }
+
+    /// Forget the selected key (e.g. after a DB switch). Bumps `generation`
+    /// so an in-flight fetch for the old key is dropped.
+    pub fn clear(&mut self) {
+        self.key = None;
         self.page = 0;
         self.total = None;
         self.rescan();
@@ -642,6 +730,40 @@ mod tests {
         assert_eq!(info.common.version, "7.2.4");
         assert_eq!(info.common.os, "");
         assert_eq!(info.common.max_clients, "");
+    }
+
+    #[test]
+    fn redis_info_reads_keyspace_section() {
+        let raw =
+            "# Keyspace\r\ndb0:keys=12,expires=1,avg_ttl=0\r\ndb3:keys=7,expires=0,avg_ttl=0\r\n";
+        let info = RedisInfo::from(crate::redis_client::client::parse_info(raw));
+        assert_eq!(info.keyspace, BTreeMap::from([(0, 12), (3, 7)]));
+        assert_eq!(info.db_keys(3), 7);
+        assert_eq!(info.db_keys(5), 0);
+    }
+
+    #[test]
+    fn reset_for_db_keeps_pattern_and_goes_to_first_page() {
+        let mut state = state_with(10);
+        state.set_pattern(Some("user:*".into()));
+        state.merge_batch(0, keys(0..30));
+        state.next_page();
+        let generation = state.generation;
+
+        state.reset_for_db();
+        assert_eq!(state.page, 0);
+        assert_eq!(state.pattern.as_deref(), Some("user:*"));
+        assert!(state.scanned.is_empty());
+        assert!(state.generation > generation);
+    }
+
+    #[test]
+    fn value_state_clear_forgets_key() {
+        let mut state = value_state(RedisType::List, 10);
+        let generation = state.generation;
+        state.clear();
+        assert_eq!(state.key, None);
+        assert!(state.generation > generation);
     }
 
     fn keys(range: std::ops::Range<usize>) -> Vec<String> {
@@ -840,6 +962,30 @@ mod tests {
         set.sweep.merge_fields(0, Vec::new());
         set.clamp_page();
         assert_eq!(set.page, 0);
+    }
+
+    #[test]
+    fn type_replies_map_to_variants() {
+        assert_eq!(RedisType::from("ReJSON-RL"), RedisType::Json);
+        assert_eq!(RedisType::from("json"), RedisType::Json);
+        assert_eq!(RedisType::from("stream"), RedisType::Stream);
+        assert_eq!(RedisType::from("hash"), RedisType::Hash);
+        assert_eq!(
+            RedisType::from("MBbloom--"),
+            RedisType::Unknown("MBbloom--".into())
+        );
+    }
+
+    #[test]
+    fn badge_label_fits_and_keeps_short_names() {
+        assert_eq!(RedisType::String.badge_label(), "str");
+        assert_eq!(RedisType::Stream.badge_label(), "stream");
+        assert_eq!(RedisType::Unknown("none".into()).badge_label(), "none");
+        assert_eq!(RedisType::Unknown(String::new()).badge_label(), "?");
+        let long = RedisType::Unknown("MBbloom--".into());
+        assert_eq!(long.badge_label(), "MBblo…");
+        assert_eq!(long.name(), "MBbloom--");
+        assert!(long.badge_label().chars().count() <= TYPE_BADGE_WIDTH);
     }
 
     #[test]

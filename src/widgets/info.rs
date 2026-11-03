@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{self, Alignment, Constraint, Layout, Rect};
 use ratatui::style::Stylize;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, StatefulWidget, Widget};
 
 use crate::{
@@ -19,8 +19,12 @@ use crate::{
 #[allow(clippy::struct_field_names)]
 pub struct Info {
     info: Arc<Mutex<Option<RedisInfo>>>,
-    /// Credential-free connection target, e.g. `redis://localhost:6379/0`.
+    /// Credential-free connection target, e.g. `redis://localhost:6379`.
     target: String,
+    /// Current DB of the keyspace browser.
+    db: Arc<Mutex<i64>>,
+    /// `--read-only`: show the `RO` badge.
+    pub read_only: bool,
     /// Source of the CPU figure: a rate over the last sampling interval.
     metrics: Arc<Mutex<MetricsHistory>>,
     /// One-line key-hint legend; follows the current mode.
@@ -48,15 +52,30 @@ pub fn build_hint(keybindings: &KeyBindings, mode: Mode, entries: &[(Command, &s
         .join("  ")
 }
 
+/// `db 3 · 120 keys`, or `db 3` before the first `INFO` arrives.
+fn db_status(db: i64, info: Option<&RedisInfo>) -> String {
+    match info {
+        Some(info) => {
+            let keys = info.db_keys(db);
+            let noun = if keys == 1 { "key" } else { "keys" };
+            format!("db {db} · {keys} {noun}")
+        }
+        None => format!("db {db}"),
+    }
+}
+
 impl Info {
     pub fn new(
         info: Arc<Mutex<Option<RedisInfo>>>,
         metrics: Arc<Mutex<MetricsHistory>>,
+        db: Arc<Mutex<i64>>,
         target: String,
     ) -> Self {
         Self {
             info,
             target,
+            db,
+            read_only: false,
             metrics,
             hint: String::new(),
         }
@@ -70,17 +89,29 @@ impl StatefulWidget for InfoWidget {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
+        let mut title = vec![Span::raw(format!(" Info · {} ", state.target))];
+        if state.read_only {
+            title.push(
+                Span::raw(" RO ")
+                    .fg(cfg.colors.base00)
+                    .bg(cfg.colors.base08)
+                    .bold(),
+            );
+            title.push(Span::raw(" "));
+        }
         Block::new()
             .fg(cfg.colors.base04)
             .bg(cfg.colors.base00)
             .borders(Borders::ALL)
-            .title(format!(" Info · {} ", state.target))
+            .title(Line::from(title))
             .title_alignment(Alignment::Left)
             .title_top(Line::from(" ? Help ").right_aligned())
             .border_type(BorderType::Rounded)
             .render(area, buf);
 
         let common_info = { state.info.lock().as_ref().map(Clone::clone) };
+        let db = *state.db.lock();
+        let db_status = db_status(db, common_info.as_ref());
         let cpu_pct = state.metrics.lock().latest.as_ref().and_then(|s| s.cpu_pct);
         let cpu = cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %"));
 
@@ -93,7 +124,7 @@ impl StatefulWidget for InfoWidget {
         .flex(layout::Flex::Center)
         .areas(area);
 
-        let [version_area, _, cpu_area] =
+        let [version_area, db_area, cpu_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Fill(1), Constraint::Min(0)])
                 .flex(layout::Flex::Center)
                 .horizontal_margin(3)
@@ -136,6 +167,10 @@ impl StatefulWidget for InfoWidget {
             .alignment(Alignment::Center)
             .render(clients_area, buf);
 
+        Paragraph::new(Line::from(db_status).fg(cfg.colors.base05))
+            .alignment(Alignment::Center)
+            .render(db_area, buf);
+
         // One-line key-hint legend (#41) so the common actions are discoverable
         // without opening the full `?` help overlay.
         Paragraph::new(Line::styled(state.hint.as_str(), cfg.colors.base04))
@@ -150,6 +185,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn db_status_shows_key_count() {
+        let mut map = HashMap::new();
+        map.insert("db3", "keys=1,expires=0,avg_ttl=0");
+        map.insert("db0", "keys=40,expires=0,avg_ttl=0");
+        let info = RedisInfo::from(map);
+        assert_eq!(db_status(3, Some(&info)), "db 3 · 1 key");
+        assert_eq!(db_status(0, Some(&info)), "db 0 · 40 keys");
+        assert_eq!(db_status(5, Some(&info)), "db 5 · 0 keys");
+        assert_eq!(db_status(5, None), "db 5");
+    }
 
     #[test]
     fn hint_follows_rebound_key_and_skips_unbound() {

@@ -48,6 +48,27 @@ impl Storage {
         Ok(batch)
     }
 
+    /// Number of logical databases (`CONFIG GET databases`). `None` if the
+    /// reply has no usable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `CONFIG GET` fails (often disabled on managed Redis).
+    pub async fn database_count(
+        &self,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Sync + Send>> {
+        let mut manager = self.manager.clone();
+        let reply: Vec<String> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("databases")
+            .query_async(&mut manager)
+            .await?;
+        Ok(reply
+            .get(1)
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0))
+    }
+
     /// Fetch TYPE / MEMORY USAGE / TTL for every key in a single pipeline.
     ///
     /// # Errors

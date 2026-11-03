@@ -16,7 +16,7 @@ use crate::{
     config,
     redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
-        RedisType, STRING_PREVIEW_BYTES,
+        RedisType, STRING_PREVIEW_BYTES, TYPE_BADGE_WIDTH,
     },
     utils::format_duration,
 };
@@ -427,7 +427,7 @@ impl KeySpace {
     pub fn selected_key(&self) -> Option<(String, RedisType)> {
         let idx = self.table.selected()?;
         let meta = self.keys.get(idx)?;
-        Some((meta.key.clone(), meta.r_type))
+        Some((meta.key.clone(), meta.r_type.clone()))
     }
 
     /// Re-select the row whose key matches `name`, if it's still present in the
@@ -778,6 +778,23 @@ impl KeySpace {
         }
     }
 
+    /// Show a dismissable one-line message.
+    pub fn show_notice(&mut self, msg: impl Into<String>) {
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::Notice(msg.into()),
+            text_area: None,
+        });
+    }
+
+    /// Drop everything shown for the old DB, so nothing stale can be edited
+    /// while the new DB loads.
+    pub fn clear_for_db_switch(&mut self) {
+        self.close_overlay();
+        self.clear_selected_value();
+        self.set_keys(Vec::new());
+        self.refresh();
+    }
+
     pub fn close_overlay(&mut self) {
         self.action_overlay = None;
     }
@@ -1084,7 +1101,9 @@ impl KeySpace {
                 build_input_text_area("Member", "Enter member", None),
                 Some(build_input_text_area("Score", "Enter score", None)),
             ),
-            RedisType::String | RedisType::Json | RedisType::Unknown => return,
+            RedisType::String | RedisType::Json | RedisType::Stream | RedisType::Unknown(_) => {
+                return
+            }
         };
         self.add_item = Some(AddItemDraft {
             key,
@@ -1167,7 +1186,9 @@ impl KeySpace {
                 };
                 KeyItem::ZsetMember { member: a, score }
             }
-            RedisType::String | RedisType::Json | RedisType::Unknown => return None,
+            RedisType::String | RedisType::Json | RedisType::Stream | RedisType::Unknown(_) => {
+                return None
+            }
         };
         let key = draft.key.clone();
         self.add_item = None;
@@ -1335,12 +1356,16 @@ fn render_focused_input(
 
 /// Titles for the two paired add-item inputs of a collection type. Single-input
 /// types return their label in `A` (their `B` is unused).
-fn add_item_pair_titles(kind: RedisType) -> (&'static str, &'static str) {
+fn add_item_pair_titles(kind: &RedisType) -> (&'static str, &'static str) {
     match kind {
         RedisType::Hash => ("Field", "Value"),
         RedisType::Zset => ("Member", "Score"),
         RedisType::Set => ("Member", ""),
-        RedisType::List | RedisType::String | RedisType::Json | RedisType::Unknown => ("Item", ""),
+        RedisType::List
+        | RedisType::String
+        | RedisType::Json
+        | RedisType::Stream
+        | RedisType::Unknown(_) => ("Item", ""),
     }
 }
 
@@ -1629,7 +1654,7 @@ impl KeySpaceWidget {
                 Constraint::Length(1),
             ])
             .areas(popup);
-            let (title_a, title_b) = add_item_pair_titles(draft.kind);
+            let (title_a, title_b) = add_item_pair_titles(&draft.kind);
             let a_active = draft.active == ActiveField::A;
             render_focused_input(&draft.input_a, title_a, a_active, a_area, buf);
             render_focused_input(input_b, title_b, !a_active, b_area, buf);
@@ -1751,13 +1776,15 @@ impl KeySpaceWidget {
                 value,
             ])
         };
-        let badge: ratatui::text::Text = key.r_type.into();
+        let badge: ratatui::text::Text = (&key.r_type).into();
         let badge = badge
             .lines
             .into_iter()
             .next()
             .and_then(|line| line.spans.into_iter().next())
             .unwrap_or_default();
+        // The detail pane has room for the full name (badges cut long ones).
+        let badge = Span::styled(key.r_type.name().to_owned(), badge.style);
         let size = Byte::from_u128(key.size)
             .unwrap_or_default()
             .get_appropriate_unit(UnitType::Binary);
@@ -1833,7 +1860,11 @@ impl KeySpaceWidget {
                     .collect();
                 Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
             }
-            KeyValue::Json(_) | KeyValue::Unknown => {}
+            KeyValue::Json(_) | KeyValue::Unknown => Self::render_placeholder(
+                vec![Line::from("Viewer for this type isn't supported yet")],
+                area,
+                buf,
+            ),
         }
     }
 
@@ -1958,7 +1989,8 @@ fn format_bytes(n: usize) -> String {
 }
 
 /// Width of the type column: fits the longest label (`json`, `hash`, …).
-const TYPE_COLUMN_WIDTH: u16 = 4;
+#[allow(clippy::cast_possible_truncation)]
+const TYPE_COLUMN_WIDTH: u16 = TYPE_BADGE_WIDTH as u16;
 
 /// Selection marker shared by the key and value tables.
 fn highlight_symbol() -> Span<'static> {
@@ -2115,7 +2147,7 @@ impl StatefulWidget for KeySpaceWidget {
         .bold();
 
         let rows = state.keys.iter().map(|meta| {
-            let badge: ratatui::text::Text = meta.r_type.into();
+            let badge: ratatui::text::Text = (&meta.r_type).into();
             // Keys with a real expiry stand out; `∞` / `—` stay dim.
             let ttl_color = if meta.ttl >= 0 {
                 cfg.colors.base0b

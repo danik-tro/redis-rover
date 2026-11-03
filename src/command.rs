@@ -26,4 +26,5 @@ pub enum Command {
     NextChart,
     PrevChart,
     ToggleAllCharts,
+    SelectDb,
 }

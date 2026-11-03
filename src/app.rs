@@ -29,6 +29,7 @@ use crate::{
     tui,
     widgets::{
         dashboard::{Dashboard, DashboardWidget},
+        db_picker::{DbPicker, DbPickerWidget},
         info::{build_hint, Info, InfoWidget},
         keyspace::{KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome},
     },
@@ -85,7 +86,22 @@ pub struct App {
     summary: Info,
     keyspace: KeySpace,
     dashboard: Dashboard,
+    db_picker: DbPicker,
+    /// `--read-only`: refuse writes before any input is asked for.
+    read_only: bool,
 }
+
+/// Shown when a write is attempted in `--read-only` mode.
+const READ_ONLY_NOTICE: &str = "Read-only mode: writes are disabled.";
+
+/// Keyspace hint entries that write; hidden in `--read-only` mode.
+const WRITE_COMMANDS: &[Command] = &[
+    Command::AddKey,
+    Command::AddItem,
+    Command::EditValue,
+    Command::DeleteKey,
+    Command::SetTtl,
+];
 
 /// Footer hint entries for the keyspace view, in display order.
 const KEYSPACE_HINT_ENTRIES: &[(Command, &str)] = &[
@@ -96,6 +112,7 @@ const KEYSPACE_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::SetTtl, "ttl"),
     (Command::EnterValue, "open"),
     (Command::SetPattern, "filter"),
+    (Command::SelectDb, "db"),
     (Command::ToggleHelp, "help"),
 ];
 
@@ -107,6 +124,43 @@ const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::NextChart, "chart"),
     (Command::ToggleAllCharts, "all"),
     (Command::ToggleHelp, "help"),
+];
+
+/// `?` help rows for the dashboard, in display order.
+const DASHBOARD_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::ToggleDashboard, "Back to keyspace"),
+    (Command::ToggleMetricsPause, "Pause / resume view"),
+    (Command::ResetMetrics, "Reset history"),
+    (Command::NextChart, "Next chart"),
+    (Command::PrevChart, "Previous chart"),
+    (Command::ToggleAllCharts, "Toggle all charts"),
+    (Command::ToggleHelp, "Toggle this help"),
+    (Command::Quit, "Quit"),
+];
+
+/// `?` help rows for the keyspace view, in display order.
+const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::ScrollDown, "Scroll down"),
+    (Command::ScrollUp, "Scroll up"),
+    (Command::LoadNextPage, "Next page (keys or open value)"),
+    (
+        Command::LoadPreviousPage,
+        "Previous page (keys or open value)",
+    ),
+    (Command::RefreshSpace, "Refresh keyspace"),
+    (Command::SetPattern, "Set filter pattern"),
+    (Command::DeletePattern, "Delete filter pattern"),
+    (Command::EnterValue, "Enter value / confirm"),
+    (Command::AddKey, "Add new key"),
+    (Command::AddItem, "Add item (in collection)"),
+    (Command::EditValue, "Edit value / item (drill in first)"),
+    (Command::DeleteKey, "Delete key / item (in value)"),
+    (Command::SetTtl, "Set TTL"),
+    (Command::SelectDb, "Switch database"),
+    (Command::ToggleDashboard, "Open metrics dashboard"),
+    (Command::ClosePopup, "Close popup / overlay"),
+    (Command::ToggleHelp, "Toggle this help"),
+    (Command::Quit, "Quit"),
 ];
 
 impl App {
@@ -123,7 +177,12 @@ impl App {
 
         let mode = Mode::KeySpace;
 
-        let summary = Info::new(state.info.clone(), state.metrics.clone(), target);
+        let summary = Info::new(
+            state.info.clone(),
+            state.metrics.clone(),
+            state.db.clone(),
+            target,
+        );
         let keyspace = KeySpace::new(Vec::new());
         let dashboard = Dashboard::new(state.metrics.clone());
 
@@ -149,9 +208,21 @@ impl App {
             tx,
             rx,
             redis_tx,
+            db_picker: DbPicker::default(),
+            read_only: false,
         };
         app.sync_hint();
         app
+    }
+
+    /// Refuse every write (`--read-only`): show the `RO` badge and drop the
+    /// write commands from the footer hint.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self.summary.read_only = read_only;
+        self.sync_hint();
+        self
     }
 
     /// Run the main event loop until quit.
@@ -228,6 +299,24 @@ impl App {
                 return Some(Action::PreviousMode);
             }
             return self.handle_keybindings(key);
+        }
+
+        // The DB picker is modal: Enter switches, Esc cancels, the rest moves
+        // the selection. Global bindings (Ctrl-c) still work.
+        if self.db_picker.is_open() {
+            if is_confirm {
+                self.confirm_db_picker();
+                return None;
+            }
+            if is_cancel {
+                self.db_picker.close();
+                return None;
+            }
+            if self.handle_keybindings(key) == Some(Action::Quit) {
+                return Some(Action::Quit);
+            }
+            self.db_picker.handle_key(key);
+            return None;
         }
 
         // Keep a half-open keyspace overlay from swallowing dashboard keys.
@@ -398,6 +487,11 @@ impl App {
             Action::RequestEditValue => self.request_edit_value(),
             Action::RequestAddKey => self.request_add_key(),
             Action::RequestAddItem => self.request_add_item(),
+            Action::OpenDbPicker => self.open_db_picker(),
+            Action::DbSwitched => {
+                self.finish_keys_fetch();
+                self.fetch_keys();
+            }
             Action::Help => self.toggle_help(),
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::Refresh => {}
@@ -428,6 +522,7 @@ impl StatefulWidget for AppWidget {
 
         StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
         state.render_main_block(main, buf);
+        StatefulWidget::render(DbPickerWidget, main, buf, &mut state.db_picker);
 
         if state.help_is_open() {
             let mode = match state.mode {
@@ -525,40 +620,10 @@ impl App {
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let entries: &[(Command, &str)] = if mode == Mode::Dashboard {
-            &[
-                (Command::ToggleDashboard, "Back to keyspace"),
-                (Command::ToggleMetricsPause, "Pause / resume view"),
-                (Command::ResetMetrics, "Reset history"),
-                (Command::NextChart, "Next chart"),
-                (Command::PrevChart, "Previous chart"),
-                (Command::ToggleAllCharts, "Toggle all charts"),
-                (Command::ToggleHelp, "Toggle this help"),
-                (Command::Quit, "Quit"),
-            ]
+        let entries = if mode == Mode::Dashboard {
+            DASHBOARD_HELP_ENTRIES
         } else {
-            &[
-                (Command::ScrollDown, "Scroll down"),
-                (Command::ScrollUp, "Scroll up"),
-                (Command::LoadNextPage, "Next page (keys or open value)"),
-                (
-                    Command::LoadPreviousPage,
-                    "Previous page (keys or open value)",
-                ),
-                (Command::RefreshSpace, "Refresh keyspace"),
-                (Command::SetPattern, "Set filter pattern"),
-                (Command::DeletePattern, "Delete filter pattern"),
-                (Command::EnterValue, "Enter value / confirm"),
-                (Command::AddKey, "Add new key"),
-                (Command::AddItem, "Add item (in collection)"),
-                (Command::EditValue, "Edit value / item (drill in first)"),
-                (Command::DeleteKey, "Delete key / item (in value)"),
-                (Command::SetTtl, "Set TTL"),
-                (Command::ToggleDashboard, "Open metrics dashboard"),
-                (Command::ClosePopup, "Close popup / overlay"),
-                (Command::ToggleHelp, "Toggle this help"),
-                (Command::Quit, "Quit"),
-            ]
+            KEYSPACE_HELP_ENTRIES
         };
         let lookup_mode = if mode == Mode::Dashboard {
             Mode::Dashboard
@@ -663,7 +728,71 @@ impl App {
         } else {
             (Mode::KeySpace, KEYSPACE_HINT_ENTRIES)
         };
-        self.summary.hint = build_hint(&config::get().keybindings, mode, entries);
+        let entries: Vec<(Command, &str)> = entries
+            .iter()
+            .filter(|(cmd, _)| !(self.read_only && WRITE_COMMANDS.contains(cmd)))
+            .copied()
+            .collect();
+        self.summary.hint = build_hint(&config::get().keybindings, mode, &entries);
+    }
+
+    /// In `--read-only` mode, show a notice and return `true` so the caller
+    /// stops before opening any write UI.
+    fn deny_write(&mut self) -> bool {
+        if self.read_only {
+            self.keyspace.show_notice(READ_ONLY_NOTICE);
+        }
+        self.read_only
+    }
+
+    /// `s`: open the DB picker. Cluster mode only has db 0.
+    fn open_db_picker(&mut self) {
+        if self.mode != Mode::KeySpace {
+            return;
+        }
+        let cluster = self
+            .state
+            .metrics
+            .lock()
+            .latest_snapshot
+            .as_ref()
+            .is_some_and(|s| s.cluster_enabled);
+        if cluster {
+            self.keyspace.show_notice("Cluster mode only has db 0.");
+            return;
+        }
+        let keyspace = self
+            .state
+            .info
+            .lock()
+            .as_ref()
+            .map(|info| info.keyspace.clone())
+            .unwrap_or_default();
+        let db_count = *self.state.db_count.lock();
+        let current = *self.state.db.lock();
+        self.db_picker.open(db_count, current, &keyspace);
+    }
+
+    /// Enter in the DB picker: ask the runner to switch. The old DB's keys are
+    /// cleared right away so nothing stale can be edited; the runner answers
+    /// with `DbSwitched` (or an error, which restores the old keys).
+    fn confirm_db_picker(&mut self) {
+        let selected = self.db_picker.selected();
+        self.db_picker.close();
+        let Some(db) = selected else {
+            return;
+        };
+        if db == *self.state.db.lock() {
+            return;
+        }
+        self.reselect_key = None;
+        self.restore_value_row = None;
+        self.restore_value_pending = false;
+        self.page_turn_row = None;
+        self.keyspace.clear_for_db_switch();
+        self.send_redis_event(RedisEvent::SelectDb(db));
+        self.keys_in_flight += 1;
+        self.keyspace.set_loading(true);
     }
 
     fn show_error_popup(&mut self, msg: &str) {
@@ -707,6 +836,7 @@ impl App {
             | Action::Render
             | Action::DiscardKeyspacePopup
             | Action::KeysLoadAborted
+            | Action::DbSwitched
             | Action::ValueLoadFailed => {}
             Action::Tick => {
                 if opened_at.elapsed() >= HELP_TIMEOUT {
@@ -875,7 +1005,7 @@ impl App {
     /// `d`: delete. From the key list this deletes the whole selected key; while
     /// drilled into a collection value it deletes only the selected element.
     fn request_delete_key(&mut self) {
-        if self.keyspace.selected_key().is_none() {
+        if self.keyspace.selected_key().is_none() || self.deny_write() {
             return;
         }
         if self.keyspace.is_value_focused() {
@@ -886,7 +1016,7 @@ impl App {
     }
 
     fn request_set_ttl(&mut self) {
-        if self.keyspace.selected_key().is_some() {
+        if self.keyspace.selected_key().is_some() && !self.deny_write() {
             self.keyspace.open_set_ttl();
         }
     }
@@ -901,7 +1031,9 @@ impl App {
         match r_type {
             RedisType::List | RedisType::Set | RedisType::Hash | RedisType::Zset => {
                 if self.keyspace.is_value_focused() {
-                    self.keyspace.open_edit_item(key);
+                    if !self.deny_write() {
+                        self.keyspace.open_edit_item(key);
+                    }
                 } else {
                     // Drill in first; a second `e` edits the selected element.
                     self.keyspace.enter_value();
@@ -909,22 +1041,26 @@ impl App {
             }
             // STRING edits the whole value; JSON/Unknown fall through to the
             // editor (which shows a notice for non-STRING scalars).
-            RedisType::String | RedisType::Json | RedisType::Unknown => {
-                self.keyspace.open_edit_value();
+            RedisType::String | RedisType::Json | RedisType::Stream | RedisType::Unknown(_) => {
+                if !self.deny_write() {
+                    self.keyspace.open_edit_value();
+                }
             }
         }
     }
 
     /// `a`: open the add-key wizard. Available from the key list at any time.
     fn request_add_key(&mut self) {
-        self.keyspace.open_new_key();
+        if !self.deny_write() {
+            self.keyspace.open_new_key();
+        }
     }
 
     /// `i`: append an item to the focused collection. No-op unless the user has
     /// drilled into a collection value (`is_value_focused()`), so it can't fire
     /// from the key list.
     fn request_add_item(&mut self) {
-        if !self.keyspace.is_value_focused() {
+        if !self.keyspace.is_value_focused() || self.deny_write() {
             return;
         }
         if let Some((key, r_type)) = self.keyspace.selected_key() {

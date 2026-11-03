@@ -136,7 +136,7 @@ pub async fn fetch_value_page(
                 KeyValue::Set(names.to_vec())
             }
         }
-        RedisType::Json | RedisType::Unknown => KeyValue::Unknown,
+        RedisType::Json | RedisType::Stream | RedisType::Unknown(_) => KeyValue::Unknown,
     };
 
     let len = match &value {

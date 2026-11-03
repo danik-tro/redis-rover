@@ -3,6 +3,8 @@ use super::types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec};
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
     FetchKeys,
+    /// Switch the browsing connection to logical database `n`.
+    SelectDb(i64),
     /// Fetch the page of the selected value described by
     /// `SharedState::value_state`.
     FetchValue,
@@ -38,4 +40,50 @@ pub enum RedisEvent {
         key: String,
         delete: ItemDelete,
     },
+}
+
+impl RedisEvent {
+    /// True for events that change data. `--read-only` blocks these.
+    ///
+    /// No `_` arm on purpose: a new variant must pick a side.
+    pub fn is_write(&self) -> bool {
+        match self {
+            Self::FetchKeys | Self::FetchValue | Self::SelectDb(_) => false,
+            Self::SetString { .. }
+            | Self::DeleteKey { .. }
+            | Self::SetTtl { .. }
+            | Self::CreateKey { .. }
+            | Self::AddItem { .. }
+            | Self::EditItem { .. }
+            | Self::DeleteItem { .. } => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_and_writes_are_classified() {
+        assert!(!RedisEvent::FetchKeys.is_write());
+        assert!(!RedisEvent::FetchValue.is_write());
+        assert!(!RedisEvent::SelectDb(3).is_write());
+        assert!(RedisEvent::DeleteKey { key: "k".into() }.is_write());
+        assert!(RedisEvent::SetTtl {
+            key: "k".into(),
+            secs: 5
+        }
+        .is_write());
+        assert!(RedisEvent::SetString {
+            key: "k".into(),
+            value: "v".into()
+        }
+        .is_write());
+        assert!(RedisEvent::DeleteItem {
+            key: "k".into(),
+            delete: ItemDelete::HashField("f".into())
+        }
+        .is_write());
+    }
 }

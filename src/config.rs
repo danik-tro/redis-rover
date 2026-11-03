@@ -242,6 +242,9 @@ pub struct KeyspacePalette {
     pub list: Color,
 
     #[serde_as(as = "DisplayFromStr")]
+    pub stream: Color,
+
+    #[serde_as(as = "DisplayFromStr")]
     pub unknown: Color,
 }
 
@@ -254,6 +257,7 @@ impl Default for KeyspacePalette {
             json: Color::from_str("#b45bcf").unwrap(),
             hash: Color::from_str("#62d6e8").unwrap(),
             list: Color::from_str("#ffb86c").unwrap(),
+            stream: Color::from_str("#8be9fd").unwrap(),
             unknown: Color::from_str("#f71638").unwrap(),
         }
     }

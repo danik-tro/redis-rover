@@ -44,6 +44,12 @@ pub struct Cli {
     )]
     pub token: bool,
 
+    #[arg(
+        long,
+        help = "Block all writes (add, edit, delete, TTL). Safe for browsing production."
+    )]
+    pub read_only: bool,
+
     #[command(flatten)]
     pub tls: TlsArgs,
 }
@@ -163,7 +169,8 @@ fn parse_redis_url(s: &str) -> Result<String, String> {
         .map_err(|e| format!("invalid Redis URL: {e}"))
 }
 
-/// Human-readable connection target for display, e.g. `redis://localhost:6379/0`.
+/// Human-readable connection target for display, e.g. `redis://localhost:6379`.
+/// The DB is shown separately in the status bar, since it can be switched.
 /// Built from the parsed address (never the raw `--url`), so credentials
 /// embedded in the URL are never shown.
 pub fn connection_label(info: &ConnectionInfo) -> String {
@@ -185,7 +192,7 @@ pub fn connection_label(info: &ConnectionInfo) -> String {
         #[allow(unreachable_patterns)]
         other => other.to_string(),
     };
-    format!("{addr}/{}{suffix}", info.redis_settings().db())
+    format!("{addr}{suffix}")
 }
 
 impl Cli {
@@ -258,7 +265,7 @@ mod tests {
         ));
         assert_eq!(
             connection_label(&out),
-            "rediss://example.com:6380/0 (insecure)"
+            "rediss://example.com:6380 (insecure)"
         );
     }
 
@@ -282,6 +289,16 @@ mod tests {
         assert!(Cli::try_parse_from(["rrover", "--tls-key", "k.pem"]).is_err());
         assert!(
             Cli::try_parse_from(["rrover", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn read_only_flag_parses() {
+        assert!(!Cli::try_parse_from(["rrover"]).unwrap().read_only);
+        assert!(
+            Cli::try_parse_from(["rrover", "--read-only"])
+                .unwrap()
+                .read_only
         );
     }
 
@@ -324,12 +341,12 @@ mod tests {
     }
 
     #[test]
-    fn label_includes_host_port_and_db() {
+    fn label_includes_host_and_port_but_not_db() {
         let info = "redis://localhost:6379".into_connection_info().unwrap();
-        assert_eq!(connection_label(&info), "redis://localhost:6379/0");
+        assert_eq!(connection_label(&info), "redis://localhost:6379");
 
         let info = "redis://example.com:6380/3".into_connection_info().unwrap();
-        assert_eq!(connection_label(&info), "redis://example.com:6380/3");
+        assert_eq!(connection_label(&info), "redis://example.com:6380");
     }
 
     #[test]
@@ -338,7 +355,7 @@ mod tests {
             .into_connection_info()
             .unwrap();
         let label = connection_label(&info);
-        assert_eq!(label, "redis://localhost:6379/1");
+        assert_eq!(label, "redis://localhost:6379");
         assert!(!label.contains("s3cret"));
     }
 }

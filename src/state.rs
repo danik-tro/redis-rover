@@ -19,7 +19,14 @@ pub struct SharedState {
     pub value_state: Arc<Mutex<ValueState>>,
     pub selected_value: Arc<Mutex<Option<LoadedValue>>>,
     pub metrics: Arc<Mutex<MetricsHistory>>,
+    /// Logical database the keyspace browser is connected to.
+    pub db: Arc<Mutex<i64>>,
+    /// Number of logical databases (`CONFIG GET databases`, default 16).
+    pub db_count: Arc<Mutex<usize>>,
 }
+
+/// Redis's default `databases` setting.
+pub const DEFAULT_DB_COUNT: usize = 16;
 
 impl Default for SharedState {
     fn default() -> Self {
@@ -32,6 +39,8 @@ impl Default for SharedState {
             metrics: Arc::new(Mutex::new(MetricsHistory::new(
                 config::get().dashboard.history(),
             ))),
+            db: Arc::new(Mutex::new(0)),
+            db_count: Arc::new(Mutex::new(DEFAULT_DB_COUNT)),
         }
     }
 }

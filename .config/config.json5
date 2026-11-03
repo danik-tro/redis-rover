@@ -18,6 +18,7 @@
       "e": "EditValue",
       "a": "AddKey",
       "i": "AddItem",
+      "s": "SelectDb",
       "m": "ToggleDashboard",
       "?": "ToggleHelp",
     },
@@ -61,6 +62,7 @@
     "zset": "#ea51b2",
     "set": "#ebff87",
     "json": "#b45bcf",
+    "stream": "#8be9fd",
     "unknown": "#f71638",
   }
 }

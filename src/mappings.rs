@@ -26,6 +26,7 @@ impl From<Command> for Action {
             Command::NextChart => Self::NextChart,
             Command::PrevChart => Self::PrevChart,
             Command::ToggleAllCharts => Self::ToggleAllCharts,
+            Command::SelectDb => Self::OpenDbPicker,
         }
     }
 }

@@ -43,6 +43,9 @@ pub enum Action {
     NextChart,
     PrevChart,
     ToggleAllCharts,
+    OpenDbPicker,
+    /// The runner connected to the newly selected DB; reload the keyspace.
+    DbSwitched,
 }
 
 impl Action {

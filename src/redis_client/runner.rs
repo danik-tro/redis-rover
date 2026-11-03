@@ -22,9 +22,16 @@ type FetchError = Box<dyn std::error::Error + Sync + Send>;
 
 const BROADCAST_CAPACITY: usize = 50;
 
+/// How long a DB switch may take to open its new connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Runner {
     cancellation_token: CancellationToken,
+    /// The client the app started with. A DB switch builds a new connection
+    /// from it, so TLS settings and credentials carry over.
+    client: redis::Client,
     manager: ConnectionManager,
+    read_only: bool,
 
     state: SharedState,
     info_task: JoinHandle<()>,
@@ -36,6 +43,7 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(
+        client: redis::Client,
         manager: ConnectionManager,
         state: SharedState,
         action_tx: ActionSender<Action>,
@@ -48,7 +56,9 @@ impl Runner {
 
         Self {
             cancellation_token,
+            client,
             manager,
+            read_only: false,
             state,
             info_task,
             state_task,
@@ -60,6 +70,13 @@ impl Runner {
     #[must_use]
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Reject every write event (`--read-only`).
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -103,9 +120,12 @@ impl Runner {
         let mut rx = self.tx.subscribe();
         let state = self.state.clone();
         let storage = Storage::new(manager);
+        let client = self.client.clone();
+        let read_only = self.read_only;
 
         self.state_task = tokio::spawn(async move {
-            let mut event_handler = EventHandler::new(state, action_tx, storage);
+            let mut event_handler = EventHandler::new(state, action_tx, storage, client, read_only);
+            event_handler.load_db_count().await;
 
             loop {
                 tokio::select! {
@@ -190,6 +210,9 @@ pub struct EventHandler {
     state: SharedState,
     tx: ActionSender<Action>,
     storage: Storage,
+    /// Base client used to open a connection to another DB.
+    client: redis::Client,
+    read_only: bool,
     /// `ValueState::generation` of the last value fetch started. Queued
     /// `FetchValue` events all read the latest state, so after the first one the
     /// rest would refetch the same page.
@@ -197,18 +220,45 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
-    fn new(state: SharedState, tx: ActionSender<Action>, storage: Storage) -> Self {
+    fn new(
+        state: SharedState,
+        tx: ActionSender<Action>,
+        storage: Storage,
+        client: redis::Client,
+        read_only: bool,
+    ) -> Self {
         Self {
             state,
             tx,
             storage,
+            client,
+            read_only,
             last_value_generation: None,
+        }
+    }
+
+    /// Read `CONFIG GET databases` once for the DB picker. Managed services
+    /// often block `CONFIG`; the default (16) is kept then.
+    async fn load_db_count(&self) {
+        match self.storage.database_count().await {
+            Ok(Some(count)) => *self.state.db_count.lock() = count,
+            Ok(None) => {}
+            Err(err) => log::debug!("CONFIG GET databases failed, assuming 16: {err}"),
         }
     }
 
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, event: RedisEvent) {
+        // The UI also refuses writes up front; this is the guarantee.
+        if self.read_only && event.is_write() {
+            log::warn!("Read-only mode: blocked {event:?}");
+            self.action_hook(Action::Error(
+                "Read-only mode: writes are disabled".to_string(),
+            ));
+            return;
+        }
         match event {
+            RedisEvent::SelectDb(db) => self.select_db(db).await,
             RedisEvent::SetString { key, value } => {
                 match self.storage.set_string(&key, &value).await {
                     Ok(()) => {
@@ -319,6 +369,42 @@ impl EventHandler {
                 }
             }
         }
+    }
+
+    /// Switch to DB `db` by opening a new connection for it.
+    ///
+    /// `SELECT` on the shared connection isn't used: the connection manager
+    /// reconnects with the DB from its connection info, so after a dropped
+    /// connection it would silently go back to the old DB.
+    async fn select_db(&mut self, db: i64) {
+        match self.connect_db(db).await {
+            Ok(manager) => {
+                self.storage = Storage::new(manager);
+                *self.state.db.lock() = db;
+                self.state.keyspace_state.lock().reset_for_db();
+                self.state.value_state.lock().clear();
+                self.state.keys.lock().clear();
+                *self.state.selected_value.lock() = None;
+                self.last_value_generation = None;
+                self.action_hook(Action::DbSwitched);
+            }
+            Err(err) => {
+                log::error!("SelectDb {db} failed: {err:?}");
+                self.action_hook(Action::Error(format!("Failed to switch to db {db}: {err}")));
+                // Still on the old DB: put its keys back on screen.
+                self.action_hook(Action::LoadKeysIntoKeySpace);
+            }
+        }
+    }
+
+    async fn connect_db(&self, db: i64) -> Result<ConnectionManager, FetchError> {
+        let info = self.client.get_connection_info().clone();
+        let settings = info.redis_settings().clone().set_db(db);
+        let client = redis::Client::open(info.set_redis_settings(settings))?;
+        let manager = tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
+            .await
+            .map_err(|_| format!("timed out after {CONNECT_TIMEOUT:?}"))??;
+        Ok(manager)
     }
 
     /// Fetch the selected value's current page. Works on a snapshot so the lock
