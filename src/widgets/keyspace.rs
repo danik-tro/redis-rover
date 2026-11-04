@@ -708,6 +708,14 @@ impl KeySpace {
         }
     }
 
+    /// Draw the current toast over `area`, for screens other than the
+    /// keyspace (the Pub/Sub tab). Until the toast moves to its own widget.
+    pub fn render_toast_over(&self, area: Rect, buf: &mut Buffer) {
+        if let Some((msg, _)) = self.toast.as_ref() {
+            KeySpaceWidget::render_toast(msg, area, buf);
+        }
+    }
+
     /// Size (`MEMORY USAGE`) of the selected key, if any.
     pub fn selected_size(&self) -> Option<u128> {
         let meta = self.keys.get(self.table.selected()?)?;

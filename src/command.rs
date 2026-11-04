@@ -36,4 +36,7 @@ pub enum Command {
     PubSubAdd,
     PubSubRemove,
     PubSubClear,
+    PubSubRefresh,
+    PubSubPublish,
+    PubSubEnter,
 }

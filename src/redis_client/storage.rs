@@ -8,6 +8,7 @@ use redis::{FromRedisValue, ScanOptions};
 
 use super::{
     client,
+    pubsub_store::ServerChannels,
     types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
         ValueState,
@@ -17,6 +18,9 @@ use super::{
 /// `SCAN ... COUNT` hint for the match counter: bigger steps than browsing,
 /// since it walks the whole keyspace.
 const COUNT_SCAN_HINT: usize = 1000;
+
+/// Most server channels listed in the Pub/Sub tab (and asked for in `NUMSUB`).
+const PUBSUB_CHANNELS_MAX: usize = 1000;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -289,5 +293,62 @@ impl Storage {
         delete: &ItemDelete,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         client::delete_item(self.manager.clone(), key, delete).await
+    }
+
+    /// Active channels of the server: the first [`PUBSUB_CHANNELS_MAX`] names
+    /// of `PUBSUB CHANNELS` (sorted) with their `PUBSUB NUMSUB` counts, plus
+    /// `PUBSUB NUMPAT`. In cluster mode this is the connected node's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a `PUBSUB` command fails.
+    pub async fn pubsub_channels(
+        &self,
+    ) -> Result<ServerChannels, Box<dyn std::error::Error + Sync + Send>> {
+        let mut manager = self.manager.clone();
+        let mut names: Vec<String> = redis::cmd("PUBSUB")
+            .arg("CHANNELS")
+            .query_async(&mut manager)
+            .await?;
+        let total = names.len();
+        names.sort_unstable();
+        names.truncate(PUBSUB_CHANNELS_MAX);
+
+        let channels = if names.is_empty() {
+            Vec::new()
+        } else {
+            redis::cmd("PUBSUB")
+                .arg("NUMSUB")
+                .arg(&names)
+                .query_async(&mut manager)
+                .await?
+        };
+        let patterns: u64 = redis::cmd("PUBSUB")
+            .arg("NUMPAT")
+            .query_async(&mut manager)
+            .await?;
+        Ok(ServerChannels {
+            channels,
+            total,
+            patterns,
+        })
+    }
+
+    /// `PUBLISH channel payload`; returns how many subscribers got it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails.
+    pub async fn publish(
+        &self,
+        channel: &str,
+        payload: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Sync + Send>> {
+        let mut manager = self.manager.clone();
+        Ok(redis::cmd("PUBLISH")
+            .arg(channel)
+            .arg(payload)
+            .query_async(&mut manager)
+            .await?)
     }
 }

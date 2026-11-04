@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 use crate::{
     config,
     mode::PopupMode,
-    redis_client::{
-        event::RedisEvent, pubsub::PubSubCmd, pubsub_store::ConnStatus, types::RedisType,
-    },
+    redis_client::{event::RedisEvent, pubsub::PubSubCmd, pubsub_store::Target, types::RedisType},
     state::SharedState,
 };
 use color_eyre::eyre::Result;
@@ -41,7 +39,7 @@ use crate::{
         keyspace::{
             format_bytes, KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome,
         },
-        pubsub::{PubSub, PubSubWidget},
+        pubsub::{PubSub, PubSubWidget, Row},
     },
 };
 
@@ -120,6 +118,7 @@ const WRITE_COMMANDS: &[Command] = &[
     Command::EditValue,
     Command::DeleteKey,
     Command::SetTtl,
+    Command::PubSubPublish,
 ];
 
 /// Footer hint entries for the keyspace view, in display order.
@@ -153,6 +152,8 @@ const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::PubSubAdd, "add"),
     (Command::PubSubRemove, "remove"),
     (Command::PubSubClear, "clear"),
+    (Command::PubSubPublish, "publish"),
+    (Command::PubSubRefresh, "refresh"),
     (Command::ScrollDown, "next"),
     (Command::ToggleHelp, "help"),
 ];
@@ -165,6 +166,9 @@ const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::PubSubAdd, "Add subscription (channel or pattern)"),
     (Command::PubSubRemove, "Unsubscribe and drop messages"),
     (Command::PubSubClear, "Clear messages and stats"),
+    (Command::PubSubEnter, "Subscribe to the server channel"),
+    (Command::PubSubPublish, "Publish a message"),
+    (Command::PubSubRefresh, "Refresh server channels"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -459,15 +463,22 @@ impl App {
         self.handle_keybindings(key)
     }
 
-    /// Keys in the Pub/Sub tab. The add popup takes raw keys (Enter
-    /// subscribes, Esc cancels, Ctrl-c still quits); otherwise Esc closes the
-    /// help overlay first, then goes through the bindings.
+    /// Keys in the Pub/Sub tab. Popups take raw keys (Esc cancels, Ctrl-c
+    /// still quits): Enter subscribes in the add popup, Ctrl-s sends in the
+    /// publish popup. Otherwise Esc closes the help overlay first, then keys
+    /// go through the bindings.
     fn handle_pubsub_key(&mut self, key: KeyEvent) -> Option<Action> {
         if self.pubsub.is_popup() {
+            let publish = self.pubsub.is_publish_popup();
+            let ctrl_s = key.code == KeyCode::Char('s')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Enter => self.confirm_add_subscription(),
                 KeyCode::Esc => self.pubsub.close_popup(),
                 _ if Self::is_quit_key(key) => return Some(Action::Quit),
+                KeyCode::Enter if !publish => self.confirm_add_subscription(),
+                _ if publish && ctrl_s => self.confirm_publish(),
                 _ => self.pubsub.handle_popup_key(key),
             }
             return None;
@@ -606,8 +617,21 @@ impl App {
             Action::PubSubAdd => self.pubsub.open_add(),
             Action::PubSubRemove => self.remove_subscription(),
             Action::PubSubClear => {
-                self.state.pubsub.lock().clear(self.pubsub.selected());
+                if let Some(index) = self.pubsub.selected_sub() {
+                    self.state.pubsub.lock().clear(index);
+                }
             }
+            Action::PubSubRefresh => self.fetch_pubsub_channels(),
+            Action::PubSubPublish => self.pubsub.open_publish(self.read_only),
+            Action::PubSubEnter => self.subscribe_selected_server_channel(),
+            Action::PubSubChannelsLoaded => self.pubsub.clamp_selection(),
+            Action::Published { receivers, .. } => self.keyspace.show_toast(
+                format!(
+                    "delivered to {receivers} subscriber{}",
+                    if receivers == 1 { "" } else { "s" }
+                ),
+                false,
+            ),
             Action::Refresh => {}
         }
 
@@ -675,7 +699,12 @@ impl App {
             Mode::Dashboard => {
                 StatefulWidget::render(DashboardWidget, area, buf, &mut self.dashboard);
             }
-            Mode::PubSub => StatefulWidget::render(PubSubWidget, area, buf, &mut self.pubsub),
+            Mode::PubSub => {
+                self.pubsub.cluster_mode = self.cluster_enabled();
+                StatefulWidget::render(PubSubWidget, area, buf, &mut self.pubsub);
+                // The keyspace toast (e.g. "delivered to …") shows here too.
+                self.keyspace.render_toast_over(area, buf);
+            }
             Mode::Common | Mode::Popup(_) => {}
         }
         if self.mode == Mode::Popup(PopupMode::Error) {
@@ -859,28 +888,48 @@ impl App {
                 self.pubsub_return = self.mode;
                 self.mode = Mode::PubSub;
                 self.sync_hint();
+                self.fetch_pubsub_channels();
             }
             Mode::Common | Mode::Popup(_) => {}
         }
     }
 
-    /// Enter in the add popup: record the subscription (the UI shows it right
-    /// away) and ask the task to subscribe. A duplicate only selects the
-    /// existing one, unless the connection is down: then it reconnects.
+    /// Enter in the add popup: subscribe to the target typed.
     fn confirm_add_subscription(&mut self) {
-        let Some(target) = self.pubsub.take_add_request() else {
-            return;
-        };
-        let (index, added, disconnected) = {
-            let mut store = self.state.pubsub.lock();
-            let (index, added) = store.add(target.clone());
-            let disconnected = matches!(store.status, ConnStatus::Disconnected(_));
-            (index, added, disconnected)
-        };
+        if let Some(target) = self.pubsub.take_add_request() {
+            self.subscribe_target(target);
+        }
+    }
+
+    /// Enter in the tab on a server channel: subscribe to it. It moves from
+    /// the server group to the subscriptions.
+    fn subscribe_selected_server_channel(&mut self) {
+        if let Some(Row::Server(name)) = self.pubsub.selected_row() {
+            self.subscribe_target(Target::Channel(name));
+        }
+    }
+
+    /// Record the subscription (the UI shows it right away), select it, and
+    /// ask the task to subscribe. A duplicate only selects the existing one.
+    fn subscribe_target(&mut self, target: Target) {
+        let (index, added) = self.state.pubsub.lock().add(target.clone());
         self.pubsub.select(index);
-        if added || disconnected {
+        if added {
             self.send_pubsub_cmd(PubSubCmd::Subscribe(target));
         }
+    }
+
+    /// Ctrl-s in the publish popup. Under `--read-only` the popup stays open
+    /// with its notice (the runner would reject the write anyway).
+    fn confirm_publish(&mut self) {
+        if let Some((channel, payload)) = self.pubsub.take_publish_request() {
+            self.send_redis_event(RedisEvent::Publish { channel, payload });
+        }
+    }
+
+    /// Ask the runner for the server's channels (tab open, `r`).
+    fn fetch_pubsub_channels(&self) {
+        self.send_redis_event(RedisEvent::FetchPubSubChannels);
     }
 
     /// `d` in the tab: unsubscribe and drop the selected subscription.
@@ -1686,6 +1735,98 @@ mod tests {
         app.remove_subscription();
         assert_eq!(cmds.try_recv(), Ok(PubSubCmd::Unsubscribe(target)));
         assert!(app.state.pubsub.lock().subs.is_empty());
+    }
+
+    fn app_with_channels() -> (
+        App,
+        mpsc::UnboundedReceiver<PubSubCmd>,
+        broadcast::Receiver<RedisEvent>,
+    ) {
+        let (mut app, cmds) = app_with_pubsub();
+        let (redis_tx, redis_rx) = broadcast::channel(8);
+        app.redis_tx = redis_tx;
+        (app, cmds, redis_rx)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn opening_the_tab_lists_server_channels() {
+        let (mut app, _, mut events) = app_with_channels();
+        app.toggle_pubsub();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(RedisEvent::FetchPubSubChannels)
+        ));
+    }
+
+    #[test]
+    fn enter_on_a_server_channel_subscribes_it() {
+        use crate::redis_client::pubsub_store::ServerChannels;
+
+        let (mut app, mut cmds, _events) = app_with_channels();
+        app.toggle_pubsub();
+        app.state.pubsub.lock().set_server_channels(ServerChannels {
+            channels: vec![("events".into(), 1)],
+            total: 1,
+            patterns: 0,
+        });
+        // An empty subscription list: the server channel is row 0.
+        assert_eq!(
+            app.handle_key_event(key(KeyCode::Enter)),
+            Some(Action::PubSubEnter)
+        );
+        app.subscribe_selected_server_channel();
+        let target = Target::Channel("events".into());
+        assert_eq!(cmds.try_recv(), Ok(PubSubCmd::Subscribe(target.clone())));
+        let store = app.state.pubsub.lock();
+        assert_eq!(store.targets(), vec![target]);
+        assert_eq!(store.server_only_channels().count(), 0);
+        drop(store);
+        assert_eq!(app.pubsub.selected_sub(), Some(0));
+    }
+
+    #[test]
+    fn publish_popup_sends_on_ctrl_s() {
+        let (mut app, _, mut events) = app_with_channels();
+        app.toggle_pubsub();
+        let _ = events.try_recv();
+        app.pubsub.open_publish(false);
+        for c in "orders:new".chars() {
+            assert_eq!(app.handle_key_event(key(KeyCode::Char(c))), None);
+        }
+        assert_eq!(app.handle_key_event(key(KeyCode::Tab)), None);
+        assert_eq!(app.handle_key_event(key(KeyCode::Char('x'))), None);
+        assert_eq!(app.handle_key_event(ctrl('s')), None);
+        match events.try_recv() {
+            Ok(RedisEvent::Publish { channel, payload }) => {
+                assert_eq!((channel.as_str(), payload.as_str()), ("orders:new", "x"));
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+        assert!(!app.pubsub.is_popup());
+    }
+
+    #[test]
+    fn read_only_publish_sends_nothing() {
+        let (app, _, mut events) = app_with_channels();
+        let mut app = app.read_only(true);
+        app.toggle_pubsub();
+        let _ = events.try_recv();
+        assert!(
+            !app.summary.hint.contains("publish"),
+            "{}",
+            app.summary.hint
+        );
+        app.pubsub.open_publish(app.read_only);
+        for c in "chan".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(ctrl('s'));
+        assert!(events.try_recv().is_err());
+        assert!(app.pubsub.is_publish_popup(), "stays open with its notice");
     }
 
     #[test]

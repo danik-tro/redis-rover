@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Seconds kept by the per-second rate ring.
@@ -125,9 +125,20 @@ fn looks_binary(bytes: &[u8]) -> bool {
     odd * 10 > head.len()
 }
 
-/// One received message.
+/// What a log entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A message received from Redis.
+    Message,
+    /// The connection came back after an outage; messages published
+    /// meanwhile are lost. Empty payload, not counted in stats.
+    Reconnected,
+}
+
+/// One received message (or a marker row, see [`EntryKind`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubSubMessage {
+    pub kind: EntryKind,
     /// Increases by one per message of a subscription, across evictions and
     /// clears.
     pub seq: u64,
@@ -176,6 +187,7 @@ impl MessageBuffer {
         let (stored, truncated) = Payload::from_bytes(payload, self.limits.payload);
         self.bytes += stored.len();
         self.items.push_back(PubSubMessage {
+            kind: EntryKind::Message,
             seq: self.next_seq,
             received_at: now,
             channel: channel.to_owned(),
@@ -184,7 +196,27 @@ impl MessageBuffer {
             truncated,
         });
         self.next_seq += 1;
+        self.evict();
+    }
 
+    /// Store a [`EntryKind::Reconnected`] marker. It takes a `seq` like a
+    /// message, so views keyed by sequence number stay consistent.
+    pub fn push_marker(&mut self, now: SystemTime) {
+        self.items.push_back(PubSubMessage {
+            kind: EntryKind::Reconnected,
+            seq: self.next_seq,
+            received_at: now,
+            channel: String::new(),
+            payload: Payload::Text(String::new()),
+            size: 0,
+            truncated: false,
+        });
+        self.next_seq += 1;
+        self.evict();
+    }
+
+    /// Drop the oldest entries until both limits hold.
+    fn evict(&mut self) {
         while self.items.len() > self.limits.messages || self.bytes > self.limits.bytes {
             let Some(old) = self.items.pop_front() else {
                 break;
@@ -212,7 +244,7 @@ impl MessageBuffer {
     }
 
     /// The newest `n` messages, oldest first.
-    pub fn last_n(&self, n: usize) -> impl Iterator<Item = &PubSubMessage> {
+    pub fn last_n(&self, n: usize) -> impl DoubleEndedIterator<Item = &PubSubMessage> {
         self.items.iter().skip(self.items.len().saturating_sub(n))
     }
 }
@@ -330,18 +362,43 @@ pub enum ConnStatus {
     NotStarted,
     Connecting,
     Connected,
-    Disconnected(String),
+    /// The connection is down; attempt number `attempt` starts at `next_at`.
+    Reconnecting {
+        attempt: u32,
+        next_at: Instant,
+    },
 }
 
-impl fmt::Display for ConnStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl ConnStatus {
+    /// Header text: `connected`, `reconnecting in 4 s`, …
+    pub fn label(&self, now: Instant) -> String {
         match self {
-            Self::NotStarted => f.write_str("not started"),
-            Self::Connecting => f.write_str("connecting"),
-            Self::Connected => f.write_str("connected"),
-            Self::Disconnected(_) => f.write_str("disconnected"),
+            Self::NotStarted => "not started".into(),
+            Self::Connecting => "connecting".into(),
+            Self::Connected => "connected".into(),
+            Self::Reconnecting { next_at, .. } => {
+                let left = next_at.saturating_duration_since(now);
+                if left.is_zero() {
+                    "reconnecting…".into()
+                } else {
+                    // Round up: "in 0 s" would read as "now".
+                    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+                    format!("reconnecting in {secs} s")
+                }
+            }
         }
     }
+}
+
+/// Result of `PUBSUB CHANNELS` / `NUMSUB` / `NUMPAT`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerChannels {
+    /// Name and subscriber count, sorted by name, at most the listing cap.
+    pub channels: Vec<(String, u64)>,
+    /// Channels the server reported before the cap.
+    pub total: usize,
+    /// `PUBSUB NUMPAT`.
+    pub patterns: u64,
 }
 
 /// Everything the Pub/Sub tab shows, shared between the task and the UI.
@@ -350,6 +407,8 @@ pub struct PubSubStore {
     /// In the order they were added.
     pub subs: Vec<Subscription>,
     pub status: ConnStatus,
+    /// Last `PUBSUB CHANNELS` listing; `None` until the first one arrives.
+    pub server: Option<ServerChannels>,
     limits: BufferLimits,
 }
 
@@ -358,6 +417,7 @@ impl PubSubStore {
         Self {
             subs: Vec::new(),
             status: ConnStatus::NotStarted,
+            server: None,
             limits,
         }
     }
@@ -395,8 +455,37 @@ impl PubSubStore {
         }
     }
 
+    /// Every target, in the order added: what a (re)connect subscribes.
     pub fn targets(&self) -> Vec<Target> {
         self.subs.iter().map(|s| s.target.clone()).collect()
+    }
+
+    pub fn set_server_channels(&mut self, server: ServerChannels) {
+        self.server = Some(server);
+    }
+
+    /// Server channels without an exact subscription of ours: those are
+    /// listed under Subscriptions only. A pattern that matches doesn't hide
+    /// a channel.
+    pub fn server_only_channels(&self) -> impl Iterator<Item = &(String, u64)> {
+        self.server
+            .iter()
+            .flat_map(|s| s.channels.iter())
+            .filter(|(name, _)| {
+                !self
+                    .subs
+                    .iter()
+                    .any(|sub| matches!(&sub.target, Target::Channel(c) if c == name))
+            })
+    }
+
+    /// Add a reconnect marker to each of `targets` still subscribed.
+    pub fn mark_reconnected(&mut self, targets: &[Target], now: SystemTime) {
+        for sub in &mut self.subs {
+            if targets.contains(&sub.target) {
+                sub.buffer.push_marker(now);
+            }
+        }
     }
 
     /// Store a message: `pattern` set means it came from `PSUBSCRIBE pattern`.
@@ -607,6 +696,73 @@ mod tests {
             assert_eq!(msgs[0].channel, "orders:new");
             assert_eq!(msgs[0].payload, Payload::Text(r#"{"id":1}"#.into()));
         }
+    }
+
+    #[test]
+    fn server_only_channels_hide_own_exact_subscriptions() {
+        let mut store = PubSubStore::new(LIMITS);
+        assert_eq!(store.server_only_channels().count(), 0);
+        store.add(Target::Channel("chat".into()));
+        store.add(Target::Pattern("events".into()));
+        store.set_server_channels(ServerChannels {
+            channels: vec![("chat".into(), 2), ("events".into(), 1), ("jobs".into(), 1)],
+            total: 3,
+            patterns: 1,
+        });
+        let names: Vec<_> = store
+            .server_only_channels()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        // A pattern with the same name doesn't hide the channel.
+        assert_eq!(names, vec!["events", "jobs"]);
+    }
+
+    #[test]
+    fn resubscribe_list_follows_changes_made_while_down() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Pattern("orders:*".into()));
+        store.add(Target::Channel("chat".into()));
+        let lost = store.targets();
+        // While reconnecting the user removes one and adds another.
+        store.remove(&Target::Channel("chat".into()));
+        store.add(Target::Channel("jobs".into()));
+        store.add(Target::Pattern("orders:*".into()));
+        assert_eq!(
+            store.targets(),
+            vec![
+                Target::Pattern("orders:*".into()),
+                Target::Channel("jobs".into())
+            ]
+        );
+
+        // Only subscriptions held before the outage get a marker.
+        store.push("orders:new", Some("orders:*"), b"x", at(0));
+        store.mark_reconnected(&lost, at(1));
+        let entries: Vec<_> = store.subs[0].buffer.last_n(10).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].kind, EntryKind::Reconnected);
+        assert_eq!(entries[1].seq, 2);
+        assert!(store.subs[1].buffer.is_empty());
+        // Markers aren't messages.
+        assert_eq!(store.subs[0].stats.total, 1);
+        assert_eq!(store.subs[0].buffer.bytes(), 1);
+    }
+
+    #[test]
+    fn status_labels() {
+        let now = Instant::now();
+        assert_eq!(ConnStatus::NotStarted.label(now), "not started");
+        assert_eq!(ConnStatus::Connected.label(now), "connected");
+        let status = ConnStatus::Reconnecting {
+            attempt: 3,
+            next_at: now + Duration::from_millis(3_200),
+        };
+        assert_eq!(status.label(now), "reconnecting in 4 s");
+        assert_eq!(
+            status.label(now + Duration::from_secs(3)),
+            "reconnecting in 1 s"
+        );
+        assert_eq!(status.label(now + Duration::from_secs(5)), "reconnecting…");
     }
 
     #[test]

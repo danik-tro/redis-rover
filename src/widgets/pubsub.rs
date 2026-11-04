@@ -1,5 +1,6 @@
-//! The Pub/Sub tab: own subscriptions on the left, the selected one's live log
-//! on the right, and the add-subscription popup.
+//! The Pub/Sub tab: own subscriptions and the server's channels on the left,
+//! the selected subscription's live log on the right, and the add / publish
+//! popups.
 
 use std::{
     fmt::Write as _,
@@ -16,13 +17,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, StatefulWidget, Widget, Wrap},
 };
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config,
     redis_client::pubsub_store::{
-        detect_kind, ConnStatus, Payload, PubSubMessage, PubSubStore, Target, TargetKind,
+        detect_kind, ConnStatus, EntryKind, Payload, PubSubMessage, PubSubStore, Target, TargetKind,
     },
     widgets::keyspace::{format_bytes, truncate_to_width},
 };
@@ -31,6 +32,59 @@ use crate::{
 const HEX_PREVIEW: usize = 16;
 /// Width of the subscriptions pane.
 const LIST_WIDTH: u16 = 32;
+/// Log row standing for a reconnect.
+const RECONNECT_MARKER: &str = "— reconnected, messages may be missing —";
+/// Header note in cluster mode.
+const CLUSTER_NOTE: &str = "⚠ PUBSUB CHANNELS: this node only";
+/// Publish popup notice under `--read-only`.
+const READ_ONLY_PUBLISH: &str = "Read-only mode: publishing is disabled";
+
+/// A selectable row of the left pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    /// Index into `PubSubStore::subs`.
+    Sub(usize),
+    /// A server channel we aren't subscribed to.
+    Server(String),
+}
+
+/// Number of selectable rows: subscriptions, then server-only channels.
+fn row_count(store: &PubSubStore) -> usize {
+    store.subs.len() + store.server_only_channels().count()
+}
+
+fn row_at(store: &PubSubStore, index: usize) -> Option<Row> {
+    if index < store.subs.len() {
+        return Some(Row::Sub(index));
+    }
+    store
+        .server_only_channels()
+        .nth(index - store.subs.len())
+        .map(|(name, _)| Row::Server(name.clone()))
+}
+
+/// Channel the publish popup starts with: the selected exact subscription
+/// or server channel; for a pattern, the concrete channel of its newest
+/// message; otherwise empty.
+pub fn publish_prefill(store: &PubSubStore, row: Option<&Row>) -> String {
+    match row {
+        Some(Row::Server(name)) => name.clone(),
+        Some(Row::Sub(i)) => match store.subs.get(*i) {
+            Some(sub) => match &sub.target {
+                Target::Channel(name) => name.clone(),
+                Target::Pattern(_) => sub
+                    .buffer
+                    .last_n(usize::MAX)
+                    .rev()
+                    .find(|m| m.kind == EntryKind::Message)
+                    .map(|m| m.channel.clone())
+                    .unwrap_or_default(),
+            },
+            None => String::new(),
+        },
+        None => String::new(),
+    }
+}
 
 /// State of the add-subscription popup.
 struct AddPopup {
@@ -68,11 +122,111 @@ impl AddPopup {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishField {
+    Channel,
+    Payload,
+}
+
+/// State of the publish popup.
+struct PublishPopup {
+    channel: TextArea<'static>,
+    payload: TextArea<'static>,
+    focus: PublishField,
+    /// `--read-only`: shown with a notice, sending is refused.
+    read_only: bool,
+}
+
+impl PublishPopup {
+    fn new(prefill: String, read_only: bool) -> Self {
+        let focus = if prefill.is_empty() {
+            PublishField::Channel
+        } else {
+            PublishField::Payload
+        };
+        let mut channel = TextArea::new(vec![prefill]);
+        channel.move_cursor(CursorMove::End);
+        channel.set_placeholder_text("any channel, e.g. orders:new");
+        let mut payload = TextArea::default();
+        payload.set_placeholder_text("message");
+        let mut popup = Self {
+            channel,
+            payload,
+            focus,
+            read_only,
+        };
+        popup.style_fields();
+        popup
+    }
+
+    fn focus(&mut self, focus: PublishField) {
+        self.focus = focus;
+        self.style_fields();
+    }
+
+    /// Highlight the focused field; hide the other one's cursor.
+    fn style_fields(&mut self) {
+        let cfg = config::get();
+        let focus = self.focus;
+        for (field, area, title) in [
+            (PublishField::Channel, &mut self.channel, " Channel "),
+            (PublishField::Payload, &mut self.payload, " Payload "),
+        ] {
+            let focused = field == focus;
+            area.set_block(
+                Block::default()
+                    .border_style(if focused {
+                        cfg.colors.base0d
+                    } else {
+                        cfg.colors.base03
+                    })
+                    .border_type(BorderType::Rounded)
+                    .borders(Borders::ALL)
+                    .title(title),
+            );
+            area.set_cursor_line_style(Style::default());
+            area.set_cursor_style(if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            });
+        }
+    }
+
+    fn channel(&self) -> String {
+        self.channel.lines().first().cloned().unwrap_or_default()
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match (key.code, self.focus) {
+            (KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter, PublishField::Channel) => {
+                self.focus(PublishField::Payload);
+            }
+            (KeyCode::Tab | KeyCode::BackTab, PublishField::Payload) => {
+                self.focus(PublishField::Channel);
+            }
+            (_, PublishField::Channel) => {
+                self.channel.input(key);
+            }
+            (_, PublishField::Payload) => {
+                self.payload.input(key);
+            }
+        }
+    }
+}
+
+enum Popup {
+    Add(Box<AddPopup>),
+    Publish(Box<PublishPopup>),
+}
+
 pub struct PubSub {
     store: Arc<Mutex<PubSubStore>>,
-    /// Index into `PubSubStore::subs`.
+    /// Index of the selected row (see [`Row`]).
     selected: usize,
-    add_popup: Option<AddPopup>,
+    popup: Option<Popup>,
+    /// The server runs in cluster mode: `PUBSUB CHANNELS` is this node's view.
+    pub cluster_mode: bool,
 }
 
 impl PubSub {
@@ -80,12 +234,13 @@ impl PubSub {
         Self {
             store,
             selected: 0,
-            add_popup: None,
+            popup: None,
+            cluster_mode: false,
         }
     }
 
     pub fn select_next(&mut self) {
-        let len = self.store.lock().subs.len();
+        let len = row_count(&self.store.lock());
         if self.selected + 1 < len {
             self.selected += 1;
         }
@@ -95,61 +250,110 @@ impl PubSub {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Select subscription `index` (subscriptions come first in the list).
     pub fn select(&mut self, index: usize) {
         self.selected = index;
     }
 
-    pub fn selected(&self) -> usize {
-        self.selected
+    pub fn selected_row(&self) -> Option<Row> {
+        row_at(&self.store.lock(), self.selected)
+    }
+
+    /// Index into `PubSubStore::subs` of the selected subscription, if a
+    /// subscription (not a server channel) is selected.
+    pub fn selected_sub(&self) -> Option<usize> {
+        match self.selected_row() {
+            Some(Row::Sub(i)) => Some(i),
+            _ => None,
+        }
     }
 
     /// Target of the selected subscription.
     pub fn selected_target(&self) -> Option<Target> {
-        self.store
-            .lock()
-            .subs
-            .get(self.selected)
-            .map(|s| s.target.clone())
+        let store = self.store.lock();
+        match row_at(&store, self.selected) {
+            Some(Row::Sub(i)) => store.subs.get(i).map(|s| s.target.clone()),
+            _ => None,
+        }
     }
 
-    /// Keep the selection on an existing row after a removal.
+    /// Keep the selection on an existing row after the list changed.
     pub fn clamp_selection(&mut self) {
-        let len = self.store.lock().subs.len();
+        let len = row_count(&self.store.lock());
         self.selected = self.selected.min(len.saturating_sub(1));
     }
 
     pub fn open_add(&mut self) {
-        self.add_popup = Some(AddPopup::new());
+        self.popup = Some(Popup::Add(Box::new(AddPopup::new())));
+    }
+
+    /// Open the publish popup, prefilled from the selection.
+    pub fn open_publish(&mut self, read_only: bool) {
+        let prefill = {
+            let store = self.store.lock();
+            publish_prefill(&store, row_at(&store, self.selected).as_ref())
+        };
+        self.popup = Some(Popup::Publish(Box::new(PublishPopup::new(
+            prefill, read_only,
+        ))));
     }
 
     pub fn is_popup(&self) -> bool {
-        self.add_popup.is_some()
+        self.popup.is_some()
+    }
+
+    pub fn is_publish_popup(&self) -> bool {
+        matches!(self.popup, Some(Popup::Publish(_)))
     }
 
     pub fn close_popup(&mut self) {
-        self.add_popup = None;
+        self.popup = None;
     }
 
-    /// A key typed into the add popup (Enter / Esc are handled by the App).
-    /// Tab flips the channel / pattern kind.
+    /// A key typed into the open popup (the App handles confirm / cancel).
+    /// Add popup: Tab flips the channel / pattern kind. Publish popup: Tab
+    /// switches fields, Enter in the channel field moves to the payload.
     pub fn handle_popup_key(&mut self, key: KeyEvent) {
-        let Some(popup) = self.add_popup.as_mut() else {
-            return;
-        };
-        if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-            popup.kind_override = Some(popup.kind().flipped());
-            return;
+        match self.popup.as_mut() {
+            Some(Popup::Add(popup)) => {
+                if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+                    popup.kind_override = Some(popup.kind().flipped());
+                    return;
+                }
+                popup.input.input(key);
+            }
+            Some(Popup::Publish(popup)) => popup.handle_key(key),
+            None => {}
         }
-        popup.input.input(key);
     }
 
     /// Close the add popup and return the target typed, if any. Surrounding
     /// whitespace is dropped.
     pub fn take_add_request(&mut self) -> Option<Target> {
-        let popup = self.add_popup.take()?;
+        if !matches!(self.popup, Some(Popup::Add(_))) {
+            return None;
+        }
+        let Some(Popup::Add(popup)) = self.popup.take() else {
+            return None;
+        };
         let kind = popup.kind();
         let name = popup.text().trim().to_owned();
         (!name.is_empty()).then(|| Target::new(kind, name))
+    }
+
+    /// `(channel, payload)` to publish, closing the popup. `None` keeps the
+    /// popup open: read-only mode, or no channel typed yet.
+    pub fn take_publish_request(&mut self) -> Option<(String, String)> {
+        let Some(Popup::Publish(popup)) = self.popup.as_ref() else {
+            return None;
+        };
+        let channel = popup.channel().trim().to_owned();
+        if popup.read_only || channel.is_empty() {
+            return None;
+        }
+        let payload = popup.payload.lines().join("\n");
+        self.popup = None;
+        Some((channel, payload))
     }
 }
 
@@ -179,20 +383,28 @@ impl StatefulWidget for PubSubWidget {
         let now = SystemTime::now();
         let (status, list, log) = {
             let store = state.store.lock();
+            let row = row_at(&store, state.selected);
             (
                 store.status.clone(),
                 list_lines(&store, state.selected, list_inner, now),
-                log_view(&store, state.selected, log_inner, now),
+                log_view(&store, row.as_ref(), log_inner, now),
             )
         };
 
-        outer
-            .title(Line::from(vec![
-                Span::raw(" Pub/Sub ── "),
-                Span::styled(status.to_string(), status_style(&status)),
-                Span::raw(" "),
-            ]))
-            .render(area, buf);
+        let mut title = vec![
+            Span::raw(" Pub/Sub ── "),
+            Span::styled(
+                status.label(std::time::Instant::now()),
+                status_style(&status),
+            ),
+            Span::raw(" "),
+        ];
+        if state.cluster_mode {
+            title.push(Span::raw("── "));
+            title.push(Span::styled(CLUSTER_NOTE, cfg.colors.base0b));
+            title.push(Span::raw(" "));
+        }
+        outer.title(Line::from(title)).render(area, buf);
 
         Paragraph::new(list)
             .block(pane_block(" Subscriptions "))
@@ -209,8 +421,10 @@ impl StatefulWidget for PubSubWidget {
             Paragraph::new(log.lines).block(block).render(log_area, buf);
         }
 
-        if let Some(popup) = state.add_popup.as_ref() {
-            render_add_popup(popup, area, buf);
+        match state.popup.as_ref() {
+            Some(Popup::Add(popup)) => render_add_popup(popup, area, buf),
+            Some(Popup::Publish(popup)) => render_publish_popup(popup, area, buf),
+            None => {}
         }
     }
 }
@@ -229,12 +443,13 @@ fn status_style(status: &ConnStatus) -> Style {
     match status {
         ConnStatus::Connected => Style::new().fg(cfg.colors.base0a),
         ConnStatus::Connecting => Style::new().fg(cfg.colors.base0b),
-        ConnStatus::Disconnected(_) => Style::new().fg(cfg.colors.base08),
+        ConnStatus::Reconnecting { .. } => Style::new().fg(cfg.colors.base08),
         ConnStatus::NotStarted => Style::new().fg(cfg.colors.base03),
     }
 }
 
-/// Rows of the subscriptions pane: `● name  N/s`, scrolled to keep the
+/// Lines of the left pane: own subscriptions (`● name  N/s`), then the
+/// server's other channels (`○ name  N subs`), scrolled to keep the
 /// selection visible.
 fn list_lines(
     store: &PubSubStore,
@@ -243,43 +458,84 @@ fn list_lines(
     now: SystemTime,
 ) -> Vec<Line<'static>> {
     let cfg = config::get();
-    if store.subs.is_empty() {
-        return vec![Line::styled(" a add subscription", cfg.colors.base03)];
-    }
-    let height = usize::from(area.height).max(1);
     let width = usize::from(area.width);
-    let offset = selected.saturating_sub(height - 1);
-    store
-        .subs
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height)
-        .map(|(i, sub)| {
-            let rate = format!(" {}/s", sub.stats.rate_1s(now));
-            let name_width = width.saturating_sub(3 + rate.width());
-            let name = truncate_to_width(sub.target.name(), name_width);
-            let pad = name_width.saturating_sub(name.width());
-            let dot = if sub.target.is_pattern() {
-                cfg.colors.base0e
-            } else {
-                cfg.colors.base0d
-            };
-            let mut line = Line::from(vec![
-                Span::styled(" ● ", dot),
-                Span::raw(format!("{name}{}", " ".repeat(pad))),
-                Span::styled(rate, cfg.colors.base04),
-            ]);
-            if i == selected {
-                line = line.style(
-                    Style::new()
-                        .bg(cfg.colors.base02)
-                        .add_modifier(Modifier::BOLD),
-                );
-            }
-            line
-        })
-        .collect()
+    let selected_style = Style::new()
+        .bg(cfg.colors.base02)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    let mut selected_line = None;
+    let mut row = 0;
+    let mut push_row = |lines: &mut Vec<Line<'static>>, line: Line<'static>| {
+        if row == selected {
+            selected_line = Some(lines.len());
+            lines.push(line.style(selected_style));
+        } else {
+            lines.push(line);
+        }
+        row += 1;
+    };
+
+    if store.subs.is_empty() {
+        lines.push(Line::styled(" a add subscription", cfg.colors.base03));
+    }
+    for sub in &store.subs {
+        let dot = if sub.target.is_pattern() {
+            cfg.colors.base0e
+        } else {
+            cfg.colors.base0d
+        };
+        let rate = format!(" {}/s", sub.stats.rate_1s(now));
+        push_row(
+            &mut lines,
+            list_row(Span::styled(" ● ", dot), sub.target.name(), rate, width),
+        );
+    }
+
+    if let Some(server) = store.server.as_ref() {
+        let title = "─ Server channels ";
+        lines.push(Line::styled(
+            format!("{title}{}", "─".repeat(width.saturating_sub(title.width()))),
+            cfg.colors.base03,
+        ));
+        let before = lines.len();
+        for (name, subs) in store.server_only_channels() {
+            let count = format!(" {subs} {}", if *subs == 1 { "sub" } else { "subs" });
+            push_row(
+                &mut lines,
+                list_row(Span::styled(" ○ ", cfg.colors.base04), name, count, width),
+            );
+        }
+        if lines.len() == before {
+            lines.push(Line::styled(" no other channels", cfg.colors.base03));
+        }
+        lines.push(Line::styled(
+            format!(" patterns on server: {}", server.patterns),
+            cfg.colors.base03,
+        ));
+        if server.total > server.channels.len() {
+            lines.push(Line::styled(
+                format!(" showing {} of {}", server.channels.len(), server.total),
+                cfg.colors.base03,
+            ));
+        }
+    }
+
+    let height = usize::from(area.height).max(1);
+    let offset = selected_line.map_or(0, |line| line.saturating_sub(height - 1));
+    lines.into_iter().skip(offset).take(height).collect()
+}
+
+/// `marker name  suffix`, the name cut so the suffix stays right-aligned.
+fn list_row(marker: Span<'static>, name: &str, suffix: String, width: usize) -> Line<'static> {
+    let cfg = config::get();
+    let name_width = width.saturating_sub(marker.width() + suffix.width());
+    let name = truncate_to_width(name, name_width);
+    let pad = name_width.saturating_sub(name.width());
+    Line::from(vec![
+        marker,
+        Span::raw(format!("{name}{}", " ".repeat(pad))),
+        Span::styled(suffix, cfg.colors.base04),
+    ])
 }
 
 struct LogView {
@@ -290,8 +546,26 @@ struct LogView {
 }
 
 /// The log of the selected subscription, following the newest message.
-fn log_view(store: &PubSubStore, selected: usize, area: Rect, now: SystemTime) -> LogView {
-    let Some(sub) = store.subs.get(selected) else {
+fn log_view(store: &PubSubStore, row: Option<&Row>, area: Rect, now: SystemTime) -> LogView {
+    if let Some(Row::Server(name)) = row {
+        let subs = store
+            .server_only_channels()
+            .find(|(n, _)| n == name)
+            .map_or(0, |(_, subs)| *subs);
+        return LogView {
+            title: format!(" {name} "),
+            footer: None,
+            lines: Vec::new(),
+            placeholder: format!(
+                "{subs} subscriber{} · Enter to subscribe",
+                if subs == 1 { "" } else { "s" }
+            ),
+        };
+    }
+    let Some(sub) = row.and_then(|row| match row {
+        Row::Sub(i) => store.subs.get(*i),
+        Row::Server(_) => None,
+    }) else {
         return LogView {
             title: " Messages ".into(),
             footer: None,
@@ -326,9 +600,13 @@ fn log_view(store: &PubSubStore, selected: usize, area: Rect, now: SystemTime) -
     }
 }
 
-/// `HH:MM:SS.mmm channel payload`, cut to `width` columns.
+/// `HH:MM:SS.mmm channel payload`, cut to `width` columns. A reconnect
+/// marker is a centered note.
 fn log_line(msg: &PubSubMessage, width: usize) -> Line<'static> {
     let cfg = config::get();
+    if msg.kind == EntryKind::Reconnected {
+        return Line::styled(RECONNECT_MARKER, cfg.colors.base03).centered();
+    }
     let time = format!("{} ", clock(msg.received_at));
     let channel = format!("{} ", msg.channel);
     let budget = width.saturating_sub(time.width() + channel.width());
@@ -456,6 +734,53 @@ fn render_add_popup(popup: &AddPopup, area: Rect, buf: &mut Buffer) {
     .render(hint_area, buf);
 }
 
+fn render_publish_popup(popup: &PublishPopup, area: Rect, buf: &mut Buffer) {
+    let cfg = config::get();
+    let [_, popup_area, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(14.min(area.height)),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let [_, popup_area, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(64.min(area.width)),
+        Constraint::Fill(1),
+    ])
+    .areas(popup_area);
+    Clear.render(popup_area, buf);
+    let block = Block::default()
+        .title(" Publish ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(cfg.colors.base04)
+        .bg(cfg.colors.base00);
+    let inner = block.inner(popup_area);
+    block.render(popup_area, buf);
+
+    let [channel_area, payload_area, notice_area, hint_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    popup.channel.render(channel_area, buf);
+    popup.payload.render(payload_area, buf);
+    let hint = if popup.read_only {
+        Paragraph::new(Line::styled(READ_ONLY_PUBLISH, cfg.colors.base08))
+            .alignment(Alignment::Center)
+            .render(notice_area, buf);
+        "Tab field · Esc cancel"
+    } else {
+        "Tab field · Ctrl-s send · Esc cancel"
+    };
+    Paragraph::new(Line::styled(hint, cfg.colors.base03))
+        .alignment(Alignment::Center)
+        .render(hint_area, buf);
+}
+
 /// `[channel] / pattern`: the selected kind is bracketed.
 fn kind_labels(kind: TargetKind) -> (&'static str, &'static str) {
     match kind {
@@ -470,7 +795,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::redis_client::pubsub_store::BufferLimits;
+    use crate::redis_client::pubsub_store::{BufferLimits, ServerChannels};
 
     fn widget() -> PubSub {
         PubSub::new(Arc::new(Mutex::new(PubSubStore::new(BufferLimits {
@@ -491,7 +816,13 @@ mod tests {
         let mut p = widget();
         p.open_add();
         type_text(&mut p, "orders:*");
-        assert_eq!(p.add_popup.as_ref().unwrap().kind(), TargetKind::Pattern);
+        assert_eq!(
+            match p.popup.as_ref() {
+                Some(Popup::Add(a)) => a.kind(),
+                _ => panic!("no add popup"),
+            },
+            TargetKind::Pattern
+        );
         p.handle_popup_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(
             p.take_add_request(),
@@ -515,7 +846,7 @@ mod tests {
     fn selection_stays_in_range() {
         let mut p = widget();
         p.select_next();
-        assert_eq!(p.selected(), 0);
+        assert_eq!(p.selected, 0);
         {
             let mut store = p.store.lock();
             store.add(Target::Channel("a".into()));
@@ -523,10 +854,10 @@ mod tests {
         }
         p.select_next();
         p.select_next();
-        assert_eq!(p.selected(), 1);
+        assert_eq!(p.selected, 1);
         p.store.lock().remove(&Target::Channel("b".into()));
         p.clamp_selection();
-        assert_eq!(p.selected(), 0);
+        assert_eq!(p.selected, 0);
         assert_eq!(p.selected_target(), Some(Target::Channel("a".into())));
     }
 
@@ -586,6 +917,130 @@ mod tests {
         p.open_add();
         PubSubWidget.render(area, &mut buf, &mut p);
         assert!(screen(&buf).contains("[channel] / pattern"));
+    }
+
+    fn server(channels: &[(&str, u64)]) -> ServerChannels {
+        ServerChannels {
+            channels: channels.iter().map(|(n, c)| ((*n).into(), *c)).collect(),
+            total: channels.len(),
+            patterns: 3,
+        }
+    }
+
+    #[test]
+    fn publish_prefill_rules() {
+        let mut store = PubSubStore::new(BufferLimits {
+            messages: 10,
+            bytes: 1024,
+            payload: 1024,
+        });
+        store.add(Target::Channel("chat".into()));
+        store.add(Target::Pattern("orders:*".into()));
+        store.set_server_channels(server(&[("jobs", 1)]));
+
+        assert_eq!(publish_prefill(&store, None), "");
+        assert_eq!(publish_prefill(&store, Some(&Row::Sub(0))), "chat");
+        assert_eq!(
+            publish_prefill(&store, Some(&Row::Server("jobs".into()))),
+            "jobs"
+        );
+        // A pattern without messages has no concrete channel yet.
+        assert_eq!(publish_prefill(&store, Some(&Row::Sub(1))), "");
+        let now = SystemTime::now();
+        store.push("orders:new", Some("orders:*"), b"1", now);
+        store.push("orders:paid", Some("orders:*"), b"2", now);
+        // A marker isn't a message: the newest message's channel wins.
+        store.mark_reconnected(&[Target::Pattern("orders:*".into())], now);
+        assert_eq!(publish_prefill(&store, Some(&Row::Sub(1))), "orders:paid");
+    }
+
+    #[test]
+    fn rows_cover_subscriptions_then_server_channels() {
+        let mut p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Channel("chat".into()));
+            store.set_server_channels(server(&[("chat", 2), ("events", 2), ("jobs", 1)]));
+        }
+        for _ in 0..5 {
+            p.select_next();
+        }
+        // chat is listed once (as ours): rows are chat, events, jobs.
+        assert_eq!(p.selected_row(), Some(Row::Server("jobs".into())));
+        assert_eq!(p.selected_target(), None);
+        assert_eq!(p.selected_sub(), None);
+        p.select(0);
+        assert_eq!(p.selected_sub(), Some(0));
+    }
+
+    #[test]
+    fn publish_popup_request() {
+        let mut p = widget();
+        p.open_publish(false);
+        // Nothing selected: the channel starts empty and must be typed.
+        assert_eq!(p.take_publish_request(), None);
+        assert!(p.is_publish_popup());
+        type_text(&mut p, "orders:new");
+        p.handle_popup_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        type_text(&mut p, "a");
+        p.handle_popup_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        type_text(&mut p, "b");
+        assert_eq!(
+            p.take_publish_request(),
+            Some(("orders:new".into(), "a\nb".into()))
+        );
+        assert!(!p.is_popup());
+
+        p.store.lock().add(Target::Channel("chat".into()));
+        p.open_publish(true);
+        type_text(&mut p, "hi");
+        assert_eq!(p.take_publish_request(), None, "read-only refuses");
+        assert!(p.is_publish_popup());
+        assert_eq!(p.take_add_request(), None);
+        assert!(p.is_publish_popup(), "take_add_request keeps other popups");
+    }
+
+    #[test]
+    fn renders_server_channels_status_and_marker() {
+        let mut p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Channel("chat".into()));
+            store.push("chat", None, b"hello", SystemTime::now());
+            store.mark_reconnected(&[Target::Channel("chat".into())], SystemTime::now());
+            store.set_server_channels(server(&[("chat", 2), ("events", 1)]));
+            store.status = ConnStatus::Reconnecting {
+                attempt: 2,
+                next_at: std::time::Instant::now() + std::time::Duration::from_millis(1_500),
+            };
+        }
+        p.cluster_mode = true;
+        let area = Rect::new(0, 0, 120, 14);
+        let mut buf = Buffer::empty(area);
+        PubSubWidget.render(area, &mut buf, &mut p);
+        let text = screen(&buf);
+        assert!(text.contains("reconnecting in 2 s"), "{text}");
+        assert!(text.contains(CLUSTER_NOTE), "{text}");
+        assert!(text.contains("─ Server channels"), "{text}");
+        assert!(text.contains("○ events"), "{text}");
+        assert!(text.contains("1 sub"), "{text}");
+        assert!(!text.contains("○ chat"), "{text}");
+        assert!(text.contains("patterns on server: 3"), "{text}");
+        assert!(text.contains(RECONNECT_MARKER), "{text}");
+
+        p.select_next();
+        PubSubWidget.render(area, &mut buf, &mut p);
+        assert!(
+            screen(&buf).contains("1 subscriber · Enter to subscribe"),
+            "{}",
+            screen(&buf)
+        );
+
+        p.open_publish(true);
+        PubSubWidget.render(area, &mut buf, &mut p);
+        let text = screen(&buf);
+        assert!(text.contains(READ_ONLY_PUBLISH), "{text}");
+        assert!(text.contains("events"), "prefilled: {text}");
     }
 
     #[test]

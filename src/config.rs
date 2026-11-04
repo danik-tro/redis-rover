@@ -552,6 +552,21 @@ mod tests {
             resolve(Mode::PubSub, KeyCode::Char('c')),
             KeyResolution::Command(Command::PubSubClear)
         );
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Char('r')),
+            KeyResolution::Command(Command::PubSubRefresh)
+        );
+        assert_eq!(
+            resolve(Mode::PubSub, KeyCode::Enter),
+            KeyResolution::Command(Command::PubSubEnter)
+        );
+        assert_eq!(
+            c.keybindings.resolve(
+                Mode::PubSub,
+                &[KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)]
+            ),
+            KeyResolution::Command(Command::PubSubPublish)
+        );
         Ok(())
     }
 

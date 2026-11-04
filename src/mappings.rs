@@ -36,6 +36,9 @@ impl From<Command> for Action {
             Command::PubSubAdd => Self::PubSubAdd,
             Command::PubSubRemove => Self::PubSubRemove,
             Command::PubSubClear => Self::PubSubClear,
+            Command::PubSubRefresh => Self::PubSubRefresh,
+            Command::PubSubPublish => Self::PubSubPublish,
+            Command::PubSubEnter => Self::PubSubEnter,
         }
     }
 }

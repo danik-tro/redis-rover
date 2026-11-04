@@ -74,6 +74,19 @@ pub enum Action {
     PubSubRemove,
     /// Clear the selected subscription's messages and stats.
     PubSubClear,
+    /// Re-list the server's channels (`PUBSUB CHANNELS`).
+    PubSubRefresh,
+    /// Open the publish popup.
+    PubSubPublish,
+    /// Enter in the tab: subscribe to the selected server channel.
+    PubSubEnter,
+    /// A server channel listing is waiting in `SharedState::pubsub`.
+    PubSubChannelsLoaded,
+    /// `PUBLISH` went through and reached `receivers` subscribers.
+    Published {
+        channel: String,
+        receivers: i64,
+    },
 }
 
 impl Action {

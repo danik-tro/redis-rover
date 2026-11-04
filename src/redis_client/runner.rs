@@ -387,6 +387,29 @@ impl EventHandler {
                 }
             }
             RedisEvent::FetchValue => self.fetch_value().await,
+            RedisEvent::FetchPubSubChannels => match self.storage.pubsub_channels().await {
+                Ok(channels) => {
+                    self.state.pubsub.lock().set_server_channels(channels);
+                    self.action_hook(Action::PubSubChannelsLoaded);
+                }
+                Err(err) => {
+                    log::error!("FetchPubSubChannels failed: {err:?}");
+                    self.action_hook(Action::Error(format!(
+                        "Failed to list Pub/Sub channels: {err}"
+                    )));
+                }
+            },
+            RedisEvent::Publish { channel, payload } => {
+                match self.storage.publish(&channel, &payload).await {
+                    Ok(receivers) => self.action_hook(Action::Published { channel, receivers }),
+                    Err(err) => {
+                        log::error!("Publish to {channel} failed: {err:?}");
+                        self.action_hook(Action::Error(format!(
+                            "Failed to publish to {channel}: {err}"
+                        )));
+                    }
+                }
+            }
             RedisEvent::FetchKeys => {
                 // Work on a snapshot so the lock isn't held across `.await`.
                 let snapshot = self.state.keyspace_state.lock().clone();

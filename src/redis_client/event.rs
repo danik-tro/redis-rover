@@ -51,6 +51,15 @@ pub enum RedisEvent {
         key: String,
         delete: ItemDelete,
     },
+    /// List the server's active channels (`PUBSUB CHANNELS` / `NUMSUB` /
+    /// `NUMPAT`) into `SharedState::pubsub`.
+    FetchPubSubChannels,
+    /// `PUBLISH channel payload`. The payload travels in the event, not in an
+    /// `Action`, so it isn't debug-logged as one.
+    Publish {
+        channel: String,
+        payload: String,
+    },
 }
 
 impl RedisEvent {
@@ -63,14 +72,16 @@ impl RedisEvent {
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
-            | Self::FetchFullValue { .. } => false,
+            | Self::FetchFullValue { .. }
+            | Self::FetchPubSubChannels => false,
             Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::SetTtl { .. }
             | Self::CreateKey { .. }
             | Self::AddItem { .. }
             | Self::EditItem { .. }
-            | Self::DeleteItem { .. } => true,
+            | Self::DeleteItem { .. }
+            | Self::Publish { .. } => true,
         }
     }
 }
@@ -107,6 +118,12 @@ mod tests {
         assert!(RedisEvent::DeleteItem {
             key: "k".into(),
             delete: ItemDelete::HashField("f".into())
+        }
+        .is_write());
+        assert!(!RedisEvent::FetchPubSubChannels.is_write());
+        assert!(RedisEvent::Publish {
+            channel: "c".into(),
+            payload: "p".into()
         }
         .is_write());
     }
