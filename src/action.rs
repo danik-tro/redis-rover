@@ -80,6 +80,8 @@ pub enum Action {
     PubSubPublish,
     /// Enter in the tab: subscribe to the selected server channel.
     PubSubEnter,
+    /// `N`: toggle notifications of the selected subscription (also un-mutes).
+    PubSubToggleNotify,
     /// A server channel listing is waiting in `SharedState::pubsub`.
     PubSubChannelsLoaded,
     /// `PUBLISH` went through and reached `receivers` subscribers.

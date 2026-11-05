@@ -39,6 +39,7 @@ impl From<Command> for Action {
             Command::PubSubRefresh => Self::PubSubRefresh,
             Command::PubSubPublish => Self::PubSubPublish,
             Command::PubSubEnter => Self::PubSubEnter,
+            Command::PubSubToggleNotify => Self::PubSubToggleNotify,
         }
     }
 }

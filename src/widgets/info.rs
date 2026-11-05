@@ -29,6 +29,9 @@ pub struct Info {
     metrics: Arc<Mutex<MetricsHistory>>,
     /// One-line key-hint legend; follows the current mode.
     pub hint: String,
+    /// Unread Pub/Sub messages over all subscriptions; badge when > 0.
+    /// The App keeps it at 0 while the Pub/Sub tab is open.
+    pub pubsub_unread: u64,
 }
 
 /// Build the footer legend from the live keymap: `"{key} {label}"` per entry,
@@ -80,6 +83,7 @@ impl Info {
             read_only: false,
             metrics,
             hint: String::new(),
+            pubsub_unread: 0,
         }
     }
 }
@@ -97,6 +101,15 @@ impl StatefulWidget for InfoWidget {
                 Span::raw(" RO ")
                     .fg(cfg.colors.base00)
                     .bg(cfg.colors.base08)
+                    .bold(),
+            );
+            title.push(Span::raw(" "));
+        }
+        if state.pubsub_unread > 0 {
+            title.push(
+                Span::raw(format!(" PubSub {} ", state.pubsub_unread))
+                    .fg(cfg.colors.base00)
+                    .bg(cfg.colors.base0e)
                     .bold(),
             );
             title.push(Span::raw(" "));

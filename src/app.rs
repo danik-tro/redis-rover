@@ -1,8 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::{
     config,
     mode::PopupMode,
+    pubsub_notify::{self, Notice},
     redis_client::{event::RedisEvent, pubsub::PubSubCmd, pubsub_store::Target, types::RedisType},
     state::SharedState,
 };
@@ -40,6 +41,7 @@ use crate::{
             format_bytes, KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome,
         },
         pubsub::{PubSub, PubSubWidget, Row},
+        toast::{Toast, ToastWidget},
     },
 };
 
@@ -106,6 +108,8 @@ pub struct App {
     /// `--read-only`: refuse writes before any input is asked for.
     read_only: bool,
     clipboard: Clipboard,
+    /// Short message drawn above every mode and popup.
+    toast: Toast,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -153,6 +157,7 @@ const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::PubSubRemove, "remove"),
     (Command::PubSubClear, "clear"),
     (Command::PubSubPublish, "publish"),
+    (Command::PubSubToggleNotify, "notify"),
     (Command::PubSubRefresh, "refresh"),
     (Command::ScrollDown, "next"),
     (Command::ToggleHelp, "help"),
@@ -168,6 +173,10 @@ const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::PubSubClear, "Clear messages and stats"),
     (Command::PubSubEnter, "Subscribe to the server channel"),
     (Command::PubSubPublish, "Publish a message"),
+    (
+        Command::PubSubToggleNotify,
+        "Toggle notifications (also un-mutes)",
+    ),
     (Command::PubSubRefresh, "Refresh server channels"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
@@ -271,6 +280,7 @@ impl App {
             pubsub_return: Mode::KeySpace,
             read_only: false,
             clipboard: Clipboard::default(),
+            toast: Toast::default(),
         };
         app.sync_hint();
         app
@@ -550,7 +560,9 @@ impl App {
             Action::Tick => {
                 self.expire_pending_chord();
                 self.request_filter_count();
-                self.keyspace.expire_toast(Instant::now());
+                let now = Instant::now();
+                self.toast.expire(now);
+                self.pubsub_tick(now, SystemTime::now());
             }
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => Self::resize(tui, (w, h))?,
@@ -586,7 +598,7 @@ impl App {
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
-            Action::YankFailed(ref msg) => self.keyspace.show_toast(msg.clone(), false),
+            Action::YankFailed(ref msg) => self.toast.show(msg.clone(), false),
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
@@ -625,7 +637,8 @@ impl App {
             Action::PubSubPublish => self.pubsub.open_publish(self.read_only),
             Action::PubSubEnter => self.subscribe_selected_server_channel(),
             Action::PubSubChannelsLoaded => self.pubsub.clamp_selection(),
-            Action::Published { receivers, .. } => self.keyspace.show_toast(
+            Action::PubSubToggleNotify => self.toggle_notify(),
+            Action::Published { receivers, .. } => self.toast.show(
                 format!(
                     "delivered to {receivers} subscriber{}",
                     if receivers == 1 { "" } else { "s" }
@@ -669,6 +682,8 @@ impl StatefulWidget for AppWidget {
             };
             App::render_help_overlay(area, buf, mode);
         }
+        // Last: above every mode, popup and overlay.
+        StatefulWidget::render(ToastWidget, main, buf, &mut state.toast);
     }
 }
 
@@ -702,8 +717,6 @@ impl App {
             Mode::PubSub => {
                 self.pubsub.cluster_mode = self.cluster_enabled();
                 StatefulWidget::render(PubSubWidget, area, buf, &mut self.pubsub);
-                // The keyspace toast (e.g. "delivered to …") shows here too.
-                self.keyspace.render_toast_over(area, buf);
             }
             Mode::Common | Mode::Popup(_) => {}
         }
@@ -888,6 +901,8 @@ impl App {
                 self.pubsub_return = self.mode;
                 self.mode = Mode::PubSub;
                 self.sync_hint();
+                self.mark_selected_read();
+                self.summary.pubsub_unread = 0;
                 self.fetch_pubsub_channels();
             }
             Mode::Common | Mode::Popup(_) => {}
@@ -914,6 +929,7 @@ impl App {
     fn subscribe_target(&mut self, target: Target) {
         let (index, added) = self.state.pubsub.lock().add(target.clone());
         self.pubsub.select(index);
+        self.mark_selected_read();
         if added {
             self.send_pubsub_cmd(PubSubCmd::Subscribe(target));
         }
@@ -940,6 +956,82 @@ impl App {
         self.state.pubsub.lock().remove(&target);
         self.pubsub.clamp_selection();
         self.send_pubsub_cmd(PubSubCmd::Unsubscribe(target));
+    }
+
+    /// The Pub/Sub tab is on screen (possibly under an error popup).
+    fn pubsub_visible(&self) -> bool {
+        self.mode == Mode::PubSub
+            || (matches!(self.mode, Mode::Popup(_)) && self.previous_mode == Some(Mode::PubSub))
+    }
+
+    /// Subscription open in the tab: its messages are being read.
+    fn open_subscription(&self) -> Option<usize> {
+        self.pubsub_visible()
+            .then(|| self.pubsub.selected_sub())
+            .flatten()
+    }
+
+    /// The subscription selected in the tab has been read.
+    fn mark_selected_read(&mut self) {
+        if let Some(index) = self.open_subscription() {
+            if let Some(sub) = self.state.pubsub.lock().subs.get_mut(index) {
+                sub.unread = 0;
+            }
+        }
+    }
+
+    /// `N`: notifications on / off for the selected subscription (also
+    /// un-mutes an auto-muted one).
+    fn toggle_notify(&mut self) {
+        let Some(index) = self.pubsub.selected_sub() else {
+            return;
+        };
+        if let Some(sub) = self.state.pubsub.lock().subs.get_mut(index) {
+            sub.notify = sub.notify.toggled();
+        }
+    }
+
+    /// Notifier, on every `Tick`: count what each subscription received since
+    /// the last tick into its unread badge, run its notification state
+    /// machine, and toast the notices. The subscription open in the tab
+    /// stays read and never toasts.
+    fn pubsub_tick(&mut self, now: Instant, wall: SystemTime) {
+        let policy = config::get().pubsub.notify.policy();
+        let open = self.open_subscription();
+        let mut notices: Vec<Notice> = Vec::new();
+        let mut unread = 0;
+        {
+            let mut store = self.state.pubsub.lock();
+            for (i, sub) in store.subs.iter_mut().enumerate() {
+                let new = sub.stats.total.saturating_sub(sub.seen_total);
+                sub.seen_total = sub.stats.total;
+                let rate = f64::from(sub.stats.rate_1s(wall));
+                let preview = (new > 0
+                    && matches!(sub.notify, pubsub_notify::NotifyState::On { .. }))
+                .then(|| sub.newest_preview())
+                .flatten();
+                let notice = pubsub_notify::on_tick(
+                    &mut sub.notify,
+                    sub.target.name(),
+                    new,
+                    rate,
+                    preview.as_deref(),
+                    now,
+                    &policy,
+                );
+                if open == Some(i) {
+                    sub.unread = 0;
+                    continue;
+                }
+                sub.unread += new;
+                unread += sub.unread;
+                notices.extend(notice);
+            }
+        }
+        self.summary.pubsub_unread = if self.pubsub_visible() { 0 } else { unread };
+        for msg in pubsub_notify::toasts(notices) {
+            self.toast.notify(msg);
+        }
     }
 
     fn send_pubsub_cmd(&self, cmd: PubSubCmd) {
@@ -1336,7 +1428,7 @@ impl App {
             return;
         }
         if matches!(r_type, RedisType::Stream | RedisType::Unknown(_)) {
-            self.keyspace.show_toast(
+            self.toast.show(
                 format!("Copying {} values isn't supported yet", r_type.name()),
                 false,
             );
@@ -1352,7 +1444,7 @@ impl App {
 
     /// Ask the runner for `key`'s whole value; `YankReady` copies it.
     fn start_full_yank(&mut self, key: String, r_type: RedisType) {
-        self.keyspace.show_toast(format!("Copying {key}…"), true);
+        self.toast.show(format!("Copying {key}…"), true);
         self.send_redis_event(RedisEvent::FetchFullValue { key, r_type });
     }
 
@@ -1387,7 +1479,7 @@ impl App {
             }
             Err(err) => format!("Copy failed: {err}"),
         };
-        self.keyspace.show_toast(msg, false);
+        self.toast.show(msg, false);
     }
 
     fn send_redis_event(&self, event: RedisEvent) {
@@ -1578,6 +1670,7 @@ impl App {
     fn scroll_down(&mut self) {
         if self.mode == Mode::PubSub {
             self.pubsub.select_next();
+            self.mark_selected_read();
             return;
         }
         if self.mode != Mode::KeySpace {
@@ -1604,6 +1697,7 @@ impl App {
     fn scroll_up(&mut self) {
         if self.mode == Mode::PubSub {
             self.pubsub.select_prev();
+            self.mark_selected_read();
             return;
         }
         if self.mode != Mode::KeySpace {
@@ -1846,5 +1940,190 @@ mod tests {
 
         app.toggle_dashboard();
         assert_eq!(app.mode, Mode::KeySpace);
+    }
+
+    /// An app with subscriptions `names` (notifications on for each).
+    fn app_with_subs(names: &[&str]) -> App {
+        let app = app();
+        {
+            let mut store = app.state.pubsub.lock();
+            for name in names {
+                let (i, _) = store.add(Target::Channel((*name).into()));
+                store.subs[i].notify = store.subs[i].notify.toggled();
+            }
+        }
+        app
+    }
+
+    fn publish(app: &App, channel: &str, payload: &str) {
+        app.state
+            .pubsub
+            .lock()
+            .push(channel, None, payload.as_bytes(), SystemTime::now());
+    }
+
+    fn unread(app: &App) -> Vec<u64> {
+        app.state
+            .pubsub
+            .lock()
+            .subs
+            .iter()
+            .map(|s| s.unread)
+            .collect()
+    }
+
+    fn render_screen(app: &mut App) -> String {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        AppWidget.render(area, &mut buf, app);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn notifier_toasts_first_message_then_only_counts() {
+        let mut app = app_with_subs(&["chat"]);
+        let start = Instant::now();
+        app.pubsub_tick(start, SystemTime::now());
+        assert_eq!(app.toast.message(), None);
+
+        publish(&app, "chat", "hi");
+        app.pubsub_tick(start, SystemTime::now());
+        assert_eq!(app.toast.message(), Some("chat: hi"));
+        assert_eq!(unread(&app), vec![1]);
+        assert_eq!(app.summary.pubsub_unread, 1);
+
+        // Inside the cooldown: the badge grows, no new toast.
+        app.toast.expire(start + Duration::from_secs(5));
+        publish(&app, "chat", "again");
+        publish(&app, "chat", "and again");
+        app.pubsub_tick(start + Duration::from_secs(5), SystemTime::now());
+        assert_eq!(app.toast.message(), None);
+        assert_eq!(unread(&app), vec![3]);
+        assert!(render_screen(&mut app).contains("PubSub 3"));
+
+        // Off: still counted, never toasted.
+        app.toggle_pubsub();
+        app.toggle_notify();
+        app.toggle_pubsub();
+        publish(&app, "chat", "later");
+        app.pubsub_tick(start + Duration::from_mins(1), SystemTime::now());
+        assert_eq!(app.toast.message(), None);
+        assert_eq!(unread(&app), vec![1], "opening the tab read it");
+    }
+
+    #[test]
+    fn several_subscriptions_share_one_toast() {
+        let mut app = app_with_subs(&["a", "b", "c"]);
+        for name in ["a", "b", "c"] {
+            publish(&app, name, "x");
+        }
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(
+            app.toast.message(),
+            Some("3 subscriptions have new messages")
+        );
+        app.toast.expire(Instant::now() + Duration::from_secs(10));
+        assert_eq!(app.toast.message(), None, "nothing else queued");
+    }
+
+    #[test]
+    fn pubsub_toast_never_replaces_a_sticky_toast() {
+        let mut app = app_with_subs(&["chat"]);
+        app.toast.show("Copying key…", true);
+        publish(&app, "chat", "hi");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(app.toast.message(), Some("Copying key…"));
+        assert_eq!(unread(&app), vec![1]);
+    }
+
+    #[test]
+    fn unread_resets_when_selected_in_the_tab() {
+        let mut app = app_with_subs(&["a", "b"]);
+        publish(&app, "a", "x");
+        publish(&app, "b", "x");
+        publish(&app, "b", "y");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(unread(&app), vec![1, 2]);
+        assert_eq!(app.summary.pubsub_unread, 3);
+
+        app.toggle_pubsub();
+        assert_eq!(unread(&app), vec![0, 2], "the first one is selected");
+        assert_eq!(app.summary.pubsub_unread, 0, "no global badge in the tab");
+        let text = render_screen(&mut app);
+        assert!(text.contains("(2)"), "{text}");
+        assert!(!text.contains("PubSub 2"), "{text}");
+
+        app.scroll_down();
+        assert_eq!(unread(&app), vec![0, 0]);
+    }
+
+    #[test]
+    fn open_subscription_never_toasts() {
+        let mut app = app_with_subs(&["a", "b"]);
+        app.toggle_pubsub();
+        publish(&app, "a", "x");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(app.toast.message(), None);
+        assert_eq!(unread(&app), vec![0, 0]);
+
+        // Another subscription toasts, even in the tab.
+        publish(&app, "b", "y");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(app.toast.message(), Some("b: y"));
+        assert_eq!(unread(&app), vec![0, 1]);
+    }
+
+    #[test]
+    fn clear_restarts_the_count() {
+        let mut app = app_with_subs(&["a"]);
+        publish(&app, "a", "x");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        app.state.pubsub.lock().clear(0);
+        publish(&app, "a", "y");
+        app.pubsub_tick(Instant::now(), SystemTime::now());
+        assert_eq!(unread(&app), vec![1]);
+    }
+
+    #[test]
+    fn toggle_notify_cycles_and_unmutes() {
+        use crate::pubsub_notify::NotifyState;
+        let mut app = app_with_subs(&["a"]);
+        app.toggle_pubsub();
+        let state = |app: &App| app.state.pubsub.lock().subs[0].notify;
+        assert!(matches!(state(&app), NotifyState::On { .. }));
+        app.toggle_notify();
+        assert_eq!(state(&app), NotifyState::Off);
+        app.state.pubsub.lock().subs[0].notify = NotifyState::AutoMuted;
+        assert!(render_screen(&mut app).contains('🔕'));
+        app.toggle_notify();
+        assert!(matches!(state(&app), NotifyState::On { .. }));
+    }
+
+    #[test]
+    fn toast_renders_over_every_mode() {
+        let mut app = app();
+        let check = |app: &mut App, what: &str| {
+            app.toast.show("hello toast", false);
+            let text = render_screen(app);
+            assert!(text.contains("hello toast"), "{what}:\n{text}");
+        };
+        check(&mut app, "keyspace");
+        app.toggle_dashboard();
+        check(&mut app, "dashboard");
+        app.toggle_dashboard();
+        app.toggle_pubsub();
+        check(&mut app, "pubsub");
+        app.show_error_popup("boom");
+        check(&mut app, "error popup");
+        app.switch_to_previous_mode();
+        app.toggle_help();
+        check(&mut app, "help overlay");
     }
 }

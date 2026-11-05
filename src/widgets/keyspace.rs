@@ -653,13 +653,7 @@ pub struct KeySpace {
     /// Key rows that fit in the table on the last render (0 before the first
     /// render). The app sizes keyspace pages to it.
     visible_rows: usize,
-    /// Short non-modal message (e.g. "Copied …") and when it expires
-    /// (`None` = until replaced).
-    toast: Option<(String, Option<Instant>)>,
 }
-
-/// How long a toast stays up.
-const TOAST_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Banner shown above the key table in cluster mode.
 const CLUSTER_BANNER: &str = "⚠ cluster: SCAN sees only this node";
@@ -687,32 +681,6 @@ impl KeySpace {
             edit_item: None,
             cluster_mode: false,
             visible_rows: 0,
-            toast: None,
-        }
-    }
-
-    /// Show a toast for [`TOAST_TIMEOUT`], or until replaced if `sticky`.
-    pub fn show_toast(&mut self, msg: impl Into<String>, sticky: bool) {
-        let expires = (!sticky).then(|| Instant::now() + TOAST_TIMEOUT);
-        self.toast = Some((msg.into(), expires));
-    }
-
-    /// Drop the toast once it has expired.
-    pub fn expire_toast(&mut self, now: Instant) {
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|(_, expires)| expires.is_some_and(|at| now >= at))
-        {
-            self.toast = None;
-        }
-    }
-
-    /// Draw the current toast over `area`, for screens other than the
-    /// keyspace (the Pub/Sub tab). Until the toast moves to its own widget.
-    pub fn render_toast_over(&self, area: Rect, buf: &mut Buffer) {
-        if let Some((msg, _)) = self.toast.as_ref() {
-            KeySpaceWidget::render_toast(msg, area, buf);
         }
     }
 
@@ -1951,35 +1919,6 @@ impl KeySpaceWidget {
             .render(popup_area, buf);
     }
 
-    /// A one-line boxed message at the bottom-right of `area`.
-    fn render_toast(msg: &str, area: Rect, buf: &mut Buffer) {
-        let cfg = config::get();
-        let text_width = u16::try_from(Line::from(msg).width()).unwrap_or(u16::MAX);
-        let width = text_width
-            .saturating_add(4)
-            .min(area.width.saturating_sub(2));
-        if width < 5 || area.height < 5 {
-            return;
-        }
-        let toast = Rect {
-            x: area.right() - width - 1,
-            y: area.bottom() - 4,
-            width,
-            height: 3,
-        };
-        Clear.render(toast, buf);
-        Paragraph::new(Line::from(msg).fg(cfg.colors.base05))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(cfg.colors.base0b)
-                    .bg(cfg.colors.base00)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .render(toast, buf);
-    }
-
     /// Center a popup of `height` rows in `area`, returning the inner Rect (after
     /// clearing it). Mirrors the centering used by the other overlays.
     fn centered_popup(area: Rect, height: u16, buf: &mut Buffer) -> Rect {
@@ -2873,10 +2812,6 @@ impl StatefulWidget for KeySpaceWidget {
         if state.is_edit_item_active() {
             Self::render_edit_item_overlay(state, area, buf);
         }
-
-        if let Some((msg, _)) = state.toast.as_ref() {
-            Self::render_toast(msg, area, buf);
-        }
     }
 }
 
@@ -3302,21 +3237,6 @@ mod tests {
         assert_eq!(keyspace.loaded_value_text(), None);
         let keyspace = with_value(RedisType::String, string_value("abc"));
         assert_eq!(keyspace.loaded_value_text().as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn toast_expires() {
-        let mut keyspace = KeySpace::new(Vec::new());
-        keyspace.show_toast("Copied", false);
-        assert!(render_text(&mut keyspace).contains("Copied"));
-        keyspace.expire_toast(std::time::Instant::now());
-        assert!(keyspace.toast.is_some());
-        keyspace.expire_toast(std::time::Instant::now() + super::TOAST_TIMEOUT);
-        assert!(keyspace.toast.is_none());
-
-        keyspace.show_toast("Copying…", true);
-        keyspace.expire_toast(std::time::Instant::now() + super::TOAST_TIMEOUT * 10);
-        assert!(keyspace.toast.is_some(), "sticky until replaced");
     }
 
     #[test]

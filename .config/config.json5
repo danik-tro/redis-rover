@@ -55,6 +55,7 @@
       "c": "PubSubClear",
       "r": "PubSubRefresh",
       "<Shift-p>": "PubSubPublish",
+      "<Shift-n>": "PubSubToggleNotify",
       "<Enter>": "PubSubEnter",
       "?": "ToggleHelp",
     },

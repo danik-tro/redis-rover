@@ -3,7 +3,6 @@
 //! popups.
 
 use std::{
-    fmt::Write as _,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,14 +21,14 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config,
+    pubsub_notify::NotifyState,
     redis_client::pubsub_store::{
-        detect_kind, ConnStatus, EntryKind, Payload, PubSubMessage, PubSubStore, Target, TargetKind,
+        detect_kind, ConnStatus, EntryKind, PubSubMessage, PubSubStore, Subscription, Target,
+        TargetKind,
     },
     widgets::keyspace::{format_bytes, truncate_to_width},
 };
 
-/// Bytes shown in a binary payload's hex preview.
-const HEX_PREVIEW: usize = 16;
 /// Width of the subscriptions pane.
 const LIST_WIDTH: u16 = 32;
 /// Log row standing for a reconnect.
@@ -484,10 +483,14 @@ fn list_lines(
         } else {
             cfg.colors.base0d
         };
-        let rate = format!(" {}/s", sub.stats.rate_1s(now));
         push_row(
             &mut lines,
-            list_row(Span::styled(" ● ", dot), sub.target.name(), rate, width),
+            list_row(
+                Span::styled(" ● ", dot),
+                sub.target.name(),
+                sub_suffix(sub, now),
+                width,
+            ),
         );
     }
 
@@ -523,6 +526,22 @@ fn list_lines(
     let height = usize::from(area.height).max(1);
     let offset = selected_line.map_or(0, |line| line.saturating_sub(height - 1));
     lines.into_iter().skip(offset).take(height).collect()
+}
+
+/// ` 12/s (37) 🔔`: rate, unread badge when there is one, and the notify
+/// marker (`🔔` on, `🔕` auto-muted, nothing when off).
+fn sub_suffix(sub: &Subscription, now: SystemTime) -> String {
+    let unread = if sub.unread > 0 {
+        format!(" ({})", sub.unread)
+    } else {
+        String::new()
+    };
+    let marker = match sub.notify {
+        NotifyState::On { .. } => " 🔔",
+        NotifyState::AutoMuted => " 🔕",
+        NotifyState::Off => "",
+    };
+    format!(" {}/s{unread}{marker}", sub.stats.rate_1s(now))
 }
 
 /// `marker name  suffix`, the name cut so the suffix stays right-aligned.
@@ -610,7 +629,7 @@ fn log_line(msg: &PubSubMessage, width: usize) -> Line<'static> {
     let time = format!("{} ", clock(msg.received_at));
     let channel = format!("{} ", msg.channel);
     let budget = width.saturating_sub(time.width() + channel.width());
-    let preview = payload_preview(&msg.payload, msg.size);
+    let preview = msg.payload.preview(msg.size);
     Line::from(vec![
         Span::styled(time, cfg.colors.base03),
         Span::styled(channel, cfg.colors.base0d),
@@ -619,27 +638,6 @@ fn log_line(msg: &PubSubMessage, width: usize) -> Line<'static> {
             cfg.colors.base05,
         ),
     ])
-}
-
-/// One-line preview: control characters become spaces; binary payloads show
-/// their size and the first bytes in hex.
-fn payload_preview(payload: &Payload, size: usize) -> String {
-    match payload {
-        Payload::Text(text) => text
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect(),
-        Payload::Binary(bytes) => {
-            let mut out = format!("[binary {size} B]");
-            for b in bytes.iter().take(HEX_PREVIEW) {
-                let _ = write!(out, " {b:02x}");
-            }
-            if bytes.len() > HEX_PREVIEW {
-                out.push_str(" …");
-            }
-            out
-        }
-    }
 }
 
 /// Local wall-clock time `HH:MM:SS.mmm`.
@@ -861,17 +859,6 @@ mod tests {
         assert_eq!(p.selected_target(), Some(Target::Channel("a".into())));
     }
 
-    #[test]
-    fn preview_is_one_line() {
-        let text = Payload::Text("a\nb\tc".into());
-        assert_eq!(payload_preview(&text, 5), "a b c");
-        let bin = Payload::Binary((0u8..20).collect());
-        assert_eq!(
-            payload_preview(&bin, 312),
-            "[binary 312 B] 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f …"
-        );
-    }
-
     fn screen(buf: &Buffer) -> String {
         let area = buf.area;
         (0..area.height)
@@ -1041,6 +1028,35 @@ mod tests {
         let text = screen(&buf);
         assert!(text.contains(READ_ONLY_PUBLISH), "{text}");
         assert!(text.contains("events"), "prefilled: {text}");
+    }
+
+    #[test]
+    fn list_shows_unread_and_notify_markers() {
+        let mut p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Channel("chat".into()));
+            store.add(Target::Channel("noisy".into()));
+            store.add(Target::Channel("quiet".into()));
+            store.subs[0].unread = 37;
+            store.subs[0].notify = NotifyState::Off.toggled();
+            store.subs[1].notify = NotifyState::AutoMuted;
+        }
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buf = Buffer::empty(area);
+        PubSubWidget.render(area, &mut buf, &mut p);
+        let lines: Vec<String> = screen(&buf).lines().map(str::to_owned).collect();
+        let row = |name: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(&format!("● {name}")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("chat").contains("0/s (37) 🔔"), "{}", row("chat"));
+        assert!(row("noisy").contains("0/s 🔕"), "{}", row("noisy"));
+        assert!(!row("quiet").contains('('), "{}", row("quiet"));
+        assert!(!row("quiet").contains('🔔'), "{}", row("quiet"));
     }
 
     #[test]

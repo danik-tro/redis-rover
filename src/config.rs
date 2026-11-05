@@ -52,6 +52,56 @@ pub struct PubSubConfig {
     pub buffer_bytes: usize,
     /// Payload bytes stored per message; see [`PubSubConfig::max_payload`].
     pub max_payload: usize,
+    /// Notification thresholds.
+    pub notify: NotifyConfig,
+}
+
+/// Thresholds of the Pub/Sub notifications.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Quiet time before the next toast; see [`NotifyConfig::cooldown`].
+    pub cooldown_secs: u64,
+    /// msg/s above which a subscription is noisy; see [`NotifyConfig::mute_rate`].
+    pub mute_rate: u64,
+    /// Time above `mute_rate` before muting; see [`NotifyConfig::mute_after`].
+    pub mute_after_secs: u64,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            cooldown_secs: 30,
+            mute_rate: 10,
+            mute_after_secs: 10,
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// Quiet time before the next toast, clamped to 1 s..=1 h.
+    pub fn cooldown(&self) -> Duration {
+        Duration::from_secs(self.cooldown_secs.clamp(1, 3600))
+    }
+
+    /// Noisy rate in msg/s, clamped to 1..=100,000.
+    pub fn mute_rate(&self) -> u64 {
+        self.mute_rate.clamp(1, 100_000)
+    }
+
+    /// Time above the rate before muting, clamped to 1 s..=10 min.
+    pub fn mute_after(&self) -> Duration {
+        Duration::from_secs(self.mute_after_secs.clamp(1, 600))
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    pub fn policy(&self) -> crate::pubsub_notify::NotifyPolicy {
+        crate::pubsub_notify::NotifyPolicy {
+            cooldown: self.cooldown(),
+            mute_rate: self.mute_rate() as f64,
+            mute_after: self.mute_after(),
+        }
+    }
 }
 
 impl Default for PubSubConfig {
@@ -60,6 +110,7 @@ impl Default for PubSubConfig {
             buffer_messages: 1000,
             buffer_bytes: 8 * 1024 * 1024,
             max_payload: 64 * 1024,
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -491,6 +542,7 @@ mod tests {
             buffer_messages: 1,
             buffer_bytes: 1,
             max_payload: 1,
+            notify: NotifyConfig::default(),
         };
         assert_eq!(c.buffer_messages(), 10);
         assert_eq!(c.buffer_bytes(), 64 * 1024);
@@ -500,6 +552,7 @@ mod tests {
             buffer_messages: usize::MAX,
             buffer_bytes: usize::MAX,
             max_payload: usize::MAX,
+            notify: NotifyConfig::default(),
         };
         assert_eq!(c.buffer_messages(), 100_000);
         assert_eq!(c.buffer_bytes(), 256 * 1024 * 1024);
@@ -510,6 +563,7 @@ mod tests {
             buffer_messages: 100,
             buffer_bytes: 100 * 1024,
             max_payload: 1024 * 1024,
+            notify: NotifyConfig::default(),
         };
         assert_eq!(c.max_payload(), 100 * 1024);
 
@@ -517,6 +571,42 @@ mod tests {
             json5::from_str("{ keybindings: {}, pubsub: { buffer_messages: 50 } }").unwrap();
         assert_eq!(cfg.pubsub.buffer_messages(), 50);
         assert_eq!(cfg.pubsub.max_payload(), 64 * 1024);
+    }
+
+    #[test]
+    fn pubsub_notify_config_defaults_and_clamps() {
+        let d = NotifyConfig::default();
+        assert_eq!(d.cooldown(), Duration::from_secs(30));
+        assert_eq!(d.mute_rate(), 10);
+        assert_eq!(d.mute_after(), Duration::from_secs(10));
+        let p = d.policy();
+        assert!((p.mute_rate - 10.0).abs() < f64::EPSILON);
+        assert_eq!(p.cooldown, Duration::from_secs(30));
+
+        let c = NotifyConfig {
+            cooldown_secs: 0,
+            mute_rate: 0,
+            mute_after_secs: 0,
+        };
+        assert_eq!(c.cooldown(), Duration::from_secs(1));
+        assert_eq!(c.mute_rate(), 1);
+        assert_eq!(c.mute_after(), Duration::from_secs(1));
+
+        let c = NotifyConfig {
+            cooldown_secs: u64::MAX,
+            mute_rate: u64::MAX,
+            mute_after_secs: u64::MAX,
+        };
+        assert_eq!(c.cooldown(), Duration::from_hours(1));
+        assert_eq!(c.mute_rate(), 100_000);
+        assert_eq!(c.mute_after(), Duration::from_mins(10));
+
+        // A partial section keeps the other defaults.
+        let cfg: Config =
+            json5::from_str("{ keybindings: {}, pubsub: { notify: { mute_rate: 50 } } }").unwrap();
+        assert_eq!(cfg.pubsub.notify.mute_rate(), 50);
+        assert_eq!(cfg.pubsub.notify.cooldown(), Duration::from_secs(30));
+        assert_eq!(cfg.pubsub.buffer_messages(), 1000);
     }
 
     #[test]
@@ -566,6 +656,13 @@ mod tests {
                 &[KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)]
             ),
             KeyResolution::Command(Command::PubSubPublish)
+        );
+        assert_eq!(
+            c.keybindings.resolve(
+                Mode::PubSub,
+                &[KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)]
+            ),
+            KeyResolution::Command(Command::PubSubToggleNotify)
         );
         Ok(())
     }

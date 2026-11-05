@@ -7,6 +7,7 @@ mod config;
 mod keybindings;
 mod mappings;
 mod mode;
+mod pubsub_notify;
 mod redis_client;
 mod state;
 mod tui;

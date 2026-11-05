@@ -3,13 +3,17 @@
 
 use std::{
     collections::VecDeque,
-    fmt,
+    fmt::{self, Write as _},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+use crate::pubsub_notify::NotifyState;
 
 /// Seconds kept by the per-second rate ring.
 const RATE_WINDOW_SECS: u32 = 60;
 const RATE_WINDOW: usize = RATE_WINDOW_SECS as usize;
+/// Bytes shown in a binary payload's hex preview.
+const HEX_PREVIEW: usize = 16;
 /// Bytes inspected by the binary-payload check.
 const BINARY_SNIFF: usize = 256;
 
@@ -103,6 +107,27 @@ impl Payload {
                 Self::Text(String::from_utf8_lossy(cut).into_owned()),
                 truncated,
             )
+        }
+    }
+
+    /// One-line preview: control characters become spaces; binary payloads
+    /// show their original `size` and the first bytes in hex.
+    pub fn preview(&self, size: usize) -> String {
+        match self {
+            Self::Text(text) => text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+            Self::Binary(bytes) => {
+                let mut out = format!("[binary {size} B]");
+                for b in bytes.iter().take(HEX_PREVIEW) {
+                    let _ = write!(out, " {b:02x}");
+                }
+                if bytes.len() > HEX_PREVIEW {
+                    out.push_str(" …");
+                }
+                out
+            }
         }
     }
 
@@ -336,15 +361,53 @@ impl SubStats {
     }
 }
 
+/// Characters of a payload kept in a notification preview (the toast cuts
+/// it further to its width).
+const PREVIEW_CHARS: usize = 200;
+
 /// One subscription and what it has received.
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub target: Target,
     pub buffer: MessageBuffer,
     pub stats: SubStats,
+    /// Notifications for this subscription (off by default).
+    pub notify: NotifyState,
+    /// Messages received while the subscription wasn't open in the tab.
+    pub unread: u64,
+    /// `stats.total` at the last notifier tick: the difference is what
+    /// arrived since (evictions and markers don't skew it).
+    pub seen_total: u64,
 }
 
 impl Subscription {
+    fn new(target: Target, limits: BufferLimits) -> Self {
+        Self {
+            target,
+            buffer: MessageBuffer::new(limits),
+            stats: SubStats::default(),
+            notify: NotifyState::Off,
+            unread: 0,
+            seen_total: 0,
+        }
+    }
+
+    /// `channel: payload` of the newest message, for a notification.
+    pub fn newest_preview(&self) -> Option<String> {
+        let msg = self
+            .buffer
+            .last_n(usize::MAX)
+            .rev()
+            .find(|m| m.kind == EntryKind::Message)?;
+        let payload: String = msg
+            .payload
+            .preview(msg.size)
+            .chars()
+            .take(PREVIEW_CHARS)
+            .collect();
+        Some(format!("{}: {payload}", msg.channel))
+    }
+
     fn matches(&self, channel: &str, pattern: Option<&str>) -> bool {
         match (&self.target, pattern) {
             (Target::Pattern(p), Some(pattern)) => p == pattern,
@@ -432,11 +495,7 @@ impl PubSubStore {
         if let Some(index) = self.position(&target) {
             return (index, false);
         }
-        self.subs.push(Subscription {
-            target,
-            buffer: MessageBuffer::new(self.limits),
-            stats: SubStats::default(),
-        });
+        self.subs.push(Subscription::new(target, self.limits));
         (self.subs.len() - 1, true)
     }
 
@@ -452,6 +511,8 @@ impl PubSubStore {
         if let Some(sub) = self.subs.get_mut(index) {
             sub.buffer.clear();
             sub.stats.reset();
+            sub.seen_total = 0;
+            sub.unread = 0;
         }
     }
 
@@ -595,6 +656,17 @@ mod tests {
         // Valid UTF-8 is always text.
         let (p, _) = Payload::from_bytes(b"\x00\x01\x02", 64);
         assert!(matches!(p, Payload::Text(_)));
+    }
+
+    #[test]
+    fn preview_is_one_line() {
+        let text = Payload::Text("a\nb\tc".into());
+        assert_eq!(text.preview(5), "a b c");
+        let bin = Payload::Binary((0u8..20).collect());
+        assert_eq!(
+            bin.preview(312),
+            "[binary 312 B] 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f …"
+        );
     }
 
     #[test]
@@ -775,5 +847,30 @@ mod tests {
         store.clear(0);
         assert!(store.subs[0].buffer.is_empty());
         assert_eq!(store.subs[0].stats.total, 0);
+    }
+
+    #[test]
+    fn clear_resets_notifier_counters() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Channel("c".into()));
+        store.push("c", None, b"x", at(0));
+        store.subs[0].seen_total = 1;
+        store.subs[0].unread = 1;
+        store.clear(0);
+        assert_eq!(store.subs[0].seen_total, 0);
+        assert_eq!(store.subs[0].unread, 0);
+    }
+
+    #[test]
+    fn newest_preview_skips_markers() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Pattern("orders:*".into()));
+        assert_eq!(store.subs[0].newest_preview(), None);
+        store.push("orders:new", Some("orders:*"), b"{\"id\":7}", at(0));
+        store.mark_reconnected(&store.targets(), at(1));
+        assert_eq!(
+            store.subs[0].newest_preview().as_deref(),
+            Some("orders:new: {\"id\":7}")
+        );
     }
 }

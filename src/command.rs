@@ -39,4 +39,5 @@ pub enum Command {
     PubSubRefresh,
     PubSubPublish,
     PubSubEnter,
+    PubSubToggleNotify,
 }
