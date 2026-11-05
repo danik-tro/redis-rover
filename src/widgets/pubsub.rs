@@ -23,10 +23,14 @@ use crate::{
     config,
     pubsub_notify::NotifyState,
     redis_client::pubsub_store::{
-        detect_kind, ConnStatus, EntryKind, PubSubMessage, PubSubStore, Subscription, Target,
-        TargetKind,
+        detect_kind, ConnStatus, EntryKind, MessageBuffer, Payload, PubSubMessage, PubSubStore,
+        Subscription, Target, TargetKind,
     },
-    widgets::keyspace::{format_bytes, truncate_to_width},
+    utils::{fmt_bytes, group_thousands},
+    widgets::{
+        keyspace::truncate_to_width,
+        text_view::{self, TextCache, TextLabels, TextView},
+    },
 };
 
 /// Width of the subscriptions pane.
@@ -37,6 +41,193 @@ const RECONNECT_MARKER: &str = "— reconnected, messages may be missing —";
 const CLUSTER_NOTE: &str = "⚠ PUBSUB CHANNELS: this node only";
 /// Publish popup notice under `--read-only`.
 const READ_ONLY_PUBLISH: &str = "Read-only mode: publishing is disabled";
+/// Rows of the stats panel, borders included.
+const STATS_HEIGHT: u16 = 5;
+/// The stats panel only shows when the right pane has this many rows.
+const STATS_MIN_PANE: u16 = 12;
+/// Concrete channels listed in the stats panel of a pattern.
+const TOP_CHANNELS: usize = 5;
+
+/// Pane that `j` / `k` drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pane {
+    #[default]
+    List,
+    Log,
+}
+
+/// A paused log: what the user looks at, by sequence number so evictions
+/// don't shift it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Paused {
+    /// Selected entry.
+    selected: u64,
+    /// First entry shown.
+    top: u64,
+    /// Newest entry when the log was paused; what came after is `+N new`.
+    newest_at_pause: u64,
+    /// The paused rows were evicted and the view jumped to the oldest one.
+    evicted: bool,
+}
+
+/// Position in a subscription's log: following the newest entry (default)
+/// or paused on one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LogCursor {
+    paused: Option<Paused>,
+    /// Rows the log showed on the last render.
+    height: usize,
+}
+
+impl LogCursor {
+    pub fn is_paused(&self) -> bool {
+        self.paused.is_some()
+    }
+
+    pub fn follow(&mut self) {
+        self.paused = None;
+    }
+
+    /// Freeze the view as it is (the newest `height` rows), selecting the
+    /// newest entry. Nothing to pause on an empty buffer.
+    fn pause(&mut self, buf: &MessageBuffer) -> bool {
+        let Some(last) = buf.last_seq() else {
+            return false;
+        };
+        let top = buf
+            .get(buf.len().saturating_sub(self.height.max(1)))
+            .map_or(last, |m| m.seq);
+        self.paused = Some(Paused {
+            selected: last,
+            top,
+            newest_at_pause: last,
+            evicted: false,
+        });
+        true
+    }
+
+    /// Space: pause, or resume following.
+    pub fn toggle_pause(&mut self, buf: &MessageBuffer) {
+        if self.is_paused() {
+            self.follow();
+        } else {
+            self.pause(buf);
+        }
+    }
+
+    /// Index of the selected entry (the oldest kept one if it was evicted).
+    fn selected_index(paused: &Paused, buf: &MessageBuffer) -> usize {
+        buf.index_of(paused.selected)
+            .unwrap_or_else(|i| i)
+            .min(buf.len().saturating_sub(1))
+    }
+
+    /// `k`: select the previous entry. Pauses a following log first.
+    pub fn up(&mut self, buf: &MessageBuffer) {
+        if !self.is_paused() && !self.pause(buf) {
+            return;
+        }
+        let Some(paused) = self.paused.as_mut() else {
+            return;
+        };
+        let i = Self::selected_index(paused, buf);
+        if let Some(prev) = i.checked_sub(1).and_then(|i| buf.get(i)) {
+            paused.selected = prev.seq;
+            paused.evicted = false;
+        }
+    }
+
+    /// `j`: select the next entry; past the newest one, follow again.
+    pub fn down(&mut self, buf: &MessageBuffer) {
+        let Some(paused) = self.paused.as_mut() else {
+            return;
+        };
+        let i = Self::selected_index(paused, buf);
+        match buf.get(i + 1) {
+            Some(next) => {
+                paused.selected = next.seq;
+                paused.evicted = false;
+            }
+            None => self.follow(),
+        }
+    }
+
+    /// Fit the view to `buf` and `height` rows: returns the index of the
+    /// first row shown and of the selected one (`None` when empty). A
+    /// paused view whose rows were evicted moves to the oldest entry still
+    /// kept; an empty buffer (cleared) follows again.
+    pub fn sync(&mut self, buf: &MessageBuffer, height: usize) -> (usize, Option<usize>) {
+        self.height = height;
+        let height = height.max(1);
+        let (Some(first), len) = (buf.first_seq(), buf.len()) else {
+            self.follow();
+            return (0, None);
+        };
+        let Some(paused) = self.paused.as_mut() else {
+            return (len.saturating_sub(height), Some(len - 1));
+        };
+        if paused.selected < first {
+            paused.selected = first;
+            paused.evicted = true;
+        }
+        let selected = Self::selected_index(paused, buf);
+        let mut top = buf.index_of(paused.top.max(first)).unwrap_or_else(|i| i);
+        if selected < top {
+            top = selected;
+        } else if selected >= top + height {
+            top = selected + 1 - height;
+        }
+        paused.top = buf.get(top).map_or(first, |m| m.seq);
+        (top, Some(selected))
+    }
+
+    /// Sequence number of the selected entry: the newest one while following.
+    pub fn selected_seq(&self, buf: &MessageBuffer) -> Option<u64> {
+        match self.paused {
+            Some(paused) => buf
+                .first_seq()
+                .map(|first| paused.selected.max(first))
+                .filter(|_| !buf.is_empty()),
+            None => buf.last_seq(),
+        }
+    }
+
+    /// Entries that arrived since the log was paused, counted by `seq`.
+    pub fn new_count(&self, buf: &MessageBuffer) -> u64 {
+        match (self.paused, buf.last_seq()) {
+            (Some(paused), Some(last)) => last.saturating_sub(paused.newest_at_pause),
+            _ => 0,
+        }
+    }
+
+    pub fn evicted(&self) -> bool {
+        self.paused.is_some_and(|p| p.evicted)
+    }
+}
+
+/// The message detail pane: one message, its full payload in the text viewer.
+struct Detail {
+    msg: PubSubMessage,
+    /// The pattern of a pattern subscription.
+    pattern: Option<String>,
+    text: TextCache,
+    view: TextView,
+}
+
+impl Detail {
+    fn new(msg: PubSubMessage, pattern: Option<String>) -> Self {
+        let text = match &msg.payload {
+            Payload::Text(text) => TextCache::from_text(text, !msg.truncated),
+            binary @ Payload::Binary(_) => TextCache::from_lines(binary.hex_dump()),
+        };
+        Self {
+            msg,
+            pattern,
+            text,
+            view: TextView::default(),
+        }
+    }
+}
 
 /// A selectable row of the left pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +417,10 @@ pub struct PubSub {
     popup: Option<Popup>,
     /// The server runs in cluster mode: `PUBSUB CHANNELS` is this node's view.
     pub cluster_mode: bool,
+    focus: Pane,
+    /// Log position of the selected subscription.
+    log: LogCursor,
+    detail: Option<Detail>,
 }
 
 impl PubSub {
@@ -235,23 +430,141 @@ impl PubSub {
             selected: 0,
             popup: None,
             cluster_mode: false,
+            focus: Pane::List,
+            log: LogCursor::default(),
+            detail: None,
         }
     }
 
     pub fn select_next(&mut self) {
         let len = row_count(&self.store.lock());
         if self.selected + 1 < len {
-            self.selected += 1;
+            self.select(self.selected + 1);
         }
     }
 
     pub fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        self.select(self.selected.saturating_sub(1));
     }
 
-    /// Select subscription `index` (subscriptions come first in the list).
+    /// Select row `index` (subscriptions come first in the list). Another
+    /// row starts its log following.
     pub fn select(&mut self, index: usize) {
+        if index != self.selected {
+            self.reset_log();
+        }
         self.selected = index;
+    }
+
+    /// Follow the log again and close the detail (`c`, `d`, another row).
+    pub fn reset_log(&mut self) {
+        self.log = LogCursor::default();
+        self.detail = None;
+    }
+
+    pub fn focus(&self) -> Pane {
+        self.focus
+    }
+
+    /// Tab: list ↔ log. A server channel has no log, so the list keeps it.
+    pub fn toggle_focus(&mut self) {
+        self.focus = if self.focus == Pane::List && self.selected_sub().is_some() {
+            Pane::Log
+        } else {
+            Pane::List
+        };
+    }
+
+    #[cfg(test)]
+    pub fn log_cursor(&self) -> LogCursor {
+        self.log
+    }
+
+    /// Run `f` on the log cursor and the selected subscription's buffer.
+    fn with_log(&mut self, f: impl FnOnce(&mut LogCursor, &MessageBuffer)) {
+        let store = self.store.lock();
+        if let Some(Row::Sub(i)) = row_at(&store, self.selected) {
+            if let Some(sub) = store.subs.get(i) {
+                f(&mut self.log, &sub.buffer);
+            }
+        }
+    }
+
+    /// Space: pause / follow the log.
+    pub fn toggle_pause(&mut self) {
+        self.with_log(LogCursor::toggle_pause);
+    }
+
+    pub fn log_up(&mut self) {
+        self.with_log(LogCursor::up);
+    }
+
+    pub fn log_down(&mut self) {
+        self.with_log(LogCursor::down);
+    }
+
+    /// The selected log entry with the pattern of its subscription. Marker
+    /// rows aren't messages.
+    fn selected_log_message(&self) -> Option<(PubSubMessage, Option<String>)> {
+        let store = self.store.lock();
+        let Some(Row::Sub(i)) = row_at(&store, self.selected) else {
+            return None;
+        };
+        let sub = store.subs.get(i)?;
+        let seq = self.log.selected_seq(&sub.buffer)?;
+        let index = sub.buffer.index_of(seq).ok()?;
+        let msg = sub.buffer.get(index)?;
+        (msg.kind == EntryKind::Message).then(|| {
+            let pattern = sub
+                .target
+                .is_pattern()
+                .then(|| sub.target.name().to_owned());
+            (msg.clone(), pattern)
+        })
+    }
+
+    /// Message `y` / `Shift-y` copy: the one in the detail, else the
+    /// selected log entry (the newest while following).
+    pub fn selected_message(&self) -> Option<PubSubMessage> {
+        match self.detail.as_ref() {
+            Some(detail) => Some(detail.msg.clone()),
+            None => self.selected_log_message().map(|(msg, _)| msg),
+        }
+    }
+
+    /// Enter in the log: open the selected message. Returns whether it opened.
+    pub fn open_detail(&mut self) -> bool {
+        let Some((msg, pattern)) = self.selected_log_message() else {
+            return false;
+        };
+        self.detail = Some(Detail::new(msg, pattern));
+        true
+    }
+
+    pub fn is_detail(&self) -> bool {
+        self.detail.is_some()
+    }
+
+    pub fn close_detail(&mut self) {
+        self.detail = None;
+    }
+
+    pub fn scroll_detail(&mut self, down: bool) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.view.scroll(down, 1);
+        }
+    }
+
+    pub fn pan_detail(&mut self, right: bool) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.view.pan(right);
+        }
+    }
+
+    pub fn toggle_detail_wrap(&mut self) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.view.toggle_wrap();
+        }
     }
 
     pub fn selected_row(&self) -> Option<Row> {
@@ -276,10 +589,15 @@ impl PubSub {
         }
     }
 
-    /// Keep the selection on an existing row after the list changed.
+    /// Keep the selection on an existing row after the list changed. The
+    /// log focus goes back to the list when no subscription is selected.
     pub fn clamp_selection(&mut self) {
         let len = row_count(&self.store.lock());
-        self.selected = self.selected.min(len.saturating_sub(1));
+        self.select(self.selected.min(len.saturating_sub(1)));
+        if self.selected_sub().is_none() {
+            self.focus = Pane::List;
+            self.detail = None;
+        }
     }
 
     pub fn open_add(&mut self) {
@@ -373,20 +691,41 @@ impl StatefulWidget for PubSubWidget {
             .fg(cfg.colors.base05);
         let inner = outer.inner(area);
 
-        let [list_area, log_area] =
+        let [list_area, right_area] =
             Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Fill(1)]).areas(inner);
-        let list_inner = pane_block("").inner(list_area);
-        let log_inner = pane_block("").inner(log_area);
+        let list_inner = pane_block("", false).inner(list_area);
+        let has_sub = state.selected_sub().is_some();
+        let [log_area, stats_area] = if has_sub && right_area.height >= STATS_MIN_PANE {
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(STATS_HEIGHT)])
+                .areas(right_area)
+        } else {
+            [right_area, Rect::default()]
+        };
+        let log_inner = pane_block("", false).inner(log_area);
+        let stats_inner = pane_block("", false).inner(stats_area);
+        let log_focused = state.focus == Pane::Log;
 
         // Build everything under one short lock, render after releasing it.
         let now = SystemTime::now();
-        let (status, list, log) = {
+        let (status, list, log, stats_view) = {
             let store = state.store.lock();
             let row = row_at(&store, state.selected);
+            let sub = match row {
+                Some(Row::Sub(i)) => store.subs.get(i),
+                _ => None,
+            };
             (
                 store.status.clone(),
-                list_lines(&store, state.selected, list_inner, now),
-                log_view(&store, row.as_ref(), log_inner, now),
+                list_lines(&store, state.selected, !log_focused, list_inner, now),
+                log_view(
+                    &store,
+                    row.as_ref(),
+                    &mut state.log,
+                    log_focused,
+                    log_inner,
+                    now,
+                ),
+                sub.map(|sub| stats_lines(sub, usize::from(stats_inner.width), now)),
             )
         };
 
@@ -406,18 +745,24 @@ impl StatefulWidget for PubSubWidget {
         outer.title(Line::from(title)).render(area, buf);
 
         Paragraph::new(list)
-            .block(pane_block(" Subscriptions "))
+            .block(pane_block(" Subscriptions ", !log_focused))
             .render(list_area, buf);
 
-        let mut block = pane_block(&log.title);
-        if let Some(footer) = log.footer {
-            block = block.title_bottom(Line::from(footer).right_aligned());
-        }
-        if log.lines.is_empty() {
-            block.render(log_area, buf);
-            render_placeholder(&log.placeholder, log_inner, buf);
+        if let Some(detail) = state.detail.as_mut() {
+            render_detail(detail, right_area, buf);
         } else {
-            Paragraph::new(log.lines).block(block).render(log_area, buf);
+            let block = pane_block(&log.title, log_focused);
+            if log.lines.is_empty() {
+                block.render(log_area, buf);
+                render_placeholder(&log.placeholder, log_inner, buf);
+            } else {
+                Paragraph::new(log.lines).block(block).render(log_area, buf);
+            }
+            if let Some(stats) = stats_view.filter(|_| !stats_area.is_empty()) {
+                Paragraph::new(stats)
+                    .block(pane_block(" Stats ", false))
+                    .render(stats_area, buf);
+            }
         }
 
         match state.popup.as_ref() {
@@ -428,13 +773,20 @@ impl StatefulWidget for PubSubWidget {
     }
 }
 
-fn pane_block(title: &str) -> Block<'_> {
+/// A pane with `title`; the focused one has a highlighted border and a bold
+/// title.
+fn pane_block(title: &str, focused: bool) -> Block<'_> {
     let cfg = config::get();
-    Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(cfg.colors.base03)
-        .title(title)
+        .border_type(BorderType::Rounded);
+    if focused {
+        block
+            .border_style(cfg.colors.base0d)
+            .title(Span::styled(title, Style::new().bold()))
+    } else {
+        block.border_style(cfg.colors.base03).title(title)
+    }
 }
 
 fn status_style(status: &ConnStatus) -> Style {
@@ -453,14 +805,20 @@ fn status_style(status: &ConnStatus) -> Style {
 fn list_lines(
     store: &PubSubStore,
     selected: usize,
+    focused: bool,
     area: Rect,
     now: SystemTime,
 ) -> Vec<Line<'static>> {
     let cfg = config::get();
     let width = usize::from(area.width);
-    let selected_style = Style::new()
-        .bg(cfg.colors.base02)
-        .add_modifier(Modifier::BOLD);
+    // Unfocused, the selection stays visible but quieter.
+    let selected_style = if focused {
+        Style::new()
+            .bg(cfg.colors.base02)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().bg(cfg.colors.base01)
+    };
     let mut lines = Vec::new();
     let mut selected_line = None;
     let mut row = 0;
@@ -559,13 +917,21 @@ fn list_row(marker: Span<'static>, name: &str, suffix: String, width: usize) -> 
 
 struct LogView {
     title: String,
-    footer: Option<String>,
     lines: Vec<Line<'static>>,
     placeholder: String,
 }
 
-/// The log of the selected subscription, following the newest message.
-fn log_view(store: &PubSubStore, row: Option<&Row>, area: Rect, now: SystemTime) -> LogView {
+/// The log of the selected subscription: the newest rows while following,
+/// a frozen window while paused. The selected row is highlighted when the
+/// log is focused or paused.
+fn log_view(
+    store: &PubSubStore,
+    row: Option<&Row>,
+    cursor: &mut LogCursor,
+    focused: bool,
+    area: Rect,
+    now: SystemTime,
+) -> LogView {
     if let Some(Row::Server(name)) = row {
         let subs = store
             .server_only_channels()
@@ -573,7 +939,6 @@ fn log_view(store: &PubSubStore, row: Option<&Row>, area: Rect, now: SystemTime)
             .map_or(0, |(_, subs)| *subs);
         return LogView {
             title: format!(" {name} "),
-            footer: None,
             lines: Vec::new(),
             placeholder: format!(
                 "{subs} subscriber{} · Enter to subscribe",
@@ -587,36 +952,171 @@ fn log_view(store: &PubSubStore, row: Option<&Row>, area: Rect, now: SystemTime)
     }) else {
         return LogView {
             title: " Messages ".into(),
-            footer: None,
             lines: Vec::new(),
             placeholder: "No subscription selected · a add one".into(),
         };
     };
     let width = usize::from(area.width);
-    let lines = if sub.buffer.is_empty() {
-        Vec::new()
-    } else {
-        sub.buffer
-            .last_n(usize::from(area.height))
-            .map(|msg| log_line(msg, width))
-            .collect()
-    };
+    let height = usize::from(area.height);
+    let (start, selected) = cursor.sync(&sub.buffer, height);
+    let highlight = focused || cursor.is_paused();
+    let selected_style = Style::new()
+        .bg(config::get().colors.base02)
+        .add_modifier(Modifier::BOLD);
+    let lines = sub
+        .buffer
+        .range(start, height)
+        .enumerate()
+        .map(|(i, msg)| {
+            let line = log_line(msg, width);
+            if highlight && selected == Some(start + i) {
+                line.style(selected_style)
+            } else {
+                line
+            }
+        })
+        .collect();
     LogView {
         title: format!(
-            " {} ── {} msg/s ── following ",
+            " {} ── {} msg/s ── {} ",
             sub.target,
-            sub.stats.rate_1s(now)
+            sub.stats.rate_1s(now),
+            log_state(cursor, &sub.buffer)
         ),
-        footer: Some(format!(
-            " {} kept ({}) · {} received · {:.1}/s 1 min ",
-            sub.buffer.len(),
-            format_bytes(sub.buffer.bytes()),
-            sub.stats.total,
-            sub.stats.rate_60s(now),
-        )),
         lines,
         placeholder: "Waiting for messages…".into(),
     }
+}
+
+/// `following`, or `paused · +128 new` (and `· older messages evicted`).
+fn log_state(cursor: &LogCursor, buf: &MessageBuffer) -> String {
+    if !cursor.is_paused() {
+        return "following".into();
+    }
+    let mut state = format!(
+        "paused · +{} new",
+        group_thousands_u64(cursor.new_count(buf))
+    );
+    if cursor.evicted() {
+        state.push_str(" · older messages evicted");
+    }
+    state
+}
+
+fn group_thousands_u64(n: u64) -> String {
+    group_thousands(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// The stats panel: totals and sizes, rates and buffer use, and for a
+/// pattern its busiest concrete channels.
+fn stats_lines(sub: &Subscription, width: usize, now: SystemTime) -> Vec<Line<'static>> {
+    let cfg = config::get();
+    let stats = &sub.stats;
+    let totals = format!(
+        " {} msgs · {} · avg {} · max {}",
+        group_thousands_u64(stats.total),
+        fmt_bytes(stats.bytes),
+        fmt_bytes(stats.avg_size()),
+        fmt_bytes(stats.max_size as u64),
+    );
+    let last = stats.last_at.map_or_else(|| "—".to_owned(), clock);
+    let rates = format!(
+        " {}/s now · {:.1}/s 1 min · last {last} · kept {} ({})",
+        stats.rate_1s(now),
+        stats.rate_60s(now),
+        group_thousands(sub.buffer.len()),
+        fmt_bytes(sub.buffer.bytes() as u64),
+    );
+    let mut lines = vec![totals, rates];
+    if sub.target.is_pattern() {
+        let mut top: Vec<String> = stats
+            .top_channels(TOP_CHANNELS)
+            .into_iter()
+            .map(|(name, count)| format!("{name} {}", group_thousands_u64(count)))
+            .collect();
+        if stats.per_channel.len() > TOP_CHANNELS {
+            top.push("…".into());
+        }
+        if stats.other > 0 {
+            top.push(format!("other {}", group_thousands_u64(stats.other)));
+        }
+        if top.is_empty() {
+            top.push("—".into());
+        }
+        lines.push(format!(" top: {}", top.join(" · ")));
+    }
+    lines
+        .into_iter()
+        .map(|l| Line::styled(truncate_to_width(&l, width).into_owned(), cfg.colors.base05))
+        .collect()
+}
+
+/// The message detail over the right pane: metadata, then the payload in
+/// the text viewer (JSON pretty-printed, binary as a hex dump).
+fn render_detail(detail: &mut Detail, area: Rect, buf: &mut Buffer) {
+    let cfg = config::get();
+    let block = pane_block(" Message ", true);
+    let inner = block.inner(area);
+    Clear.render(area, buf);
+    block.render(area, buf);
+
+    let msg = &detail.msg;
+    let size = if msg.truncated {
+        format!(
+            "{} stored · truncated (original {})",
+            fmt_bytes(msg.payload.len() as u64),
+            fmt_bytes(msg.size as u64)
+        )
+    } else {
+        fmt_bytes(msg.size as u64)
+    };
+    let mut meta = vec![("channel", msg.channel.clone())];
+    if let Some(pattern) = detail.pattern.as_ref() {
+        meta.push(("pattern", pattern.clone()));
+    }
+    meta.push(("received", clock(msg.received_at)));
+    meta.push(("size", size));
+    let meta: Vec<Line<'static>> = meta
+        .into_iter()
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(format!(" {label:<9}"), cfg.colors.base03),
+                Span::styled(value, cfg.colors.base05),
+            ])
+        })
+        .collect();
+
+    let meta_height = u16::try_from(meta.len()).unwrap_or(u16::MAX);
+    let [meta_area, rule_area, text_area] = Layout::vertical([
+        Constraint::Length(meta_height),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    Paragraph::new(meta).render(meta_area, buf);
+    Paragraph::new(Line::styled(
+        "─".repeat(usize::from(rule_area.width)),
+        cfg.colors.base03,
+    ))
+    .render(rule_area, buf);
+
+    let header = match msg.payload {
+        Payload::Text(_) => "Payload",
+        Payload::Binary(_) => "Payload · binary (hex)",
+    };
+    text_view::render(
+        &detail.text,
+        &TextLabels {
+            header,
+            paging: false,
+            close: Some("y copy · Esc close"),
+        },
+        None,
+        true,
+        text_area,
+        buf,
+        &mut detail.view,
+    );
 }
 
 /// `HH:MM:SS.mmm channel payload`, cut to `width` columns. A reconnect
@@ -793,7 +1293,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::redis_client::pubsub_store::{BufferLimits, ServerChannels};
+    use crate::redis_client::pubsub_store::{BufferLimits, MessageBuffer, ServerChannels};
 
     fn widget() -> PubSub {
         PubSub::new(Arc::new(Mutex::new(PubSubStore::new(BufferLimits {
@@ -888,7 +1388,7 @@ mod tests {
             }
             store.status = ConnStatus::Connected;
         }
-        let area = Rect::new(0, 0, 100, 12);
+        let area = Rect::new(0, 0, 100, 16);
         let mut buf = Buffer::empty(area);
         PubSubWidget.render(area, &mut buf, &mut p);
         let text = screen(&buf);
@@ -899,7 +1399,7 @@ mod tests {
         // Follow mode: the newest message is on screen, the oldest isn't.
         assert!(text.contains("orders:new m29"), "{text}");
         assert!(!text.contains("orders:new m0 "), "{text}");
-        assert!(text.contains("10 kept"), "{text}");
+        assert!(text.contains("kept 10"), "{text}");
 
         p.open_add();
         PubSubWidget.render(area, &mut buf, &mut p);
@@ -1071,5 +1571,284 @@ mod tests {
         assert_eq!(utc_hms(86_400 + 3_723), (1, 2, 3));
         let t = UNIX_EPOCH + std::time::Duration::from_millis(5_042);
         assert!(clock(t).ends_with(".042"));
+    }
+
+    fn limits(messages: usize) -> BufferLimits {
+        BufferLimits {
+            messages,
+            bytes: 1 << 20,
+            payload: 64,
+        }
+    }
+
+    fn fill(buf: &mut MessageBuffer, from: usize, to: usize) {
+        for i in from..to {
+            buf.push("c", format!("m{i}").as_bytes(), SystemTime::now());
+        }
+    }
+
+    fn shown(
+        cursor: &mut LogCursor,
+        buf: &MessageBuffer,
+        height: usize,
+    ) -> (Vec<u64>, Option<u64>) {
+        let (start, selected) = cursor.sync(buf, height);
+        (
+            buf.range(start, height).map(|m| m.seq).collect(),
+            selected.and_then(|i| buf.get(i)).map(|m| m.seq),
+        )
+    }
+
+    #[test]
+    fn paused_view_keeps_its_rows_while_messages_arrive() {
+        let mut buf = MessageBuffer::new(limits(1000));
+        fill(&mut buf, 0, 10);
+        let mut cursor = LogCursor::default();
+        assert_eq!(shown(&mut cursor, &buf, 4), (vec![7, 8, 9, 10], Some(10)));
+
+        cursor.toggle_pause(&buf);
+        assert!(cursor.is_paused());
+        fill(&mut buf, 10, 138);
+        assert_eq!(shown(&mut cursor, &buf, 4), (vec![7, 8, 9, 10], Some(10)));
+        assert_eq!(cursor.new_count(&buf), 128);
+        assert_eq!(log_state(&cursor, &buf), "paused · +128 new");
+
+        // Up moves the selection, the window follows it.
+        for _ in 0..5 {
+            cursor.up(&buf);
+        }
+        assert_eq!(shown(&mut cursor, &buf, 4), (vec![5, 6, 7, 8], Some(5)));
+
+        cursor.toggle_pause(&buf);
+        assert_eq!(log_state(&cursor, &buf), "following");
+        assert_eq!(shown(&mut cursor, &buf, 2), (vec![137, 138], Some(138)));
+    }
+
+    #[test]
+    fn up_pauses_and_down_past_the_end_follows() {
+        let mut buf = MessageBuffer::new(limits(100));
+        fill(&mut buf, 0, 5);
+        let mut cursor = LogCursor::default();
+        cursor.down(&buf);
+        assert!(!cursor.is_paused(), "down while following does nothing");
+        cursor.up(&buf);
+        assert!(cursor.is_paused());
+        assert_eq!(cursor.selected_seq(&buf), Some(4));
+        cursor.down(&buf);
+        assert_eq!(cursor.selected_seq(&buf), Some(5));
+        assert!(cursor.is_paused());
+        fill(&mut buf, 5, 6);
+        cursor.down(&buf);
+        assert_eq!(cursor.selected_seq(&buf), Some(6));
+        cursor.down(&buf);
+        assert!(!cursor.is_paused(), "past the newest row: following");
+
+        // Nothing to pause on.
+        let empty = MessageBuffer::new(limits(10));
+        let mut cursor = LogCursor::default();
+        cursor.toggle_pause(&empty);
+        cursor.up(&empty);
+        assert!(!cursor.is_paused());
+    }
+
+    #[test]
+    fn eviction_moves_a_paused_view_to_the_oldest_row() {
+        let mut buf = MessageBuffer::new(limits(5));
+        fill(&mut buf, 0, 5);
+        let mut cursor = LogCursor::default();
+        cursor.sync(&buf, 3);
+        cursor.up(&buf);
+        assert_eq!(cursor.selected_seq(&buf), Some(4));
+        fill(&mut buf, 5, 12);
+        // Seqs 1..=7 are gone: the oldest kept is 8.
+        assert_eq!(shown(&mut cursor, &buf, 3), (vec![8, 9, 10], Some(8)));
+        assert!(cursor.evicted());
+        assert_eq!(
+            log_state(&cursor, &buf),
+            "paused · +7 new · older messages evicted"
+        );
+        cursor.down(&buf);
+        assert!(!cursor.evicted(), "moving clears the note");
+
+        // Cleared (`c`): following again.
+        buf.clear();
+        assert_eq!(shown(&mut cursor, &buf, 3), (vec![], None));
+        assert!(!cursor.is_paused());
+    }
+
+    fn pattern_widget() -> PubSub {
+        let p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Pattern("orders:*".into()));
+            store.status = ConnStatus::Connected;
+            for i in 0..12 {
+                let channel = if i % 3 == 0 {
+                    "orders:paid"
+                } else {
+                    "orders:new"
+                };
+                store.push(
+                    channel,
+                    Some("orders:*"),
+                    format!(r#"{{"id":{i}}}"#).as_bytes(),
+                    SystemTime::now(),
+                );
+            }
+        }
+        p
+    }
+
+    fn render(p: &mut PubSub) -> (Buffer, String) {
+        let area = Rect::new(0, 0, 110, 24);
+        let mut buf = Buffer::empty(area);
+        PubSubWidget.render(area, &mut buf, p);
+        let text = screen(&buf);
+        (buf, text)
+    }
+
+    #[test]
+    fn tab_moves_the_focus_style_to_the_log() {
+        let mut p = pattern_widget();
+        let colors = &config::get().colors;
+        let (buf, _) = render(&mut p);
+        // Top-left corners of the list and the log panes.
+        assert_eq!(buf[(1, 1)].fg, colors.base0d);
+        assert_eq!(buf[(1 + LIST_WIDTH, 1)].fg, colors.base03);
+
+        p.toggle_focus();
+        assert_eq!(p.focus(), Pane::Log);
+        let (buf, _) = render(&mut p);
+        assert_eq!(buf[(1, 1)].fg, colors.base03);
+        assert_eq!(buf[(1 + LIST_WIDTH, 1)].fg, colors.base0d);
+        p.toggle_focus();
+        assert_eq!(p.focus(), Pane::List);
+
+        // A server channel has no log to focus.
+        p.store.lock().set_server_channels(server(&[("jobs", 1)]));
+        p.select_next();
+        p.toggle_focus();
+        assert_eq!(p.focus(), Pane::List);
+    }
+
+    #[test]
+    fn stats_panel_shows_totals_rates_and_top_channels() {
+        let mut p = pattern_widget();
+        let (_, text) = render(&mut p);
+        assert!(text.contains("Stats"), "{text}");
+        assert!(
+            text.contains("12 msgs · 98 B · avg 8 B · max 9 B"),
+            "{text}"
+        );
+        assert!(text.contains("/s 1 min · last "), "{text}");
+        assert!(text.contains("kept 10 ("), "{text}");
+        assert!(text.contains("top: orders:new 8 · orders:paid 4"), "{text}");
+
+        // A channel subscription has no top line.
+        let mut p = widget();
+        p.store.lock().add(Target::Channel("chat".into()));
+        let (_, text) = render(&mut p);
+        assert!(text.contains("0 msgs"), "{text}");
+        assert!(!text.contains("top:"), "{text}");
+    }
+
+    #[test]
+    fn paused_title_counts_new_messages() {
+        let mut p = pattern_widget();
+        render(&mut p);
+        p.toggle_pause();
+        p.store
+            .lock()
+            .push("orders:new", Some("orders:*"), b"x", SystemTime::now());
+        let (_, text) = render(&mut p);
+        assert!(text.contains("── paused · +1 new"), "{text}");
+    }
+
+    #[test]
+    fn detail_shows_metadata_and_pretty_json() {
+        let mut p = pattern_widget();
+        p.toggle_focus();
+        render(&mut p);
+        assert!(p.open_detail());
+        let (_, text) = render(&mut p);
+        for want in [
+            "channel  orders:new",
+            "pattern  orders:*",
+            "received ",
+            "size     9 B",
+            "Payload · JSON",
+            "\"id\": 11",
+            "Esc close",
+        ] {
+            assert!(text.contains(want), "{want} missing:\n{text}");
+        }
+        assert!(!text.contains("truncated"), "{text}");
+        assert_eq!(
+            p.selected_message().map(|m| m.channel),
+            Some("orders:new".into())
+        );
+        p.close_detail();
+        assert!(!p.is_detail());
+    }
+
+    #[test]
+    fn detail_of_a_cut_binary_payload() {
+        let mut p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Channel("bin".into()));
+            // Over the 1024-byte payload limit of `widget()`.
+            let mut bytes: Vec<u8> = (0..3000)
+                .map(|i: u16| u8::try_from(i % 7).unwrap())
+                .collect();
+            bytes[0] = 0xff;
+            store.push("bin", None, &bytes, SystemTime::now());
+        }
+        let (_, text) = render(&mut p);
+        assert!(text.contains("[binary 3000 B] ff 01 02"), "{text}");
+        p.toggle_focus();
+        assert!(p.open_detail());
+        let (_, text) = render(&mut p);
+        assert!(!text.contains("pattern "), "{text}");
+        assert!(
+            text.contains("1.0 KiB stored · truncated (original 2.9 KiB)"),
+            "{text}"
+        );
+        assert!(text.contains("Payload · binary (hex)"), "{text}");
+        assert!(text.contains("00000000  ff 01 02 03 04 05 06 00"), "{text}");
+    }
+
+    #[test]
+    fn markers_and_server_rows_open_no_detail() {
+        let mut p = widget();
+        {
+            let mut store = p.store.lock();
+            store.add(Target::Channel("chat".into()));
+            store.mark_reconnected(&[Target::Channel("chat".into())], SystemTime::now());
+        }
+        assert!(!p.open_detail());
+        assert_eq!(p.selected_message(), None);
+    }
+
+    #[test]
+    fn another_row_or_clear_resets_the_log() {
+        let mut p = pattern_widget();
+        p.store.lock().add(Target::Channel("chat".into()));
+        p.toggle_focus();
+        p.toggle_pause();
+        assert!(p.open_detail());
+        p.select(1);
+        assert!(!p.log_cursor().is_paused());
+        assert!(!p.is_detail());
+        p.select(0);
+        p.toggle_pause();
+        p.reset_log();
+        assert!(!p.log_cursor().is_paused());
+        // Removing the last subscription sends the focus back to the list.
+        let mut store = p.store.lock();
+        store.subs.clear();
+        drop(store);
+        p.clamp_selection();
+        assert_eq!(p.focus(), Pane::List);
     }
 }

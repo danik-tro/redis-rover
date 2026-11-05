@@ -27,6 +27,22 @@ First public release. Requires Rust 1.97 or newer.
 - `--token` prompts for the password, so it stays out of shell history.
 - Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients
   charts, pause / reset, cluster summary.
+- Pub/Sub tab (`b`): subscribe to channels and glob patterns on a dedicated connection,
+  list the server's channels (`PUBSUB CHANNELS` / `NUMSUB` / `NUMPAT`) and subscribe
+  with `Enter`, and publish to any channel (`delivered to N subscribers`; disabled with
+  `--read-only`). Each subscription keeps a bounded buffer (1,000 messages / 8 MiB,
+  payloads cut at 64 KiB) and keeps collecting in the other views.
+- Pub/Sub log: follows the newest message; `Space` or `k` pauses it (`paused · +N new`),
+  `Tab` switches focus between the list and the log. `Enter` opens a message detail
+  with channel, pattern, time, size and the payload pretty-printed as JSON or as a hex
+  dump. `y` / `Shift-y` copy the payload / channel.
+- Pub/Sub stats panel: message count, bytes, average and largest size, 1 s and 1 min
+  rates, last message time, and the busiest concrete channels of a pattern.
+- Pub/Sub resilience and notifications: reconnects with backoff and resubscribes
+  (the log marks the gap); opt-in toasts per subscription (`Shift-n`) with a cooldown
+  and an auto-mute for noisy subscriptions; unread badges per subscription and in the
+  footer.
+- Toasts now render above every mode and popup.
 - `?` help overlay and a key-hint footer that follow the configured key bindings.
 - Configurable key bindings, colors and styles (JSON5, JSON, YAML, TOML, INI).
 

@@ -40,6 +40,8 @@ impl From<Command> for Action {
             Command::PubSubPublish => Self::PubSubPublish,
             Command::PubSubEnter => Self::PubSubEnter,
             Command::PubSubToggleNotify => Self::PubSubToggleNotify,
+            Command::PubSubFocus => Self::PubSubFocus,
+            Command::PubSubTogglePause => Self::PubSubTogglePause,
         }
     }
 }

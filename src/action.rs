@@ -82,6 +82,10 @@ pub enum Action {
     PubSubEnter,
     /// `N`: toggle notifications of the selected subscription (also un-mutes).
     PubSubToggleNotify,
+    /// Tab in the tab: move focus between the list and the log.
+    PubSubFocus,
+    /// Space in the tab: pause / follow the log.
+    PubSubTogglePause,
     /// A server channel listing is waiting in `SharedState::pubsub`.
     PubSubChannelsLoaded,
     /// `PUBLISH` went through and reached `receivers` subscribers.

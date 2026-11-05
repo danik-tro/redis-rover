@@ -40,7 +40,7 @@ use crate::{
         keyspace::{
             format_bytes, KeySpace, KeySpaceWidget, OverlayRequest, PageInfo, ScrollOutcome,
         },
-        pubsub::{PubSub, PubSubWidget, Row},
+        pubsub::{Pane, PubSub, PubSubWidget, Row},
         toast::{Toast, ToastWidget},
     },
 };
@@ -150,28 +150,43 @@ const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleHelp, "help"),
 ];
 
-/// Footer hint entries for the Pub/Sub tab, in display order.
+/// Footer hint entries for the Pub/Sub tab, in display order. Kept short:
+/// remove, clear and refresh are in the `?` help.
 const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::TogglePubSub, "back"),
     (Command::PubSubAdd, "add"),
-    (Command::PubSubRemove, "remove"),
-    (Command::PubSubClear, "clear"),
     (Command::PubSubPublish, "publish"),
     (Command::PubSubToggleNotify, "notify"),
-    (Command::PubSubRefresh, "refresh"),
-    (Command::ScrollDown, "next"),
+    (Command::PubSubFocus, "focus"),
+    (Command::PubSubTogglePause, "pause"),
+    (Command::PubSubEnter, "detail"),
+    (Command::YankValue, "yank"),
+    (Command::YankKey, "channel"),
     (Command::ToggleHelp, "help"),
 ];
 
 /// `?` help rows for the Pub/Sub tab, in display order.
 const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
-    (Command::TogglePubSub, "Back"),
-    (Command::ScrollDown, "Next subscription"),
-    (Command::ScrollUp, "Previous subscription"),
+    (Command::TogglePubSub, "Back (Esc closes the detail first)"),
+    (Command::ScrollDown, "Down (list, log or detail)"),
+    (
+        Command::ScrollUp,
+        "Up (list, log or detail; pauses the log)",
+    ),
+    (Command::PubSubFocus, "Switch focus: list / log"),
+    (Command::PubSubTogglePause, "Pause / follow the log"),
+    (
+        Command::PubSubEnter,
+        "Subscribe to server channel / open message",
+    ),
+    (Command::YankValue, "Copy message payload"),
+    (Command::YankKey, "Copy message channel"),
+    (Command::ToggleWrap, "Wrap message detail on / off"),
+    (Command::ScrollLeft, "Pan detail left (wrap off)"),
+    (Command::ScrollRight, "Pan detail right (wrap off)"),
     (Command::PubSubAdd, "Add subscription (channel or pattern)"),
     (Command::PubSubRemove, "Unsubscribe and drop messages"),
     (Command::PubSubClear, "Clear messages and stats"),
-    (Command::PubSubEnter, "Subscribe to the server channel"),
     (Command::PubSubPublish, "Publish a message"),
     (
         Command::PubSubToggleNotify,
@@ -497,6 +512,10 @@ impl App {
             self.help_opened_at = None;
             return None;
         }
+        if key.code == KeyCode::Esc && self.pubsub.is_detail() {
+            self.pubsub.close_detail();
+            return None;
+        }
         self.handle_keybindings(key)
     }
 
@@ -592,9 +611,21 @@ impl App {
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
-            Action::ScrollLeft => self.keyspace.pan_text(false),
-            Action::ScrollRight => self.keyspace.pan_text(true),
-            Action::ToggleWrap => self.keyspace.toggle_wrap(),
+            Action::ScrollLeft | Action::ScrollRight => {
+                let right = *action == Action::ScrollRight;
+                if self.mode == Mode::PubSub {
+                    self.pubsub.pan_detail(right);
+                } else {
+                    self.keyspace.pan_text(right);
+                }
+            }
+            Action::ToggleWrap => {
+                if self.mode == Mode::PubSub {
+                    self.pubsub.toggle_detail_wrap();
+                } else {
+                    self.keyspace.toggle_wrap();
+                }
+            }
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
@@ -625,17 +656,45 @@ impl App {
             } => self
                 .keyspace
                 .set_filter_count(pattern.clone(), count, complete),
+            Action::TogglePubSub
+            | Action::PubSubAdd
+            | Action::PubSubRemove
+            | Action::PubSubClear
+            | Action::PubSubRefresh
+            | Action::PubSubPublish
+            | Action::PubSubEnter
+            | Action::PubSubFocus
+            | Action::PubSubTogglePause
+            | Action::PubSubChannelsLoaded
+            | Action::PubSubToggleNotify
+            | Action::Published { .. } => self.handle_pubsub_action(action),
+            Action::Refresh => {}
+        }
+
+        Ok(None)
+    }
+
+    /// Actions of the Pub/Sub tab.
+    fn handle_pubsub_action(&mut self, action: &Action) {
+        match *action {
             Action::TogglePubSub => self.toggle_pubsub(),
             Action::PubSubAdd => self.pubsub.open_add(),
             Action::PubSubRemove => self.remove_subscription(),
             Action::PubSubClear => {
                 if let Some(index) = self.pubsub.selected_sub() {
                     self.state.pubsub.lock().clear(index);
+                    self.pubsub.reset_log();
                 }
             }
             Action::PubSubRefresh => self.fetch_pubsub_channels(),
             Action::PubSubPublish => self.pubsub.open_publish(self.read_only),
-            Action::PubSubEnter => self.subscribe_selected_server_channel(),
+            Action::PubSubEnter => self.pubsub_enter(),
+            Action::PubSubFocus => self.pubsub.toggle_focus(),
+            Action::PubSubTogglePause => {
+                if !self.pubsub.is_detail() {
+                    self.pubsub.toggle_pause();
+                }
+            }
             Action::PubSubChannelsLoaded => self.pubsub.clamp_selection(),
             Action::PubSubToggleNotify => self.toggle_notify(),
             Action::Published { receivers, .. } => self.toast.show(
@@ -645,10 +704,8 @@ impl App {
                 ),
                 false,
             ),
-            Action::Refresh => {}
+            _ => {}
         }
-
-        Ok(None)
     }
 
     fn draw(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -685,6 +742,25 @@ impl StatefulWidget for AppWidget {
         // Last: above every mode, popup and overlay.
         StatefulWidget::render(ToastWidget, main, buf, &mut state.toast);
     }
+}
+
+/// Text for the clipboard, what it is (for the toast) and an optional note.
+struct Copy {
+    text: String,
+    what: String,
+    note: Option<&'static str>,
+}
+
+/// `Copied value of k (12 B)`, with `note` next to the size and how it got
+/// there when not via the OS clipboard.
+fn copied_toast(what: &str, len: usize, note: Option<&str>, via: Via) -> String {
+    let how = if via == Via::Terminal {
+        " via terminal (OSC 52)"
+    } else {
+        ""
+    };
+    let note = note.map(|n| format!(", {n}")).unwrap_or_default();
+    format!("Copied {what} ({}{note}){how}", format_bytes(len))
 }
 
 /// Columns between a help label and its keys.
@@ -894,6 +970,7 @@ impl App {
         match self.mode {
             Mode::PubSub => {
                 self.pubsub.close_popup();
+                self.pubsub.close_detail();
                 self.mode = self.pubsub_return;
                 self.sync_hint();
             }
@@ -916,11 +993,21 @@ impl App {
         }
     }
 
-    /// Enter in the tab on a server channel: subscribe to it. It moves from
-    /// the server group to the subscriptions.
-    fn subscribe_selected_server_channel(&mut self) {
-        if let Some(Row::Server(name)) = self.pubsub.selected_row() {
-            self.subscribe_target(Target::Channel(name));
+    /// Enter in the tab. Log: open the selected message. List: subscribe to
+    /// a server channel (it moves to the subscriptions), or move focus into
+    /// a subscription's log.
+    fn pubsub_enter(&mut self) {
+        if self.pubsub.is_detail() {
+            return;
+        }
+        if self.pubsub.focus() == Pane::Log {
+            self.pubsub.open_detail();
+            return;
+        }
+        match self.pubsub.selected_row() {
+            Some(Row::Server(name)) => self.subscribe_target(Target::Channel(name)),
+            Some(Row::Sub(_)) => self.pubsub.toggle_focus(),
+            None => {}
         }
     }
 
@@ -954,6 +1041,7 @@ impl App {
             return;
         };
         self.state.pubsub.lock().remove(&target);
+        self.pubsub.reset_log();
         self.pubsub.clamp_selection();
         self.send_pubsub_cmd(PubSubCmd::Unsubscribe(target));
     }
@@ -1411,6 +1499,10 @@ impl App {
     /// key's whole value (#27). A value that isn't fully loaded is fetched in
     /// the background; above [`YANK_WARN_BYTES`] the user confirms first.
     fn yank_value(&mut self) {
+        if self.mode == Mode::PubSub {
+            self.yank_pubsub_payload();
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -1458,6 +1550,12 @@ impl App {
 
     /// `Shift-y`: copy the selected key's name.
     fn yank_key(&mut self) {
+        if self.mode == Mode::PubSub {
+            if let Some(copy) = self.pubsub_copy(false) {
+                self.copy_text_noted(&copy.text, &copy.what, copy.note);
+            }
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -1466,17 +1564,43 @@ impl App {
         }
     }
 
+    /// `y` in the Pub/Sub tab: copy the selected message's stored payload
+    /// (binary as hex). A payload cut at `max_payload` says so.
+    fn yank_pubsub_payload(&mut self) {
+        if let Some(copy) = self.pubsub_copy(true) {
+            self.copy_text_noted(&copy.text, &copy.what, copy.note);
+        }
+    }
+
+    /// What `y` (`payload`) / `Shift-y` copy in the Pub/Sub tab: the
+    /// selected message's payload or channel.
+    fn pubsub_copy(&self, payload: bool) -> Option<Copy> {
+        let msg = self.pubsub.selected_message()?;
+        Some(if payload {
+            Copy {
+                text: msg.payload.copy_text(),
+                what: format!("payload of {}", msg.channel),
+                note: msg.truncated.then_some("truncated"),
+            }
+        } else {
+            Copy {
+                what: format!("channel {}", msg.channel),
+                text: msg.channel,
+                note: None,
+            }
+        })
+    }
+
     /// Put `text` on the clipboard and confirm with a toast.
     fn copy_text(&mut self, text: &str, what: &str) {
+        self.copy_text_noted(text, what, None);
+    }
+
+    /// [`Self::copy_text`] with a `note` next to the size, e.g.
+    /// `Copied payload of c (64.00 KiB, truncated)`.
+    fn copy_text_noted(&mut self, text: &str, what: &str, note: Option<&str>) {
         let msg = match self.clipboard.copy(text) {
-            Ok(via) => {
-                let how = if via == Via::Terminal {
-                    " via terminal (OSC 52)"
-                } else {
-                    ""
-                };
-                format!("Copied {what} ({}){how}", format_bytes(text.len()))
-            }
+            Ok(via) => copied_toast(what, text.len(), note, via),
             Err(err) => format!("Copy failed: {err}"),
         };
         self.toast.show(msg, false);
@@ -1667,10 +1791,30 @@ impl App {
         self.keyspace.set_loading(self.keys_in_flight > 0);
     }
 
+    /// `j` / `k` in the Pub/Sub tab: scroll the open detail, else move in
+    /// the focused pane (the log pauses when moving up).
+    fn pubsub_move(&mut self, down: bool) {
+        if self.pubsub.is_detail() {
+            self.pubsub.scroll_detail(down);
+            return;
+        }
+        match (self.pubsub.focus(), down) {
+            (Pane::Log, true) => self.pubsub.log_down(),
+            (Pane::Log, false) => self.pubsub.log_up(),
+            (Pane::List, true) => {
+                self.pubsub.select_next();
+                self.mark_selected_read();
+            }
+            (Pane::List, false) => {
+                self.pubsub.select_prev();
+                self.mark_selected_read();
+            }
+        }
+    }
+
     fn scroll_down(&mut self) {
         if self.mode == Mode::PubSub {
-            self.pubsub.select_next();
-            self.mark_selected_read();
+            self.pubsub_move(true);
             return;
         }
         if self.mode != Mode::KeySpace {
@@ -1696,8 +1840,7 @@ impl App {
 
     fn scroll_up(&mut self) {
         if self.mode == Mode::PubSub {
-            self.pubsub.select_prev();
-            self.mark_selected_read();
+            self.pubsub_move(false);
             return;
         }
         if self.mode != Mode::KeySpace {
@@ -1784,9 +1927,23 @@ mod tests {
         // Key order within a row follows the keymap's hash order.
         let back = text.lines().find(|l| l.contains("Back")).unwrap();
         assert!(back.contains("Esc") && back.contains('b'), "{text}");
-        let next = text.lines().find(|l| l.contains("Next")).unwrap();
-        assert!(next.contains("Down") && next.contains('j'), "{text}");
-        for whole in ["Ctrl-c", "Clear messages and stats"] {
+        let next = text.lines().find(|l| l.contains("Down (list")).unwrap();
+        assert!(
+            next.contains("Down, j") || next.contains("j, Down"),
+            "{text}"
+        );
+        let row = |label: &str| {
+            text.lines()
+                .find(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("{label} missing:\n{text}"))
+                .to_owned()
+        };
+        assert!(row("Switch focus").contains("Tab"), "{text}");
+        assert!(row("Pause / follow").contains("Space"), "{text}");
+        assert!(row("Copy message channel").contains("Shift-Y"), "{text}");
+        assert!(row("Copy message payload").contains("  y "), "{text}");
+        assert!(row("open message").contains("Enter"), "{text}");
+        for whole in ["Ctrl-c", "Clear messages and stats", "Pan detail right"] {
             assert!(text.contains(whole), "{whole} missing:\n{text}");
         }
     }
@@ -1872,7 +2029,7 @@ mod tests {
             app.handle_key_event(key(KeyCode::Enter)),
             Some(Action::PubSubEnter)
         );
-        app.subscribe_selected_server_channel();
+        app.pubsub_enter();
         let target = Target::Channel("events".into());
         assert_eq!(cmds.try_recv(), Ok(PubSubCmd::Subscribe(target.clone())));
         let store = app.state.pubsub.lock();
@@ -2125,5 +2282,157 @@ mod tests {
         app.switch_to_previous_mode();
         app.toggle_help();
         check(&mut app, "help overlay");
+    }
+
+    /// Press `code` in the app: the key goes through the key map, and the
+    /// resulting action runs the same App method `handle_action` would
+    /// (that one needs a terminal).
+    fn press(app: &mut App, code: KeyCode, modifiers: crossterm::event::KeyModifiers) {
+        let Some(action) = app.handle_key_event(KeyEvent::new(code, modifiers)) else {
+            return;
+        };
+        match action {
+            Action::PubSubFocus => app.pubsub.toggle_focus(),
+            Action::PubSubTogglePause => app.pubsub.toggle_pause(),
+            Action::PubSubEnter => app.pubsub_enter(),
+            Action::ScrollDown => app.scroll_down(),
+            Action::ScrollUp => app.scroll_up(),
+            Action::TogglePubSub => app.toggle_pubsub(),
+            other => panic!("unexpected action {other:?}"),
+        }
+    }
+
+    fn tap(app: &mut App, code: KeyCode) {
+        press(app, code, crossterm::event::KeyModifiers::empty());
+    }
+
+    /// The tab open on `orders:*` with three JSON messages.
+    fn app_on_orders() -> App {
+        let mut app = app();
+        app.toggle_pubsub();
+        app.subscribe_target(Target::Pattern("orders:*".into()));
+        let mut store = app.state.pubsub.lock();
+        for i in 1..=3 {
+            store.push(
+                "orders:new",
+                Some("orders:*"),
+                format!(r#"{{"id":{i}}}"#).as_bytes(),
+                SystemTime::now(),
+            );
+        }
+        drop(store);
+        app
+    }
+
+    #[test]
+    fn tab_space_and_enter_drive_the_log() {
+        use crate::widgets::pubsub::Pane;
+
+        let mut app = app_on_orders();
+        assert_eq!(app.pubsub.focus(), Pane::List);
+        tap(&mut app, KeyCode::Tab);
+        assert_eq!(app.pubsub.focus(), Pane::Log);
+
+        tap(&mut app, KeyCode::Char(' '));
+        assert!(app.pubsub.log_cursor().is_paused());
+        app.state
+            .pubsub
+            .lock()
+            .push("orders:new", Some("orders:*"), b"4", SystemTime::now());
+        assert!(render_screen(&mut app).contains("paused · +1 new"));
+        tap(&mut app, KeyCode::Char(' '));
+        assert!(!app.pubsub.log_cursor().is_paused());
+
+        // k pauses on the previous row; j twice moves past the end and follows.
+        tap(&mut app, KeyCode::Char('k'));
+        assert!(app.pubsub.log_cursor().is_paused());
+        tap(&mut app, KeyCode::Char('j'));
+        assert!(app.pubsub.log_cursor().is_paused());
+        tap(&mut app, KeyCode::Char('j'));
+        assert!(!app.pubsub.log_cursor().is_paused());
+
+        tap(&mut app, KeyCode::Tab);
+        assert_eq!(app.pubsub.focus(), Pane::List);
+        // Enter on a subscription in the list focuses its log.
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(app.pubsub.focus(), Pane::Log);
+        tap(&mut app, KeyCode::Char('k'));
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.pubsub.is_detail());
+        let text = render_screen(&mut app);
+        assert!(text.contains("\"id\": 3"), "{text}");
+    }
+
+    #[test]
+    fn esc_closes_the_detail_before_leaving_the_tab() {
+        let mut app = app_on_orders();
+        tap(&mut app, KeyCode::Tab);
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.pubsub.is_detail());
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.pubsub.is_detail());
+        assert_eq!(app.mode, Mode::PubSub);
+        tap(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::KeySpace);
+
+        // `b` leaves at once and drops the detail.
+        app.toggle_pubsub();
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.pubsub.is_detail());
+        tap(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.mode, Mode::KeySpace);
+        assert!(!app.pubsub.is_detail());
+    }
+
+    #[test]
+    fn y_and_shift_y_pick_the_payload_and_channel() {
+        let mut app = app_on_orders();
+        assert_eq!(
+            app.handle_key_event(key(KeyCode::Char('y'))),
+            Some(Action::YankValue)
+        );
+        assert_eq!(
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char('Y'),
+                crossterm::event::KeyModifiers::SHIFT
+            )),
+            Some(Action::YankKey)
+        );
+        // Following: the newest message.
+        let copy = app.pubsub_copy(true).unwrap();
+        assert_eq!(copy.text, r#"{"id":3}"#);
+        assert_eq!(copy.what, "payload of orders:new");
+        assert_eq!(copy.note, None);
+        let copy = app.pubsub_copy(false).unwrap();
+        assert_eq!(
+            (copy.text.as_str(), copy.what.as_str()),
+            ("orders:new", "channel orders:new")
+        );
+
+        // The selected row, not the newest one.
+        tap(&mut app, KeyCode::Tab);
+        tap(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.pubsub_copy(true).unwrap().text, r#"{"id":2}"#);
+
+        // A payload cut at `max_payload` says so.
+        let big = "x".repeat(config::get().pubsub.max_payload() + 10);
+        app.state.pubsub.lock().push(
+            "orders:big",
+            Some("orders:*"),
+            big.as_bytes(),
+            SystemTime::now(),
+        );
+        tap(&mut app, KeyCode::Char(' '));
+        let copy = app.pubsub_copy(true).unwrap();
+        assert_eq!(copy.note, Some("truncated"));
+        assert_eq!(copy.text.len(), config::get().pubsub.max_payload());
+        assert_eq!(
+            copied_toast(&copy.what, 65_536, copy.note, Via::System),
+            "Copied payload of orders:big (64.00 KiB, truncated)"
+        );
+        assert_eq!(
+            copied_toast("key name k", 1, None, Via::Terminal),
+            "Copied key name k (1 B) via terminal (OSC 52)"
+        );
     }
 }

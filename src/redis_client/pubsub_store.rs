@@ -2,7 +2,7 @@
 //! buffers and stats. Written by the Pub/Sub task, read by the UI.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::{self, Write as _},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +16,11 @@ const RATE_WINDOW: usize = RATE_WINDOW_SECS as usize;
 const HEX_PREVIEW: usize = 16;
 /// Bytes inspected by the binary-payload check.
 const BINARY_SNIFF: usize = 256;
+/// Bytes per row of a hex dump.
+const HEX_ROW: usize = 16;
+/// Concrete channels counted by name per pattern subscription; the rest go
+/// into [`SubStats::other`].
+pub const PER_CHANNEL_CAP: usize = 1_000;
 
 /// What a subscription listens to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,6 +134,56 @@ impl Payload {
                 out
             }
         }
+    }
+
+    /// What `y` copies: the stored text, or the stored bytes as
+    /// space-separated hex (the clipboard takes text only).
+    pub fn copy_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Binary(bytes) => bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    /// `00000000  0a 1f … 8c  |..ascii..|` rows, 16 bytes each. A text
+    /// payload is dumped as its UTF-8 bytes.
+    pub fn hex_dump(&self) -> Vec<String> {
+        let bytes = match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Binary(bytes) => bytes,
+        };
+        bytes
+            .chunks(HEX_ROW)
+            .enumerate()
+            .map(|(row, chunk)| {
+                let mut out = format!("{:08x} ", row * HEX_ROW);
+                for i in 0..HEX_ROW {
+                    if i % 8 == 0 {
+                        out.push(' ');
+                    }
+                    match chunk.get(i) {
+                        Some(b) => {
+                            let _ = write!(out, "{b:02x} ");
+                        }
+                        None => out.push_str("   "),
+                    }
+                }
+                out.push('|');
+                out.extend(chunk.iter().map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        char::from(b)
+                    } else {
+                        '.'
+                    }
+                }));
+                out.push('|');
+                out
+            })
+            .collect()
     }
 
     /// Stored size in bytes.
@@ -272,6 +327,31 @@ impl MessageBuffer {
     pub fn last_n(&self, n: usize) -> impl DoubleEndedIterator<Item = &PubSubMessage> {
         self.items.iter().skip(self.items.len().saturating_sub(n))
     }
+
+    /// Up to `n` entries from index `start`, oldest first.
+    pub fn range(&self, start: usize, n: usize) -> impl Iterator<Item = &PubSubMessage> {
+        self.items.iter().skip(start).take(n)
+    }
+
+    pub fn get(&self, index: usize) -> Option<&PubSubMessage> {
+        self.items.get(index)
+    }
+
+    /// Sequence number of the oldest entry still kept.
+    pub fn first_seq(&self) -> Option<u64> {
+        self.items.front().map(|m| m.seq)
+    }
+
+    /// Sequence number of the newest entry.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.items.back().map(|m| m.seq)
+    }
+
+    /// Index of the entry with `seq`, or where it would go. Sequence numbers
+    /// only increase, so the buffer is sorted by them.
+    pub fn index_of(&self, seq: u64) -> Result<usize, usize> {
+        self.items.binary_search_by_key(&seq, |m| m.seq)
+    }
 }
 
 /// Counters of a subscription. Rates come from a ring of per-second counts.
@@ -285,6 +365,11 @@ pub struct SubStats {
     /// Unix second of the newest bucket written.
     head: u64,
     pub last_at: Option<SystemTime>,
+    /// Messages per concrete channel (pattern subscriptions only), at most
+    /// [`PER_CHANNEL_CAP`] names.
+    pub per_channel: HashMap<String, u64>,
+    /// Messages of channels past the cap.
+    pub other: u64,
 }
 
 impl Default for SubStats {
@@ -296,6 +381,8 @@ impl Default for SubStats {
             buckets: [0; RATE_WINDOW],
             head: 0,
             last_at: None,
+            per_channel: HashMap::new(),
+            other: 0,
         }
     }
 }
@@ -310,7 +397,18 @@ fn slot(sec: u64) -> usize {
 }
 
 impl SubStats {
-    pub fn record(&mut self, size: usize, now: SystemTime) {
+    /// Count a message of `size` bytes. `channel` is its concrete channel,
+    /// set for pattern subscriptions only.
+    pub fn record(&mut self, size: usize, now: SystemTime, channel: Option<&str>) {
+        if let Some(channel) = channel {
+            if let Some(count) = self.per_channel.get_mut(channel) {
+                *count += 1;
+            } else if self.per_channel.len() < PER_CHANNEL_CAP {
+                self.per_channel.insert(channel.to_owned(), 1);
+            } else {
+                self.other += 1;
+            }
+        }
         self.total += 1;
         self.bytes += size as u64;
         self.max_size = self.max_size.max(size);
@@ -354,6 +452,23 @@ impl SubStats {
             .map(|s| self.count_at(s))
             .sum();
         f64::from(sum) / f64::from(RATE_WINDOW_SECS)
+    }
+
+    /// Average message size in bytes (0 before the first message).
+    pub fn avg_size(&self) -> u64 {
+        self.bytes.checked_div(self.total).unwrap_or(0)
+    }
+
+    /// The `n` busiest concrete channels, busiest first (ties by name).
+    pub fn top_channels(&self, n: usize) -> Vec<(&str, u64)> {
+        let mut all: Vec<(&str, u64)> = self
+            .per_channel
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+            .collect();
+        all.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        all.truncate(n);
+        all
     }
 
     pub fn reset(&mut self) {
@@ -554,7 +669,8 @@ impl PubSubStore {
     pub fn push(&mut self, channel: &str, pattern: Option<&str>, payload: &[u8], now: SystemTime) {
         if let Some(sub) = self.subs.iter_mut().find(|s| s.matches(channel, pattern)) {
             sub.buffer.push(channel, payload, now);
-            sub.stats.record(payload.len(), now);
+            let concrete = sub.target.is_pattern().then_some(channel);
+            sub.stats.record(payload.len(), now, concrete);
         }
     }
 
@@ -686,10 +802,10 @@ mod tests {
     fn rate_buckets_over_synthetic_seconds() {
         let mut stats = SubStats::default();
         for _ in 0..5 {
-            stats.record(10, at(0));
+            stats.record(10, at(0), None);
         }
         for _ in 0..3 {
-            stats.record(20, at(1));
+            stats.record(20, at(1), None);
         }
         assert_eq!(stats.rate_1s(at(1)), 5, "second 1 isn't complete yet");
         assert_eq!(stats.rate_1s(at(2)), 3);
@@ -704,7 +820,7 @@ mod tests {
         assert!(stats.rate_60s(at(62)).abs() < 1e-9);
 
         // A gap zeroes stale buckets that share a slot with new seconds.
-        stats.record(1, at(60));
+        stats.record(1, at(60), None);
         assert_eq!(stats.rate_1s(at(61)), 1);
         assert_eq!(stats.count_at(0), 0);
         assert!((stats.rate_60s(at(61)) - 4.0 / 60.0).abs() < 1e-9);
@@ -872,5 +988,106 @@ mod tests {
             store.subs[0].newest_preview().as_deref(),
             Some("orders:new: {\"id\":7}")
         );
+    }
+
+    #[test]
+    fn per_channel_counts_patterns_only_up_to_the_cap() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Pattern("orders:*".into()));
+        store.add(Target::Channel("orders:new".into()));
+        store.push("orders:new", Some("orders:*"), b"x", at(0));
+        store.push("orders:new", Some("orders:*"), b"x", at(0));
+        store.push("orders:paid", Some("orders:*"), b"x", at(0));
+        store.push("orders:new", None, b"x", at(0));
+        let pattern = &store.subs[0].stats;
+        assert_eq!(
+            pattern.top_channels(5),
+            vec![("orders:new", 2), ("orders:paid", 1)]
+        );
+        assert!(store.subs[1].stats.per_channel.is_empty(), "channel subs");
+
+        let mut stats = SubStats::default();
+        for i in 0..PER_CHANNEL_CAP {
+            stats.record(1, at(0), Some(&format!("c{i}")));
+        }
+        stats.record(1, at(0), Some("late"));
+        stats.record(1, at(0), Some("late"));
+        stats.record(1, at(0), Some("c7"));
+        assert_eq!(stats.per_channel.len(), PER_CHANNEL_CAP);
+        assert_eq!(stats.other, 2);
+        assert_eq!(stats.per_channel["c7"], 2);
+        assert_eq!(stats.top_channels(2), vec![("c7", 2), ("c0", 1)]);
+
+        stats.reset();
+        assert!(stats.per_channel.is_empty());
+        assert_eq!(stats.other, 0);
+    }
+
+    #[test]
+    fn average_size() {
+        let mut stats = SubStats::default();
+        assert_eq!(stats.avg_size(), 0);
+        stats.record(100, at(0), None);
+        stats.record(300, at(0), None);
+        stats.record(9, at(0), None);
+        assert_eq!(stats.avg_size(), 136);
+        assert_eq!(stats.max_size, 300);
+    }
+
+    /// `odd` control bytes in an invalid-UTF-8 payload of `len` bytes.
+    fn sample(len: usize, odd: usize) -> Vec<u8> {
+        let mut bytes = vec![b'a'; len];
+        bytes[0] = 0xff;
+        for b in bytes.iter_mut().skip(1).take(odd) {
+            *b = 0x01;
+        }
+        bytes
+    }
+
+    #[test]
+    fn binary_detection_thresholds() {
+        let kind = |bytes: &[u8]| matches!(Payload::from_bytes(bytes, 1024).0, Payload::Binary(_));
+        // Exactly 10 % is still text; more is binary.
+        assert!(!kind(&sample(100, 10)));
+        assert!(kind(&sample(100, 11)));
+        // Only the first 256 bytes count: 25 of them is under 10 %, whatever
+        // follows.
+        let mut long = sample(256, 25);
+        long.extend(std::iter::repeat_n(0x01, 500));
+        assert!(!kind(&long));
+        assert!(kind(&sample(256, 26)));
+        // Tabs and newlines are printable.
+        let mut text = sample(100, 0);
+        text[1..30].fill(b'\n');
+        assert!(!kind(&text));
+    }
+
+    #[test]
+    fn hex_dump_and_copy_text() {
+        let bin = Payload::Binary((0u8..20).chain(*b"A ").collect());
+        assert_eq!(
+            bin.hex_dump(),
+            vec![
+                "00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f |................|",
+                "00000010  10 11 12 13 41 20                                |....A |",
+            ]
+        );
+        assert!(bin.copy_text().starts_with("00 01 02"));
+        assert_eq!(Payload::Text("hi".into()).copy_text(), "hi");
+    }
+
+    #[test]
+    fn index_of_follows_seq() {
+        let mut buf = MessageBuffer::new(LIMITS);
+        assert_eq!(buf.first_seq(), None);
+        for _ in 0..5 {
+            buf.push("c", b"x", at(0));
+        }
+        assert_eq!((buf.first_seq(), buf.last_seq()), (Some(3), Some(5)));
+        assert_eq!(buf.index_of(4), Ok(1));
+        assert_eq!(buf.index_of(1), Err(0));
+        assert_eq!(buf.get(2).map(|m| m.seq), Some(5));
+        let seqs: Vec<u64> = buf.range(1, 5).map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![4, 5]);
     }
 }

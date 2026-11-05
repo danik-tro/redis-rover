@@ -19,6 +19,7 @@ A Redis terminal-ui client written in rust 🦀
 - `--read-only` mode for browsing production safely
 - TLS (`rediss://`), including private CAs and mutual TLS
 - Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients charts, pause/reset, cluster summary
+- Pub/Sub tab (`b`): subscribe to channels and patterns, a live log you can pause, message detail with pretty JSON, publish, per-subscription stats and notifications that don't spam
 - Fully configurable key bindings, colors, and styles via a config file (JSON5, JSON, YAML, TOML, INI)
 
 ---
@@ -68,6 +69,20 @@ Press `s` to open the DB picker. Move with `j`/`k` (or the arrow keys), or type 
 ### Cluster
 
 In cluster mode `rrover` connects to a single node. SCAN only sees that node's keys, so the key list is partial. A warning banner above the key table says so, and the footer key count reads `(this node)`. Cluster mode has only DB 0, so the DB picker is disabled. Full cluster browsing is planned after 0.1.0.
+
+### Pub/Sub
+
+Press `b` (from the keyspace or the dashboard) to open the Pub/Sub tab. `b` or `Esc` goes back.
+
+- **Subscribe**: `a` opens a one-field popup. Text with `*`, `?` or `[` subscribes to a pattern (`PSUBSCRIBE`), anything else to a channel; `Tab` flips the kind. The left list also shows the server's other channels (`PUBSUB CHANNELS` with subscriber counts, `r` refreshes them); `Enter` on one subscribes to it. `d` unsubscribes, `c` clears the messages and stats.
+- **Log**: the right pane shows the selected subscription's messages (time, concrete channel, one-line preview; binary payloads as `[binary N B]` plus hex). `Tab` moves the focus between the list and the log. The log follows the newest message; `Space` or `k` pauses it, and the title counts what arrived since (`paused · +128 new`). `Space` again, or `j` past the last row, follows again. Each subscription keeps the last 1,000 messages (8 MiB): if the paused rows are evicted, the view moves to the oldest message still kept.
+- **Detail**: `Enter` in the log opens the message: channel, pattern, time, size (and `truncated (original …)` when it was cut at 64 KiB), and the payload in the same viewer as string values: JSON pretty-printed, `w` wrap, arrows pan, binary as a hex dump. `Esc` closes it.
+- **Copy**: `y` copies the selected message's payload (binary as hex; the toast says `truncated` when the stored payload was cut), `Shift-y` its channel.
+- **Stats** under the log: message count, bytes, average and largest size, rate over the last second and minute, time of the last message, and for patterns the five busiest channels.
+- **Publish**: `Shift-p` opens a popup with a channel (prefilled from the selection) and a multi-line payload; `Ctrl-s` sends, and a toast says how many subscribers got it. Disabled with `--read-only`.
+- **Notifications**: off by default, `Shift-n` toggles them per subscription. The first message toasts, later ones only bump the unread badge (per subscription, and `PubSub N` in the footer outside the tab) until the subscription has been quiet for 30 s. A subscription above 10 msg/s for 10 s is muted (`🔕`) until you press `Shift-n` again.
+
+Subscriptions use their own connection, keep collecting while you're in other views, and resubscribe after a lost connection (the log marks the gap). They last for the session only. In cluster mode `PUBSUB CHANNELS` lists the connected node's channels only. Buffer sizes and notification thresholds are set in the `pubsub` section of the config.
 
 ### TLS
 
@@ -127,6 +142,7 @@ Press `?` in the app for the full list. Defaults:
 | `t` | Set TTL |
 | `s` | Switch database |
 | `m` | Open the metrics dashboard |
+| `b` | Open Pub/Sub |
 | `?` | Toggle help |
 | `Ctrl-c` | Quit |
 
@@ -140,7 +156,26 @@ Press `?` in the app for the full list. Defaults:
 | `Tab` / `→` / `l` | Next chart |
 | `Shift-Tab` / `←` / `h` | Previous chart |
 | `a` | Show all charts |
+| `b` | Open Pub/Sub |
 | `?` | Toggle help |
+
+**Pub/Sub**
+
+| Key | Action |
+|---|---|
+| `b` / `Esc` | Back (`Esc` closes the message detail first) |
+| `j` / `k` | Move in the focused pane (`k` in the log pauses it) |
+| `Tab` | Switch focus between the list and the log |
+| `Space` | Pause / follow the log |
+| `Enter` | List: subscribe to a server channel. Log: open the message |
+| `y` / `Shift-y` | Copy the message payload / its channel |
+| `w`, `←` / `→` | Wrap / pan the message detail |
+| `a` | Add a subscription (channel or pattern) |
+| `d` | Unsubscribe |
+| `c` | Clear messages and stats |
+| `Shift-p` | Publish |
+| `Shift-n` | Toggle notifications |
+| `r` | Refresh server channels |
 
 ### Configuration
 

@@ -40,4 +40,6 @@ pub enum Command {
     PubSubPublish,
     PubSubEnter,
     PubSubToggleNotify,
+    PubSubFocus,
+    PubSubTogglePause,
 }

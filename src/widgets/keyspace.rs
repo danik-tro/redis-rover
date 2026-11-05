@@ -24,7 +24,8 @@ use crate::{
         zset_entry_json, ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState,
         LoadedValue, NewKeySpec, RedisType, STRING_PREVIEW_BYTES, TYPE_BADGE_WIDTH,
     },
-    utils::format_duration,
+    utils::{format_duration, group_thousands},
+    widgets::text_view::{self, TextCache, TextLabels, TextView},
 };
 
 /// Snapshot of the paging state shown in the Filters box.
@@ -174,176 +175,6 @@ enum Focus {
     Keys,
     Value,
     Text,
-}
-
-/// Scroll state of a STRING / JSON value in the detail view (#30). The
-/// limits are measured by the last render.
-#[derive(Debug, Clone, Copy)]
-struct TextView {
-    /// First shown row.
-    top: usize,
-    /// First shown column (only when `wrap` is off).
-    left: usize,
-    wrap: bool,
-    /// Rows the text area showed on the last render.
-    height: usize,
-    max_top: usize,
-    max_left: usize,
-}
-
-impl Default for TextView {
-    fn default() -> Self {
-        Self {
-            top: 0,
-            left: 0,
-            wrap: true,
-            height: 0,
-            max_top: 0,
-            max_left: 0,
-        }
-    }
-}
-
-/// Columns one `←` / `→` press pans a text value.
-const TEXT_PAN_STEP: usize = 8;
-
-/// The selected STRING / JSON value as display lines, built once per load.
-struct TextCache {
-    lines: Vec<Line<'static>>,
-    /// The value is JSON (a `RedisJSON` document, or a STRING that parses).
-    json: bool,
-}
-
-impl TextCache {
-    /// Lines for a text value; `None` for collections / unsupported types.
-    fn build(value: &KeyValue) -> Option<Self> {
-        match value {
-            KeyValue::String { value: text, .. } => {
-                let parsed = if value.is_truncated() {
-                    None
-                } else {
-                    parse_json_text(text)
-                };
-                Some(match parsed {
-                    Some(json) => Self {
-                        lines: json_lines(&json),
-                        json: true,
-                    },
-                    None => Self {
-                        lines: plain_lines(text),
-                        json: false,
-                    },
-                })
-            }
-            KeyValue::Json(json) => Some(Self {
-                lines: json_lines(json),
-                json: true,
-            }),
-            KeyValue::List(_)
-            | KeyValue::Set(_)
-            | KeyValue::Hash(_)
-            | KeyValue::Zset(_)
-            | KeyValue::Unknown => None,
-        }
-    }
-}
-
-/// Parse a STRING value as JSON if it looks like an object or array.
-fn parse_json_text(text: &str) -> Option<serde_json::Value> {
-    let trimmed = text.trim_start();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-        return None;
-    }
-    serde_json::from_str(text).ok()
-}
-
-/// A plain STRING value, one display line per text line.
-fn plain_lines(text: &str) -> Vec<Line<'static>> {
-    let color = config::get().colors.base05;
-    let mut lines: Vec<Line<'static>> = text
-        .lines()
-        .map(|line| Line::from(line.to_owned()).fg(color))
-        .collect();
-    if lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines
-}
-
-/// Pretty-print `value` with 2-space indents and syntax colors.
-fn json_lines(value: &serde_json::Value) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    push_json(value, 0, Vec::new(), "", &mut out);
-    out
-}
-
-/// Append the lines of `value` at `depth`. `prefix` goes before the value on
-/// its first line (an object key), `comma` after it on its last line.
-fn push_json(
-    value: &serde_json::Value,
-    depth: usize,
-    prefix: Vec<Span<'static>>,
-    comma: &'static str,
-    out: &mut Vec<Line<'static>>,
-) {
-    use serde_json::Value;
-
-    let colors = &config::get().colors;
-    let punct = |text: &'static str| Span::from(text).fg(colors.base05);
-    let line = |spans: Vec<Span<'static>>| {
-        let mut all = vec![Span::raw("  ".repeat(depth))];
-        all.extend(spans);
-        Line::from(all)
-    };
-    let (open, close) = match value {
-        Value::Array(items) if !items.is_empty() => ("[", "]"),
-        Value::Object(map) if !map.is_empty() => ("{", "}"),
-        scalar => {
-            let mut spans = prefix;
-            spans.push(json_scalar(scalar));
-            spans.push(punct(comma));
-            out.push(line(spans));
-            return;
-        }
-    };
-
-    let mut first = prefix;
-    first.push(punct(open));
-    out.push(line(first));
-    match value {
-        Value::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                let comma = if i + 1 < items.len() { "," } else { "" };
-                push_json(item, depth + 1, Vec::new(), comma, out);
-            }
-        }
-        Value::Object(map) => {
-            for (i, (key, item)) in map.iter().enumerate() {
-                let comma = if i + 1 < map.len() { "," } else { "" };
-                let key = vec![
-                    Span::from(Value::String(key.clone()).to_string()).fg(colors.base0d),
-                    punct(": "),
-                ];
-                push_json(item, depth + 1, key, comma, out);
-            }
-        }
-        _ => {}
-    }
-    out.push(line(vec![punct(close), punct(comma)]));
-}
-
-/// One JSON scalar (or empty array / object), colored by kind.
-fn json_scalar(value: &serde_json::Value) -> Span<'static> {
-    use serde_json::Value;
-
-    let colors = &config::get().colors;
-    let color = match value {
-        Value::String(_) => colors.base0b,
-        Value::Number(_) => colors.base09,
-        Value::Bool(_) | Value::Null => colors.base0e,
-        Value::Array(_) | Value::Object(_) => colors.base05,
-    };
-    Span::from(value.to_string()).fg(color)
 }
 
 /// Result of a `j` / `k` move.
@@ -1020,38 +851,24 @@ impl KeySpace {
 
     /// Scroll the focused text value `step` rows down (or up).
     pub fn scroll_text(&mut self, down: bool, step: usize) {
-        let view = &mut self.text_view;
-        view.top = if down {
-            (view.top + step).min(view.max_top)
-        } else {
-            view.top.saturating_sub(step)
-        };
+        self.text_view.scroll(down, step);
     }
 
     /// Scroll the focused text value by one screen.
     pub fn scroll_text_page(&mut self, down: bool) {
-        let step = self.text_view.height.saturating_sub(1).max(1);
-        self.scroll_text(down, step);
+        self.text_view.scroll_page(down);
     }
 
     /// Pan the focused text value sideways. Only with wrap off.
     pub fn pan_text(&mut self, right: bool) {
-        let view = &mut self.text_view;
-        if view.wrap || !self.focus.eq(&Focus::Text) {
-            return;
+        if self.focus == Focus::Text {
+            self.text_view.pan(right);
         }
-        view.left = if right {
-            (view.left + TEXT_PAN_STEP).min(view.max_left)
-        } else {
-            view.left.saturating_sub(TEXT_PAN_STEP)
-        };
     }
 
     /// Turn line wrapping of text values on / off.
     pub fn toggle_wrap(&mut self) {
-        self.text_view.wrap = !self.text_view.wrap;
-        self.text_view.top = 0;
-        self.text_view.left = 0;
+        self.text_view.toggle_wrap();
     }
 
     /// The currently selected row within the value table, if value-focused.
@@ -2266,8 +2083,13 @@ impl KeySpaceWidget {
 
         if let Some(cache) = state.text_cache.as_ref() {
             let footer = value_footer(loaded, state.value_loading);
-            Self::render_text_value(
+            text_view::render(
                 cache,
+                &TextLabels {
+                    header: "Value",
+                    paging: true,
+                    close: None,
+                },
                 footer,
                 state.focus == Focus::Text,
                 view_area,
@@ -2292,80 +2114,6 @@ impl KeySpaceWidget {
         Self::render_value(&loaded.value, view_area, buf, &mut state.value_table);
     }
 
-    /// A STRING / JSON value: a header, the scrollable text, and a footer
-    /// with the shown line range, truncation note (`note`) and key hints.
-    fn render_text_value(
-        cache: &TextCache,
-        note: Option<String>,
-        focused: bool,
-        area: Rect,
-        buf: &mut Buffer,
-        view: &mut TextView,
-    ) {
-        let cfg = config::get();
-        let [header_area, body_area, footer_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
-        let header = if cache.json { "Value · JSON" } else { "Value" };
-        Paragraph::new(Line::from(header).fg(cfg.colors.base03).bold()).render(header_area, buf);
-
-        let height = usize::from(body_area.height);
-        let width = usize::from(body_area.width);
-        let paragraph = if view.wrap {
-            Paragraph::new(cache.lines.clone()).wrap(Wrap { trim: false })
-        } else {
-            Paragraph::new(cache.lines.clone())
-        };
-        let total = if view.wrap {
-            paragraph.line_count(body_area.width)
-        } else {
-            cache.lines.len()
-        };
-        view.height = height;
-        view.max_top = total.saturating_sub(height);
-        view.max_left = if view.wrap {
-            0
-        } else {
-            cache
-                .lines
-                .iter()
-                .map(Line::width)
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(width)
-        };
-        view.top = view.top.min(view.max_top);
-        view.left = view.left.min(view.max_left);
-
-        let to_u16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-        if view.wrap {
-            paragraph
-                .scroll((to_u16(view.top), 0))
-                .render(body_area, buf);
-        } else {
-            // Slice the rows first: `scroll` takes a `u16` offset.
-            let rows: Vec<Line<'static>> = cache
-                .lines
-                .iter()
-                .skip(view.top)
-                .take(height)
-                .cloned()
-                .collect();
-            Paragraph::new(rows)
-                .scroll((0, to_u16(view.left)))
-                .render(body_area, buf);
-        }
-
-        let footer = text_footer(note, view, total, focused);
-        Paragraph::new(Line::from(footer).fg(cfg.colors.base03))
-            .alignment(Alignment::Right)
-            .render(footer_area, buf);
-    }
-
     fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, table_state: &mut TableState) {
         match value {
             KeyValue::List(items) => {
@@ -2388,7 +2136,7 @@ impl KeySpaceWidget {
                     .collect();
                 Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
             }
-            // STRING / JSON go through `render_text_value`.
+            // STRING / JSON go through `text_view::render`.
             KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => {
                 Self::render_placeholder(
                     vec![Line::from("Viewer for this type isn't supported yet")],
@@ -2497,42 +2245,6 @@ fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String> {
         footer.push_str(" · loading…");
     }
     Some(footer)
-}
-
-/// Footer under a text value: truncation note, the shown line range, and the
-/// keys that work (`Enter to scroll` when there's more than fits).
-fn text_footer(note: Option<String>, view: &TextView, total: usize, focused: bool) -> String {
-    let mut parts: Vec<String> = note.into_iter().collect();
-    if total > view.height {
-        let last = (view.top + view.height).min(total);
-        parts.push(format!(
-            "lines {}–{} of {}",
-            group_thousands(view.top + 1),
-            group_thousands(last),
-            group_thousands(total)
-        ));
-    }
-    if focused {
-        let pan = if view.wrap { "" } else { " · ←/→ pan" };
-        let wrap = if view.wrap { "w no-wrap" } else { "w wrap" };
-        parts.push(format!("j/k scroll · n/p page{pan} · {wrap}"));
-    } else if total > view.height || view.max_left > 0 {
-        parts.push("Enter to scroll".to_owned());
-    }
-    parts.join(" · ")
-}
-
-/// `1234567` → `1,234,567`.
-fn group_thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Human byte size, matching the Size field (`64.00 KiB`).
@@ -3046,13 +2758,6 @@ mod tests {
         assert_eq!(keyspace.confirm_filter_pattern(), Some("foo*".to_owned()));
     }
 
-    fn line_text(line: &ratatui::text::Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
     fn string_value(text: &str) -> LoadedValue {
         LoadedValue {
             value: KeyValue::String {
@@ -3076,53 +2781,6 @@ mod tests {
         keyspace.table.select(Some(0));
         keyspace.set_selected_value(Some(value));
         keyspace
-    }
-
-    #[test]
-    fn json_is_pretty_printed_in_order() {
-        let value: serde_json::Value =
-            serde_json::from_str(r#"{"z":1,"b":[true,null],"c":{},"s":"x\"y"}"#).unwrap();
-        let lines: Vec<String> = super::json_lines(&value).iter().map(line_text).collect();
-        assert_eq!(
-            lines,
-            vec![
-                "{",
-                "  \"z\": 1,",
-                "  \"b\": [",
-                "    true,",
-                "    null",
-                "  ],",
-                "  \"c\": {},",
-                "  \"s\": \"x\\\"y\"",
-                "}",
-            ]
-        );
-    }
-
-    #[test]
-    fn string_json_detection() {
-        assert!(super::parse_json_text("  {\"a\": 1}").is_some());
-        assert!(super::parse_json_text("[1, 2]").is_some());
-        assert!(
-            super::parse_json_text("42").is_none(),
-            "only objects / arrays"
-        );
-        assert!(super::parse_json_text("{not json").is_none());
-
-        let json = super::TextCache::build(&string_value("{\"a\":1}").value).unwrap();
-        assert!(json.json);
-        assert_eq!(json.lines.len(), 3);
-
-        let truncated = KeyValue::String {
-            value: "{\"a\":1}".into(),
-            total_len: 100,
-        };
-        assert!(!super::TextCache::build(&truncated).unwrap().json);
-
-        let plain = super::TextCache::build(&string_value("a\nb").value).unwrap();
-        assert!(!plain.json);
-        assert_eq!(plain.lines.len(), 2);
-        assert!(super::TextCache::build(&KeyValue::List(Vec::new())).is_none());
     }
 
     #[test]
@@ -3167,7 +2825,10 @@ mod tests {
         keyspace.toggle_wrap();
         render_text(&mut keyspace);
         keyspace.pan_text(true);
-        assert_eq!(keyspace.text_view.left, super::TEXT_PAN_STEP);
+        assert_eq!(
+            keyspace.text_view.left,
+            crate::widgets::text_view::TEXT_PAN_STEP
+        );
         for _ in 0..100 {
             keyspace.pan_text(true);
         }
