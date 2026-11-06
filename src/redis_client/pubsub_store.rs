@@ -552,6 +552,7 @@ pub enum ConnStatus {
 
 impl ConnStatus {
     /// Header text: `connected`, `reconnecting in 4 s`, …
+    #[must_use]
     pub fn label(&self, now: Instant) -> String {
         match self {
             Self::NotStarted => "not started".into(),

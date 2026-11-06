@@ -623,6 +623,16 @@ mod tests {
     /// after seeding `big:hash` (200k fields), `big:list` / `big:set` /
     /// `big:zset` (50k each), `big:str` (5 MB), `str:utf8` ("éa" × 30000) and
     /// `small:hash` (3 fields).
+    /// True (and says so) when `RROVER_TEST_URL` isn't set, so
+    /// `cargo test -- --ignored` without that server skips these tests.
+    fn skip_live() -> bool {
+        let skip = std::env::var_os("RROVER_TEST_URL").is_none();
+        if skip {
+            eprintln!("skipped: set RROVER_TEST_URL to a seeded Redis to run this test");
+        }
+        skip
+    }
+
     async fn manager() -> redis::aio::ConnectionManager {
         let url = std::env::var("RROVER_TEST_URL").expect("RROVER_TEST_URL not set");
         redis::Client::open(url)
@@ -641,6 +651,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
     async fn live_hash_pages_with_hscan() {
+        if skip_live() {
+            return;
+        }
         let (mut st, loaded) =
             fetch_value_page(manager().await, state("big:hash", RedisType::Hash))
                 .await
@@ -665,6 +678,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
     async fn live_list_zset_set_windows() {
+        if skip_live() {
+            return;
+        }
         let mut list = state("big:list", RedisType::List);
         list.page = 3;
         let (_, loaded) = fetch_value_page(manager().await, list).await.unwrap();
@@ -696,6 +712,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
     async fn live_full_value_fetches_every_chunk() {
+        if skip_live() {
+            return;
+        }
         let KeyValue::List(items) = fetch_full_value(manager().await, "big:list", &RedisType::List)
             .await
             .unwrap()
@@ -728,6 +747,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
     async fn live_page_past_end_is_clamped() {
+        if skip_live() {
+            return;
+        }
         let mut list = state("big:list", RedisType::List);
         list.page = 600;
         let (st, loaded) = fetch_value_page(manager().await, list).await.unwrap();
@@ -739,6 +761,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a seeded Redis at RROVER_TEST_URL"]
     async fn live_small_hash_and_strings() {
+        if skip_live() {
+            return;
+        }
         let (_, loaded) = fetch_value_page(manager().await, state("small:hash", RedisType::Hash))
             .await
             .unwrap();

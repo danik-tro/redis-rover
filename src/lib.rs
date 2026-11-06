@@ -97,7 +97,7 @@ pub mod internals {
     pub use crate::action::Action;
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::pubsub::PubSubCmd;
-    pub use crate::redis_client::pubsub_store::{PubSubStore, Target};
+    pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
     pub use crate::redis_client::runner::Runner;
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,

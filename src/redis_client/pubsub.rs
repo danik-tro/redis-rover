@@ -281,6 +281,15 @@ mod tests {
         })))
     }
 
+    /// `RROVER_TEST_URL`, or `None` (and a note) so the test skips.
+    fn live_url() -> Option<String> {
+        let url = std::env::var("RROVER_TEST_URL").ok();
+        if url.is_none() {
+            eprintln!("skipped: set RROVER_TEST_URL to a Redis server to run this test");
+        }
+        url
+    }
+
     async fn wait_for(store: &Arc<Mutex<PubSubStore>>, check: impl Fn(&PubSubStore) -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !check(&store.lock()) {
@@ -289,12 +298,15 @@ mod tests {
         }
     }
 
-    /// Needs Redis on localhost:6379: `cargo test -- --ignored pubsub`.
+    /// Needs Redis at `RROVER_TEST_URL`: `cargo test -- --ignored pubsub`.
     #[tokio::test]
-    #[ignore = "needs a Redis server on localhost:6379"]
+    #[ignore = "needs a Redis server at RROVER_TEST_URL"]
     async fn pubsub_live_pattern_subscription() {
+        let Some(url) = live_url() else {
+            return;
+        };
         let _live = LIVE.lock().await;
-        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let client = redis::Client::open(url).unwrap();
         let store = live_store();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (action_tx, mut action_rx) = mpsc::channel(16);
@@ -357,13 +369,16 @@ mod tests {
         assert!(action_rx.try_recv().is_err(), "no error expected");
     }
 
-    /// Needs Redis on localhost:6379: `cargo test -- --ignored pubsub`.
+    /// Needs Redis at `RROVER_TEST_URL`: `cargo test -- --ignored pubsub`.
     /// Kills every Pub/Sub client on that server.
     #[tokio::test]
-    #[ignore = "needs a Redis server on localhost:6379"]
+    #[ignore = "needs a Redis server at RROVER_TEST_URL"]
     async fn pubsub_live_reconnects_and_resubscribes() {
+        let Some(url) = live_url() else {
+            return;
+        };
         let _live = LIVE.lock().await;
-        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let client = redis::Client::open(url).unwrap();
         let store = live_store();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (action_tx, mut action_rx) = mpsc::channel(16);
