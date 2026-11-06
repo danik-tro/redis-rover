@@ -189,6 +189,7 @@ Key bindings, colors and styles can be overridden in `config.json5` (or `.json`,
 
 - Rust 1.97 (the toolchain is pinned via `rust-toolchain.toml` — `rustup` will pick it up automatically)
 - A running Redis instance on `localhost:6379`
+- Docker, for the integration tests only
 
 **Common commands:**
 
@@ -199,15 +200,28 @@ cargo build
 # Run
 cargo run
 
-# Run tests
+# Run tests (no Docker or Redis needed)
 cargo test
 
+# Integration tests against a real Redis 7 in Docker
+cargo test -- --ignored --test-threads=1
+
+# Benchmarks (no Redis needed)
+cargo bench
+scripts/bench.sh --quick    # writes benches/baseline.md
+
 # Lint
-cargo clippy
+cargo clippy --all-targets --all-features -- -D warnings -W clippy::all -W clippy::pedantic
 
 # Check formatting
 cargo fmt --check
 ```
+
+The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging, DB switching, `--read-only`, value edits, Pub/Sub reconnects and TLS, and run in CI on every push, PR and nightly.
+
+If a change touches the keyspace or rendering, run the benches before and after and compare with `benches/baseline.md`. `scripts/bench.sh` without `--quick` also runs the 10M-key case, which takes a few minutes and about 2 GB of RAM.
+
+The crate has a library target only so benches and tests can reach internal types. It is not a public API.
 
 **Pre-commit hooks:**
 
@@ -234,6 +248,6 @@ prek run --all-files
 1. Fork the repository and create a branch from `master`
 2. Install the pre-commit hooks (`prek install`) — they enforce formatting and lints locally
 3. Make your changes and ensure `prek run --all-files` passes
-4. Open a pull request — CI will run `cargo fmt`, `cargo clippy`, `cargo build`, and `cargo nextest` automatically
+4. Open a pull request — CI will run `cargo fmt`, `cargo clippy`, `cargo build`, `cargo nextest` and the Docker integration tests automatically
 
 Please keep commits focused and PRs scoped to a single concern.
