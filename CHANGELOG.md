@@ -46,4 +46,20 @@ First public release. Requires Rust 1.97 or newer.
 - `?` help overlay and a key-hint footer that follow the configured key bindings.
 - Configurable key bindings, colors and styles (JSON5, JSON, YAML, TOML, INI).
 
+### Fixed
+
+- `cargo install` and release builds failed to compile (the panic handler used an old
+  `human-panic` API).
+- The config environment variables are `REDIS_ROVER_CONFIG`, `REDIS_ROVER_DATA` and
+  `REDIS_ROVER_LOGLEVEL`, as the README says (they were `RROVER_*` before).
+
+### Development
+
+- Criterion benches without Redis (`cargo bench`): keyspace sweeps at 100k / 1M / 10M keys
+  and rendering the key table and a 5 MB value. `scripts/bench.sh` records time and memory in
+  `benches/baseline.md`.
+- Integration tests against `redis:7-alpine` in Docker (`cargo test -- --ignored`), also run
+  in CI on push, PR and nightly. Plain `cargo test` still needs neither Docker nor Redis.
+- The crate now has a library target for the benches and tests; it is not a public API.
+
 [0.1.0]: https://github.com/danik-tro/redis-rover/releases/tag/v0.1.0
