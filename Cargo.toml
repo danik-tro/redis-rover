@@ -76,6 +76,8 @@ vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
+# No plots, no HTML reports, no rayon: just the timings (`scripts/bench.sh`).
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 strip = true
@@ -84,3 +86,13 @@ strip = true
 bench = false
 path = "src/main.rs"
 name = "rrover"
+
+# Benches use only synthetic data, no Redis. `scripts/bench.sh` runs them and
+# writes `benches/baseline.md`.
+[[bench]]
+name = "keyspace"
+harness = false
+
+[[bench]]
+name = "render"
+harness = false
