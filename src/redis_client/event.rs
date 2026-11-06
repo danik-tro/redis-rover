@@ -66,6 +66,7 @@ impl RedisEvent {
     /// True for events that change data. `--read-only` blocks these.
     ///
     /// No `_` arm on purpose: a new variant must pick a side.
+    #[must_use]
     pub fn is_write(&self) -> bool {
         match self {
             Self::FetchKeys

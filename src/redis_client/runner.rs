@@ -53,6 +53,7 @@ pub struct Runner {
 }
 
 impl Runner {
+    #[must_use]
     pub fn new(
         client: redis::Client,
         manager: ConnectionManager,
@@ -96,11 +97,13 @@ impl Runner {
         self
     }
 
+    #[must_use]
     pub fn tx(&self) -> BroadcastSender<RedisEvent> {
         self.tx.clone()
     }
 
     /// Control channel of the Pub/Sub task.
+    #[must_use]
     pub fn pubsub_tx(&self) -> UnboundedSender<PubSubCmd> {
         self.pubsub_tx.clone()
     }

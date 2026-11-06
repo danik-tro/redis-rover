@@ -209,6 +209,7 @@ impl RedisType {
     }
 
     /// Full type name, as `TYPE` reports it (`ReJSON-RL` shows as `json`).
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::String => "string",
@@ -225,6 +226,7 @@ impl RedisType {
 
     /// Short label for the type badge, at most [`TYPE_BADGE_WIDTH`] chars.
     /// Long unknown names are cut and end with `…`.
+    #[must_use]
     pub fn badge_label(&self) -> Cow<'_, str> {
         match self {
             Self::String => Cow::Borrowed("str"),
@@ -313,6 +315,7 @@ pub struct KeyspaceState {
 
 impl KeyspaceState {
     /// Range of `scanned` covered by the current page (clamped to what's known).
+    #[must_use]
     pub fn page_range(&self) -> std::ops::Range<usize> {
         let start = (self.page * self.page_size).min(self.scanned.len());
         let end = (start + self.page_size).min(self.scanned.len());
@@ -320,19 +323,23 @@ impl KeyspaceState {
     }
 
     /// Number of key names the sweep must have found to fill the current page.
+    #[must_use]
     pub fn keys_needed(&self) -> usize {
         (self.page + 1) * self.page_size
     }
 
     /// The sweep still needs to `SCAN` further to fill the current page.
+    #[must_use]
     pub fn needs_scan(&self) -> bool {
         !self.sweep_done && self.scanned.len() < self.keys_needed()
     }
 
+    #[must_use]
     pub fn has_next_page(&self) -> bool {
         self.scanned.len() > self.page_range().end || !self.sweep_done
     }
 
+    #[must_use]
     pub fn has_previous_page(&self) -> bool {
         self.page > 0
     }
@@ -450,6 +457,7 @@ impl Default for KeyspaceState {
 
 impl KeyValue {
     /// True for a STRING whose preview is shorter than the stored value.
+    #[must_use]
     pub fn is_truncated(&self) -> bool {
         matches!(self, Self::String { value, total_len } if value.len() < *total_len)
     }
