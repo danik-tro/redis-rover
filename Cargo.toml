@@ -78,6 +78,12 @@ vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]
 pretty_assertions = "1.4.1"
 # No plots, no HTML reports, no rayon: just the timings (`scripts/bench.sh`).
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# Integration suite (`tests/`, every test #[ignore]d): Redis in Docker, and a
+# self-signed certificate for the TLS test.
+# 0.27: the version testcontainers-modules 0.15 builds on.
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["redis"] }
+rcgen = "0.14.10"
 
 [profile.release]
 strip = true

@@ -7,6 +7,9 @@ on:
       - "v*"
   pull_request:
     branches: "*"
+  # Nightly, so the integration suite also catches changes in the Redis image.
+  schedule:
+    - cron: "0 3 * * *"
 
 jobs:
   audit:
@@ -141,3 +144,29 @@ jobs:
 
       - name: Nextest
         run: cargo +${{ matrix.rust }} nextest run --workspace --all-targets
+
+  integration:
+    needs: [build]
+    name: Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pull up front so a slow registry shows up here, not as a test timeout.
+      - name: Pull Redis image
+        run: docker pull redis:7-alpine
+
+      # Real Redis in Docker via testcontainers; every test is #[ignore]d so
+      # the regular Tests job stays Docker-free.
+      - name: Integration tests
+        run: cargo +1.97.1 test --locked --test integration -- --ignored --test-threads=1
