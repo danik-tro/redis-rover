@@ -33,6 +33,7 @@ pub enum Target {
 
 impl Target {
     /// Build a target of `kind` named `name`.
+    #[must_use]
     pub fn new(kind: TargetKind, name: String) -> Self {
         match kind {
             TargetKind::Channel => Self::Channel(name),
@@ -40,12 +41,14 @@ impl Target {
         }
     }
 
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Channel(name) | Self::Pattern(name) => name,
         }
     }
 
+    #[must_use]
     pub fn is_pattern(&self) -> bool {
         matches!(self, Self::Pattern(_))
     }
@@ -591,6 +594,7 @@ pub struct PubSubStore {
 }
 
 impl PubSubStore {
+    #[must_use]
     pub fn new(limits: BufferLimits) -> Self {
         Self {
             subs: Vec::new(),
@@ -600,6 +604,7 @@ impl PubSubStore {
         }
     }
 
+    #[must_use]
     pub fn position(&self, target: &Target) -> Option<usize> {
         self.subs.iter().position(|s| &s.target == target)
     }
@@ -632,6 +637,7 @@ impl PubSubStore {
     }
 
     /// Every target, in the order added: what a (re)connect subscribes.
+    #[must_use]
     pub fn targets(&self) -> Vec<Target> {
         self.subs.iter().map(|s| s.target.clone()).collect()
     }

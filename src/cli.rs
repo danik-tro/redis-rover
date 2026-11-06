@@ -204,6 +204,10 @@ impl Cli {
     /// on the typed `redis` settings, whose `Debug` impl redacts the password —
     /// so it never leaks into logs or panic dumps (unlike embedding it in the
     /// URL string).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `--url` is not a valid Redis URL or the token prompt can't be read.
     pub fn connection_info(&self) -> Result<ConnectionInfo> {
         let conn_info = self
             .url
@@ -223,6 +227,11 @@ impl Cli {
     }
 
     /// Builds the Redis client, including TLS settings from the flags.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the connection info can't be built, the TLS flags are used
+    /// without a `rediss://` URL, or a certificate / key file can't be read.
     pub fn client(&self) -> Result<redis::Client> {
         let info = apply_tls_flags(self.connection_info()?, &self.tls)?;
         let client = if self.tls.has_certificates() {

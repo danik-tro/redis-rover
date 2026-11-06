@@ -15,7 +15,7 @@ use crate::{config, redis_client::types::KeyValue, utils::group_thousands};
 /// Scroll state of a text in the viewer (#30). The limits are measured by
 /// the last render.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TextView {
+pub struct TextView {
     /// First shown row.
     pub(crate) top: usize,
     /// First shown column (only when `wrap` is off).
@@ -72,7 +72,7 @@ impl TextView {
     }
 
     /// Turn line wrapping on / off, back at the top-left.
-    pub(crate) fn toggle_wrap(&mut self) {
+    pub fn toggle_wrap(&mut self) {
         self.wrap = !self.wrap;
         self.top = 0;
         self.left = 0;
@@ -80,7 +80,7 @@ impl TextView {
 }
 
 /// A text as display lines, built once per load.
-pub(crate) struct TextCache {
+pub struct TextCache {
     pub(crate) lines: Vec<Line<'static>>,
     /// The text is JSON (a `RedisJSON` document, or text that parses).
     pub(crate) json: bool,
@@ -107,7 +107,8 @@ impl TextCache {
 
     /// Lines for `text`: pretty JSON when `try_json` and it parses (a cut
     /// text never does), plain lines otherwise.
-    pub(crate) fn from_text(text: &str, try_json: bool) -> Self {
+    #[must_use]
+    pub fn from_text(text: &str, try_json: bool) -> Self {
         match try_json.then(|| parse_json_text(text)).flatten() {
             Some(json) => Self {
                 lines: json_lines(&json),
@@ -231,18 +232,18 @@ fn json_scalar(value: &serde_json::Value) -> Span<'static> {
 }
 
 /// How the viewer is labelled and which keys its footer advertises.
-pub(crate) struct TextLabels<'a> {
+pub struct TextLabels<'a> {
     /// Header, e.g. `Value` (` · JSON` is added for JSON).
-    pub(crate) header: &'a str,
+    pub header: &'a str,
     /// `n/p page` works (the keyspace value viewer).
-    pub(crate) paging: bool,
+    pub paging: bool,
     /// Extra key hint at the end of the focused footer, e.g. `Esc close`.
-    pub(crate) close: Option<&'a str>,
+    pub close: Option<&'a str>,
 }
 
 /// A header, the scrollable text, and a footer with the shown line range,
 /// a note (`note`, e.g. truncation) and key hints.
-pub(crate) fn render(
+pub fn render(
     cache: &TextCache,
     labels: &TextLabels<'_>,
     note: Option<String>,

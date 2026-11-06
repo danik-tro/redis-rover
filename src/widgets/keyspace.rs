@@ -490,6 +490,7 @@ pub struct KeySpace {
 const CLUSTER_BANNER: &str = "⚠ cluster: SCAN sees only this node";
 
 impl KeySpace {
+    #[must_use]
     pub fn new(keys: Vec<KeyMeta>) -> Self {
         Self {
             keys,
