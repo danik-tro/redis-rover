@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run the benches and write a summary to benches/baseline.md.
+# Run the benches and write a summary table to target/bench-summary.md.
+# Compare it with benches/baseline.md, which is kept by hand (baseline plus
+# per-sol sections) so a plain run never overwrites it.
 #
 #   scripts/bench.sh            all benches, including 10M keys (slow, ~2 GB RAM)
 #   scripts/bench.sh --quick    skip 10M
@@ -16,7 +18,7 @@ if [[ "${1:-}" == "--quick" ]]; then
     large=0
     shift
 fi
-out="${OUT:-benches/baseline.md}"
+out="${OUT:-${CARGO_TARGET_DIR:-target}/bench-summary.md}"
 target="${CARGO_TARGET_DIR:-target}"
 
 command -v python3 >/dev/null || { echo "bench.sh needs python3" >&2; exit 1; }
@@ -127,11 +129,11 @@ if large != "1":
             order_rows.append(f"| `{bid}` | not run (`--quick`) | | | |")
     rows = order_rows + list(by_id.values())
 
-text = f"""# Benchmark baseline
+text = f"""# Benchmark summary
 
-Written by `scripts/bench.sh`. Synthetic data, no Redis. Sol 02 and later are
-judged against these numbers (a regression above 10 % needs an explanation in
-the PR).
+Written by `scripts/bench.sh`. Synthetic data, no Redis. Compare with
+`benches/baseline.md` (a regression above 10 % needs an explanation in the
+PR).
 
 | | |
 |---|---|
