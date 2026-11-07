@@ -13,7 +13,7 @@ A Redis terminal-ui client written in rust 🦀
 **Features:**
 
 - Browse and filter Redis keys with type-colored badges; module types (`json`, `stream`, `MBbloom--`, ...) show their real name
-- Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes)
+- Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes). A page turn costs the same on page 1 and page 10,000, even with 10M keys swept
 - View strings, lists, sets, hashes and sorted sets; add, edit and delete keys and items, with a confirm step on delete
 - Switch between logical databases (`s`) and see the key count of the current one
 - `--read-only` mode for browsing production safely
@@ -208,7 +208,7 @@ cargo test -- --ignored --test-threads=1
 
 # Benchmarks (no Redis needed)
 cargo bench
-scripts/bench.sh --quick    # writes benches/baseline.md
+scripts/bench.sh --quick    # writes target/bench-summary.md; compare with benches/baseline.md
 
 # Lint
 cargo clippy --all-targets --all-features -- -D warnings -W clippy::all -W clippy::pedantic
@@ -217,9 +217,9 @@ cargo clippy --all-targets --all-features -- -D warnings -W clippy::all -W clipp
 cargo fmt --check
 ```
 
-The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging, DB switching, `--read-only`, value edits, Pub/Sub reconnects and TLS, and run in CI on every push, PR and nightly.
+The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging (including paging to page 1,000 over 1M keys, each page under 100 ms), DB switching, `--read-only`, value edits, Pub/Sub reconnects and TLS, and run in CI on every push, PR and nightly.
 
-If a change touches the keyspace or rendering, run the benches before and after and compare with `benches/baseline.md`. `scripts/bench.sh` without `--quick` also runs the 10M-key case, which takes a few minutes and about 2 GB of RAM.
+If a change touches the keyspace or rendering, run the benches before and after and compare with `benches/baseline.md` (the sol 01 baseline plus an "After sol 02" section). `scripts/bench.sh` without `--quick` also runs the 10M-key case, which takes a few minutes and about 2 GB of RAM.
 
 The crate has a library target only so benches and tests can reach internal types. It is not a public API.
 
