@@ -144,6 +144,96 @@ async fn filtered_paging_matches_the_count() {
     h.shutdown().await;
 }
 
+/// AC4: the filter changes while a page fetch is still scanning. The stale
+/// result is dropped and the new filter's page is what ends up shown.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn filter_change_mid_fetch_shows_new_filter() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("midfetch");
+    // A rare match: filling a 100-row page of `user:` takes the whole sweep,
+    // so the first fetch is still scanning when the filter changes.
+    support::seed_strings(&mut admin, &format!("{p}order:"), 20_000).await;
+    support::seed_strings(&mut admin, &format!("{p}user:"), 50).await;
+
+    let mut h = Harness::new(server.client(0), false).await;
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        ks.set_page_size(100, 0);
+        ks.set_pattern(Some(format!("{p}user:*")));
+    }
+    h.send(RedisEvent::FetchKeys);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_pattern(Some(format!("{p}order:*")));
+    h.send(RedisEvent::FetchKeys);
+
+    let is_reply = |a: &Action| {
+        matches!(
+            a,
+            Action::LoadKeysIntoKeySpace | Action::KeysLoadAborted | Action::Error(_)
+        )
+    };
+    let first = h.expect("first reply", is_reply).await;
+    let second = h.expect("second reply", is_reply).await;
+    assert!(
+        matches!(
+            first,
+            Action::KeysLoadAborted | Action::LoadKeysIntoKeySpace
+        ),
+        "first reply: {first:?}"
+    );
+    assert_eq!(second, Action::LoadKeysIntoKeySpace);
+    if first == Action::KeysLoadAborted {
+        eprintln!("stale user:* fetch was aborted");
+    }
+
+    let shown: Vec<String> = h.state.keys.lock().iter().map(|k| k.key.clone()).collect();
+    assert_eq!(shown.len(), 100);
+    assert!(
+        shown.iter().all(|k| k.starts_with(&format!("{p}order:"))),
+        "a stale key is shown: {shown:?}"
+    );
+    h.shutdown().await;
+}
+
+/// Keys deleted after the user paged deep: the rescan lands on the last
+/// page that still has keys.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn deleted_keys_clamp_the_page() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("clamp");
+    let keys = support::seed_strings(&mut admin, &p, 250).await;
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().set_page_size(100, 0);
+    h.fetch_page().await;
+    for page in 1..=2 {
+        assert!(h.state.keyspace_state.lock().next_page());
+        let shown = h.fetch_page().await;
+        assert_eq!(h.state.keyspace_state.lock().page, page);
+        if page == 2 {
+            assert_eq!(shown.len(), 50);
+        }
+    }
+
+    let (gone, kept) = keys.split_at(200);
+    let deleted: usize = admin.del(gone).await.expect("DEL");
+    assert_eq!(deleted, 200);
+    h.state.keyspace_state.lock().rescan();
+    let shown = h.fetch_page().await;
+
+    assert_eq!(h.state.keyspace_state.lock().page, 0, "page clamped");
+    let shown: HashSet<String> = shown.into_iter().collect();
+    assert_eq!(shown, kept.iter().cloned().collect::<HashSet<_>>());
+    h.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "needs Docker"]
 async fn db_switch_survives_a_reconnect() {
