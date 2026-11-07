@@ -1185,7 +1185,7 @@ impl App {
 
     /// Enter in the DB picker: ask the runner to switch. The old DB's keys are
     /// cleared right away so nothing stale can be edited; the runner answers
-    /// with `DbSwitched` (or an error, which restores the old keys).
+    /// with `DbSwitched` (or an error and a reload of the old DB's page).
     fn confirm_db_picker(&mut self) {
         let selected = self.db_picker.selected();
         self.db_picker.close();
@@ -1684,7 +1684,12 @@ impl App {
     fn load_new_keys(&mut self) {
         let page_info = PageInfo::from(&*self.state.keyspace_state.lock());
         self.keyspace.set_page_info(page_info);
-        self.keyspace.set_keys(self.state.keys.lock().clone());
+        // Move, don't copy. `None` means an earlier LoadKeysIntoKeySpace
+        // already took this page (two fetches finished back to back), so the
+        // table already shows it.
+        if let Some(keys) = self.state.keys.lock().take() {
+            self.keyspace.set_keys(keys);
+        }
         self.keyspace.clear_selected_value();
 
         // After a non-destructive edit, keep the cursor on the edited key and
@@ -1892,6 +1897,31 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    fn meta(key: &str) -> crate::redis_client::types::KeyMeta {
+        crate::redis_client::types::KeyMeta {
+            key: key.into(),
+            r_type: RedisType::String,
+            size: 0,
+            ttl: -1,
+            value: crate::redis_client::types::KeyValue::Unknown,
+        }
+    }
+
+    #[test]
+    fn load_new_keys_moves_the_page_once() {
+        let mut app = app();
+        *app.state.keys.lock() = Some(vec![meta("a"), meta("b")]);
+
+        app.load_new_keys();
+        assert!(app.state.keys.lock().is_none(), "page moved, not copied");
+        assert!(app.keyspace.select_key_by_name("b"));
+
+        // A second LoadKeysIntoKeySpace for the same page keeps the table.
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name("a"));
+        assert!(app.keyspace.select_key_by_name("b"));
     }
 
     #[test]

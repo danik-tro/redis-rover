@@ -191,7 +191,15 @@ async fn filter_change_mid_fetch_shows_new_filter() {
         eprintln!("stale user:* fetch was aborted");
     }
 
-    let shown: Vec<String> = h.state.keys.lock().iter().map(|k| k.key.clone()).collect();
+    let shown: Vec<String> = h
+        .state
+        .keys
+        .lock()
+        .as_ref()
+        .expect("a page was loaded")
+        .iter()
+        .map(|k| k.key.clone())
+        .collect();
     assert_eq!(shown.len(), 100);
     assert!(
         shown.iter().all(|k| k.starts_with(&format!("{p}order:"))),
@@ -281,6 +289,50 @@ async fn db_switch_survives_a_reconnect() {
     let shown: HashSet<String> = h.fetch_all_pages().await.into_iter().collect();
     assert_eq!(shown, db3, "after the reconnect");
     assert_eq!(*h.state.db.lock(), 3);
+    h.shutdown().await;
+}
+
+/// A DB switch that fails (no such DB) reloads the old DB's page: the App
+/// moved the last page out of `state.keys`, so there's nothing to put back.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn failed_db_switch_reloads_the_old_page() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("baddb");
+    support::seed_strings(&mut admin, &p, 30).await;
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().set_page_size(100, 0);
+    let before = h.fetch_page().await;
+    assert_eq!(before.len(), 30);
+    // What App::load_new_keys does with the page.
+    assert!(h.state.keys.lock().take().is_some());
+
+    h.send(RedisEvent::SelectDb(999));
+    let error = h
+        .expect("the switch error", |a| matches!(a, Action::Error(_)))
+        .await;
+    assert!(
+        matches!(&error, Action::Error(msg) if msg.contains("db 999")),
+        "{error:?}"
+    );
+    h.expect("the old page again", |a| {
+        matches!(a, Action::LoadKeysIntoKeySpace)
+    })
+    .await;
+
+    assert_eq!(*h.state.db.lock(), 0);
+    let after: Vec<String> = h
+        .state
+        .keys
+        .lock()
+        .as_ref()
+        .expect("the old page was reloaded")
+        .iter()
+        .map(|k| k.key.clone())
+        .collect();
+    assert_eq!(after, before);
     h.shutdown().await;
 }
 

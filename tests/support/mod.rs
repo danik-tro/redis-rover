@@ -325,6 +325,8 @@ impl Harness {
         self.state
             .keys
             .lock()
+            .as_ref()
+            .expect("LoadKeysIntoKeySpace leaves a page in state.keys")
             .iter()
             .map(|k| k.key.clone())
             .collect()
