@@ -503,16 +503,6 @@ impl KeyspaceState {
         let last_page = self.scanned.len().saturating_sub(1) / self.page_size;
         self.page = self.page.min(last_page);
     }
-
-    /// Copy the sweep progress (and the possibly clamped page, but not the
-    /// pattern / generation) from a working copy the background fetcher advanced.
-    pub fn apply_sweep(&mut self, other: KeyspaceState) {
-        self.page = other.page;
-        self.scanned = other.scanned;
-        self.seen = other.seen;
-        self.sweep_cursor = other.sweep_cursor;
-        self.sweep_done = other.sweep_done;
-    }
 }
 
 impl Default for KeyspaceState {

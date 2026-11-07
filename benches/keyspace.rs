@@ -1,14 +1,17 @@
-//! Keyspace sweep benches: merging SCAN batches, a deep page turn, and
-//! applying a sweep. Synthetic key names, no Redis.
+//! Keyspace sweep benches: merging SCAN batches and a deep page turn.
+//! Synthetic key names, no Redis.
 //!
 //! 10M keys runs only with `RROVER_BENCH_LARGE=1` (slow, about 2 GB of RAM).
 
 mod support;
 
-use std::hint::black_box;
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use criterion::{BatchSize, Criterion, Throughput};
-use redis_rover::internals::KeyspaceState;
+use redis_rover::internals::{KeyspaceState, SweepResult};
 
 #[global_allocator]
 static ALLOC: support::Counting = support::Counting;
@@ -47,12 +50,40 @@ fn merge_all(batches: Vec<Vec<String>>, finish: bool) -> KeyspaceState {
     state
 }
 
-/// A 1M-key sweep that is not finished yet, sitting on a deep page (the
-/// second to last), the way it is after paging far into a big keyspace.
+/// An `n`-key sweep that is not finished yet, on its last full page, the way
+/// it is after paging far into a big keyspace. Pages are as big as a SCAN
+/// batch, so every page turn from here needs exactly one batch.
 fn deep_sweep(n: usize) -> KeyspaceState {
     let mut state = merge_all(batches(n), false);
-    state.page = (n / state.page_size).saturating_sub(2);
+    state.page_size = state.scan_count;
+    state.page = (n / state.page_size).saturating_sub(1);
     state
+}
+
+/// `count` fresh SCAN batches of key names the sweep hasn't seen yet.
+fn fresh_batches(state: &KeyspaceState, count: usize) -> Vec<Vec<String>> {
+    let first = state.scanned.len();
+    (0..count)
+        .map(|b| {
+            let from = first + b * state.scan_count;
+            (from..from + state.scan_count)
+                .map(|i| format!("fresh:{}:{i}", i / 1000))
+                .collect()
+        })
+        .collect()
+}
+
+/// What the app and the runner do under the keyspace lock for one `n`:
+/// `next_page`, take a `SweepRequest`, merge the SCAN answer, copy the page's
+/// names for `fetch_meta`. The SCAN and `fetch_meta` I/O themselves are not
+/// included.
+fn page_turn(state: &mut KeyspaceState, batch: Vec<String>) -> Vec<String> {
+    assert!(state.next_page());
+    if let Some(request) = state.sweep_request() {
+        let cursor = request.cursor + 1;
+        assert!(state.apply_result(&request, SweepResult { cursor, batch }));
+    }
+    state.page_keys()
 }
 
 fn sizes() -> Vec<(usize, &'static str)> {
@@ -91,58 +122,47 @@ fn bench_merge_batch(c: &mut Criterion) {
     group.finish();
 }
 
-/// What `RedisEvent::FetchKeys` does today before any I/O:
-/// `keyspace_state.lock().clone()`, then the page moves on. The clone is
-/// dropped inside the timing, as the real snapshot is.
+/// A page turn deep into an `n`-key sweep. Each sample starts from a fresh
+/// clone of the base sweep and turns `iters` pages forward; the clone and the
+/// fresh key names are made outside the timing. Hash-table growth stays in,
+/// as the real sweep pays it too.
 fn bench_page_turn_deep(c: &mut Criterion) {
-    let base = deep_sweep(1_000_000);
-    if support::is_bench_run() {
-        let (snapshot, mem) = support::measure(|| {
-            let mut snapshot = base.clone();
-            snapshot.next_page();
-            snapshot
-        });
-        drop(snapshot);
-        support::record("page_turn_deep/1M", mem, "allocated = one snapshot clone");
-    }
     let mut group = c.benchmark_group("page_turn_deep");
     group.sample_size(10);
-    group.bench_function("1M", |b| {
-        b.iter(|| {
-            let mut snapshot = black_box(&base).clone();
-            black_box(snapshot.next_page());
-            snapshot
+    for (n, label) in sizes() {
+        let mut base = deep_sweep(n);
+        if support::is_bench_run() {
+            // On the sweep as built, not a clone: a clone has no spare
+            // capacity, so its first push would reallocate the whole list.
+            let batch = fresh_batches(&base, 1).remove(0);
+            let (page, mem) = support::measure(|| page_turn(&mut base, batch));
+            assert_eq!(page.len(), base.page_size);
+            drop(page);
+            support::record(
+                &format!("page_turn_deep/{label}"),
+                mem,
+                "allocated = one page turn",
+            );
+        }
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                let mut state = base.clone();
+                let count = usize::try_from(iters).expect("iters fits in usize");
+                let batches = fresh_batches(&state, count);
+                // Give the clone the spare room the real sweep has, so the
+                // timing doesn't include copying the whole list once.
+                state.scanned.reserve(count * state.scan_count);
+                let mut elapsed = Duration::ZERO;
+                for batch in batches {
+                    let started = Instant::now();
+                    let page = page_turn(black_box(&mut state), batch);
+                    elapsed += started.elapsed();
+                    drop(black_box(page));
+                }
+                elapsed
+            });
         });
-    });
-    group.finish();
-}
-
-/// The runner writing a finished snapshot back: `apply_sweep` replaces the
-/// 1M-key sweep held in shared state with the one the fetch advanced.
-fn bench_apply_sweep(c: &mut Criterion) {
-    let base = deep_sweep(1_000_000);
-    if support::is_bench_run() {
-        let (mut current, next) = (base.clone(), base.clone());
-        let ((), mem) = support::measure(|| current.apply_sweep(next));
-        drop(current);
-        support::record(
-            "apply_sweep/1M",
-            mem,
-            "retained < 0: the old sweep is freed",
-        );
     }
-    let mut group = c.benchmark_group("apply_sweep");
-    group.sample_size(10);
-    group.bench_function("1M", |b| {
-        b.iter_batched(
-            || (base.clone(), base.clone()),
-            |(mut current, next)| {
-                current.apply_sweep(next);
-                current
-            },
-            BatchSize::PerIteration,
-        );
-    });
     group.finish();
 }
 
@@ -151,6 +171,5 @@ fn main() {
     let mut c = Criterion::default().configure_from_args();
     bench_merge_batch(&mut c);
     bench_page_turn_deep(&mut c);
-    bench_apply_sweep(&mut c);
     c.final_summary();
 }

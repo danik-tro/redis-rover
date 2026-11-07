@@ -57,7 +57,7 @@ BUDGET_NS = 16e6  # 16 ms per frame
 
 ORDER = [
     "merge_batch/100k", "merge_batch/1M", "merge_batch/10M",
-    "page_turn_deep/1M", "apply_sweep/1M",
+    "page_turn_deep/100k", "page_turn_deep/1M", "page_turn_deep/10M",
     "render/key_table_100",
     "render_text/5MB_plain_wrap", "render_text/5MB_plain_nowrap",
     "render_text/5MB_json_wrap",
@@ -117,7 +117,15 @@ for bid in ids:
     rows.append(f"| `{bid}` | {time} | {budget} | {mem} | {note} |")
 
 if large != "1":
-    rows.insert(2, "| `merge_batch/10M` | not run (`--quick`) | | | |")
+    # Keep the 10M rows in place, marked as skipped.
+    order_rows = []
+    by_id = dict(zip(ids, rows))
+    for bid in ORDER:
+        if bid in by_id:
+            order_rows.append(by_id.pop(bid))
+        elif bid.endswith("/10M"):
+            order_rows.append(f"| `{bid}` | not run (`--quick`) | | | |")
+    rows = order_rows + list(by_id.values())
 
 text = f"""# Benchmark baseline
 
@@ -147,10 +155,10 @@ start, **allocated** = every byte allocated, freed or not.
 
 - `merge_batch/N`: build a sweep from N key names (~20 bytes each), merged in
   SCAN-sized batches (`scan_count` = 100, the default) with `merge_batch`.
-- `page_turn_deep/1M`: what `RedisEvent::FetchKeys` does before any I/O today:
-  `keyspace_state.lock().clone()` of a 1M-key sweep, then `next_page()`. The
-  clone is dropped inside the timing. This is the number sol 02 must bring down.
-- `apply_sweep/1M`: write an advanced 1M-key sweep back into the shared state.
+- `page_turn_deep/N`: one `n` deep into an unfinished N-key sweep, as done
+  under the keyspace lock: `next_page`, take a `SweepRequest`, merge one
+  100-key SCAN answer (`apply_result`), copy the page's names. No I/O. Before
+  sol 02 this was a clone of the whole sweep (52.95 ms at 1M).
 - `render/key_table_100`: one frame of `KeySpaceWidget` with 100 keys on a
   120×40 `TestBackend`.
 - `render_text/*`: one frame of a 5 MB value in the text viewer (`TextView`),

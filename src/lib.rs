@@ -101,7 +101,7 @@ pub mod internals {
     pub use crate::redis_client::runner::Runner;
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
-        RedisType,
+        RedisType, SweepResult,
     };
     pub use crate::state::SharedState;
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget};
