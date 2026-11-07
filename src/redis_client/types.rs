@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasher;
+use std::sync::LazyLock;
 use std::{borrow::Cow, collections::HashSet};
+
+use hashbrown::HashTable;
 
 use crate::config;
 use ratatui::{
@@ -301,9 +305,13 @@ pub struct KeyspaceState {
     pub scan_count: usize,
     /// Current page, 0-based.
     pub page: usize,
-    /// Key names discovered so far, in SCAN order, deduplicated.
+    /// Key names discovered so far, in SCAN order, deduplicated. Each name is
+    /// stored once, here; indices into it stay stable until the next rescan.
     pub scanned: Vec<String>,
-    seen: HashSet<String>,
+    /// Dedup index over `scanned` (#46): which names it already holds.
+    seen: HashTable<SeenSlot>,
+    /// Hashes a key name for `seen`. A field so tests can force collisions.
+    hash: fn(&str) -> u32,
     /// Cursor for the next `SCAN` step of the sweep.
     pub sweep_cursor: usize,
     /// The sweep reached the end (SCAN returned cursor 0).
@@ -315,6 +323,29 @@ pub struct KeyspaceState {
     /// A SCAN result from the same epoch still extends the sweep even if the
     /// user turned the page meanwhile.
     sweep_epoch: u64,
+}
+
+/// One `KeyspaceState::seen` entry: where the name sits in `scanned`, plus
+/// 32 bits of its hash. Keeping the hash means the table never re-reads the
+/// names when it grows; a matching hash is still confirmed by comparing names.
+#[derive(Debug, Clone, Copy)]
+struct SeenSlot {
+    index: u32,
+    hash: u32,
+}
+
+/// 32-bit hash of a key name. Seeded once per process.
+fn hash_name(name: &str) -> u32 {
+    static STATE: LazyLock<hashbrown::DefaultHashBuilder> = LazyLock::new(Default::default);
+    // Truncation is the point: the low 32 bits are all `SeenSlot` keeps.
+    #[allow(clippy::cast_possible_truncation)]
+    let hash = STATE.hash_one(name) as u32;
+    hash
+}
+
+/// Spread a 32-bit hash over the 64 bits the table probes with.
+fn table_hash(hash: u32) -> u64 {
+    u64::from(hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// What the runner needs to advance the sweep, copied out under the lock so
@@ -447,13 +478,32 @@ impl KeyspaceState {
     /// Merge one `SCAN` step into the sweep, skipping keys already seen (SCAN
     /// may return a key more than once). A returned cursor of 0 ends the sweep.
     pub fn merge_batch(&mut self, cursor: usize, keys: Vec<String>) {
+        let mut full = false;
         for key in keys {
-            if self.seen.insert(key.clone()) {
-                self.scanned.push(key);
+            let hash = (self.hash)(&key);
+            let scanned = &self.scanned;
+            let known = self.seen.find(table_hash(hash), |slot| {
+                slot.hash == hash && scanned[slot.index as usize] == key
+            });
+            if known.is_some() {
+                continue;
             }
+            let Ok(index) = u32::try_from(self.scanned.len()) else {
+                log::error!(
+                    "Keyspace sweep stopped at {} keys: the index is full",
+                    self.scanned.len()
+                );
+                full = true;
+                break;
+            };
+            self.seen
+                .insert_unique(table_hash(hash), SeenSlot { index, hash }, |slot| {
+                    table_hash(slot.hash)
+                });
+            self.scanned.push(key);
         }
         self.sweep_cursor = cursor;
-        self.sweep_done = cursor == 0;
+        self.sweep_done = cursor == 0 || full;
     }
 
     /// The next `SCAN` work the current page needs, or `None` when the sweep
@@ -513,7 +563,8 @@ impl Default for KeyspaceState {
             scan_count: DEFAULT_SCAN_COUNT,
             page: 0,
             scanned: Vec::new(),
-            seen: HashSet::new(),
+            seen: HashTable::new(),
+            hash: hash_name,
             sweep_cursor: 0,
             sweep_done: false,
             generation: 0,
@@ -1086,6 +1137,48 @@ mod tests {
         state.next_page();
         assert_eq!(state.page_keys(), keys(20..25));
         assert!(state_with(10).page_keys().is_empty());
+    }
+
+    #[test]
+    fn merge_batch_keeps_both_keys_on_hash_collision() {
+        // Every name hashes the same: only the name compare tells them apart.
+        let mut state = KeyspaceState {
+            hash: |_| 7,
+            ..state_with(10)
+        };
+        state.merge_batch(3, vec!["a".into(), "b".into(), "a".into()]);
+        state.merge_batch(0, vec!["c".into(), "b".into(), "d".into()]);
+        assert_eq!(state.scanned, vec!["a", "b", "c", "d"]);
+
+        // Some collide (same length), some don't.
+        let mut state = KeyspaceState {
+            #[allow(clippy::cast_possible_truncation)]
+            hash: |name| name.len() as u32,
+            ..state_with(10)
+        };
+        state.merge_batch(0, keys(0..20).into_iter().chain(keys(5..15)).collect());
+        assert_eq!(state.scanned, keys(0..20));
+    }
+
+    #[test]
+    fn rescan_clears_the_index() {
+        let mut state = state_with(10);
+        state.merge_batch(5, keys(0..10));
+        state.rescan();
+        state.merge_batch(0, keys(0..10));
+        assert_eq!(state.scanned, keys(0..10), "old names don't count as seen");
+    }
+
+    #[test]
+    fn index_survives_growth() {
+        let mut state = state_with(10);
+        for b in 0..100 {
+            state.merge_batch(b + 1, keys(b * 100..(b + 1) * 100));
+        }
+        // Every name again, after many table resizes: all repeats.
+        state.merge_batch(0, keys(0..10_000));
+        assert_eq!(state.scanned.len(), 10_000);
+        assert_eq!(state.scanned, keys(0..10_000));
     }
 
     #[test]
