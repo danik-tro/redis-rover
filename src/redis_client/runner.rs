@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
 use redis::aio::ConnectionManager;
 use tokio::{
@@ -185,6 +185,7 @@ impl Runner {
     fn launch_refresh_info_task(&mut self) {
         let tick: Duration = config::get().dashboard.interval();
         let info = self.state.info.clone();
+        let info_seq = self.state.info_seq.clone();
         let metrics = self.state.metrics.clone();
         let mut manager = self.manager.clone();
         let cancellation_token = self.cancellation_token.clone();
@@ -207,7 +208,6 @@ impl Runner {
                         match info_res {
                             Ok((redis_info, snapshot)) => {
                                 let cluster_enabled = snapshot.cluster_enabled;
-                                *info.lock() = Some(redis_info);
                                 info_failing = false;
                                 tick_no += 1;
                                 {
@@ -217,6 +217,9 @@ impl Runner {
                                         m.set_cluster(None);
                                     }
                                 }
+                                *info.lock() = Some(redis_info);
+                                // Last, so the footer sees both writes.
+                                info_seq.fetch_add(1, Ordering::Release);
 
                                 if cluster_enabled && tick_no % 5 == 1 {
                                     // No lock is held across this await.
@@ -229,6 +232,7 @@ impl Runner {
                             Err(err) => {
                                 log::error!("Failed to fetch INFO: {err}");
                                 metrics.lock().mark_unavailable();
+                                info_seq.fetch_add(1, Ordering::Release);
                                 if !info_failing {
                                     info_failing = true;
                                     crate::action::try_send_action(

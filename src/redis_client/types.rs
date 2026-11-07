@@ -73,22 +73,27 @@ fn parse_db_keys(value: &str) -> Option<u64> {
 
 impl RedisInfo {
     /// Number of keys in `db` (0 if `INFO` doesn't list it).
+    #[must_use]
     pub fn db_keys(&self, db: i64) -> u64 {
         self.keyspace.get(&db).copied().unwrap_or_default()
     }
 
+    #[must_use]
     pub fn redis_version(&self) -> String {
         format!("Redis version: {}", self.common.version)
     }
 
+    #[must_use]
     pub fn os(&self) -> String {
         format!("OS: {}", self.common.os)
     }
 
+    #[must_use]
     pub fn memory(&self) -> String {
         format!("RAM: {}/{}", self.common.memory, self.common.total_memory)
     }
 
+    #[must_use]
     pub fn clients(&self) -> String {
         format!(
             "Connected clients: {}/{}",

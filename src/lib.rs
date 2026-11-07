@@ -76,7 +76,7 @@ pub async fn run(args: Cli) -> Result<()> {
         rx,
         watcher.tx(),
         watcher.pubsub_tx(),
-        target,
+        &target,
         args.tick_rate,
         args.frame_rate,
     )
@@ -101,9 +101,10 @@ pub mod internals {
     pub use crate::redis_client::runner::Runner;
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
-        RedisType, SweepResult,
+        RedisInfo, RedisType, SweepResult,
     };
     pub use crate::state::SharedState;
+    pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
 }

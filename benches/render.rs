@@ -1,15 +1,15 @@
-//! Render benches on `ratatui`'s `TestBackend`: the key table, and a 5 MB text
-//! value through `TextCache` + `TextView`. Budget: 16 ms per frame.
+//! Render benches on `ratatui`'s `TestBackend`: the key table, the footer, and
+//! a 5 MB text value through `TextCache` + `TextView`. Budget: 16 ms per frame.
 
 mod support;
 
-use std::{fmt::Write as _, hint::black_box};
+use std::{collections::HashMap, fmt::Write as _, hint::black_box};
 
 use criterion::Criterion;
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{backend::TestBackend, widgets::StatefulWidget, Terminal};
 use redis_rover::internals::{
-    render_text, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, RedisType, TextCache, TextLabels,
-    TextView,
+    render_text, Info, InfoWidget, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, RedisInfo,
+    RedisType, SharedState, TextCache, TextLabels, TextView,
 };
 
 #[global_allocator]
@@ -109,6 +109,38 @@ fn bench_key_table(c: &mut Criterion) {
     });
 }
 
+/// The footer with a full `INFO` sample, as drawn on every frame.
+fn bench_footer(c: &mut Criterion) {
+    let state = SharedState::default();
+    *state.info.lock() = Some(RedisInfo::from(HashMap::from([
+        ("redis_version", "7.2.4"),
+        ("os", "Linux 6.8.0-1012-aws x86_64"),
+        ("used_memory_human", "1.53M"),
+        ("total_system_memory_human", "15.47G"),
+        ("connected_clients", "3"),
+        ("maxclients", "10000"),
+        ("db0", "keys=1234,expires=0,avg_ttl=0"),
+    ])));
+    let mut info = Info::new(&state, "redis://localhost:6379");
+    info.hint = "j/k move  / filter  n/p page  ? help".into();
+    // Straight into a buffer, not through `Terminal::draw`, so the numbers
+    // are the widget's own work (the terminal's diff is in key_table_100).
+    let area = ratatui::layout::Rect::new(0, 0, WIDTH, 5);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    let mut draw = |info: &mut Info| {
+        buf.reset();
+        StatefulWidget::render(InfoWidget, area, &mut buf, info);
+    };
+    draw(&mut info);
+    if support::is_bench_run() {
+        let ((), mem) = support::measure(|| draw(&mut info));
+        support::record("render/footer", mem, "allocated = one frame");
+    }
+    c.bench_function("render/footer", |b| {
+        b.iter(|| draw(black_box(&mut info)));
+    });
+}
+
 fn bench_text(c: &mut Criterion) {
     let plain = plain_text();
     let json = json_text();
@@ -173,6 +205,7 @@ fn main() {
     support::use_default_config();
     let mut c = Criterion::default().configure_from_args();
     bench_key_table(&mut c);
+    bench_footer(&mut c);
     bench_text(&mut c);
     c.final_summary();
 }

@@ -249,7 +249,7 @@ impl App {
         rx: Receiver<Action>,
         redis_tx: broadcast::Sender<RedisEvent>,
         pubsub_tx: UnboundedSender<PubSubCmd>,
-        target: String,
+        target: &str,
         tick_rate: f64,
         frame_rate: f64,
     ) -> Self {
@@ -257,12 +257,7 @@ impl App {
 
         let mode = Mode::KeySpace;
 
-        let summary = Info::new(
-            state.info.clone(),
-            state.metrics.clone(),
-            state.db.clone(),
-            target,
-        );
+        let summary = Info::new(&state, target);
         let keyspace = KeySpace::new(Vec::new());
         let dashboard = Dashboard::new(state.metrics.clone());
         let pubsub = PubSub::new(state.pubsub.clone());
@@ -595,10 +590,7 @@ impl App {
             Action::PrevChart => self.dashboard.prev_chart(),
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
             Action::ToggleMetricsPause => self.dashboard.toggle_pause(),
-            Action::ResetMetrics => {
-                self.state.metrics.lock().reset();
-                self.dashboard.unpause();
-            }
+            Action::ResetMetrics => self.reset_metrics(),
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
             Action::LoadKeysIntoKeySpace => {
@@ -1770,6 +1762,15 @@ impl App {
         self.fetch_keys();
     }
 
+    fn reset_metrics(&mut self) {
+        self.state.metrics.lock().reset();
+        // The footer's CPU figure comes from the metrics.
+        self.state
+            .info_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.dashboard.unpause();
+    }
+
     fn load_keyspace(&mut self) {
         self.fetch_keys();
     }
@@ -1888,7 +1889,7 @@ mod tests {
             rx,
             redis_tx,
             pubsub_tx,
-            "redis://localhost:6379".into(),
+            "redis://localhost:6379",
             4.0,
             30.0,
         );
