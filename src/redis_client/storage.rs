@@ -11,7 +11,7 @@ use super::{
     pubsub_store::ServerChannels,
     types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
-        ValueState,
+        SweepRequest, SweepResult, ValueState,
     },
 };
 
@@ -59,6 +59,37 @@ impl Storage {
             .query_async(&mut manager)
             .await?;
         Ok(batch)
+    }
+
+    /// Answer a [`SweepRequest`]: run `SCAN` steps from its cursor until they
+    /// returned at least `need` keys or the sweep ended. Keys are returned raw
+    /// (possibly repeating earlier ones); the caller merges them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a SCAN step fails.
+    pub async fn scan_until(
+        &self,
+        request: &SweepRequest,
+    ) -> Result<SweepResult, Box<dyn std::error::Error + Sync + Send>> {
+        let mut result = SweepResult {
+            cursor: request.cursor,
+            batch: Vec::new(),
+        };
+        loop {
+            let (cursor, keys) = self
+                .scan_batch(
+                    result.cursor,
+                    request.pattern.as_deref(),
+                    request.scan_count,
+                )
+                .await?;
+            result.cursor = cursor;
+            result.batch.extend(keys);
+            if result.done() || result.batch.len() >= request.need {
+                return Ok(result);
+            }
+        }
     }
 
     /// Count the keys matching `pattern` with a full `SCAN` sweep, stopping

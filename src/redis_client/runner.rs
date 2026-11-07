@@ -16,7 +16,7 @@ use super::{
     event::RedisEvent,
     pubsub::{self, PubSubCmd},
     storage::Storage,
-    types::{KeyMeta, KeyspaceState, RedisType},
+    types::RedisType,
 };
 
 type FetchError = Box<dyn std::error::Error + Sync + Send>;
@@ -413,34 +413,7 @@ impl EventHandler {
                     }
                 }
             }
-            RedisEvent::FetchKeys => {
-                // Work on a snapshot so the lock isn't held across `.await`.
-                let snapshot = self.state.keyspace_state.lock().clone();
-                let generation = snapshot.generation;
-
-                match self.fetch_page(snapshot).await {
-                    Ok((sweep, keys)) => {
-                        {
-                            let mut state = self.state.keyspace_state.lock();
-                            if state.generation != generation {
-                                // The user paged / filtered / refreshed meanwhile;
-                                // a newer FetchKeys is already queued.
-                                drop(state);
-                                self.action_hook(Action::KeysLoadAborted);
-                                return;
-                            }
-                            state.apply_sweep(sweep);
-                            *self.state.keys.lock() = keys;
-                        }
-                        self.action_hook(Action::LoadKeysIntoKeySpace);
-                    }
-                    Err(err) => {
-                        log::error!("FetchKeys failed: {err:?}");
-                        self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
-                        self.action_hook(Action::KeysLoadAborted);
-                    }
-                }
-            }
+            RedisEvent::FetchKeys => self.fetch_keys().await,
         }
     }
 
@@ -583,30 +556,56 @@ impl EventHandler {
         }
     }
 
-    /// Advance the SCAN sweep until it covers the current page (or ends), then
-    /// fetch metadata for just that page's keys.
-    async fn fetch_page(
-        &self,
-        mut sweep: KeyspaceState,
-    ) -> Result<(KeyspaceState, Vec<KeyMeta>), FetchError> {
-        while sweep.needs_scan() {
-            let (cursor, batch) = self
-                .storage
-                .scan_batch(
-                    sweep.sweep_cursor,
-                    sweep.pattern.as_deref(),
-                    sweep.scan_count,
-                )
-                .await?;
-            sweep.merge_batch(cursor, batch);
+    /// Load the current keyspace page into `state.keys` and send
+    /// `LoadKeysIntoKeySpace`, or `KeysLoadAborted` when the user left the page
+    /// meanwhile (a newer `FetchKeys` is then queued) or the fetch failed.
+    async fn fetch_keys(&mut self) {
+        match self.fetch_page().await {
+            Ok(true) => self.action_hook(Action::LoadKeysIntoKeySpace),
+            Ok(false) => self.action_hook(Action::KeysLoadAborted),
+            Err(err) => {
+                log::error!("FetchKeys failed: {err:?}");
+                self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
+                self.action_hook(Action::KeysLoadAborted);
+            }
         }
-        sweep.clamp_page();
+    }
 
-        let keys = self
-            .storage
-            .fetch_meta(&sweep.scanned[sweep.page_range()])
-            .await?;
-        Ok((sweep, keys))
+    /// Advance the SCAN sweep until it covers the current page (or ends), then
+    /// fetch metadata for just that page's keys. Returns `false` if the result
+    /// is stale.
+    ///
+    /// The sweep is never copied and the lock is never held across `.await`:
+    /// the runner takes a [`SweepRequest`](super::types::SweepRequest) under
+    /// the lock, scans without it, and merges the raw keys back under it. If
+    /// SCAN repeated keys and the page is still short, it asks again.
+    async fn fetch_page(&self) -> Result<bool, FetchError> {
+        loop {
+            let Some(request) = self.state.keyspace_state.lock().sweep_request() else {
+                break;
+            };
+            let result = self.storage.scan_until(&request).await?;
+            let mut state = self.state.keyspace_state.lock();
+            // Merge even after a page turn (the sweep is still valid), but
+            // leave the newer page to the newer FetchKeys.
+            if !state.apply_result(&request, result) || state.generation != request.generation {
+                return Ok(false);
+            }
+        }
+
+        let (generation, page) = {
+            let mut state = self.state.keyspace_state.lock();
+            state.clamp_page();
+            (state.generation, state.page_keys())
+        };
+        let keys = self.storage.fetch_meta(&page).await?;
+
+        let state = self.state.keyspace_state.lock();
+        if state.generation != generation {
+            return Ok(false);
+        }
+        *self.state.keys.lock() = keys;
+        Ok(true)
     }
 
     fn action_hook(&self, action: Action) {
