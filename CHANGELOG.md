@@ -46,6 +46,15 @@ First public release. Requires Rust 1.97 or newer.
 - `?` help overlay and a key-hint footer that follow the configured key bindings.
 - Configurable key bindings, colors and styles (JSON5, JSON, YAML, TOML, INI).
 
+### Changed
+
+- Paging deep into a big keyspace is as fast as the first page: a page turn no longer
+  copies every key swept so far (52.95 ms → 3.3 µs at 1M keys, the same at 10M).
+- The keyspace sweep uses about half the memory: each key name is stored once
+  (1M keys: 108 MiB → 61 MiB; 10M keys: 1.2 GiB → 821 MiB).
+- The footer builds its text once per `INFO` sample instead of on every frame, and a loaded
+  page of keys is moved into the key table instead of copied.
+
 ### Fixed
 
 - `cargo install` and release builds failed to compile (the panic handler used an old
@@ -61,5 +70,10 @@ First public release. Requires Rust 1.97 or newer.
 - Integration tests against `redis:7-alpine` in Docker (`cargo test -- --ignored`), also run
   in CI on push, PR and nightly. Plain `cargo test` still needs neither Docker nor Redis.
 - The crate now has a library target for the benches and tests; it is not a public API.
+- `page_turn_deep` now times a page turn at 100k / 1M / 10M keys, and a `render/footer` bench
+  was added. `benches/baseline.md` keeps the sol 01 baseline next to the after-sol-02 numbers;
+  `scripts/bench.sh` now writes to `target/bench-summary.md` so a run never overwrites it.
+- New integration tests: paging to page 1,000 over 1M keys, a filter change while a page is
+  loading, deleted keys clamping the page, and a failed DB switch.
 
 [0.1.0]: https://github.com/danik-tro/redis-rover/releases/tag/v0.1.0

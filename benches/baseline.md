@@ -47,30 +47,68 @@ start, **allocated** = every byte allocated, freed or not.
 - `text_cache/*`: building the viewer's lines for a 5 MB value (`TextCache`),
   done once when the value loads, not per frame.
 
-## Sol 02 in progress
+## After sol 02
 
-Measured on the same machine as the baseline above, during sol 02. The
-baseline table is still the reference; the full "after sol 02" run replaces
-this section when the sol is done.
+`scripts/bench.sh` (full run, incl. 10M) on the same machine as the baseline:
+commit `0d364e7`, 2026-11-07T20:31Z, `rustc 1.97.1`. Times are criterion's
+median (95 % CI in brackets); memory as above.
 
-### Page turn without the clone (#45)
+| Bench | Baseline (sol 01) | After sol 02 | Change | Memory baseline → after |
+|---|---|---|---|---|
+| `merge_batch/100k` | 4.09 ms | 1.34 ms (1.34 – 1.35 ms) | −67 % | retained 9.0 MiB → 5.7 MiB |
+| `merge_batch/1M` | 74.23 ms | 22.10 ms (22.06 – 22.25 ms) | −70 % | retained 108.0 MiB → **60.7 MiB (56 %)** |
+| `merge_batch/10M` | 1.23 s | 287.25 ms (285.78 – 288.37 ms) | −77 % | retained 1.2 GiB → 821.4 MiB |
+| `page_turn_deep/100k` | – | 3.28 µs (3.16 – 3.53 µs) | new | allocated 3.9 KiB |
+| `page_turn_deep/1M` | 52.95 ms | **3.32 µs** (3.09 – 3.63 µs) | ≈16,000× faster | allocated 103.5 MiB → 4.1 KiB |
+| `page_turn_deep/10M` | – | 4.39 µs (4.27 – 4.58 µs) | new | allocated 4.3 KiB |
+| `apply_sweep/1M` | 18.39 ms | – | removed | no longer exists |
+| `render/key_table_100` | 132.53 µs | 133.45 µs (132.85 – 133.76 µs) | +0.7 % | allocated 150.2 KiB → 150.2 KiB |
+| `render/footer` | 8.92 µs ¹ | 8.15 µs (8.13 – 8.17 µs) | −9 % | allocated 16.1 KiB ¹ → 15.4 KiB |
+| `render_text/5MB_plain_wrap` | 78.83 ms | 77.60 ms (77.30 – 78.02 ms) | −1.6 % | unchanged |
+| `render_text/5MB_plain_nowrap` | 6.08 ms | 5.83 ms (5.78 – 5.92 ms) | −4.1 % | unchanged |
+| `render_text/5MB_json_wrap` | 188.03 ms | 187.40 ms (187.18 – 187.82 ms) | −0.3 % | unchanged |
+| `text_cache/5MB_plain` | 4.38 ms | 4.67 ms (4.66 – 4.69 ms) | +6.6 % ² | unchanged |
+| `text_cache/5MB_json` | 137.07 ms | 135.57 ms (134.49 – 136.73 ms) | −1.1 % | unchanged |
 
-`page_turn_deep/N` now times what one `n` does under the keyspace lock:
-`next_page`, take a `SweepRequest`, merge one 100-key SCAN answer
-(`apply_result`), copy the page's names. Commit `cb26f56`, still the old
-`HashSet<String>` sweep store.
+¹ `render/footer` is new in sol 02. Its baseline is the same bench run on
+the pre-#52 code (commit `6d9c2f2`), not part of the sol 01 run.
+² Sol 02 doesn't touch `TextCache`. The change is under the 10 % limit and
+within run-to-run spread.
 
-| Bench | Baseline (sol 01) | Now | Memory now |
-|---|---|---|---|
-| `page_turn_deep/100k` | – | 10.20 µs (8.21 µs – 11.60 µs) | allocated 5.5 KiB |
-| `page_turn_deep/1M` | 52.95 ms (one full clone) | 10.47 µs (7.81 µs – 12.36 µs) | allocated 5.9 KiB |
-| `page_turn_deep/10M` | – | 27.85 µs (27.23 µs – 28.50 µs) | allocated 6.3 KiB |
-| `merge_batch/1M` | 74.23 ms | 74.55 ms (74.17 ms – 74.88 ms) | retained 108.0 MiB |
-| `merge_batch/10M` | 1.23 s | 1.25 s (1.24 s – 1.27 s) | retained 1.2 GiB |
+Benches that changed in sol 02 (`scripts/bench.sh` has the current text):
 
-### Choosing the sweep store (#46)
+- `page_turn_deep/N`: one `n` deep into an unfinished N-key sweep, as it
+  runs under the keyspace lock: `next_page`, take a `SweepRequest`, merge
+  one 100-key SCAN answer (`apply_result`), copy the page's names. No I/O.
+  The sol 01 version timed a clone of the whole sweep.
+- `render/footer` (new): one footer frame (`InfoWidget`, 120×5) with a
+  full `INFO` sample, rendered straight into a buffer.
+- `apply_sweep/1M`: removed, along with `apply_sweep`.
 
-A standalone program merged synthetic key names in 100-key batches into
+What changed:
+
+- **#45, page turn:** `FetchKeys` no longer clones the sweep. The runner
+  sends a `SweepRequest` (pattern, cursor, count, keys still needed),
+  scans without the lock and merges the raw keys back under it. A page
+  turn now costs the same at 100k, 1M and 10M keys: 3.3 / 3.3 / 4.4 µs,
+  within 1.34× (AC1).
+- **#46, sweep memory:** each key name is stored once. The index is
+  `hashbrown::HashTable<{ index: u32, hash: u32 }>` over `scanned`.
+  A 1M sweep keeps 56 % of the baseline memory (AC2), and merges are 3–4×
+  faster.
+- **#52, footer:** text is built once per `INFO` sample. The ~15 KiB still
+  allocated per frame is ratatui layout and line building, not the INFO
+  text.
+- **#51, page keys:** the page is moved into the key table instead of
+  cloned. No bench covers it; the saving is one page of `KeyMeta` per load.
+
+Against a real Redis (`deep_paging_stays_fast`, integration suite): paging to
+page 1,000 at 30 rows over 1M keys, each `FetchKeys` reply took p50 0.38 ms,
+p99 0.90 ms and at most 4.2 ms (AC3 limit: 100 ms).
+
+### Why A2: choosing the sweep store (#46)
+
+Measured before step 5 with a standalone program. It merged synthetic key names in 100-key batches into
 each candidate store. It used the same counting allocator as the benches,
 built in release mode, and timed with the median of 7 runs. "Slowest
 batch" is the longest single 100-key merge, which is the longest time the
@@ -104,23 +142,3 @@ The AC2 limit is 60 % of the baseline: 64.8 MiB at 1M with ~20 B names, or
 At 10M the saving is smaller (66 %), because spare capacity in
 `scanned: Vec<String>` (24 B per slot, grown to 2^24 slots) is the same for
 every store.
-
-### Sweep store A2 in place (#46)
-
-`cargo bench --bench keyspace` with `RROVER_BENCH_LARGE=1`, after
-`KeyspaceState::seen` became a `HashTable<SeenSlot { index: u32, hash: u32 }>`.
-
-| Bench | Baseline (sol 01) | Now | Memory baseline → now |
-|---|---|---|---|
-| `merge_batch/100k` | 4.09 ms | 1.35 ms (1.34 ms – 1.35 ms) | retained 9.0 MiB → 5.7 MiB |
-| `merge_batch/1M` | 74.23 ms | 23.42 ms (23.11 ms – 23.58 ms) | retained 108.0 MiB → **60.7 MiB (56 %)** |
-| `merge_batch/10M` | 1.23 s | 293.22 ms (289.14 ms – 297.37 ms) | retained 1.2 GiB → 821.4 MiB |
-| `page_turn_deep/100k` | – | 3.58 µs (3.29 µs – 3.77 µs) | allocated 3.9 KiB |
-| `page_turn_deep/1M` | 52.95 ms | **3.49 µs** (3.20 µs – 3.70 µs) | allocated 103.5 MiB → 4.1 KiB |
-| `page_turn_deep/10M` | – | 4.31 µs (4.23 µs – 4.45 µs) | allocated 4.3 KiB |
-
-- **AC1:** a page turn at 1M is about 15,000× faster than the baseline.
-  100k, 1M and 10M are within 1.24× of each other (the old store gave
-  2.7×, because of cache misses in a 400 MB hash set).
-- **AC2:** the 1M sweep keeps 56 % of the baseline memory, under the 60 %
-  limit.
