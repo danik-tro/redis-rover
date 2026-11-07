@@ -311,6 +311,43 @@ pub struct KeyspaceState {
     /// Bumped on every page / pattern / rescan change, so the background
     /// fetcher can drop results computed for a state the user already left.
     pub generation: u64,
+    /// Bumped only when the sweep restarts (rescan, new pattern, DB switch).
+    /// A SCAN result from the same epoch still extends the sweep even if the
+    /// user turned the page meanwhile.
+    sweep_epoch: u64,
+}
+
+/// What the runner needs to advance the sweep, copied out under the lock so
+/// the sweep itself is never cloned (#45).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepRequest {
+    pub pattern: Option<String>,
+    /// Cursor to continue the sweep from.
+    pub cursor: usize,
+    /// `COUNT` hint for every `SCAN` step.
+    pub scan_count: usize,
+    /// New keys the current page still needs. The runner can't dedup against
+    /// keys it doesn't hold, so it stops once it has this many raw keys.
+    pub need: usize,
+    /// `KeyspaceState::generation` when the request was made.
+    pub generation: u64,
+    epoch: u64,
+}
+
+/// Raw keys from one or more `SCAN` steps, in order, and the cursor after the
+/// last step. Duplicates are settled by [`KeyspaceState::apply_result`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepResult {
+    pub cursor: usize,
+    pub batch: Vec<String>,
+}
+
+impl SweepResult {
+    /// SCAN returned cursor 0: the sweep is over.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.cursor == 0
+    }
 }
 
 impl KeyspaceState {
@@ -387,6 +424,7 @@ impl KeyspaceState {
         self.sweep_cursor = 0;
         self.sweep_done = false;
         self.generation += 1;
+        self.sweep_epoch += 1;
     }
 
     /// Start over after a DB switch: keep the filter, go back to page 1 and
@@ -416,6 +454,44 @@ impl KeyspaceState {
         }
         self.sweep_cursor = cursor;
         self.sweep_done = cursor == 0;
+    }
+
+    /// The next `SCAN` work the current page needs, or `None` when the sweep
+    /// already covers it (or has ended).
+    #[must_use]
+    pub fn sweep_request(&self) -> Option<SweepRequest> {
+        if !self.needs_scan() {
+            return None;
+        }
+        Some(SweepRequest {
+            pattern: self.pattern.clone(),
+            cursor: self.sweep_cursor,
+            scan_count: self.scan_count,
+            need: self.keys_needed() - self.scanned.len(),
+            generation: self.generation,
+            epoch: self.sweep_epoch,
+        })
+    }
+
+    /// Merge the runner's answer to `request`. Returns `false`, and changes
+    /// nothing, when the sweep moved on meanwhile: it restarted (rescan, new
+    /// pattern, DB switch), ended, or no longer sits at the request's cursor.
+    /// A page turn alone doesn't make the result stale.
+    pub fn apply_result(&mut self, request: &SweepRequest, result: SweepResult) -> bool {
+        if request.epoch != self.sweep_epoch
+            || self.sweep_done
+            || request.cursor != self.sweep_cursor
+        {
+            return false;
+        }
+        self.merge_batch(result.cursor, result.batch);
+        true
+    }
+
+    /// Copy of the current page's key names: at most `page_size` of them.
+    #[must_use]
+    pub fn page_keys(&self) -> Vec<String> {
+        self.scanned[self.page_range()].to_vec()
     }
 
     /// If the finished sweep doesn't reach the current page (keys were deleted
@@ -451,6 +527,7 @@ impl Default for KeyspaceState {
             sweep_cursor: 0,
             sweep_done: false,
             generation: 0,
+            sweep_epoch: 0,
         }
     }
 }
@@ -906,6 +983,119 @@ mod tests {
         state.set_pattern(Some("k1*".into()));
         assert_eq!(state.page, 0);
         assert_eq!(state.pattern.as_deref(), Some("k1*"));
+    }
+
+    fn result(cursor: usize, batch: Vec<String>) -> SweepResult {
+        SweepResult { cursor, batch }
+    }
+
+    #[test]
+    fn sweep_request_none_when_page_is_covered() {
+        let mut state = state_with(10);
+        state.merge_batch(5, keys(0..10));
+        assert_eq!(state.sweep_request(), None, "page 1 is full");
+
+        let mut done = state_with(10);
+        done.merge_batch(0, keys(0..3));
+        assert_eq!(done.sweep_request(), None, "sweep ended short");
+    }
+
+    #[test]
+    fn sweep_request_needs_only_missing_keys() {
+        let mut state = state_with(10);
+        state.set_pattern(Some("k*".into()));
+        state.merge_batch(42, keys(0..14));
+        assert!(state.next_page());
+
+        let request = state.sweep_request().expect("page 2 needs keys");
+        assert_eq!(request.cursor, 42);
+        assert_eq!(request.need, 6);
+        assert_eq!(request.pattern.as_deref(), Some("k*"));
+        assert_eq!(request.scan_count, DEFAULT_SCAN_COUNT);
+        assert_eq!(request.generation, state.generation);
+    }
+
+    #[test]
+    fn apply_result_merges_and_moves_cursor() {
+        let mut state = state_with(10);
+        let request = state.sweep_request().expect("empty sweep needs keys");
+        assert!(state.apply_result(&request, result(17, keys(0..12))));
+        assert_eq!(state.sweep_cursor, 17);
+        assert!(!state.sweep_done);
+        assert_eq!(state.page_range(), 0..10);
+        assert_eq!(state.sweep_request(), None);
+
+        // Applying the same answer twice is refused: the cursor moved.
+        assert!(!state.apply_result(&request, result(99, keys(50..60))));
+        assert_eq!(state.scanned.len(), 12);
+    }
+
+    #[test]
+    fn apply_result_drops_stale_epoch() {
+        let mut state = state_with(10);
+        let request = state.sweep_request().expect("needs keys");
+        // The user changes the filter while the SCAN is in flight.
+        state.set_pattern(Some("user:*".into()));
+        assert!(!state.apply_result(&request, result(5, keys(0..10))));
+        assert!(state.scanned.is_empty());
+        assert_eq!(state.sweep_cursor, 0);
+
+        let mut state = state_with(10);
+        let request = state.sweep_request().expect("needs keys");
+        state.rescan();
+        assert!(!state.apply_result(&request, result(5, keys(0..10))));
+        assert!(state.scanned.is_empty());
+    }
+
+    #[test]
+    fn apply_result_keeps_progress_when_only_page_changed() {
+        let mut state = state_with(10);
+        state.merge_batch(3, keys(0..10));
+        assert!(state.next_page());
+        let request = state.sweep_request().expect("page 2 needs keys");
+        // The user presses `n` again before the SCAN answer lands.
+        assert!(state.next_page());
+        assert_ne!(state.generation, request.generation);
+
+        assert!(state.apply_result(&request, result(8, keys(10..20))));
+        assert_eq!(state.scanned.len(), 20);
+        assert_eq!(state.sweep_cursor, 8);
+        let next = state.sweep_request().expect("page 3 still needs keys");
+        assert_eq!(next.cursor, 8);
+        assert_eq!(next.need, 10);
+    }
+
+    #[test]
+    fn duplicates_leave_page_short_then_request_again() {
+        let mut state = state_with(10);
+        state.merge_batch(4, keys(0..10));
+        assert!(state.next_page());
+
+        // 10 raw keys, but SCAN repeated six of page 1's.
+        let request = state.sweep_request().expect("page 2 needs keys");
+        assert_eq!(request.need, 10);
+        let mut batch = keys(0..6);
+        batch.extend(keys(10..14));
+        assert!(state.apply_result(&request, result(9, batch)));
+        assert_eq!(state.scanned.len(), 14, "repeats are merged once");
+
+        let again = state.sweep_request().expect("page 2 is still short");
+        assert_eq!(again.cursor, 9);
+        assert_eq!(again.need, 6);
+        assert!(state.apply_result(&again, result(0, keys(10..20))));
+        assert_eq!(state.page_keys(), keys(10..20));
+        assert_eq!(state.sweep_request(), None);
+    }
+
+    #[test]
+    fn page_keys_copies_only_the_page() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..25));
+        assert_eq!(state.page_keys(), keys(0..10));
+        state.next_page();
+        state.next_page();
+        assert_eq!(state.page_keys(), keys(20..25));
+        assert!(state_with(10).page_keys().is_empty());
     }
 
     #[test]
