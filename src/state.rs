@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use parking_lot::Mutex;
 
@@ -14,6 +14,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct SharedState {
     pub info: Arc<Mutex<Option<RedisInfo>>>,
+    /// Bumped by the info task after each `INFO` sample (or failure) has been
+    /// written to `info` and `metrics`, so the footer rebuilds its text only
+    /// then.
+    pub info_seq: Arc<AtomicU64>,
     /// The keyspace page the runner loaded last, until the App moves it into
     /// the key table (`None` once taken).
     pub keys: Arc<Mutex<Option<Vec<KeyMeta>>>>,
@@ -40,6 +44,7 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             info: Arc::new(Mutex::new(None)),
+            info_seq: Arc::new(AtomicU64::new(0)),
             keys: Arc::new(Mutex::new(None)),
             keyspace_state: Arc::new(Mutex::new(KeyspaceState::default())),
             value_state: Arc::new(Mutex::new(ValueState::default())),

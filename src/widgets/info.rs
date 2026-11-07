@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use parking_lot::Mutex;
 
@@ -14,24 +17,73 @@ use crate::{
     keybindings::KeyBindings,
     mode::Mode,
     redis_client::{metrics::MetricsHistory, types::RedisInfo},
+    state::SharedState,
 };
 
-#[allow(clippy::struct_field_names)]
 pub struct Info {
-    info: Arc<Mutex<Option<RedisInfo>>>,
-    /// Credential-free connection target, e.g. `redis://localhost:6379`.
-    target: String,
+    /// The last `INFO` sample.
+    sample: Arc<Mutex<Option<RedisInfo>>>,
+    /// Bumped by the info task after each sample; the text is rebuilt only
+    /// when it (or the DB) changes.
+    sample_seq: Arc<AtomicU64>,
     /// Current DB of the keyspace browser.
     db: Arc<Mutex<i64>>,
-    /// `--read-only`: show the `RO` badge.
-    pub read_only: bool,
     /// Source of the CPU figure: a rate over the last sampling interval.
     metrics: Arc<Mutex<MetricsHistory>>,
+    /// ` Info · redis://localhost:6379 `: the credential-free target.
+    title: String,
+    /// `--read-only`: show the `RO` badge.
+    pub read_only: bool,
     /// One-line key-hint legend; follows the current mode.
     pub hint: String,
     /// Unread Pub/Sub messages over all subscriptions; badge when > 0.
     /// The App keeps it at 0 while the Pub/Sub tab is open.
     pub pubsub_unread: u64,
+    text: FooterText,
+}
+
+/// The footer's text, built once per `INFO` sample (#52) rather than on
+/// every frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FooterText {
+    /// `(info_seq, db)` this was built for; `None` until the first build.
+    key: Option<(u64, i64)>,
+    version: String,
+    os: String,
+    memory: String,
+    clients: String,
+    db_status: String,
+    cpu: String,
+}
+
+impl FooterText {
+    fn build(key: (u64, i64), info: Option<&RedisInfo>, metrics: &MetricsHistory) -> Self {
+        let cpu_pct = metrics.latest.as_ref().and_then(|s| s.cpu_pct);
+        let cluster = metrics
+            .latest_snapshot
+            .as_ref()
+            .is_some_and(|s| s.cluster_enabled);
+        let (version, os, memory, clients) = info.map_or_else(
+            || ("-".into(), "-".into(), "-".into(), "-".into()),
+            |info| {
+                (
+                    info.redis_version(),
+                    info.os(),
+                    info.memory(),
+                    info.clients(),
+                )
+            },
+        );
+        Self {
+            key: Some(key),
+            version,
+            os,
+            memory,
+            clients,
+            db_status: db_status(key.1, info, cluster),
+            cpu: cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %")),
+        }
+    }
 }
 
 /// Build the footer legend from the live keymap: `"{key} {label}"` per entry,
@@ -70,21 +122,33 @@ fn db_status(db: i64, info: Option<&RedisInfo>, cluster: bool) -> String {
 }
 
 impl Info {
-    pub fn new(
-        info: Arc<Mutex<Option<RedisInfo>>>,
-        metrics: Arc<Mutex<MetricsHistory>>,
-        db: Arc<Mutex<i64>>,
-        target: String,
-    ) -> Self {
+    /// `target` is the credential-free connection target, e.g.
+    /// `redis://localhost:6379`.
+    #[must_use]
+    pub fn new(state: &SharedState, target: &str) -> Self {
         Self {
-            info,
-            target,
-            db,
+            sample: state.info.clone(),
+            sample_seq: state.info_seq.clone(),
+            db: state.db.clone(),
+            metrics: state.metrics.clone(),
+            title: format!(" Info · {target} "),
             read_only: false,
-            metrics,
             hint: String::new(),
             pubsub_unread: 0,
+            text: FooterText::default(),
         }
+    }
+
+    /// Rebuild the footer text if a new `INFO` sample landed or the DB
+    /// changed since the last frame.
+    fn refresh_text(&mut self) {
+        let key = (self.sample_seq.load(Ordering::Acquire), *self.db.lock());
+        if self.text.key == Some(key) {
+            return;
+        }
+        let info = self.sample.lock();
+        let metrics = self.metrics.lock();
+        self.text = FooterText::build(key, info.as_ref(), &metrics);
     }
 }
 
@@ -95,7 +159,7 @@ impl StatefulWidget for InfoWidget {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        let mut title = vec![Span::raw(format!(" Info · {} ", state.target))];
+        let mut title = vec![Span::raw(state.title.as_str())];
         if state.read_only {
             title.push(
                 Span::raw(" RO ")
@@ -124,20 +188,8 @@ impl StatefulWidget for InfoWidget {
             .border_type(BorderType::Rounded)
             .render(area, buf);
 
-        let common_info = { state.info.lock().as_ref().map(Clone::clone) };
-        let db = *state.db.lock();
-        let (cpu_pct, cluster) = {
-            let metrics = state.metrics.lock();
-            (
-                metrics.latest.as_ref().and_then(|s| s.cpu_pct),
-                metrics
-                    .latest_snapshot
-                    .as_ref()
-                    .is_some_and(|s| s.cluster_enabled),
-            )
-        };
-        let db_status = db_status(db, common_info.as_ref(), cluster);
-        let cpu = cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %"));
+        state.refresh_text();
+        let text = &state.text;
 
         // Reserve the last inner row for the always-on key-hint legend (#41).
         let [top, bottom, hint] = Layout::vertical([
@@ -160,38 +212,26 @@ impl StatefulWidget for InfoWidget {
                 .horizontal_margin(3)
                 .areas(bottom);
 
-        // TODO: handle failed case
-        let (os_info, memory, redis_info, clients) = if let Some(info) = common_info {
-            (
-                info.os(),
-                info.memory(),
-                info.redis_version(),
-                info.clients(),
-            )
-        } else {
-            ("-".into(), "-".into(), "-".into(), "-".into())
-        };
-
-        Paragraph::new(os_info)
+        Paragraph::new(text.os.as_str())
             .alignment(Alignment::Left)
             .render(os_area, buf);
-        Paragraph::new(redis_info)
+        Paragraph::new(text.version.as_str())
             .alignment(Alignment::Left)
             .render(version_area, buf);
 
-        Paragraph::new(memory)
+        Paragraph::new(text.memory.as_str())
             .alignment(Alignment::Right)
             .render(memory_area, buf);
 
-        Paragraph::new(cpu)
+        Paragraph::new(text.cpu.as_str())
             .alignment(Alignment::Right)
             .render(cpu_area, buf);
 
-        Paragraph::new(clients)
+        Paragraph::new(text.clients.as_str())
             .alignment(Alignment::Center)
             .render(clients_area, buf);
 
-        Paragraph::new(Line::from(db_status).fg(cfg.colors.base05))
+        Paragraph::new(Line::from(text.db_status.as_str()).fg(cfg.colors.base05))
             .alignment(Alignment::Center)
             .render(db_area, buf);
 
@@ -224,6 +264,130 @@ mod tests {
             db_status(0, Some(&info), true),
             "db 0 · 40 keys (this node)"
         );
+    }
+
+    fn sample_info() -> RedisInfo {
+        RedisInfo::from(HashMap::from([
+            ("redis_version", "7.2.4"),
+            ("os", "Linux 6.8.0-1012-aws x86_64"),
+            ("used_memory_human", "1.53M"),
+            ("total_system_memory_human", "15.47G"),
+            ("connected_clients", "3"),
+            ("maxclients", "10000"),
+            ("db0", "keys=1234,expires=0,avg_ttl=0"),
+        ]))
+    }
+
+    fn footer(info: Option<RedisInfo>, width: u16) -> Vec<String> {
+        let shared = SharedState::default();
+        *shared.info.lock() = info;
+        let mut state = Info::new(&shared, "redis://localhost:6379");
+        state.read_only = true;
+        state.pubsub_unread = 3;
+        state.hint = "j/k move  / filter  ? help".into();
+        draw(&mut state, width)
+    }
+
+    fn draw(state: &mut Info, width: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, 5);
+        let mut buf = Buffer::empty(area);
+        InfoWidget.render(area, &mut buf, state);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Pins the footer text, so caching it per INFO sample (#52) can't change
+    /// what is drawn.
+    #[test]
+    fn footer_renders_same_text() {
+        let cases: [(u16, bool, [&str; 5]); 4] = [
+            (
+                80,
+                true,
+            [
+                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────── ? Help ╮",
+                "│  Redis version: 7.2.4         db 0 · 1234 keys                       CPU: -  │",
+                "│  OS: Linux 6.8.0-1012-aws Connected clients: 3/100        RAM: 1.53M/15.47G  │",
+                "│                          j/k move  / filter  ? help                          │",
+                "╰──────────────────────────────────────────────────────────────────────────────╯",
+            ],
+            ),
+            (
+                120,
+                true,
+            [
+                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────────────────────────────────────────────── ? Help ╮",
+                "│  Redis version: 7.2.4                             db 0 · 1234 keys                                           CPU: -  │",
+                "│  OS: Linux 6.8.0-1012-aws x86_64             Connected clients: 3/10000                           RAM: 1.53M/15.47G  │",
+                "│                                              j/k move  / filter  ? help                                              │",
+                "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+            ],
+            ),
+            (
+                80,
+                false,
+            [
+                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────── ? Help ╮",
+                "│  -                                  db 0                             CPU: -  │",
+                "│  -                                    -                                   -  │",
+                "│                          j/k move  / filter  ? help                          │",
+                "╰──────────────────────────────────────────────────────────────────────────────╯",
+            ],
+            ),
+            (
+                120,
+                false,
+            [
+                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────────────────────────────────────────────── ? Help ╮",
+                "│  -                                                      db 0                                                 CPU: -  │",
+                "│  -                                                        -                                                       -  │",
+                "│                                              j/k move  / filter  ? help                                              │",
+                "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+            ],
+            ),
+        ];
+        for (width, info, expected) in cases {
+            assert_eq!(
+                footer(info.then(sample_info), width),
+                expected,
+                "{width} columns, info: {info}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_text_rebuilds_only_on_new_sample_or_db() {
+        let shared = SharedState::default();
+        *shared.info.lock() = Some(sample_info());
+        let mut state = Info::new(&shared, "redis://localhost:6379");
+        draw(&mut state, 120);
+        let first = state.text.version.clone();
+        assert_eq!(first, "Redis version: 7.2.4");
+
+        // Info changed but no new sample was announced: the cached text stays.
+        let mut newer = sample_info();
+        newer.common.version = "7.4.0".into();
+        *shared.info.lock() = Some(newer);
+        draw(&mut state, 120);
+        assert_eq!(state.text.version, first);
+
+        shared.info_seq.fetch_add(1, Ordering::Release);
+        let lines = draw(&mut state, 120);
+        assert_eq!(state.text.version, "Redis version: 7.4.0");
+        assert!(lines[1].contains("Redis version: 7.4.0"));
+
+        // A DB switch rebuilds it too, without a new sample.
+        *shared.db.lock() = 3;
+        let lines = draw(&mut state, 120);
+        assert_eq!(state.text.db_status, "db 3 · 0 keys");
+        assert!(lines[1].contains("db 3 · 0 keys"));
     }
 
     #[test]

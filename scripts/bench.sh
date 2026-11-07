@@ -58,7 +58,7 @@ BUDGET_NS = 16e6  # 16 ms per frame
 ORDER = [
     "merge_batch/100k", "merge_batch/1M", "merge_batch/10M",
     "page_turn_deep/100k", "page_turn_deep/1M", "page_turn_deep/10M",
-    "render/key_table_100",
+    "render/key_table_100", "render/footer",
     "render_text/5MB_plain_wrap", "render_text/5MB_plain_nowrap",
     "render_text/5MB_json_wrap",
     "text_cache/5MB_plain", "text_cache/5MB_json",
@@ -161,6 +161,8 @@ start, **allocated** = every byte allocated, freed or not.
   sol 02 this was a clone of the whole sweep (52.95 ms at 1M).
 - `render/key_table_100`: one frame of `KeySpaceWidget` with 100 keys on a
   120×40 `TestBackend`.
+- `render/footer`: one frame of the footer (`InfoWidget`, 120×5) with a full
+  `INFO` sample, rendered straight into a buffer (no terminal diff).
 - `render_text/*`: one frame of a 5 MB value in the text viewer (`TextView`),
   with wrap on and off, plain text and pretty JSON.
 - `text_cache/*`: building the viewer's lines for a 5 MB value (`TextCache`),
