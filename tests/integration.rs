@@ -242,6 +242,64 @@ async fn deleted_keys_clamp_the_page() {
     h.shutdown().await;
 }
 
+/// AC3: on a 1M-key DB, holding `n` to page 1,000 shows every page fast.
+/// Each `FetchKeys` reply (SCAN + metadata + merge) must land within 100 ms.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn deep_paging_stays_fast() {
+    const KEYS: usize = 1_000_000;
+    const PAGES: usize = 1_000;
+    const PAGE_SIZE: usize = 30;
+    const LIMIT: Duration = Duration::from_millis(100);
+
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("deep");
+    // 1,000 MSETs of 1,000 keys, sent 50 at a time.
+    for chunk in (0..KEYS).collect::<Vec<_>>().chunks(50_000) {
+        let mut pipe = redis::pipe();
+        for keys in chunk.chunks(1_000) {
+            let mut mset = redis::cmd("MSET");
+            for i in keys {
+                mset.arg(format!("{p}user:{}:{i}", i / 1000)).arg("v");
+            }
+            pipe.add_command(mset).ignore();
+        }
+        let () = pipe.query_async(&mut admin).await.expect("seed MSET");
+    }
+    let size: usize = redis::cmd("DBSIZE")
+        .query_async(&mut admin)
+        .await
+        .expect("DBSIZE");
+    assert_eq!(size, KEYS);
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().set_page_size(PAGE_SIZE, 0);
+    let mut times = Vec::with_capacity(PAGES);
+    let mut shown = HashSet::new();
+    for page in 0..PAGES {
+        if page > 0 {
+            assert!(h.state.keyspace_state.lock().next_page(), "page {page}");
+        }
+        let started = std::time::Instant::now();
+        let keys = h.fetch_page().await;
+        times.push(started.elapsed());
+        assert_eq!(keys.len(), PAGE_SIZE, "page {page} is full");
+        shown.extend(keys);
+    }
+    assert_eq!(shown.len(), PAGES * PAGE_SIZE, "a key was shown twice");
+
+    let swept = h.state.keyspace_state.lock().scanned.len();
+    times.sort();
+    let (p50, p99, max) = (times[PAGES / 2], times[PAGES * 99 / 100], times[PAGES - 1]);
+    eprintln!(
+        "deep paging over {KEYS} keys, {PAGES} pages of {PAGE_SIZE}: p50 {p50:?}, \
+         p99 {p99:?}, max {max:?}; sweep holds {swept} keys"
+    );
+    assert!(max < LIMIT, "slowest page took {max:?}");
+    h.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "needs Docker"]
 async fn db_switch_survives_a_reconnect() {
