@@ -433,7 +433,7 @@ impl EventHandler {
                 *self.state.db.lock() = db;
                 self.state.keyspace_state.lock().reset_for_db();
                 self.state.value_state.lock().clear();
-                self.state.keys.lock().clear();
+                *self.state.keys.lock() = None;
                 *self.state.selected_value.lock() = None;
                 self.last_value_generation = None;
                 self.action_hook(Action::DbSwitched);
@@ -441,8 +441,10 @@ impl EventHandler {
             Err(err) => {
                 log::error!("SelectDb {db} failed: {err:?}");
                 self.action_hook(Action::Error(format!("Failed to switch to db {db}: {err}")));
-                // Still on the old DB: put its keys back on screen.
-                self.action_hook(Action::LoadKeysIntoKeySpace);
+                // Still on the old DB: load its current page again. The App
+                // moved the last page out of `state.keys`, so there is
+                // nothing to put back.
+                self.fetch_keys().await;
             }
         }
     }
@@ -604,7 +606,7 @@ impl EventHandler {
         if state.generation != generation {
             return Ok(false);
         }
-        *self.state.keys.lock() = keys;
+        *self.state.keys.lock() = Some(keys);
         Ok(true)
     }
 
