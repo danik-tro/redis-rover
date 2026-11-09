@@ -206,6 +206,9 @@ cargo test
 # Integration tests against a real Redis 7 in Docker
 cargo test -- --ignored --test-threads=1
 
+# Golden frames: rewrite tests/golden/*.txt after an intended UI change
+UPDATE_GOLDEN=1 cargo test --test golden
+
 # Benchmarks (no Redis needed)
 cargo bench
 scripts/bench.sh --quick    # writes target/bench-summary.md; compare with benches/baseline.md
@@ -220,6 +223,8 @@ cargo fmt --check
 The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging (including paging to page 1,000 over 1M keys, each page under 100 ms), DB switching, `--read-only`, value edits, Pub/Sub reconnects and TLS, and run in CI on every push, PR and nightly.
 
 If a change touches the keyspace or rendering, run the benches before and after and compare with `benches/baseline.md` (the sol 01 baseline plus an "After sol 02" section). `scripts/bench.sh` without `--quick` also runs the 10M-key case, which takes a few minutes and about 2 GB of RAM.
+
+Golden-frame tests (`tests/golden.rs`) draw the main screens from fixed data and compare their text with `tests/golden/<name>.txt`. A UI change makes them fail with the rows that differ; if the change is intended, rewrite the files with `UPDATE_GOLDEN=1` and review their diff in the PR.
 
 The crate has a library target only so benches and tests can reach internal types. It is not a public API.
 

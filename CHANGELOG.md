@@ -77,5 +77,14 @@ First public release. Requires Rust 1.97 or newer.
   loading, deleted keys clamping the page, and a failed DB switch.
 - `vergen` is gone: `build.rs` gets the git describe and build date with plain std, so the
   ~35 `gix` crates (and their security advisories) are no longer in the build tree.
+- Golden-frame tests (`tests/golden.rs`): twelve screens drawn from fixed data and compared
+  as text with `tests/golden/*.txt`. After an intended UI change, rewrite them with
+  `UPDATE_GOLDEN=1 cargo test --test golden` and review the diff.
+- Internal restructuring with no behaviour change: the largest files are split into module
+  directories (`src/app/`, `widgets/keyspace/`, `widgets/pubsub/`, `widgets/dashboard/`,
+  `redis_client/types/`), widgets draw from a per-frame snapshot instead of locking shared
+  state, and the UI reads the time through an injected clock.
+- Benches compile as one codegen unit (`[profile.bench]`), so moving code between modules
+  doesn't shift their results.
 
 [0.1.0]: https://github.com/danik-tro/redis-rover/releases/tag/v0.1.0
