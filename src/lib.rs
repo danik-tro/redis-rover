@@ -103,7 +103,7 @@ pub mod internals {
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
         RedisInfo, RedisType, SweepResult,
     };
-    pub use crate::state::SharedState;
+    pub use crate::state::{FrameData, SharedState};
     pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};

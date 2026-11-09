@@ -8,8 +8,8 @@ use std::{collections::HashMap, fmt::Write as _, hint::black_box};
 use criterion::Criterion;
 use ratatui::{backend::TestBackend, widgets::StatefulWidget, Terminal};
 use redis_rover::internals::{
-    render_text, Info, InfoWidget, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, RedisInfo,
-    RedisType, SharedState, TextCache, TextLabels, TextView,
+    render_text, FrameData, Info, InfoWidget, KeyMeta, KeySpace, KeySpaceWidget, KeyValue,
+    RedisInfo, RedisType, SharedState, TextCache, TextLabels, TextView,
 };
 
 #[global_allocator]
@@ -121,15 +121,18 @@ fn bench_footer(c: &mut Criterion) {
         ("maxclients", "10000"),
         ("db0", "keys=1234,expires=0,avg_ttl=0"),
     ])));
-    let mut info = Info::new(&state, "redis://localhost:6379");
+    let mut info = Info::new("redis://localhost:6379");
     info.hint = "j/k move  / filter  n/p page  ? help".into();
     // Straight into a buffer, not through `Terminal::draw`, so the numbers
     // are the widget's own work (the terminal's diff is in key_table_100).
+    // Each frame refreshes the footer text first, as `App::draw` does.
     let area = ratatui::layout::Rect::new(0, 0, WIDTH, 5);
     let mut buf = ratatui::buffer::Buffer::empty(area);
+    let mut frame = FrameData::default();
     let mut draw = |info: &mut Info| {
         buf.reset();
-        StatefulWidget::render(InfoWidget, area, &mut buf, info);
+        frame.refresh_footer(&state);
+        StatefulWidget::render(InfoWidget { frame: &frame }, area, &mut buf, info);
     };
     draw(&mut info);
     if support::is_bench_run() {
