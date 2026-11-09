@@ -75,5 +75,7 @@ First public release. Requires Rust 1.97 or newer.
   `scripts/bench.sh` now writes to `target/bench-summary.md` so a run never overwrites it.
 - New integration tests: paging to page 1,000 over 1M keys, a filter change while a page is
   loading, deleted keys clamping the page, and a failed DB switch.
+- `vergen` is gone: `build.rs` gets the git describe and build date with plain std, so the
+  ~35 `gix` crates (and their security advisories) are no longer in the build tree.
 
 [0.1.0]: https://github.com/danik-tro/redis-rover/releases/tag/v0.1.0
