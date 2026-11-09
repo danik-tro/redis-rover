@@ -87,6 +87,11 @@ rcgen = "0.14.10"
 [profile.release]
 strip = true
 
+# One codegen unit, so moving code between modules doesn't change how the
+# crate is split for optimization and shift bench results by a few percent.
+[profile.bench]
+codegen-units = 1
+
 [[bin]]
 bench = false
 path = "src/main.rs"
