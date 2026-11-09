@@ -1,0 +1,61 @@
+name: Supply chain
+
+# Informational only: never fails. Findings go to the job summary and a sticky
+# PR comment (see scripts/supply-chain-report.sh). Runs once per PR commit;
+# never on push, so master and branch pushes don't spend minutes on it.
+on:
+  pull_request:
+
+# A new commit on the PR cancels the run for the previous one.
+concurrency:
+  group: supply-chain-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  report:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      # Advisories come from cargo-audit only, so they aren't listed twice.
+      - name: cargo deny
+        id: deny
+        run: |
+          set +e
+          cargo deny --color never check bans licenses sources > deny.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: cargo audit
+        id: audit
+        run: |
+          set +e
+          cargo audit --color never > audit.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Build report
+        id: report
+        env:
+          DENY_CODE: ${{ steps.deny.outputs.code }}
+          AUDIT_CODE: ${{ steps.audit.outputs.code }}
+        run: scripts/supply-chain-report.sh
+
+      - run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Fork PRs get a read-only token, so they only get the job summary.
+      # When clean, only update an existing comment (to ✅), never post a new one.
+      - name: Comment on PR
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: supply-chain
+          path: report.md
+          only_update: ${{ steps.report.outputs.clean }}

@@ -4,12 +4,30 @@ ignore = []
 
 [licenses]
 version = 2
+# Permissive licenses that can be used as dependencies of an MIT project.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "ISC",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
 ]
+
+# Allowed per crate only, so a new dependency under these licenses is still flagged.
+# MPL-2.0 is file-level copyleft: fine as long as option-ext's own files are not modified.
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "terminfo"
+allow = ["WTFPL"]
 
 [bans]
 multiple-versions = "warn"
