@@ -73,9 +73,6 @@ arboard = { version = "3.7.0", default-features = false }
 base64 = "0.22"
 unicode-width = "0.2"
 
-[build-dependencies]
-vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]}
-
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 # No plots, no HTML reports, no rayon: just the timings (`scripts/bench.sh`).
