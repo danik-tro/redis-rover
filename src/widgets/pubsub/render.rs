@@ -1,9 +1,7 @@
 use super::{
-    clock, list_lines, log_view, render_add_popup, render_publish_popup, row_at, stats_lines,
-    Detail, Pane, Popup, PubSub, Row, CLUSTER_NOTE, LIST_WIDTH, STATS_HEIGHT, STATS_MIN_PANE,
+    clock, render_add_popup, render_publish_popup, Detail, Pane, Popup, PubSub, PubSubView,
+    CLUSTER_NOTE, LIST_WIDTH, STATS_HEIGHT, STATS_MIN_PANE,
 };
-
-use std::time::SystemTime;
 
 use ratatui::{
     buffer::Buffer,
@@ -20,60 +18,82 @@ use crate::{
     widgets::text_view::{self, TextLabels},
 };
 
-pub struct PubSubWidget;
+/// Draws the Pub/Sub tab from the frame's [`PubSubView`], built by
+/// [`PubSub::build_view`] for the same area.
+pub struct PubSubWidget {
+    pub view: PubSubView,
+}
+
+/// The tab's panes: the list, the right side (log and stats, or the message
+/// detail over both), and the inner areas their rows are built for.
+pub(super) struct PaneAreas {
+    pub(super) list_area: Rect,
+    pub(super) right_area: Rect,
+    pub(super) log_area: Rect,
+    pub(super) stats_area: Rect,
+    pub(super) list_inner: Rect,
+    pub(super) log_inner: Rect,
+    pub(super) stats_inner: Rect,
+}
+
+fn outer_border() -> Block<'static> {
+    let cfg = config::get();
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(cfg.colors.base04)
+        .bg(cfg.colors.base00)
+        .fg(cfg.colors.base05)
+}
+
+/// Pane layout of `area`; the stats panel only shows for a subscription.
+pub(super) fn pane_areas(area: Rect, has_sub: bool) -> PaneAreas {
+    let inner = outer_border().inner(area);
+
+    let [list_area, right_area] =
+        Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Fill(1)]).areas(inner);
+    let list_inner = pane_block("", false).inner(list_area);
+    let [log_area, stats_area] = if has_sub && right_area.height >= STATS_MIN_PANE {
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(STATS_HEIGHT)]).areas(right_area)
+    } else {
+        [right_area, Rect::default()]
+    };
+    let log_inner = pane_block("", false).inner(log_area);
+    let stats_inner = pane_block("", false).inner(stats_area);
+    PaneAreas {
+        list_area,
+        right_area,
+        log_area,
+        stats_area,
+        list_inner,
+        log_inner,
+        stats_inner,
+    }
+}
 
 impl StatefulWidget for PubSubWidget {
     type State = PubSub;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        state.clamp_selection();
+        let PubSubView {
+            has_sub,
+            status,
+            list,
+            log,
+            stats: stats_view,
+        } = self.view;
 
-        let outer = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(cfg.colors.base04)
-            .bg(cfg.colors.base00)
-            .fg(cfg.colors.base05);
-        let inner = outer.inner(area);
-
-        let [list_area, right_area] =
-            Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Fill(1)]).areas(inner);
-        let list_inner = pane_block("", false).inner(list_area);
-        let has_sub = state.selected_sub().is_some();
-        let [log_area, stats_area] = if has_sub && right_area.height >= STATS_MIN_PANE {
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(STATS_HEIGHT)])
-                .areas(right_area)
-        } else {
-            [right_area, Rect::default()]
-        };
-        let log_inner = pane_block("", false).inner(log_area);
-        let stats_inner = pane_block("", false).inner(stats_area);
+        let outer = outer_border();
+        let PaneAreas {
+            list_area,
+            right_area,
+            log_area,
+            stats_area,
+            log_inner,
+            ..
+        } = pane_areas(area, has_sub);
         let log_focused = state.focus == Pane::Log;
-
-        // Build everything under one short lock, render after releasing it.
-        let now = SystemTime::now();
-        let (status, list, log, stats_view) = {
-            let store = state.store.lock();
-            let row = row_at(&store, state.selected);
-            let sub = match row {
-                Some(Row::Sub(i)) => store.subs.get(i),
-                _ => None,
-            };
-            (
-                store.status.clone(),
-                list_lines(&store, state.selected, !log_focused, list_inner, now),
-                log_view(
-                    &store,
-                    row.as_ref(),
-                    &mut state.log,
-                    log_focused,
-                    log_inner,
-                    now,
-                ),
-                sub.map(|sub| stats_lines(sub, usize::from(stats_inner.width), now)),
-            )
-        };
 
         let mut title = vec![
             Span::raw(" Pub/Sub ── "),
@@ -232,9 +252,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::time::SystemTime;
 
-    use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+    use ratatui::{buffer::Buffer, layout::Rect};
 
-    use crate::widgets::pubsub::tests::{pattern_widget, render, screen, server, widget};
+    use crate::widgets::pubsub::tests::{draw, pattern_widget, render, screen, server, widget};
     use crate::{
         config,
         redis_client::pubsub_store::{ConnStatus, Target},
@@ -259,7 +279,7 @@ mod tests {
         }
         let area = Rect::new(0, 0, 100, 16);
         let mut buf = Buffer::empty(area);
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         let text = screen(&buf);
         assert!(text.contains("Pub/Sub ── connected"), "{text}");
         assert!(text.contains("● orders:*"), "{text}");
@@ -271,7 +291,7 @@ mod tests {
         assert!(text.contains("kept 10"), "{text}");
 
         p.open_add();
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         assert!(screen(&buf).contains("[channel] / pattern"));
     }
 
@@ -292,7 +312,7 @@ mod tests {
         p.cluster_mode = true;
         let area = Rect::new(0, 0, 120, 14);
         let mut buf = Buffer::empty(area);
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         let text = screen(&buf);
         assert!(text.contains("reconnecting in 2 s"), "{text}");
         assert!(text.contains(CLUSTER_NOTE), "{text}");
@@ -304,7 +324,7 @@ mod tests {
         assert!(text.contains(RECONNECT_MARKER), "{text}");
 
         p.select_next();
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         assert!(
             screen(&buf).contains("1 subscriber · Enter to subscribe"),
             "{}",
@@ -312,7 +332,7 @@ mod tests {
         );
 
         p.open_publish(true);
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         let text = screen(&buf);
         assert!(text.contains(READ_ONLY_PUBLISH), "{text}");
         assert!(text.contains("events"), "prefilled: {text}");

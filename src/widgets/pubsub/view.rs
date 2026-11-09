@@ -1,4 +1,5 @@
-use super::{LogCursor, Row, RECONNECT_MARKER, TOP_CHANNELS};
+use super::render::{pane_areas, PaneAreas};
+use super::{row_at, LogCursor, Pane, PubSub, Row, RECONNECT_MARKER, TOP_CHANNELS};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,11 +14,68 @@ use crate::{
     config,
     pubsub_notify::NotifyState,
     redis_client::pubsub_store::{
-        EntryKind, MessageBuffer, PubSubMessage, PubSubStore, Subscription,
+        ConnStatus, EntryKind, MessageBuffer, PubSubMessage, PubSubStore, Subscription,
     },
     utils::{fmt_bytes, group_thousands},
     widgets::keyspace::truncate_to_width,
 };
+
+/// One frame of the tab, built under one short lock of the store; part of
+/// [`crate::state::FrameData`].
+pub struct PubSubView {
+    pub(super) has_sub: bool,
+    pub(super) status: ConnStatus,
+    pub(super) list: Vec<Line<'static>>,
+    pub(super) log: LogView,
+    pub(super) stats: Option<Vec<Line<'static>>>,
+}
+
+impl PubSub {
+    /// Build this frame's rows for the tab drawn in `area`. Keeps the
+    /// selection in range and moves the log cursor, as drawing did.
+    pub fn build_view(&mut self, area: Rect) -> PubSubView {
+        self.clamp_selection();
+        let has_sub = self.selected_sub().is_some();
+        let PaneAreas {
+            list_inner,
+            log_inner,
+            stats_inner,
+            ..
+        } = pane_areas(area, has_sub);
+        let log_focused = self.focus == Pane::Log;
+
+        // Build everything under one short lock, render after releasing it.
+        let now = SystemTime::now();
+        let (status, list, log, stats_view) = {
+            let store = self.store.lock();
+            let row = row_at(&store, self.selected);
+            let sub = match row {
+                Some(Row::Sub(i)) => store.subs.get(i),
+                _ => None,
+            };
+            (
+                store.status.clone(),
+                list_lines(&store, self.selected, !log_focused, list_inner, now),
+                log_view(
+                    &store,
+                    row.as_ref(),
+                    &mut self.log,
+                    log_focused,
+                    log_inner,
+                    now,
+                ),
+                sub.map(|sub| stats_lines(sub, usize::from(stats_inner.width), now)),
+            )
+        };
+        PubSubView {
+            has_sub,
+            status,
+            list,
+            log,
+            stats: stats_view,
+        }
+    }
+}
 
 /// Lines of the left pane: own subscriptions (`● name  N/s`), then the
 /// server's other channels (`○ name  N subs`), scrolled to keep the
@@ -328,13 +386,13 @@ fn utc_hms(secs: u64) -> (u64, u64, u64) {
 mod tests {
 
     use super::*;
-    use crate::widgets::pubsub::PubSubWidget;
+
     use pretty_assertions::assert_eq;
     use std::time::UNIX_EPOCH;
 
-    use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+    use ratatui::{buffer::Buffer, layout::Rect};
 
-    use crate::widgets::pubsub::tests::{pattern_widget, render, screen, widget};
+    use crate::widgets::pubsub::tests::{draw, pattern_widget, render, screen, widget};
     use crate::{pubsub_notify::NotifyState, redis_client::pubsub_store::Target};
 
     #[test]
@@ -351,7 +409,7 @@ mod tests {
         }
         let area = Rect::new(0, 0, 100, 10);
         let mut buf = Buffer::empty(area);
-        PubSubWidget.render(area, &mut buf, &mut p);
+        draw(&mut p, area, &mut buf);
         let lines: Vec<String> = screen(&buf).lines().map(str::to_owned).collect();
         let row = |name: &str| {
             lines

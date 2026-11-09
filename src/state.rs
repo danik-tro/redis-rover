@@ -1,4 +1,7 @@
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use parking_lot::Mutex;
 
@@ -9,6 +12,7 @@ use crate::{
         pubsub_store::PubSubStore,
         types::{KeyMeta, KeyspaceState, LoadedValue, RedisInfo, ValueState},
     },
+    widgets::{info::FooterText, pubsub::PubSubView},
 };
 
 #[derive(Clone, Debug)]
@@ -57,5 +61,38 @@ impl Default for SharedState {
             yank: Arc::new(Mutex::new(None)),
             pubsub: Arc::new(Mutex::new(PubSubStore::new(config::get().pubsub.limits()))),
         }
+    }
+}
+
+/// What the widgets read from [`SharedState`], copied once per frame by
+/// `App::draw` under short locks, so no widget locks anything while drawing.
+/// Owned by the App and updated in place: the footer text is rebuilt only
+/// when a new `INFO` sample lands or the DB changes.
+#[derive(Default)]
+pub struct FrameData {
+    /// Footer text for the current `(info_seq, db)`.
+    pub footer: FooterText,
+    /// The server runs in cluster mode.
+    pub cluster: bool,
+    /// Metrics window for the dashboard's width; `None` outside the
+    /// dashboard and while it is paused (it draws its frozen copy then).
+    pub metrics: Option<MetricsHistory>,
+    /// The Pub/Sub tab's rows; `None` outside the tab. Taken by the widget
+    /// when it draws.
+    pub pubsub: Option<PubSubView>,
+}
+
+impl FrameData {
+    /// Rebuild the footer text if a new `INFO` sample landed or the DB
+    /// changed since the last frame. `info_seq` is bumped by the info task
+    /// after each sample.
+    pub fn refresh_footer(&mut self, state: &SharedState) {
+        let key = (state.info_seq.load(Ordering::Acquire), *state.db.lock());
+        if self.footer.key() == Some(key) {
+            return;
+        }
+        let info = state.info.lock();
+        let metrics = state.metrics.lock();
+        self.footer = FooterText::build(key, info.as_ref(), &metrics);
     }
 }

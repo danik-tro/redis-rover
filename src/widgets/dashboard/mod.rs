@@ -26,6 +26,7 @@ use ratatui::{
 use crate::{
     config,
     redis_client::metrics::{MetricsHistory, Series},
+    state::FrameData,
     utils::{fmt_bytes, fmt_compact, fmt_rate_bytes, format_duration},
 };
 
@@ -137,9 +138,21 @@ impl Dashboard {
     pub fn is_paused(&self) -> bool {
         self.frozen.is_some()
     }
+
+    /// The live metrics for a frame `width` columns wide, copied under one
+    /// short lock; `None` while paused (the frozen copy is drawn then).
+    pub fn live_window(&self, width: u16) -> Option<MetricsHistory> {
+        if self.is_paused() {
+            return None;
+        }
+        Some(self.metrics.lock().window(usize::from(width) * 2))
+    }
 }
 
-pub struct DashboardWidget;
+/// Draws the dashboard from the frame's metrics window (or the frozen copy).
+pub struct DashboardWidget<'a> {
+    pub frame: &'a FrameData,
+}
 
 /// One plotted line: label, values (already scaled for display), colour.
 struct PlotLine {
@@ -373,19 +386,14 @@ fn selected_stat_rows(m: Metric) -> u16 {
     }
 }
 
-impl StatefulWidget for DashboardWidget {
+impl StatefulWidget for DashboardWidget<'_> {
     type State = Dashboard;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        // Paused: draw the frozen copy. Live: one short lock, then draw from
-        // the clone.
-        let live;
-        let h = if let Some(f) = &state.frozen {
-            f
-        } else {
-            live = state.metrics.lock().window(usize::from(area.width) * 2);
-            &live
+        // Paused: draw the frozen copy. Live: the frame's copy.
+        let Some(h) = state.frozen.as_ref().or(self.frame.metrics.as_ref()) else {
+            return;
         };
         let paused = state.is_paused();
 
@@ -458,7 +466,11 @@ mod tests {
     fn render_to_string(d: &mut Dashboard, w: u16, h: u16) -> String {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
-        StatefulWidget::render(DashboardWidget, area, &mut buf, d);
+        let frame = FrameData {
+            metrics: d.live_window(w),
+            ..FrameData::default()
+        };
+        StatefulWidget::render(DashboardWidget { frame: &frame }, area, &mut buf, d);
         buf.content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)

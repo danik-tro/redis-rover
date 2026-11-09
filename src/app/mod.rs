@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::{
     config,
     redis_client::{event::RedisEvent, pubsub::PubSubCmd},
-    state::SharedState,
+    state::{FrameData, SharedState},
 };
 use color_eyre::eyre::Result;
 use ratatui::crossterm::event::KeyEvent;
@@ -91,6 +91,8 @@ pub struct App {
     clipboard: Clipboard,
     /// Short message drawn above every mode and popup.
     toast: Toast,
+    /// What the widgets draw from, rebuilt at the start of every frame.
+    frame: FrameData,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -112,7 +114,7 @@ impl App {
 
         let mode = Mode::KeySpace;
 
-        let summary = Info::new(&state, target);
+        let summary = Info::new(target);
         let keyspace = KeySpace::new(Vec::new());
         let dashboard = Dashboard::new(state.metrics.clone());
         let pubsub = PubSub::new(state.pubsub.clone());
@@ -146,6 +148,7 @@ impl App {
             read_only: false,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
+            frame: FrameData::default(),
         };
         app.sync_hint();
         app
@@ -357,6 +360,7 @@ mod tests {
     pub(super) fn render_screen(app: &mut App) -> String {
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
+        app.build_frame(area);
         AppWidget.render(area, &mut buf, app);
         (0..area.height)
             .map(|y| {

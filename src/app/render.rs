@@ -154,6 +154,14 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::Quit, "Quit"),
 ];
 
+/// The main area and, below it, the five-row footer.
+fn layout(area: Rect) -> [Rect; 2] {
+    Layout::vertical([Constraint::Percentage(100), Constraint::Length(5)])
+        .flex(Flex::Center)
+        .margin(1)
+        .areas(area)
+}
+
 /// Columns between a help label and its keys.
 const HELP_GAP: usize = 2;
 
@@ -172,9 +180,33 @@ fn help_columns(rows: &[(String, String)]) -> (usize, usize) {
 impl App {
     pub(super) fn draw(&mut self, tui: &mut tui::Tui) -> Result<()> {
         tui.draw(|frame| {
+            self.build_frame(frame.area());
             frame.render_stateful_widget(AppWidget, frame.area(), self);
         })?;
         Ok(())
+    }
+
+    /// Copy what this frame draws out of the shared state, each lock held
+    /// only for its copy. Widgets then render from `self.frame` alone.
+    pub(super) fn build_frame(&mut self, area: Rect) {
+        let [main, _] = layout(area);
+        self.frame.cluster = self.cluster_enabled();
+        self.frame.refresh_footer(&self.state);
+        let mode = self.view_mode();
+        self.frame.metrics = if mode == Mode::Dashboard {
+            self.dashboard.live_window(main.width)
+        } else {
+            None
+        };
+        self.frame.pubsub = (mode == Mode::PubSub).then(|| self.pubsub.build_view(main));
+    }
+
+    /// The mode drawn under a popup: the one it was opened from.
+    fn view_mode(&self) -> Mode {
+        match self.mode {
+            Mode::Popup(_) => self.previous_mode.unwrap_or(Mode::KeySpace),
+            m => m,
+        }
     }
 
     /// Point the footer hint at the current mode.
@@ -200,12 +232,16 @@ impl StatefulWidget for AppWidget {
         let cfg = config::get();
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
-        let [main, footer] = Layout::vertical([Constraint::Percentage(100), Constraint::Length(5)])
-            .flex(Flex::Center)
-            .margin(1)
-            .areas(area);
+        let [main, footer] = layout(area);
 
-        StatefulWidget::render(InfoWidget, footer, buf, &mut state.summary);
+        StatefulWidget::render(
+            InfoWidget {
+                frame: &state.frame,
+            },
+            footer,
+            buf,
+            &mut state.summary,
+        );
         state.render_main_block(main, buf);
         StatefulWidget::render(DbPickerWidget, main, buf, &mut state.db_picker);
 
@@ -224,18 +260,17 @@ impl StatefulWidget for AppWidget {
 /// Render logic
 impl App {
     fn render_main_block(&mut self, area: Rect, buf: &mut Buffer) {
-        let mode = match self.mode {
-            Mode::Popup(_) => self.previous_mode.unwrap_or(Mode::KeySpace),
-            m => m,
-        };
-        match mode {
+        match self.view_mode() {
             Mode::KeySpace => self.render_key_space(area, buf),
             Mode::Dashboard => {
-                StatefulWidget::render(DashboardWidget, area, buf, &mut self.dashboard);
+                let widget = DashboardWidget { frame: &self.frame };
+                StatefulWidget::render(widget, area, buf, &mut self.dashboard);
             }
             Mode::PubSub => {
-                self.pubsub.cluster_mode = self.cluster_enabled();
-                StatefulWidget::render(PubSubWidget, area, buf, &mut self.pubsub);
+                self.pubsub.cluster_mode = self.frame.cluster;
+                if let Some(view) = self.frame.pubsub.take() {
+                    StatefulWidget::render(PubSubWidget { view }, area, buf, &mut self.pubsub);
+                }
             }
             Mode::Common | Mode::Popup(_) => {}
         }
@@ -297,7 +332,7 @@ impl App {
     }
 
     fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
-        self.keyspace.cluster_mode = self.cluster_enabled();
+        self.keyspace.cluster_mode = self.frame.cluster;
         StatefulWidget::render(KeySpaceWidget, area, buf, &mut self.keyspace);
     }
 

@@ -10,7 +10,8 @@ mod view;
 use cursor::{Detail, LogCursor};
 use popups::{render_add_popup, render_publish_popup, AddPopup, Popup, PublishPopup};
 pub use render::PubSubWidget;
-use view::{clock, list_lines, log_view, stats_lines};
+use view::clock;
+pub use view::PubSubView;
 
 use std::sync::Arc;
 
@@ -462,10 +463,16 @@ mod tests {
         p
     }
 
+    /// One frame, as `App::draw` does it: build the view, then render it.
+    pub(super) fn draw(p: &mut PubSub, area: Rect, buf: &mut Buffer) {
+        let view = p.build_view(area);
+        PubSubWidget { view }.render(area, buf, p);
+    }
+
     pub(super) fn render(p: &mut PubSub) -> (Buffer, String) {
         let area = Rect::new(0, 0, 110, 24);
         let mut buf = Buffer::empty(area);
-        PubSubWidget.render(area, &mut buf, p);
+        draw(p, area, &mut buf);
         let text = screen(&buf);
         (buf, text)
     }

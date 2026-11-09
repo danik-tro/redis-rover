@@ -1,10 +1,3 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
-
-use parking_lot::Mutex;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::{self, Alignment, Constraint, Layout, Rect};
 use ratatui::style::Stylize;
@@ -17,19 +10,10 @@ use crate::{
     keybindings::KeyBindings,
     mode::Mode,
     redis_client::{metrics::MetricsHistory, types::RedisInfo},
-    state::SharedState,
+    state::FrameData,
 };
 
 pub struct Info {
-    /// The last `INFO` sample.
-    sample: Arc<Mutex<Option<RedisInfo>>>,
-    /// Bumped by the info task after each sample; the text is rebuilt only
-    /// when it (or the DB) changes.
-    sample_seq: Arc<AtomicU64>,
-    /// Current DB of the keyspace browser.
-    db: Arc<Mutex<i64>>,
-    /// Source of the CPU figure: a rate over the last sampling interval.
-    metrics: Arc<Mutex<MetricsHistory>>,
     /// ` Info · redis://localhost:6379 `: the credential-free target.
     title: String,
     /// `--read-only`: show the `RO` badge.
@@ -39,13 +23,12 @@ pub struct Info {
     /// Unread Pub/Sub messages over all subscriptions; badge when > 0.
     /// The App keeps it at 0 while the Pub/Sub tab is open.
     pub pubsub_unread: u64,
-    text: FooterText,
 }
 
 /// The footer's text, built once per `INFO` sample (#52) rather than on
-/// every frame.
+/// every frame. Lives in [`FrameData`].
 #[derive(Debug, Default, PartialEq, Eq)]
-struct FooterText {
+pub struct FooterText {
     /// `(info_seq, db)` this was built for; `None` until the first build.
     key: Option<(u64, i64)>,
     version: String,
@@ -57,7 +40,7 @@ struct FooterText {
 }
 
 impl FooterText {
-    fn build(key: (u64, i64), info: Option<&RedisInfo>, metrics: &MetricsHistory) -> Self {
+    pub fn build(key: (u64, i64), info: Option<&RedisInfo>, metrics: &MetricsHistory) -> Self {
         let cpu_pct = metrics.latest.as_ref().and_then(|s| s.cpu_pct);
         let cluster = metrics
             .latest_snapshot
@@ -83,6 +66,11 @@ impl FooterText {
             db_status: db_status(key.1, info, cluster),
             cpu: cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %")),
         }
+    }
+
+    /// `(info_seq, db)` this was built for; `None` until the first build.
+    pub fn key(&self) -> Option<(u64, i64)> {
+        self.key
     }
 }
 
@@ -125,36 +113,22 @@ impl Info {
     /// `target` is the credential-free connection target, e.g.
     /// `redis://localhost:6379`.
     #[must_use]
-    pub fn new(state: &SharedState, target: &str) -> Self {
+    pub fn new(target: &str) -> Self {
         Self {
-            sample: state.info.clone(),
-            sample_seq: state.info_seq.clone(),
-            db: state.db.clone(),
-            metrics: state.metrics.clone(),
             title: format!(" Info · {target} "),
             read_only: false,
             hint: String::new(),
             pubsub_unread: 0,
-            text: FooterText::default(),
         }
-    }
-
-    /// Rebuild the footer text if a new `INFO` sample landed or the DB
-    /// changed since the last frame.
-    fn refresh_text(&mut self) {
-        let key = (self.sample_seq.load(Ordering::Acquire), *self.db.lock());
-        if self.text.key == Some(key) {
-            return;
-        }
-        let info = self.sample.lock();
-        let metrics = self.metrics.lock();
-        self.text = FooterText::build(key, info.as_ref(), &metrics);
     }
 }
 
-pub struct InfoWidget;
+/// Draws the footer from the frame's [`FooterText`].
+pub struct InfoWidget<'a> {
+    pub frame: &'a FrameData,
+}
 
-impl StatefulWidget for InfoWidget {
+impl StatefulWidget for InfoWidget<'_> {
     type State = Info;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
@@ -188,8 +162,7 @@ impl StatefulWidget for InfoWidget {
             .border_type(BorderType::Rounded)
             .render(area, buf);
 
-        state.refresh_text();
-        let text = &state.text;
+        let text = &self.frame.footer;
 
         // Reserve the last inner row for the always-on key-hint legend (#41).
         let [top, bottom, hint] = Layout::vertical([
@@ -247,8 +220,10 @@ impl StatefulWidget for InfoWidget {
 mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     use super::*;
+    use crate::state::SharedState;
 
     #[test]
     fn db_status_shows_key_count() {
@@ -281,17 +256,24 @@ mod tests {
     fn footer(info: Option<RedisInfo>, width: u16) -> Vec<String> {
         let shared = SharedState::default();
         *shared.info.lock() = info;
-        let mut state = Info::new(&shared, "redis://localhost:6379");
+        let mut state = Info::new("redis://localhost:6379");
         state.read_only = true;
         state.pubsub_unread = 3;
         state.hint = "j/k move  / filter  ? help".into();
-        draw(&mut state, width)
+        draw(&mut state, &mut FrameData::default(), &shared, width)
     }
 
-    fn draw(state: &mut Info, width: u16) -> Vec<String> {
+    /// One frame: refresh the footer text as `App::draw` does, then render.
+    fn draw(
+        state: &mut Info,
+        frame: &mut FrameData,
+        shared: &SharedState,
+        width: u16,
+    ) -> Vec<String> {
+        frame.refresh_footer(shared);
         let area = Rect::new(0, 0, width, 5);
         let mut buf = Buffer::empty(area);
-        InfoWidget.render(area, &mut buf, state);
+        InfoWidget { frame }.render(area, &mut buf, state);
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -366,27 +348,28 @@ mod tests {
     fn footer_text_rebuilds_only_on_new_sample_or_db() {
         let shared = SharedState::default();
         *shared.info.lock() = Some(sample_info());
-        let mut state = Info::new(&shared, "redis://localhost:6379");
-        draw(&mut state, 120);
-        let first = state.text.version.clone();
+        let mut state = Info::new("redis://localhost:6379");
+        let mut frame = FrameData::default();
+        draw(&mut state, &mut frame, &shared, 120);
+        let first = frame.footer.version.clone();
         assert_eq!(first, "Redis version: 7.2.4");
 
         // Info changed but no new sample was announced: the cached text stays.
         let mut newer = sample_info();
         newer.common.version = "7.4.0".into();
         *shared.info.lock() = Some(newer);
-        draw(&mut state, 120);
-        assert_eq!(state.text.version, first);
+        draw(&mut state, &mut frame, &shared, 120);
+        assert_eq!(frame.footer.version, first);
 
         shared.info_seq.fetch_add(1, Ordering::Release);
-        let lines = draw(&mut state, 120);
-        assert_eq!(state.text.version, "Redis version: 7.4.0");
+        let lines = draw(&mut state, &mut frame, &shared, 120);
+        assert_eq!(frame.footer.version, "Redis version: 7.4.0");
         assert!(lines[1].contains("Redis version: 7.4.0"));
 
         // A DB switch rebuilds it too, without a new sample.
         *shared.db.lock() = 3;
-        let lines = draw(&mut state, 120);
-        assert_eq!(state.text.db_status, "db 3 · 0 keys");
+        let lines = draw(&mut state, &mut frame, &shared, 120);
+        assert_eq!(frame.footer.db_status, "db 3 · 0 keys");
         assert!(lines[1].contains("db 3 · 0 keys"));
     }
 
