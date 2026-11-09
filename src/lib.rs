@@ -95,16 +95,25 @@ pub async fn run(args: Cli) -> Result<()> {
 #[doc(hidden)]
 pub mod internals {
     pub use crate::action::Action;
+    pub use crate::mode::Mode;
     pub use crate::redis_client::event::RedisEvent;
+    pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
     pub use crate::redis_client::runner::Runner;
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
-        RedisInfo, RedisType, SweepResult,
+        RedisInfo, RedisType, SweepResult, ValuePageInfo,
     };
     pub use crate::state::{FrameData, SharedState};
+    pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
     pub use crate::widgets::info::{Info, InfoWidget};
-    pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget};
+    pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, PageInfo};
+    pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
+
+    /// The `?` help overlay for `mode`, as the App draws it.
+    pub fn render_help(area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, mode: Mode) {
+        crate::app::App::render_help_overlay(area, buf, mode);
+    }
 }

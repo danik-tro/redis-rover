@@ -150,6 +150,7 @@ impl PubSub {
         self.detail = None;
     }
 
+    #[must_use]
     pub fn focus(&self) -> Pane {
         self.focus
     }
@@ -164,6 +165,7 @@ impl PubSub {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn log_cursor(&self) -> LogCursor {
         self.log
     }
@@ -213,6 +215,7 @@ impl PubSub {
 
     /// Message `y` / `Shift-y` copy: the one in the detail, else the
     /// selected log entry (the newest while following).
+    #[must_use]
     pub fn selected_message(&self) -> Option<PubSubMessage> {
         match self.detail.as_ref() {
             Some(detail) => Some(detail.msg.clone()),
@@ -229,6 +232,7 @@ impl PubSub {
         true
     }
 
+    #[must_use]
     pub fn is_detail(&self) -> bool {
         self.detail.is_some()
     }
@@ -255,12 +259,14 @@ impl PubSub {
         }
     }
 
+    #[must_use]
     pub fn selected_row(&self) -> Option<Row> {
         row_at(&self.store.lock(), self.selected)
     }
 
     /// Index into `PubSubStore::subs` of the selected subscription, if a
     /// subscription (not a server channel) is selected.
+    #[must_use]
     pub fn selected_sub(&self) -> Option<usize> {
         match self.selected_row() {
             Some(Row::Sub(i)) => Some(i),
@@ -269,6 +275,7 @@ impl PubSub {
     }
 
     /// Target of the selected subscription.
+    #[must_use]
     pub fn selected_target(&self) -> Option<Target> {
         let store = self.store.lock();
         match row_at(&store, self.selected) {
@@ -303,10 +310,12 @@ impl PubSub {
         ))));
     }
 
+    #[must_use]
     pub fn is_popup(&self) -> bool {
         self.popup.is_some()
     }
 
+    #[must_use]
     pub fn is_publish_popup(&self) -> bool {
         matches!(self.popup, Some(Popup::Publish(_)))
     }

@@ -135,12 +135,14 @@ impl Dashboard {
         self.frozen = None;
     }
 
+    #[must_use]
     pub fn is_paused(&self) -> bool {
         self.frozen.is_some()
     }
 
     /// The live metrics for a frame `width` columns wide, copied under one
     /// short lock; `None` while paused (the frozen copy is drawn then).
+    #[must_use]
     pub fn live_window(&self, width: u16) -> Option<MetricsHistory> {
         if self.is_paused() {
             return None;

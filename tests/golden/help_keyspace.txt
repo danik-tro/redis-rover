@@ -1,0 +1,33 @@
+
+
+
+
+
+
+
+                                     ╭─────────────────── Help ────────────────────╮
+                                     │ Scroll down                         j       │
+                                     │ Scroll up                           k       │
+                                     │ Next page (keys or open value)      n       │
+                                     │ Previous page (keys or open value)  p       │
+                                     │ Refresh keyspace                    r       │
+                                     │ Set filter pattern                  f       │
+                                     │ Delete filter pattern               l       │
+                                     │ Enter value / confirm               Enter   │
+                                     │ Add new key                         a       │
+                                     │ Add item (in collection)            i       │
+                                     │ Edit value / item (drill in first)  e       │
+                                     │ Delete key / item (in value)        d       │
+                                     │ Set TTL                             t       │
+                                     │ Copy value / item                   y       │
+                                     │ Copy key name                       Shift-Y │
+                                     │ Wrap text value on / off            w       │
+                                     │ Pan text left (wrap off)            Left    │
+                                     │ Pan text right (wrap off)           Right   │
+                                     │ Switch database                     s       │
+                                     │ Open metrics dashboard              m       │
+                                     │ Open Pub/Sub                        b       │
+                                     │ Close popup / overlay               Esc     │
+                                     │ Toggle this help                    ?       │
+                                     │ Quit                                Ctrl-c  │
+                                     ╰─────────────────────────────────────────────╯

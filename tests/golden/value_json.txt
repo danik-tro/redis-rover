@@ -1,0 +1,20 @@
+╭ Keys ──────────────────────────────────╮╭ Values ────────────────────────────────────────────────────────────────────╮
+│ filter *                               ││ Key   doc:settings                                                         │
+│ ────────────────────────────────────── ││ Type  json                                                                 │
+│   Type   Key            TTL       Size ││ TTL   No expiry                                                            │
+│ ────────────────────────────────────── ││ Size  420 B                                                                │
+│   hash   user:1001        ∞      312 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   hash   user:1002        ∞      296 B ││ Value · JSON                                                               │
+│   str    session:7…      1h       96 B ││ {                                                                          │
+│   list   queue:jobs       ∞   2.00 KiB ││   "theme": "dark",                                                         │
+│   set    tags:popu…       ∞      540 B ││   "notifications": {                                                       │
+│   zset   leaderboa…      1d   1.17 KiB ││     "email": true,                                                         │
+│   stream events:or…       ∞   8.00 KiB ││     "push": false                                                          │
+│ ▌ json   doc:setti…       ∞      420 B ││   },                                                                       │
+│   str    cache:pag…      2m  14.65 KiB ││   "shortcuts": [                                                           │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││     "j",                                                                   │
+│                                        ││     "k",                                                                   │
+│                                        ││     "/"                                                                    │
+│                                        ││   ]                                                                        │
+│                                        ││                                         lines 1–11 of 12 · Enter to scroll │
+╰ Page 1 · 1–10 of 10 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯
