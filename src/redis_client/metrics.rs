@@ -126,6 +126,7 @@ fn parse_keyspace_line(v: &str) -> Option<u64> {
 
 impl InfoSnapshot {
     /// A snapshot with every field unset.
+    #[must_use]
     pub fn empty(taken_at: Instant) -> Self {
         Self {
             taken_at,
@@ -160,6 +161,7 @@ impl InfoSnapshot {
 
     /// Build a snapshot from a parsed `INFO` map. The time is a parameter so
     /// tests control it.
+    #[must_use]
     pub fn from_map(map: &HashMap<&str, &str>, taken_at: Instant) -> Self {
         let total_keys = Some(
             map.iter()
@@ -324,6 +326,7 @@ fn ratio(hits: Option<u64>, misses: Option<u64>) -> Option<f64> {
 
 impl MetricsHistory {
     /// Create a history whose series each hold `capacity` points.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let s = || Series::new(capacity);
         Self {
@@ -465,6 +468,7 @@ impl MetricsHistory {
     }
 
     /// Longest series length, i.e. how many points the widest panel can draw.
+    #[must_use]
     pub fn window_len(&self) -> usize {
         self.series().iter().map(|s| s.len()).max().unwrap_or(0)
     }
@@ -485,6 +489,7 @@ impl MetricsHistory {
     }
 
     /// Copy of this history keeping only the last `n` points of each series.
+    #[must_use]
     pub fn window(&self, n: usize) -> MetricsHistory {
         let t = |s: &Series| s.tail_series(n);
         MetricsHistory {

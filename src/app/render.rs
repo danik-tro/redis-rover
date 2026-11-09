@@ -340,7 +340,7 @@ impl App {
     /// the key sequence(s) bound to it. The box grows ("extends") to fit its
     /// content — both width and height are derived from the rows — and is
     /// clamped to the available area.
-    fn render_help_overlay(area: Rect, buf: &mut Buffer, mode: Mode) {
+    pub(crate) fn render_help_overlay(area: Rect, buf: &mut Buffer, mode: Mode) {
         let cfg = config::get();
         let keybindings = &cfg.keybindings;
 

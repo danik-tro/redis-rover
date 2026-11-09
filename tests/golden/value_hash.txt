@@ -1,0 +1,20 @@
+╭ Keys ──────────────────────────────────╮╭ Values ────────────────────────────────────────────────────────────────────╮
+│ filter *                               ││ Key   user:1001                                                            │
+│ ────────────────────────────────────── ││ Type  hash                                                                 │
+│   Type   Key            TTL       Size ││ TTL   No expiry                                                            │
+│ ────────────────────────────────────── ││ Size  312 B                                                                │
+│ ▌ hash   user:1001        ∞      312 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   hash   user:1002        ∞      296 B ││   Field                                Value                               │
+│   str    session:7…      1h       96 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   list   queue:jobs       ∞   2.00 KiB ││   name                                 Ann Example                         │
+│   set    tags:popu…       ∞      540 B ││   email                                ann@example.com                     │
+│   zset   leaderboa…      1d   1.17 KiB ││   plan                                 pro                                 │
+│   stream events:or…       ∞   8.00 KiB ││   visits                               42                                  │
+│   json   doc:setti…       ∞      420 B ││                                                                            │
+│   str    cache:pag…      2m  14.65 KiB ││                                                                            │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+╰ Page 1 · 1–10 of 10 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯

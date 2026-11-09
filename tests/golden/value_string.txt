@@ -1,0 +1,20 @@
+╭ Keys ──────────────────────────────────╮╭ Values ────────────────────────────────────────────────────────────────────╮
+│ filter *                               ││ Key   session:7f3a9c                                                       │
+│ ────────────────────────────────────── ││ Type  string                                                               │
+│   Type   Key            TTL       Size ││ TTL   1h (3600s)                                                           │
+│ ────────────────────────────────────── ││ Size  96 B                                                                 │
+│   hash   user:1001        ∞      312 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   hash   user:1002        ∞      296 B ││ Value                                                                      │
+│ ▌ str    session:7…      1h       96 B ││ Hello from redis-rover.                                                    │
+│   list   queue:jobs       ∞   2.00 KiB ││ A second line of a plain string value.                                     │
+│   set    tags:popu…       ∞      540 B ││                                                                            │
+│   zset   leaderboa…      1d   1.17 KiB ││                                                                            │
+│   stream events:or…       ∞   8.00 KiB ││                                                                            │
+│   json   doc:setti…       ∞      420 B ││                                                                            │
+│   str    cache:pag…      2m  14.65 KiB ││                                                                            │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+╰ Page 1 · 1–10 of 10 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯

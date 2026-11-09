@@ -293,6 +293,7 @@ pub struct ValuePageInfo {
 
 impl ValuePageInfo {
     /// More than one page exists, so row navigation turns pages at the edges.
+    #[must_use]
     pub fn is_paged(&self) -> bool {
         self.has_next || self.has_prev
     }
