@@ -376,7 +376,10 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
-    use std::{sync::Arc, time::SystemTime};
+    use std::{
+        sync::Arc,
+        time::{Instant, SystemTime},
+    };
 
     use parking_lot::Mutex;
     use ratatui::{
@@ -474,7 +477,7 @@ mod tests {
 
     /// One frame, as `App::draw` does it: build the view, then render it.
     pub(super) fn draw(p: &mut PubSub, area: Rect, buf: &mut Buffer) {
-        let view = p.build_view(area);
+        let view = p.build_view(area, Instant::now(), SystemTime::now());
         PubSubWidget { view }.render(area, buf, p);
     }
 

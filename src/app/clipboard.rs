@@ -55,6 +55,7 @@ impl App {
             self.toast.show(
                 format!("Copying {} values isn't supported yet", r_type.name()),
                 false,
+                self.clock.now(),
             );
             return;
         }
@@ -68,7 +69,8 @@ impl App {
 
     /// Ask the runner for `key`'s whole value; `YankReady` copies it.
     pub(super) fn start_full_yank(&mut self, key: String, r_type: RedisType) {
-        self.toast.show(format!("Copying {key}…"), true);
+        self.toast
+            .show(format!("Copying {key}…"), true, self.clock.now());
         self.send_redis_event(RedisEvent::FetchFullValue { key, r_type });
     }
 
@@ -135,7 +137,7 @@ impl App {
             Ok(via) => copied_toast(what, text.len(), note, via),
             Err(err) => format!("Copy failed: {err}"),
         };
-        self.toast.show(msg, false);
+        self.toast.show(msg, false, self.clock.now());
     }
 }
 

@@ -190,6 +190,7 @@ impl App {
     /// only for its copy. Widgets then render from `self.frame` alone.
     pub(super) fn build_frame(&mut self, area: Rect) {
         let [main, _] = layout(area);
+        let (now, wall) = (self.clock.now(), self.clock.wall());
         self.frame.cluster = self.cluster_enabled();
         self.frame.refresh_footer(&self.state);
         let mode = self.view_mode();
@@ -198,7 +199,7 @@ impl App {
         } else {
             None
         };
-        self.frame.pubsub = (mode == Mode::PubSub).then(|| self.pubsub.build_view(main));
+        self.frame.pubsub = (mode == Mode::PubSub).then(|| self.pubsub.build_view(main, now, wall));
     }
 
     /// The mode drawn under a popup: the one it was opened from.
@@ -488,7 +489,7 @@ mod tests {
     fn toast_renders_over_every_mode() {
         let mut app = app();
         let check = |app: &mut App, what: &str| {
-            app.toast.show("hello toast", false);
+            app.toast.show("hello toast", false, app.clock.now());
             let text = render_screen(app);
             assert!(text.contains("hello toast"), "{what}:\n{text}");
         };
@@ -501,7 +502,7 @@ mod tests {
         app.show_error_popup("boom");
         check(&mut app, "error popup");
         app.switch_to_previous_mode();
-        app.toggle_help();
+        app.toggle_help(app.clock.now());
         check(&mut app, "help overlay");
     }
 }

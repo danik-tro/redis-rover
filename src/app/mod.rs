@@ -7,9 +7,10 @@ mod keyspace;
 mod pubsub;
 mod render;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use crate::{
+    clock::{Clock, SystemClock},
     config,
     redis_client::{event::RedisEvent, pubsub::PubSubCmd},
     state::{FrameData, SharedState},
@@ -93,6 +94,8 @@ pub struct App {
     toast: Toast,
     /// What the widgets draw from, rebuilt at the start of every frame.
     frame: FrameData,
+    /// Read once per action (and per frame) and passed down.
+    clock: Arc<dyn Clock>,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -149,6 +152,7 @@ impl App {
             clipboard: Clipboard::default(),
             toast: Toast::default(),
             frame: FrameData::default(),
+            clock: Arc::new(SystemClock),
         };
         app.sync_hint();
         app

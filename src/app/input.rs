@@ -60,7 +60,7 @@ impl App {
         // While the filter popup is open, raw keys feed its text-area; only
         // Enter (confirm) and Esc (cancel) escape to the dispatcher.
         if self.keyspace.is_popup() && !is_confirm && !is_cancel {
-            self.keyspace.handle_key(key);
+            self.keyspace.handle_key(key, self.clock.now());
             return None;
         }
 
@@ -173,7 +173,7 @@ impl App {
         }
 
         self.pending_keys.push(key);
-        self.last_key_at = Some(Instant::now());
+        self.last_key_at = Some(self.clock.now());
 
         let keybindings = &config::get().keybindings;
         let mut resolution = keybindings.resolve(self.mode, &self.pending_keys);
@@ -197,10 +197,10 @@ impl App {
     }
 
     /// Drop a partially typed chord once it has waited [`CHORD_TIMEOUT`].
-    pub(super) fn expire_pending_chord(&mut self) {
+    pub(super) fn expire_pending_chord(&mut self, now: Instant) {
         if self
             .last_key_at
-            .is_some_and(|at| at.elapsed() >= CHORD_TIMEOUT)
+            .is_some_and(|at| now.duration_since(at) >= CHORD_TIMEOUT)
         {
             self.pending_keys.clear();
             self.last_key_at = None;

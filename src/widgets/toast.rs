@@ -32,18 +32,18 @@ pub struct Toast {
 
 impl Toast {
     /// Show `msg` now, replacing the current toast: user feedback. It stays
-    /// for [`TOAST_TIMEOUT`], or until replaced if `sticky`.
-    pub fn show(&mut self, msg: impl Into<String>, sticky: bool) {
-        let expires = (!sticky).then(|| Instant::now() + TOAST_TIMEOUT);
+    /// for [`TOAST_TIMEOUT`] from `now`, or until replaced if `sticky`.
+    pub fn show(&mut self, msg: impl Into<String>, sticky: bool, now: Instant) {
+        let expires = (!sticky).then(|| now + TOAST_TIMEOUT);
         self.current = Some((msg.into(), expires));
     }
 
     /// A background message (Pub/Sub notification). It never replaces the
     /// current toast (a sticky "Copying …" in particular): it waits in a
     /// short queue, the oldest dropped when full.
-    pub fn notify(&mut self, msg: impl Into<String>) {
+    pub fn notify(&mut self, msg: impl Into<String>, now: Instant) {
         if self.current.is_none() {
-            self.show(msg, false);
+            self.show(msg, false, now);
             return;
         }
         if self.queue.len() == QUEUE_CAP {
@@ -68,6 +68,7 @@ impl Toast {
         }
     }
 
+    #[must_use]
     pub fn message(&self) -> Option<&str> {
         self.current.as_ref().map(|(msg, _)| msg.as_str())
     }
@@ -133,7 +134,7 @@ mod tests {
     #[test]
     fn toast_expires() {
         let mut toast = Toast::default();
-        toast.show("Copied", false);
+        toast.show("Copied", false, Instant::now());
         assert!(render(&mut toast, 80).contains("Copied"));
         toast.expire(Instant::now());
         assert_eq!(toast.message(), Some("Copied"));
@@ -141,7 +142,7 @@ mod tests {
         assert_eq!(toast.message(), None);
         assert!(!render(&mut toast, 80).contains("Copied"));
 
-        toast.show("Copying…", true);
+        toast.show("Copying…", true, Instant::now());
         toast.expire(Instant::now() + TOAST_TIMEOUT * 10);
         assert_eq!(toast.message(), Some("Copying…"), "sticky until replaced");
     }
@@ -149,13 +150,13 @@ mod tests {
     #[test]
     fn notify_never_replaces_a_sticky_toast() {
         let mut toast = Toast::default();
-        toast.show("Copying key…", true);
-        toast.notify("chat: hi");
+        toast.show("Copying key…", true, Instant::now());
+        toast.notify("chat: hi", Instant::now());
         toast.expire(Instant::now() + TOAST_TIMEOUT * 10);
         assert_eq!(toast.message(), Some("Copying key…"));
 
         // The copy finishes: its result shows, then the queued notice.
-        toast.show("Copied", false);
+        toast.show("Copied", false, Instant::now());
         assert_eq!(toast.message(), Some("Copied"));
         let later = Instant::now() + TOAST_TIMEOUT;
         toast.expire(later);
@@ -167,10 +168,10 @@ mod tests {
     #[test]
     fn notify_shows_at_once_when_free_and_queue_is_capped() {
         let mut toast = Toast::default();
-        toast.notify("a");
+        toast.notify("a", Instant::now());
         assert_eq!(toast.message(), Some("a"));
         for msg in ["b", "c", "d", "e"] {
-            toast.notify(msg);
+            toast.notify(msg, Instant::now());
         }
         let mut now = Instant::now();
         let mut seen = Vec::new();
@@ -186,7 +187,11 @@ mod tests {
     #[test]
     fn long_text_is_cut_to_fit() {
         let mut toast = Toast::default();
-        toast.show(format!("orders:new: {}", "x".repeat(200)), false);
+        toast.show(
+            format!("orders:new: {}", "x".repeat(200)),
+            false,
+            Instant::now(),
+        );
         let text = render(&mut toast, 40);
         assert!(text.contains("orders:new: xxx"), "{text}");
         assert!(text.contains('…'), "{text}");
