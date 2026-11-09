@@ -7,6 +7,7 @@ mod action;
 mod app;
 mod cli;
 mod clipboard;
+mod clock;
 mod command;
 mod config;
 mod keybindings;
@@ -95,6 +96,7 @@ pub async fn run(args: Cli) -> Result<()> {
 #[doc(hidden)]
 pub mod internals {
     pub use crate::action::Action;
+    pub use crate::clock::{Clock, FixedClock, SystemClock};
     pub use crate::mode::Mode;
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
@@ -111,6 +113,7 @@ pub mod internals {
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, PageInfo};
     pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
+    pub use crate::widgets::toast::{Toast, ToastWidget};
 
     /// The `?` help overlay for `mode`, as the App draws it.
     pub fn render_help(area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, mode: Mode) {

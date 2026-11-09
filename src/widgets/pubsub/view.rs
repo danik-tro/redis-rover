@@ -1,7 +1,7 @@
 use super::render::{pane_areas, PaneAreas};
 use super::{row_at, LogCursor, Pane, PubSub, Row, RECONNECT_MARKER, TOP_CHANNELS};
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     layout::Rect,
@@ -25,15 +25,18 @@ use crate::{
 pub struct PubSubView {
     pub(super) has_sub: bool,
     pub(super) status: ConnStatus,
+    /// `status` as text at the frame's time (`reconnecting in 3 s`).
+    pub(super) status_label: String,
     pub(super) list: Vec<Line<'static>>,
     pub(super) log: LogView,
     pub(super) stats: Option<Vec<Line<'static>>>,
 }
 
 impl PubSub {
-    /// Build this frame's rows for the tab drawn in `area`. Keeps the
-    /// selection in range and moves the log cursor, as drawing did.
-    pub fn build_view(&mut self, area: Rect) -> PubSubView {
+    /// Build this frame's rows for the tab drawn in `area` at `now` /
+    /// `wall`. Keeps the selection in range and moves the log cursor, as
+    /// drawing did.
+    pub fn build_view(&mut self, area: Rect, now: Instant, wall: SystemTime) -> PubSubView {
         self.clamp_selection();
         let has_sub = self.selected_sub().is_some();
         let PaneAreas {
@@ -45,7 +48,6 @@ impl PubSub {
         let log_focused = self.focus == Pane::Log;
 
         // Build everything under one short lock, render after releasing it.
-        let now = SystemTime::now();
         let (status, list, log, stats_view) = {
             let store = self.store.lock();
             let row = row_at(&store, self.selected);
@@ -55,20 +57,21 @@ impl PubSub {
             };
             (
                 store.status.clone(),
-                list_lines(&store, self.selected, !log_focused, list_inner, now),
+                list_lines(&store, self.selected, !log_focused, list_inner, wall),
                 log_view(
                     &store,
                     row.as_ref(),
                     &mut self.log,
                     log_focused,
                     log_inner,
-                    now,
+                    wall,
                 ),
-                sub.map(|sub| stats_lines(sub, usize::from(stats_inner.width), now)),
+                sub.map(|sub| stats_lines(sub, usize::from(stats_inner.width), wall)),
             )
         };
         PubSubView {
             has_sub,
+            status_label: status.label(now),
             status,
             list,
             log,

@@ -11,14 +11,15 @@ use crate::{
 
 impl App {
     pub(super) fn enter_filter_popup(&mut self) {
-        self.keyspace.enter_filter_pattern();
-        self.request_filter_count();
+        let now = self.clock.now();
+        self.keyspace.enter_filter_pattern(now);
+        self.request_filter_count(now);
     }
 
     /// Ask the runner to count the filter popup's matches once its text has
     /// settled (#24).
-    pub(super) fn request_filter_count(&mut self) {
-        if let Some(pattern) = self.keyspace.filter_count_request(Instant::now()) {
+    pub(super) fn request_filter_count(&mut self, now: Instant) {
+        if let Some(pattern) = self.keyspace.filter_count_request(now) {
             self.send_redis_event(RedisEvent::CountMatches { pattern });
         }
     }

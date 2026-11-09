@@ -15,20 +15,22 @@ impl KeySpace {
         matches!(self.mode, KeySpaceMode::Popup(_))
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    /// A key typed into the filter popup at `now` (the live count waits
+    /// for the text to settle).
+    pub fn handle_key(&mut self, key: KeyEvent, now: Instant) {
         if let Some(ref mut text_area) = self.text_area {
             if text_area.input(key) {
                 if let Some(preview) = self.filter_preview.as_mut() {
-                    preview.edited_at = Instant::now();
+                    preview.edited_at = now;
                 }
             }
         }
     }
 
-    pub fn enter_filter_pattern(&mut self) {
+    pub fn enter_filter_pattern(&mut self, now: Instant) {
         self.mode = KeySpaceMode::Popup(KeySpacePopupMode::FilterPattern);
         self.text_area = Some(build_input_text_area("Pattern", "Enter pattern", None));
-        self.filter_preview = Some(FilterPreview::new(Instant::now()));
+        self.filter_preview = Some(FilterPreview::new(now));
     }
 
     /// Current text of the filter input (empty when the popup is closed).
@@ -598,14 +600,14 @@ mod tests {
     #[test]
     fn empty_filter_pattern_is_none() {
         let mut keyspace = KeySpace::new(Vec::new());
-        keyspace.enter_filter_pattern();
+        keyspace.enter_filter_pattern(Instant::now());
         assert_eq!(keyspace.confirm_filter_pattern(), None);
     }
 
     #[test]
     fn non_empty_filter_pattern_is_some() {
         let mut keyspace = KeySpace::new(Vec::new());
-        keyspace.enter_filter_pattern();
+        keyspace.enter_filter_pattern(Instant::now());
         keyspace.text_area = Some(build_input_text_area(
             "Pattern",
             "Enter pattern",
@@ -671,7 +673,7 @@ mod tests {
     #[test]
     fn filter_popup_shows_count() {
         let mut keyspace = KeySpace::new(Vec::new());
-        keyspace.enter_filter_pattern();
+        keyspace.enter_filter_pattern(Instant::now());
         assert!(render_text(&mut keyspace).contains("counting…"));
         keyspace.set_filter_count(String::new(), 42, true);
         assert!(render_text(&mut keyspace).contains("42 matches"));

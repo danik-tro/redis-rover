@@ -1,5 +1,5 @@
 use super::App;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::mode::PopupMode;
 use color_eyre::eyre::Result;
@@ -18,14 +18,15 @@ impl App {
         if action != &Action::Tick && action != &Action::Render {
             log::debug!("{action:?}");
         }
-        self.maybe_dismiss_help(action);
+        // One clock reading per action, passed down.
+        let now = self.clock.now();
+        self.maybe_dismiss_help(action, now);
         match *action {
             Action::Tick => {
-                self.expire_pending_chord();
-                self.request_filter_count();
-                let now = Instant::now();
+                self.expire_pending_chord(now);
+                self.request_filter_count(now);
                 self.toast.expire(now);
-                self.pubsub_tick(now, SystemTime::now());
+                self.pubsub_tick(now, self.clock.wall());
             }
             Action::Quit => self.should_quit = true,
             Action::Resize(w, h) => Self::resize(tui, (w, h))?,
@@ -70,7 +71,7 @@ impl App {
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
-            Action::YankFailed(ref msg) => self.toast.show(msg.clone(), false),
+            Action::YankFailed(ref msg) => self.toast.show(msg.clone(), false, now),
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
@@ -88,7 +89,7 @@ impl App {
                 self.finish_keys_fetch();
                 self.fetch_keys();
             }
-            Action::Help => self.toggle_help(),
+            Action::Help => self.toggle_help(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::FilterMatchCount {
                 ref pattern,
@@ -144,6 +145,7 @@ impl App {
                     if receivers == 1 { "" } else { "s" }
                 ),
                 false,
+                self.clock.now(),
             ),
             _ => {}
         }
@@ -168,11 +170,11 @@ impl App {
         }
     }
 
-    pub(super) fn toggle_help(&mut self) {
+    pub(super) fn toggle_help(&mut self, now: Instant) {
         self.help_opened_at = if self.help_opened_at.is_some() {
             None
         } else {
-            Some(Instant::now())
+            Some(now)
         };
     }
 
@@ -183,7 +185,7 @@ impl App {
     /// Hide the help overlay when it has been up longer than [`HELP_TIMEOUT`]
     /// (checked on `Tick`) or as soon as the user issues any real command —
     /// `Help` itself toggles it, and `Tick`/`Render` are background noise.
-    fn maybe_dismiss_help(&mut self, action: &Action) {
+    fn maybe_dismiss_help(&mut self, action: &Action, now: Instant) {
         let Some(opened_at) = self.help_opened_at else {
             return;
         };
@@ -203,7 +205,7 @@ impl App {
             | Action::YankReady
             | Action::YankFailed(_) => {}
             Action::Tick => {
-                if opened_at.elapsed() >= HELP_TIMEOUT {
+                if now.duration_since(opened_at) >= HELP_TIMEOUT {
                     self.help_opened_at = None;
                 }
             }
@@ -281,11 +283,30 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::UNIX_EPOCH};
 
+    use super::HELP_TIMEOUT;
+    use crate::action::Action;
+    use crate::app::tests::app;
+    use crate::clock::{Clock, FixedClock};
+    use crate::mode::Mode;
     use crate::mode::PopupMode;
 
-    use crate::app::tests::app;
-    use crate::mode::Mode;
+    #[test]
+    fn help_closes_on_the_tick_after_its_timeout() {
+        let mut app = app();
+        let clock = Arc::new(FixedClock::new(UNIX_EPOCH));
+        app.clock = clock.clone();
+        app.toggle_help(clock.now());
+
+        clock.advance(HELP_TIMEOUT / 2);
+        app.maybe_dismiss_help(&Action::Tick, clock.now());
+        assert!(app.help_is_open());
+
+        clock.advance(HELP_TIMEOUT / 2);
+        app.maybe_dismiss_help(&Action::Tick, clock.now());
+        assert!(!app.help_is_open());
+    }
 
     #[test]
     fn error_popup_returns_to_the_screen_it_opened_on() {

@@ -79,6 +79,7 @@ impl StatefulWidget for PubSubWidget {
         let PubSubView {
             has_sub,
             status,
+            status_label,
             list,
             log,
             stats: stats_view,
@@ -97,10 +98,7 @@ impl StatefulWidget for PubSubWidget {
 
         let mut title = vec![
             Span::raw(" Pub/Sub ── "),
-            Span::styled(
-                status.label(std::time::Instant::now()),
-                status_style(&status),
-            ),
+            Span::styled(status_label, status_style(&status)),
             Span::raw(" "),
         ];
         if state.cluster_mode {

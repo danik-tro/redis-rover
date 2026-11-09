@@ -19,9 +19,10 @@ use std::{
 use parking_lot::Mutex;
 use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
 use redis_rover::internals::{
-    render_help, ConnStatus, Dashboard, DashboardWidget, FrameData, Info, InfoSnapshot, InfoWidget,
-    KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory, Mode, PageInfo,
-    PubSub, PubSubWidget, RedisInfo, RedisType, SharedState, Target, ValuePageInfo,
+    render_help, Clock, ConnStatus, Dashboard, DashboardWidget, FixedClock, FrameData, Info,
+    InfoSnapshot, InfoWidget, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
+    MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisInfo, RedisType, SharedState,
+    Target, Toast, ToastWidget, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -247,6 +248,29 @@ fn value_hash() {
     check("value_hash", &draw_keyspace(&mut keyspace, 120, 20));
 }
 
+/// AC5: TTLs and a toast drawn at a fixed time render the same on every run.
+#[test]
+fn keys_ttl_toast() {
+    init();
+    let clock = FixedClock::new(at(0));
+    let mut keyspace = with_value(
+        "cache:page:/home",
+        KeyValue::String {
+            value: "<html>…</html>".into(),
+            total_len: 15_000,
+        },
+    );
+    let mut toast = Toast::default();
+    toast.show("Copied cache:page:/home (15000 bytes)", false, clock.now());
+    // Still up a second later.
+    clock.advance(Duration::from_secs(1));
+    toast.expire(clock.now());
+
+    let mut buf = draw_keyspace(&mut keyspace, 120, 20);
+    ToastWidget.render(buf.area, &mut buf, &mut toast);
+    check("keys_ttl_toast", &buf);
+}
+
 // ---- Footer ---------------------------------------------------------------
 
 fn sample_info() -> RedisInfo {
@@ -338,10 +362,12 @@ fn pubsub_log_paused() {
             store.push("orders", None, payload.as_bytes(), at(i));
         }
     }
+    // Five seconds after the last message: the rates are steady.
+    let clock = FixedClock::new(at(25));
     let mut pubsub = PubSub::new(store.clone());
     let area = Rect::new(0, 0, 110, 24);
     // A frame before the keys, as in the app: the log learns its height.
-    pubsub.build_view(area);
+    pubsub.build_view(area, clock.now(), clock.wall());
     pubsub.toggle_focus();
     pubsub.toggle_pause();
     pubsub.log_up();
@@ -350,7 +376,7 @@ fn pubsub_log_paused() {
     store.lock().push("orders", None, br#"{"id":20}"#, at(20));
 
     let mut buf = Buffer::empty(area);
-    let view = pubsub.build_view(area);
+    let view = pubsub.build_view(area, clock.now(), clock.wall());
     PubSubWidget { view }.render(buf.area, &mut buf, &mut pubsub);
     check("pubsub_log_paused", &buf);
 }

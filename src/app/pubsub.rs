@@ -167,7 +167,7 @@ impl App {
         }
         self.summary.pubsub_unread = if self.pubsub_visible() { 0 } else { unread };
         for msg in pubsub_notify::toasts(notices) {
-            self.toast.notify(msg);
+            self.toast.notify(msg, now);
         }
     }
 
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn pubsub_toast_never_replaces_a_sticky_toast() {
         let mut app = app_with_subs(&["chat"]);
-        app.toast.show("Copying key…", true);
+        app.toast.show("Copying key…", true, Instant::now());
         publish(&app, "chat", "hi");
         app.pubsub_tick(Instant::now(), SystemTime::now());
         assert_eq!(app.toast.message(), Some("Copying key…"));
