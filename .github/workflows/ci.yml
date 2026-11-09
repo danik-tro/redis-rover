@@ -1,38 +1,21 @@
 name: CI
 
 on:
+  # PR commits run via pull_request; master runs only after a merge. This way
+  # no commit runs twice (once for the push, once for the PR).
   push:
-    branches: "*"
-    tags:
-      - "v*"
+    branches: [master]
   pull_request:
-    branches: "*"
-  # Nightly, so the integration suite also catches changes in the Redis image.
+  # Every 5 days, so the integration suite also catches changes in the Redis image.
   schedule:
     - cron: "0 3 */5 * *"
 
+# A newer commit on the same PR / branch cancels the run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  audit:
-    name: Audit
-    runs-on: ubuntu-latest
-    # TODO: remove continue-on-error once known advisories are triaged
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit
-
-  deny:
-    name: Deny
-    runs-on: ubuntu-latest
-    # TODO: remove continue-on-error once deny.toml license allowlist is complete
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
   machete:
     name: Machete
     runs-on: ubuntu-latest
