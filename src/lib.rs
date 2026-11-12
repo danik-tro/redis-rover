@@ -16,11 +16,13 @@ mod mode;
 mod pubsub_notify;
 mod redis_client;
 mod state;
+mod target;
 mod tui;
 mod utils;
 mod widgets;
 
 pub use cli::Cli;
+pub use target::TargetError;
 
 use color_eyre::eyre::Result;
 use redis::aio::ConnectionManager;
@@ -44,10 +46,19 @@ const ACTION_CHANNEL_CAPACITY: usize = 256;
 ///
 /// # Errors
 ///
-/// Fails if logging or the panic handler can't be set up, the connection
+/// A configuration problem (unknown profile, failing `password_command`,
+/// invalid config file) is a [`TargetError`]; `main` exits with code 3 on
+/// it. Also fails if logging or the panic handler can't be set up, the connection
 /// settings are invalid, the first connection to Redis fails, or the app loop
 /// returns an error.
 pub async fn run(args: Cli) -> Result<()> {
+    // `--print-target` opens no socket and writes no log file (creating the
+    // log would truncate a running session's).
+    if args.print_target {
+        print!("{}", resolve_target(&args)?.report()?);
+        return Ok(());
+    }
+
     initialize_logging()?;
     initialize_panic_handler()?;
 
@@ -60,7 +71,8 @@ pub async fn run(args: Cli) -> Result<()> {
     // already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client = args.client()?;
+    let target = resolve_target(&args)?;
+    let client = target.client()?;
     let target = cli::connection_label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
     let manager: ConnectionManager = ConnectionManager::new(client.clone())
@@ -89,6 +101,14 @@ pub async fn run(args: Cli) -> Result<()> {
     run_result?;
 
     Ok(())
+}
+
+/// The connection target from the flags, the config's profiles and
+/// `REDIS_URL`.
+fn resolve_target(args: &Cli) -> Result<target::Target> {
+    let cfg = config::try_get().map_err(|e| TargetError::Config(e.to_string()))?;
+    let redis_url = std::env::var("REDIS_URL").ok();
+    Ok(target::resolve(args, &cfg.profiles, redis_url.as_deref())?)
 }
 
 /// Internals for the benches and integration tests. Not a stable API: anything
