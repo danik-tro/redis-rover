@@ -21,13 +21,20 @@ use redis::{aio::ConnectionManager, AsyncCommands};
 use redis_rover::internals::{
     Action, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
 };
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers::{
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+};
 use testcontainers_modules::redis::Redis;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Image every test runs against.
 pub const REDIS_TAG: &str = "7-alpine";
+/// Redis with modules (`RedisJSON` 2.x), for the JSON tests.
+pub const REDIS_STACK_IMAGE: &str = "redis/redis-stack-server";
+pub const REDIS_STACK_TAG: &str = "7.4.0-v3";
 /// How long a test waits for an expected action.
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -48,9 +55,15 @@ pub fn init() {
     });
 }
 
-/// A running `redis:7-alpine` container. Stopped and removed on drop.
+/// The container behind a [`Server`]; stopped and removed on drop.
+enum Container {
+    Redis(ContainerAsync<Redis>),
+    Stack(ContainerAsync<GenericImage>),
+}
+
+/// A running Redis container. Stopped and removed on drop.
 pub struct Server {
-    _container: ContainerAsync<Redis>,
+    _container: Container,
     pub host: String,
     pub port: u16,
 }
@@ -91,6 +104,31 @@ pub async fn start_redis() -> Server {
         .get_host_port_ipv4(6379)
         .await
         .expect("container port");
+    serve(Container::Redis(container), host, port).await
+}
+
+/// Start `redis/redis-stack-server` (`RedisJSON` 2.x and the other modules).
+pub async fn start_redis_stack() -> Server {
+    init();
+    let container = GenericImage::new(REDIS_STACK_IMAGE, REDIS_STACK_TAG)
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .expect("start redis-stack container (is Docker running?)");
+    let host = container
+        .get_host()
+        .await
+        .expect("container host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("container port");
+    serve(Container::Stack(container), host, port).await
+}
+
+async fn serve(container: Container, host: String, port: u16) -> Server {
     let server = Server {
         _container: container,
         host,
