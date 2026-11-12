@@ -1,5 +1,6 @@
 use super::{
-    format_ttl, format_ttl_detail, truncate_to_width, value_footer, Focus, KeySpace, CLUSTER_BANNER,
+    format_bytes_u128, format_ttl, format_ttl_detail, truncate_to_width, value_footer, Focus,
+    KeySpace, CLUSTER_BANNER,
 };
 
 use byte_unit::{Byte, UnitType};
@@ -16,7 +17,7 @@ use ratatui::{
 
 use crate::{
     config,
-    redis_client::types::{KeyValue, TYPE_BADGE_WIDTH},
+    redis_client::types::{JsonField, JsonPreview, JsonPreviewKind, KeyValue, TYPE_BADGE_WIDTH},
     widgets::text_view::{self, TextLabels},
 };
 
@@ -123,7 +124,7 @@ impl KeySpaceWidget {
         };
 
         if let Some(cache) = state.text_cache.as_ref() {
-            let footer = value_footer(loaded, state.value_loading);
+            let footer = value_footer(loaded, state.value_loading, &state.json_path);
             text_view::render(
                 cache,
                 &TextLabels {
@@ -140,7 +141,7 @@ impl KeySpaceWidget {
             return;
         }
 
-        let view_area = match value_footer(loaded, state.value_loading) {
+        let view_area = match value_footer(loaded, state.value_loading, &state.json_path) {
             Some(footer) => {
                 let [value_area, footer_area] =
                     Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(view_area);
@@ -177,8 +178,15 @@ impl KeySpaceWidget {
                     .collect();
                 Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
             }
+            KeyValue::JsonPreview(JsonPreview {
+                kind: JsonPreviewKind::Object { fields, .. },
+                ..
+            }) => Self::render_json_fields(fields, area, buf, table_state),
             // STRING / JSON go through `text_view::render`.
-            KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => {
+            KeyValue::String { .. }
+            | KeyValue::Json(_)
+            | KeyValue::JsonPreview(_)
+            | KeyValue::Unknown => {
                 Self::render_placeholder(
                     vec![Line::from("Viewer for this type isn't supported yet")],
                     area,
@@ -186,6 +194,41 @@ impl KeySpaceWidget {
                 );
             }
         }
+    }
+
+    /// The fields of a JSON object preview: name, type and size.
+    fn render_json_fields(
+        fields: &[JsonField],
+        area: Rect,
+        buf: &mut Buffer,
+        table_state: &mut TableState,
+    ) {
+        let cfg = config::get();
+        let widths = [
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(11),
+        ];
+        let header = Row::new([Cell::from("Field"), Cell::from("Type"), Cell::from("Size")])
+            .bottom_margin(1)
+            .fg(cfg.colors.base03)
+            .bold();
+        let rows = fields.iter().map(|field| {
+            Row::new([
+                Cell::from(field.name.as_str()).fg(cfg.colors.base05),
+                Cell::from(field.json_type.as_str()).fg(cfg.colors.base04),
+                Cell::from(format_bytes_u128(u128::from(field.bytes))).fg(cfg.colors.base04),
+            ])
+        });
+        let table = Table::new(rows, widths)
+            .header(header)
+            .column_spacing(2)
+            .highlight_symbol(highlight_symbol())
+            .row_highlight_style(selected_row_style())
+            .highlight_spacing(HighlightSpacing::Always);
+
+        StatefulWidget::render(table, area, buf, table_state);
+        render_header_rule(area, buf);
     }
 
     fn render_single_column_table(

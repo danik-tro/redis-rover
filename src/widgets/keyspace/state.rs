@@ -1,7 +1,9 @@
 use super::KeySpace;
 
 use crate::{
-    redis_client::types::{ItemDelete, KeyMeta, KeyValue, KeyspaceState, LoadedValue},
+    redis_client::types::{
+        ItemDelete, JsonPreview, JsonPreviewKind, KeyMeta, KeyValue, KeyspaceState, LoadedValue,
+    },
     widgets::text_view::{TextCache, TextView},
 };
 
@@ -194,7 +196,17 @@ impl KeySpace {
             Some(KeyValue::List(items) | KeyValue::Set(items)) => items.len(),
             Some(KeyValue::Hash(entries)) => entries.len(),
             Some(KeyValue::Zset(entries)) => entries.len(),
-            Some(KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown) | None => 0,
+            Some(KeyValue::JsonPreview(JsonPreview {
+                kind: JsonPreviewKind::Object { fields, .. },
+                ..
+            })) => fields.len(),
+            Some(
+                KeyValue::String { .. }
+                | KeyValue::Json(_)
+                | KeyValue::JsonPreview(_)
+                | KeyValue::Unknown,
+            )
+            | None => 0,
         }
     }
 
@@ -239,7 +251,40 @@ impl KeySpace {
                 member: m.clone(),
                 score: *s,
             }),
-            KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => None,
+            KeyValue::String { .. }
+            | KeyValue::Json(_)
+            | KeyValue::JsonPreview(_)
+            | KeyValue::Unknown => None,
+        }
+    }
+
+    /// The field the cursor is on in a JSON object preview, if value-focused.
+    pub fn selected_json_field(&self) -> Option<String> {
+        if !self.is_value_focused() {
+            return None;
+        }
+        let row = self.value_table.selected()?;
+        match &self.selected_value.as_ref()?.value {
+            KeyValue::JsonPreview(JsonPreview {
+                kind: JsonPreviewKind::Object { fields, .. },
+                ..
+            }) => fields.get(row).map(|field| field.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The JSON field path the loaded value belongs to (shown in its footer).
+    pub fn set_json_path(&mut self, path: Vec<String>) {
+        self.json_path = path;
+    }
+
+    /// Put focus in the value after a JSON field opened or closed: on its
+    /// text, or on row `row` of its field table.
+    pub fn focus_value_at(&mut self, row: usize) {
+        if self.text_cache.is_some() {
+            self.focus = Focus::Text;
+        } else {
+            self.restore_value_focus(row);
         }
     }
 

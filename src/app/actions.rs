@@ -246,7 +246,10 @@ impl App {
         }
 
         if self.keyspace.is_value_focused() || self.keyspace.is_text_focused() {
-            self.keyspace.exit_value_focus();
+            // Inside an opened JSON field, Esc goes back one level first.
+            if !self.close_json_field() {
+                self.keyspace.exit_value_focus();
+            }
             return;
         }
 
@@ -306,6 +309,78 @@ mod tests {
         clock.advance(HELP_TIMEOUT / 2);
         app.maybe_dismiss_help(&Action::Tick, clock.now());
         assert!(!app.help_is_open());
+    }
+
+    /// #49: Enter on a field of a JSON preview opens it, Esc goes back to the
+    /// preview on the same row.
+    #[test]
+    fn json_preview_field_opens_and_closes() {
+        use crate::app::tests::{app_with_channels, meta};
+        use crate::redis_client::{
+            event::RedisEvent,
+            types::{
+                JsonField, JsonPreview, JsonPreviewKind, KeyValue, LoadedValue, RedisType,
+                ValuePageInfo,
+            },
+        };
+
+        let (mut app, _cmds, mut redis_rx) = app_with_channels();
+        let mut doc = meta("doc");
+        doc.r_type = RedisType::Json;
+        doc.size = 50 << 20;
+        app.keyspace.set_keys(vec![doc]);
+        assert!(app.keyspace.select_key_by_name("doc"));
+        app.request_selected_value();
+        assert_eq!(
+            app.state.value_state.lock().size,
+            Some(50 << 20),
+            "KeyMeta's size reaches the fetch"
+        );
+
+        let field = |name: &str| JsonField {
+            name: name.into(),
+            json_type: "object".into(),
+            bytes: 10,
+        };
+        let preview = LoadedValue {
+            value: KeyValue::JsonPreview(JsonPreview {
+                bytes: 50 << 20,
+                kind: JsonPreviewKind::Object {
+                    len: 2,
+                    fields: vec![field("a"), field("b")],
+                },
+            }),
+            page: ValuePageInfo::default(),
+        };
+        app.keyspace.set_selected_value(Some(preview.clone()));
+        app.keyspace.enter_value();
+        app.keyspace.scroll_next();
+        while redis_rx.try_recv().is_ok() {}
+
+        app.enter_value();
+        assert_eq!(app.state.value_state.lock().json_path, vec!["b"]);
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchValue)));
+
+        // The field loads as JSON text and gets the focus.
+        *app.state.selected_value.lock() = Some(LoadedValue {
+            value: KeyValue::Json(serde_json::json!({ "x": 1 })),
+            page: ValuePageInfo::default(),
+        });
+        app.load_selected_value();
+        assert!(app.keyspace.is_text_focused());
+
+        // Esc: back to the preview, on row 1 ("b").
+        app.close_popup();
+        assert!(app.state.value_state.lock().json_path.is_empty());
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchValue)));
+        *app.state.selected_value.lock() = Some(preview);
+        app.load_selected_value();
+        assert_eq!(app.keyspace.selected_json_field().as_deref(), Some("b"));
+
+        // Esc at the root leaves the value as before.
+        app.close_popup();
+        assert!(!app.keyspace.is_value_focused());
+        assert!(redis_rx.try_recv().is_err(), "nothing to fetch");
     }
 
     #[test]

@@ -10,7 +10,12 @@ use ratatui::{
     widgets::{Paragraph, Widget, Wrap},
 };
 
-use crate::{config, redis_client::types::KeyValue, utils::group_thousands};
+use crate::{
+    config,
+    redis_client::types::{JsonPreviewKind, KeyValue},
+    utils::group_thousands,
+    widgets::keyspace::format_bytes,
+};
 
 /// Scroll state of a text in the viewer (#30). The limits are measured by
 /// the last render.
@@ -97,6 +102,18 @@ impl TextCache {
                 lines: json_lines(json),
                 json: true,
             }),
+            KeyValue::JsonPreview(preview) => match &preview.kind {
+                JsonPreviewKind::Array { items, .. } => Some(Self {
+                    lines: json_lines(items),
+                    json: true,
+                }),
+                JsonPreviewKind::TooLarge { json_type } => Some(Self::from_lines(too_large_lines(
+                    preview.bytes,
+                    json_type.as_deref(),
+                ))),
+                // A table of its fields.
+                JsonPreviewKind::Object { .. } => None,
+            },
             KeyValue::List(_)
             | KeyValue::Set(_)
             | KeyValue::Hash(_)
@@ -130,6 +147,21 @@ impl TextCache {
             lines.push(Line::default());
         }
         Self { lines, json: false }
+    }
+}
+
+/// What a JSON preview says when there is nothing it can show.
+fn too_large_lines(bytes: u64, json_type: Option<&str>) -> Vec<String> {
+    let size = format_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
+    match json_type {
+        Some(json_type) => vec![
+            format!("This {json_type} is {size}, above keyspace.json_preview_bytes."),
+            "Only objects and arrays have a preview. y copies it whole.".into(),
+        ],
+        None => vec![
+            format!("This document is {size}, above keyspace.json_preview_bytes."),
+            "A preview needs RedisJSON 2 or later ($ paths). y copies it whole.".into(),
+        ],
     }
 }
 

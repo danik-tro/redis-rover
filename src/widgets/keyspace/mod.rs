@@ -63,6 +63,8 @@ pub struct KeySpace {
     /// Key rows that fit in the table on the last render (0 before the first
     /// render). The app sizes keyspace pages to it.
     visible_rows: usize,
+    /// JSON field opened from a preview that the loaded value shows.
+    json_path: Vec<String>,
 }
 
 /// Banner shown above the key table in cluster mode.
@@ -92,6 +94,7 @@ impl KeySpace {
             edit_item: None,
             cluster_mode: false,
             visible_rows: 0,
+            json_path: Vec::new(),
         }
     }
 
@@ -129,7 +132,7 @@ impl KeySpace {
             KeyValue::List(_) | KeyValue::Set(_) | KeyValue::Hash(_) | KeyValue::Zset(_) => {
                 !loaded.page.is_paged()
             }
-            KeyValue::Unknown => false,
+            KeyValue::JsonPreview(_) | KeyValue::Unknown => false,
         };
         if !whole {
             return None;

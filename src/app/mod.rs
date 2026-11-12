@@ -63,6 +63,12 @@ pub struct App {
     /// After turning a value page with `j` / `k` / `n` / `p`, the row to select
     /// once the new page loads (`usize::MAX` = last row; clamped).
     page_turn_row: Option<usize>,
+    /// For each JSON field opened from a preview (#49), the preview row it
+    /// was opened from, so Esc lands back on it.
+    json_rows: Vec<usize>,
+    /// A JSON field was opened or closed: once its value loads, focus it
+    /// (its text, or this row of its field table).
+    json_focus_row: Option<usize>,
 
     should_quit: bool,
     /// Keys of a partially typed chord (a strict prefix of some binding).
@@ -138,6 +144,8 @@ impl App {
             restore_value_row: None,
             restore_value_pending: false,
             page_turn_row: None,
+            json_rows: Vec::new(),
+            json_focus_row: None,
             pending_keys: Vec::new(),
             last_key_at: None,
             keys_in_flight: 0,

@@ -4,7 +4,9 @@ use byte_unit::{Byte, UnitType};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    redis_client::types::{KeyValue, LoadedValue, STRING_PREVIEW_BYTES},
+    redis_client::types::{
+        JsonPreview, JsonPreviewKind, KeyValue, LoadedValue, ValuePageInfo, STRING_PREVIEW_BYTES,
+    },
     utils::{format_duration, group_thousands},
 };
 
@@ -34,7 +36,12 @@ pub(super) fn format_ttl_detail(ttl: isize) -> String {
 /// One-line paging / truncation summary shown under the value, e.g.
 /// `Items 101–200 of 12,345 · n/p page`. `None` when there's nothing to say
 /// (an untruncated STRING, an empty collection, an unsupported type).
-pub(super) fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String> {
+/// `json_path` is the JSON field opened from a preview, if any.
+pub(super) fn value_footer(
+    loaded: &LoadedValue,
+    loading: bool,
+    json_path: &[String],
+) -> Option<String> {
     let noun = match &loaded.value {
         KeyValue::String { value, total_len } => {
             if !loaded.value.is_truncated() {
@@ -47,7 +54,19 @@ pub(super) fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String
         KeyValue::List(_) => "Items",
         KeyValue::Hash(_) => "Fields",
         KeyValue::Set(_) | KeyValue::Zset(_) => "Members",
-        KeyValue::Json(_) | KeyValue::Unknown => return None,
+        KeyValue::Json(_) => {
+            return (!json_path.is_empty())
+                .then(|| format!("{} · Esc back", display_json_path(json_path)));
+        }
+        KeyValue::JsonPreview(preview) => {
+            return Some(json_preview_footer(
+                preview,
+                loaded.page,
+                loading,
+                json_path,
+            ));
+        }
+        KeyValue::Unknown => return None,
     };
     let page = loaded.page;
     if page.len == 0 {
@@ -69,6 +88,79 @@ pub(super) fn value_footer(loaded: &LoadedValue, loading: bool) -> Option<String
         footer.push_str(" · loading…");
     }
     Some(footer)
+}
+
+/// `14.21 MiB preview · fields 1–100 of 50,000 · n/p page · Enter opens`, led
+/// by the opened field's path, if any. Kept short: it must fit the value pane
+/// at 80 columns.
+fn json_preview_footer(
+    preview: &JsonPreview,
+    page: ValuePageInfo,
+    loading: bool,
+    json_path: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if !json_path.is_empty() {
+        parts.push(display_json_path(json_path));
+    }
+    parts.push(format!(
+        "{} preview",
+        format_bytes_u128(u128::from(preview.bytes))
+    ));
+    match &preview.kind {
+        JsonPreviewKind::Object { len, fields } => {
+            if !fields.is_empty() {
+                parts.push(format!(
+                    "fields {}–{} of {}",
+                    group_thousands(page.start + 1),
+                    group_thousands(page.start + fields.len()),
+                    group_thousands(*len)
+                ));
+            }
+            if page.is_paged() {
+                parts.push("n/p page".into());
+            }
+            parts.push("Enter opens".into());
+        }
+        JsonPreviewKind::Array { len, items } => {
+            let shown = items.as_array().map_or(0, Vec::len);
+            parts.push(format!(
+                "first {} of {} items",
+                group_thousands(shown),
+                group_thousands(*len)
+            ));
+        }
+        JsonPreviewKind::TooLarge { .. } => {}
+    }
+    if !json_path.is_empty() {
+        parts.push("Esc back".into());
+    }
+    if loading {
+        parts.push("loading…".into());
+    }
+    parts.join(" · ")
+}
+
+/// A JSON field path as shown to the user: `$.orders["2024-01"]`. Plain
+/// identifiers use dot notation, anything else a quoted bracket.
+pub(super) fn display_json_path(path: &[String]) -> String {
+    let mut out = String::from("$");
+    for name in path {
+        let plain = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if plain {
+            out.push('.');
+            out.push_str(name);
+        } else {
+            out.push('[');
+            out.push_str(&serde_json::Value::from(name.as_str()).to_string());
+            out.push(']');
+        }
+    }
+    out
 }
 
 /// Human byte size, matching the Size field (`64.00 KiB`).
@@ -112,15 +204,81 @@ mod tests {
     use crate::utils::group_thousands;
     use crate::widgets::keyspace::tests::list_page;
 
+    fn object_preview(fields: usize, len: usize) -> LoadedValue {
+        LoadedValue {
+            value: KeyValue::JsonPreview(JsonPreview {
+                bytes: 14_900_000,
+                kind: JsonPreviewKind::Object {
+                    len,
+                    fields: (0..fields)
+                        .map(|i| crate::redis_client::types::JsonField {
+                            name: format!("f{i}"),
+                            json_type: "object".into(),
+                            bytes: 10,
+                        })
+                        .collect(),
+                },
+            }),
+            page: ValuePageInfo {
+                start: 0,
+                len: fields,
+                total: Some(len),
+                has_next: fields < len,
+                has_prev: false,
+            },
+        }
+    }
+
+    #[test]
+    fn json_preview_footer_text() {
+        assert_eq!(
+            value_footer(&object_preview(100, 50_000), false, &[]).as_deref(),
+            Some("14.21 MiB preview · fields 1–100 of 50,000 · n/p page · Enter opens")
+        );
+        let opened = ["orders".to_string(), "2024-01".to_string()];
+        assert_eq!(
+            value_footer(&object_preview(2, 2), true, &opened).as_deref(),
+            Some(
+                "$.orders[\"2024-01\"] · 14.21 MiB preview · fields 1–2 of 2 · Enter opens · \
+                 Esc back · loading…"
+            )
+        );
+
+        let array = LoadedValue {
+            value: KeyValue::JsonPreview(JsonPreview {
+                bytes: 2 << 20,
+                kind: JsonPreviewKind::Array {
+                    len: 1_000_000,
+                    items: serde_json::json!([1, 2, 3]),
+                },
+            }),
+            page: ValuePageInfo::default(),
+        };
+        assert_eq!(
+            value_footer(&array, false, &[]).as_deref(),
+            Some("2.00 MiB preview · first 3 of 1,000,000 items")
+        );
+
+        let field = LoadedValue {
+            value: KeyValue::Json(serde_json::json!({"a": 1})),
+            page: ValuePageInfo::default(),
+        };
+        assert_eq!(value_footer(&field, false, &[]), None, "a whole document");
+        assert_eq!(
+            value_footer(&field, false, &["orders".into()]).as_deref(),
+            Some("$.orders · Esc back")
+        );
+    }
+
     #[test]
     fn value_footer_text() {
         let page = list_page(100, 100, true, true);
         assert_eq!(
-            value_footer(&page, false).as_deref(),
+            value_footer(&page, false, &[]).as_deref(),
             Some("Items 101–200 of 1,000 · n/p page")
         );
         assert_eq!(
-            value_footer(&page, true).as_deref(),
+            value_footer(&page, true, &[]).as_deref(),
             Some("Items 101–200 of 1,000 · n/p page · loading…")
         );
 
@@ -133,7 +291,7 @@ mod tests {
             },
         };
         assert_eq!(
-            value_footer(&small, false).as_deref(),
+            value_footer(&small, false, &[]).as_deref(),
             Some("Members 1–1 of 1")
         );
 
@@ -144,7 +302,7 @@ mod tests {
             },
             page: ValuePageInfo::default(),
         };
-        assert_eq!(value_footer(&full, false), None);
+        assert_eq!(value_footer(&full, false, &[]), None);
 
         let cut = LoadedValue {
             value: KeyValue::String {
@@ -154,7 +312,7 @@ mod tests {
             page: ValuePageInfo::default(),
         };
         assert_eq!(
-            value_footer(&cut, false).as_deref(),
+            value_footer(&cut, false, &[]).as_deref(),
             Some("Showing first 1.00 KiB of 2.00 KiB")
         );
     }

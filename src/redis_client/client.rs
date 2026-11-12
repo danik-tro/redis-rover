@@ -6,8 +6,9 @@ use redis::{aio::ConnectionManager, AsyncCommands};
 
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{
-    ItemDelete, ItemEdit, KeyItem, KeyValue, LoadedValue, NewKeySpec, RedisInfo, RedisType,
-    ScanSweep, ValuePageInfo, ValueState, STRING_PREVIEW_BYTES,
+    json_path, ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyValue,
+    LoadedValue, NewKeySpec, RedisInfo, RedisType, ScanSweep, ValuePageInfo, ValueState,
+    JSON_PREVIEW_ITEMS, STRING_PREVIEW_BYTES,
 };
 
 /// Elements per command when fetching a whole collection for copying.
@@ -101,19 +102,16 @@ pub async fn fetch_value_page(
             ));
         }
         RedisType::Json => {
-            // RedisJSON: the whole document, as JSON text.
-            let raw: String = redis::cmd("JSON.GET")
-                .arg(&key)
-                .query_async(manager)
-                .await?;
-            state.total = None;
-            return Ok((
-                state,
-                LoadedValue {
-                    value: KeyValue::Json(serde_json::from_str(&raw)?),
-                    page: ValuePageInfo::default(),
-                },
-            ));
+            let value = fetch_json(manager, &key, &mut state).await?;
+            let len = match &value {
+                KeyValue::JsonPreview(JsonPreview {
+                    kind: JsonPreviewKind::Object { fields, .. },
+                    ..
+                }) => fields.len(),
+                _ => 0,
+            };
+            let page = state.page_info(len);
+            return Ok((state, LoadedValue { value, page }));
         }
         RedisType::List => {
             let mut items = fetch_list_window(manager, &key, &mut state).await?;
@@ -161,10 +159,215 @@ pub async fn fetch_value_page(
         KeyValue::List(items) | KeyValue::Set(items) => items.len(),
         KeyValue::Hash(entries) => entries.len(),
         KeyValue::Zset(entries) => entries.len(),
-        KeyValue::String { .. } | KeyValue::Json(_) | KeyValue::Unknown => 0,
+        KeyValue::String { .. }
+        | KeyValue::Json(_)
+        | KeyValue::JsonPreview(_)
+        | KeyValue::Unknown => 0,
     };
     let page = state.page_info(len);
     Ok((state, LoadedValue { value, page }))
+}
+
+/// Load the JSON value `state` points at: the document, or the field
+/// `state.json_path` opened. Up to `state.json_cap` bytes it is read whole;
+/// above, only its shape (#49):
+///
+/// - object: its top-level field names (`JSON.OBJKEYS`, once per sweep, kept
+///   in `state.sweep.names`), then type and size of the current page's fields;
+/// - array: its length and first [`JSON_PREVIEW_ITEMS`] items;
+/// - anything else: just its type.
+///
+/// Uses `$` paths (`RedisJSON` 2.x). The root is read without a path, so a
+/// document under the cap loads on `RedisJSON` 1.x too; above the cap, a server
+/// that rejects `$` paths gets [`JsonPreviewKind::TooLarge`].
+async fn fetch_json(
+    manager: &mut ConnectionManager,
+    key: &str,
+    state: &mut ValueState,
+) -> Result<KeyValue, BoxError> {
+    state.total = None;
+    let at_root = state.json_path.is_empty();
+    let path = json_path(&state.json_path);
+    let cap = u64::try_from(state.json_cap).unwrap_or(u64::MAX);
+
+    let bytes = if let Some(bytes) = state.size.filter(|_| at_root) {
+        bytes
+    } else {
+        let mut cmd = redis::cmd("JSON.DEBUG");
+        cmd.arg("MEMORY").arg(key);
+        if !at_root {
+            cmd.arg(&path);
+        }
+        first_u64(&cmd.query_async(manager).await?).unwrap_or(0)
+    };
+
+    if bytes <= cap {
+        let mut cmd = redis::cmd("JSON.GET");
+        cmd.arg(key);
+        if !at_root {
+            cmd.arg(&path);
+        }
+        let raw: String = cmd.query_async(manager).await?;
+        let mut json: serde_json::Value = serde_json::from_str(&raw)?;
+        if !at_root {
+            // `$` paths answer with the list of matches.
+            json = first_match(json).ok_or("JSON field not found")?;
+        }
+        return Ok(KeyValue::Json(json));
+    }
+
+    let json_type: redis::Value = match redis::cmd("JSON.TYPE")
+        .arg(key)
+        .arg(&path)
+        .query_async(manager)
+        .await
+    {
+        Ok(reply) => reply,
+        // RedisJSON 1.x has no `$` paths: show the size only.
+        Err(err) if is_server_error(&err) => {
+            log::debug!("JSON.TYPE {key} {path} failed, no preview: {err}");
+            return Ok(json_preview(
+                bytes,
+                JsonPreviewKind::TooLarge { json_type: None },
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let json_type = first_string(&json_type).ok_or("JSON value not found")?;
+
+    let kind = match json_type.as_str() {
+        "object" => {
+            if !state.sweep.done {
+                let names: redis::Value = redis::cmd("JSON.OBJKEYS")
+                    .arg(key)
+                    .arg(&path)
+                    .query_async(manager)
+                    .await?;
+                state.sweep.names = first_strings(&names);
+                state.sweep.done = true;
+            }
+            state.total = Some(state.sweep.names.len());
+            state.clamp_page();
+            let start = state.page_start().min(state.sweep.names.len());
+            let end = (start + state.page_size).min(state.sweep.names.len());
+            let names = &state.sweep.names[start..end];
+            JsonPreviewKind::Object {
+                len: state.sweep.names.len(),
+                fields: fetch_json_fields(manager, key, &state.json_path, names).await?,
+            }
+        }
+        "array" => {
+            let (len, items): (redis::Value, String) = redis::pipe()
+                .cmd("JSON.ARRLEN")
+                .arg(key)
+                .arg(&path)
+                .cmd("JSON.GET")
+                .arg(key)
+                .arg(format!("{path}[0:{JSON_PREVIEW_ITEMS}]"))
+                .query_async(manager)
+                .await?;
+            JsonPreviewKind::Array {
+                len: usize::try_from(first_u64(&len).unwrap_or(0)).unwrap_or(usize::MAX),
+                items: serde_json::from_str(&items)?,
+            }
+        }
+        _ => JsonPreviewKind::TooLarge {
+            json_type: Some(json_type),
+        },
+    };
+    Ok(json_preview(bytes, kind))
+}
+
+fn json_preview(bytes: u64, kind: JsonPreviewKind) -> KeyValue {
+    KeyValue::JsonPreview(JsonPreview { bytes, kind })
+}
+
+/// Type and size of the fields `names` of the object at `parent`, in one
+/// pipeline.
+async fn fetch_json_fields(
+    manager: &mut ConnectionManager,
+    key: &str,
+    parent: &[String],
+    names: &[String],
+) -> Result<Vec<JsonField>, BoxError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = redis::pipe();
+    let mut path = parent.to_vec();
+    for name in names {
+        path.push(name.clone());
+        let field = json_path(&path);
+        path.pop();
+        pipe.cmd("JSON.TYPE")
+            .arg(key)
+            .arg(&field)
+            .cmd("JSON.DEBUG")
+            .arg("MEMORY")
+            .arg(key)
+            .arg(&field);
+    }
+    let replies: Vec<redis::Value> = pipe.query_async(manager).await?;
+    let mut replies = replies.iter();
+    let mut fields = Vec::with_capacity(names.len());
+    for name in names {
+        let (Some(json_type), Some(bytes)) = (replies.next(), replies.next()) else {
+            return Err("pipeline response truncated".into());
+        };
+        fields.push(JsonField {
+            name: name.clone(),
+            json_type: first_string(json_type).unwrap_or_else(|| "?".into()),
+            bytes: first_u64(bytes).unwrap_or(0),
+        });
+    }
+    Ok(fields)
+}
+
+/// The server answered with an error (as opposed to a lost connection).
+fn is_server_error(err: &redis::RedisError) -> bool {
+    !(err.is_io_error() || err.is_connection_dropped() || err.is_timeout())
+}
+
+/// First match of a `$` path reply: the reply itself for a plain value
+/// (no path), the first element of a list of matches.
+fn first_reply(value: &redis::Value) -> &redis::Value {
+    match value {
+        redis::Value::Array(items) => items.first().unwrap_or(value),
+        other => other,
+    }
+}
+
+fn first_u64(value: &redis::Value) -> Option<u64> {
+    match first_reply(value) {
+        redis::Value::Int(n) => u64::try_from(*n).ok(),
+        other => <u64 as redis::FromRedisValue>::from_redis_value_ref(other).ok(),
+    }
+}
+
+fn first_string(value: &redis::Value) -> Option<String> {
+    match first_reply(value) {
+        redis::Value::Array(_) | redis::Value::Nil => None,
+        other => <String as redis::FromRedisValue>::from_redis_value_ref(other).ok(),
+    }
+}
+
+/// `JSON.OBJKEYS key $` answers `[[name, …]]`; `JSON.OBJKEYS key` `[name, …]`.
+fn first_strings(value: &redis::Value) -> Vec<String> {
+    let list = match value {
+        redis::Value::Array(items) if matches!(items.first(), Some(redis::Value::Array(_))) => {
+            &items[0]
+        }
+        other => other,
+    };
+    <Vec<String> as redis::FromRedisValue>::from_redis_value_ref(list).unwrap_or_default()
+}
+
+/// The first match in a `$` path `JSON.GET` reply (a JSON array of matches).
+fn first_match(json: serde_json::Value) -> Option<serde_json::Value> {
+    match json {
+        serde_json::Value::Array(matches) => matches.into_iter().next(),
+        _ => None,
+    }
 }
 
 /// Fetch a key's whole value, for copying it (#27). Collections are read in
