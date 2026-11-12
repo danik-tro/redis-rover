@@ -18,7 +18,9 @@ use std::{
 };
 
 use redis::{aio::ConnectionManager, AsyncCommands};
-use redis_rover::internals::{Action, PubSubCmd, RedisEvent, Runner, SharedState};
+use redis_rover::internals::{
+    Action, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
+};
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::redis::Redis;
 use tokio::sync::{broadcast, mpsc};
@@ -117,6 +119,23 @@ pub async fn wait_for_ping(client: &redis::Client) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+/// Slows every value fetch by `ms` until dropped (the runner's test hook), so
+/// a test can keep one fetch in flight without stalling the server.
+pub struct ValueDelay;
+
+impl ValueDelay {
+    pub fn set(ms: u64) -> Self {
+        VALUE_FETCH_DELAY_MS.store(ms, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ValueDelay {
+    fn drop(&mut self) {
+        VALUE_FETCH_DELAY_MS.store(0, Ordering::Relaxed);
     }
 }
 
