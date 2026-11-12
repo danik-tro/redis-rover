@@ -49,8 +49,38 @@ First public release. Requires Rust 1.97 or newer.
   read whole. Objects list their top-level fields with type and size (100 per page, `Enter`
   opens a field, `Esc` goes back), arrays show their first 100 items. A 50 MB document
   previews in about 70 ms instead of freezing the pane. Needs RedisJSON 2 (`$` paths).
+- Connection profiles: a `profiles` section in the config (`url`, `environment`, `db`,
+  `read_only`, `tls`, `password_command`), used with `rrover <name>` or `--profile <name>`.
+  `--db` picks the starting DB. An unknown profile exits with code 3 and lists the defined
+  ones.
+- `password_command` in a profile: the password comes from a command (`op`, `pass`,
+  `security`). It runs before the TUI starts and its output is never logged. If it fails,
+  `rrover` shows its stderr and exits with code 3.
+- Environments (`local`, `staging`, `prod`, `unknown`), set by a profile or inferred
+  from the host. The footer badge names the environment (`PROD · RO`), and a line in its
+  colour runs along the top of the screen. The colours are configurable with
+  `colors.env_*`.
+- A preview of the exact Redis command before every write (`HSET "user:1" "name" "Ada"`,
+  quoted like `redis-cli`). `y` runs it, and `n` / `Esc` cancels. `safety.preview`
+  (`writes`, `destructive`, `off`) picks which writes are previewed; `prod` previews
+  every write.
+- On `prod`, deleting a key needs its name typed first.
+- `Shift-r` toggles read-only during the session (asks first on `prod`).
+- `--print-target` prints the resolved target and where each setting came from (password
+  masked), without connecting. `--probe` connects and reports PING, server version, role,
+  cluster and RESP3 support. A pre-6.0 server reports `RESP3: no` and still exits 0.
 
 ### Changed
+
+- `prod` and `unknown` servers (any host that isn't loopback or a unix socket, unless a
+  profile says otherwise) start read-only. `--writable` lifts it for one run, and
+  `--read-only` still wins. A plain `rrover` on localhost is writable as before.
+- With no `--url` or profile, `rrover` connects to `$REDIS_URL` when it is set.
+- Writes show their commands in a popup first (see Added). Deleting a key or an item
+  confirms once, in that popup, instead of in the old "Delete …?" box, which is now used
+  only with `safety.preview = "off"`.
+- The footer's ` RO ` badge is now the environment badge (` LOCAL `, ` PROD · RO `, …).
+- A partial `colors` table in the user config no longer fails to load.
 
 - Paging deep into a big keyspace is as fast as the first page: a page turn no longer
   copies every key swept so far (52.95 ms → 3.3 µs at 1M keys, the same at 10M).

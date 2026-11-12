@@ -42,18 +42,115 @@ Requires Rust 1.97 or newer.
 ## Usage
 
 ```bash
-rrover
+rrover                 # localhost:6379
+rrover prod            # a profile from your config
+rrover -u redis://10.0.0.5:6379
 ```
 
-Connects to Redis at `localhost:6379` by default. Use `-u/--url` to pick a server and `--token` to type a password without it showing up in your shell history.
+With no flags, `rrover` connects to `$REDIS_URL` if it is set, else to `localhost:6379`. Use `-u/--url` to pick a server, a [profile](#profiles) to keep servers in the config, and `--token` to type a password without it showing up in your shell history.
 
 | Flag | Meaning |
 |---|---|
-| `-u, --url <URL>` | Redis URL. Default `redis://localhost:6379`. A path picks the starting DB, e.g. `redis://localhost:6379/3`. |
+| `PROFILE`, `--profile <NAME>` | Connect with a profile from the config. See [Profiles](#profiles). |
+| `-u, --url <URL>` | Redis URL. A path picks the starting DB, e.g. `redis://localhost:6379/3`. |
+| `--db <N>` | Starting DB; overrides the URL path. |
 | `--token` | Prompt for the password (input is hidden). |
-| `--read-only` | Block every write. See [Read-only mode](#read-only-mode). |
+| `--read-only` | Block every write. Always wins. See [Read-only mode](#read-only-mode). |
+| `--writable` | Start writable on a `prod` or `unknown` server, which start read-only. See [Environments](#environments). |
+| `--print-target` | Print where `rrover` would connect, and where each setting came from, then exit. Opens no connection. |
+| `--probe` | Connect, print a short report (PING, server version, role, cluster, RESP3), then exit. |
 | `--tls-ca`, `--tls-cert`, `--tls-key`, `--insecure` | TLS options. See [TLS](#tls). |
 | `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. A frame is drawn only when something on screen changed, so an idle key list redraws a few times a minute. |
+
+Each setting is taken from the first place that sets it:
+
+| Setting | Order |
+|---|---|
+| URL | `--url` > profile `url` > `$REDIS_URL` > `redis://localhost:6379` |
+| DB | `--db` > profile `db` > the URL path > 0 |
+| TLS files | each `--tls-*` flag > profile `tls` |
+| Password | `--token` > profile `password_command` > the URL |
+| Environment | profile `environment` > inferred from the host |
+| Read-only | `--read-only` > `--writable` > profile `read_only` > the environment's default |
+
+```console
+$ rrover prod --print-target
+profile     prod
+target      rediss://redis.example.com:6380                     (profile prod)
+db          0                                                   (default)
+tls         on, verified with the bundled roots                 (url)
+user        default
+password    from `op read op://vault/redis/password` (not run)  (password_command)
+environment prod                                                (profile prod)
+read-only   yes                                                 (environment default)
+
+$ rrover --probe
+target    redis://localhost:6379
+PING      PONG (1.9 ms incl. connect)
+server    Redis 7.4.1 (standalone)
+role      master
+cluster   no
+RESP3     yes
+```
+
+`--probe` exits 0 even when the server is older than 6.0 (`RESP3: no`). It exits 1 if it can't connect. An unknown profile, a failing `password_command` or an invalid config file exits with code 3.
+
+### Profiles
+
+Keep the servers you use in the `profiles` section of your [config](#configuration), then connect with `rrover <name>` (or `--profile <name>`):
+
+```json5
+{
+  "profiles": {
+    "local": { "url": "redis://localhost:6379" },
+    "staging": {
+      "url": "redis://staging-cache.internal:6379",
+      "environment": "staging",
+      "db": 2,
+    },
+    "prod": {
+      "url": "rediss://default@prod-cache.example.com:6380",
+      "environment": "prod",
+      "password_command": "op read op://vault/redis-prod/password",
+      "tls": { "ca": "~/certs/prod-ca.pem" },
+    },
+  },
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `url` | Redis URL. `--url` still wins. |
+| `environment` | `local`, `staging`, `prod` or `unknown`. Inferred from the host when unset. |
+| `db` | Starting DB. `--db` still wins. |
+| `read_only` | `true` / `false` overrides the environment's default. |
+| `password_command` | A shell command that prints the password, e.g. `op read op://…` (1Password), `pass show redis/prod`, or `security find-generic-password -s redis-prod -w` (macOS Keychain). |
+| `tls` | `ca`, `cert`, `key` (paths, `~` allowed) and `insecure`, like the `--tls-*` flags. Each flag still wins. |
+
+`password_command` runs with `sh -c` (`cmd /C` on Windows) before the TUI starts. Its output, minus one trailing newline, becomes the password. It is never logged or shown, and `--print-target` doesn't run it. If the command fails, `rrover` prints its stderr and exits with code 3.
+
+### Environments
+
+Every connection has an environment. It sets how much protection you get:
+
+| Environment | Starts | Write preview | Typed confirm on key delete |
+|---|---|---|---|
+| `local` | writable | per `safety.preview` | no |
+| `staging` | writable | per `safety.preview` | no |
+| `unknown` | **read-only** | per `safety.preview` | no |
+| `prod` | **read-only** | always, for every write | yes |
+
+A profile sets it with `environment`. Without one, a loopback host (`localhost`, `127.0.0.1`, `::1`) or a unix socket is `local`, and any other host is `unknown`. The footer shows the environment as a badge (`LOCAL`, `PROD · RO`, …), and a line in its colour runs along the top of the screen. You can change the colours with `colors.env_local`, `env_staging`, `env_prod` and `env_unknown` in your config. `prod` is red.
+
+> **SSH tunnels:** a tunnel to production on `localhost:6380` looks local, so it is inferred as `local` and starts writable. Use a profile with `"environment": "prod"` for it.
+
+**Write preview.** Before a write is sent, a popup shows the exact Redis commands, quoted the way `redis-cli` prints them, e.g. `HSET "user:1" "name" "Ada"`. Writes that take several commands show all of them, e.g. `SREM` + `SADD` to replace a set member. Long values are cut, e.g. `"…"…(2.1 KiB more)`. Press `y` to run it, or `n` / `Esc` to cancel. The `safety.preview` setting picks which writes are previewed: `"writes"` (the default, every write), `"destructive"` (deletes only) or `"off"`. With `"off"`, deleting a key or an item still asks "Delete …?". On `prod`, every write is previewed whatever the setting.
+
+```json5
+{ "safety": { "preview": "destructive" } }
+```
+
+**Typed confirm.** On `prod`, deleting a key asks you to type its name (or `delete` for names longer than 40 characters) into the popup. `Enter` deletes only once the name matches.
 
 ### Read-only mode
 
@@ -61,7 +158,9 @@ Connects to Redis at `localhost:6379` by default. Use `-u/--url` to pick a serve
 rrover -u rediss://prod-cache:6379 --token --read-only
 ```
 
-With `--read-only`, every write is refused: add, edit, delete and TTL changes. The UI shows a notice instead of opening the edit form, the footer shows an `RO` badge and hides the write keys, and the background runner rejects any write that still gets through. Use it whenever you point `rrover` at production.
+In read-only mode every write is refused: add, edit, delete, TTL changes and publish. The UI shows a notice instead of opening the edit form, the footer badge adds `· RO` and hides the write keys, and the background runner rejects any write that still gets through. `prod` and `unknown` servers start read-only. `--read-only` forces it for any server, and `--writable` lifts the default for one run.
+
+`Shift-r` toggles read-only during the session. On `prod`, turning it off asks first ("Allow writes to PROD?"). The runner's check follows the toggle.
 
 ### Databases
 
@@ -149,11 +248,12 @@ Press `?` in the app for the full list. Defaults:
 | `a` | Add a new key |
 | `i` | Add an item to the open collection |
 | `e` | Edit the value, or the selected item |
-| `d` | Delete the key, or the selected item (asks first) |
+| `d` | Delete the key, or the selected item (shows the command first) |
 | `t` | Set TTL |
 | `s` | Switch database |
 | `m` | Open the metrics dashboard |
 | `b` | Open Pub/Sub |
+| `Shift-r` | Toggle read-only (asks first on `prod`) |
 | `?` | Toggle help |
 | `Ctrl-c` | Quit |
 
@@ -168,6 +268,7 @@ Press `?` in the app for the full list. Defaults:
 | `Shift-Tab` / `←` / `h` | Previous chart |
 | `a` | Show all charts |
 | `b` | Open Pub/Sub |
+| `Shift-r` | Toggle read-only |
 | `?` | Toggle help |
 
 **Pub/Sub**
@@ -187,10 +288,13 @@ Press `?` in the app for the full list. Defaults:
 | `Shift-p` | Publish |
 | `Shift-n` | Toggle notifications |
 | `r` | Refresh server channels |
+| `Shift-r` | Toggle read-only |
+
+In the write preview, `y` runs the write and `n` / `Esc` cancels. In the typed confirm on `prod`, `Enter` deletes once the key name matches.
 
 ### Configuration
 
-Key bindings, colors, styles and limits can be overridden in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
+Key bindings, environment colors, styles, limits, [profiles](#profiles) and the [write preview](#environments) can be set in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
 
 For example, to preview RedisJSON documents only above 4 MiB:
 
