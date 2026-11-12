@@ -16,7 +16,7 @@ use super::{
     event::RedisEvent,
     pubsub::{self, PubSubCmd},
     storage::Storage,
-    types::RedisType,
+    types::{RedisType, ValueState},
 };
 
 type FetchError = Box<dyn std::error::Error + Sync + Send>;
@@ -529,37 +529,14 @@ impl EventHandler {
     /// another key / page meanwhile (a newer `FetchValue` is then queued).
     async fn fetch_value(&mut self) {
         let snapshot = self.state.value_state.lock().clone();
-        let Some(key) = snapshot.key.clone() else {
-            return;
-        };
-        let generation = snapshot.generation;
-        if self.last_value_generation == Some(generation) {
+        if snapshot.key.is_none() {
             return;
         }
-        self.last_value_generation = Some(generation);
-
-        match self.storage.fetch_value_page(snapshot).await {
-            Ok((swept, loaded)) => {
-                {
-                    let mut state = self.state.value_state.lock();
-                    if state.generation != generation {
-                        return;
-                    }
-                    state.apply(swept);
-                    *self.state.selected_value.lock() = Some(loaded);
-                }
-                self.action_hook(Action::LoadSelectedValueIntoView);
-            }
-            Err(err) => {
-                log::error!("FetchValue failed for {key}: {err:?}");
-                if self.state.value_state.lock().generation == generation {
-                    self.action_hook(Action::ValueLoadFailed);
-                    self.action_hook(Action::Error(format!(
-                        "Failed to load value of {key}: {err}"
-                    )));
-                }
-            }
+        if self.last_value_generation == Some(snapshot.generation) {
+            return;
         }
+        self.last_value_generation = Some(snapshot.generation);
+        load_value(&self.storage, &self.state, &self.tx, snapshot).await;
     }
 
     /// Load the current keyspace page into `state.keys` and send
@@ -616,5 +593,44 @@ impl EventHandler {
 
     fn action_hook(&self, action: Action) {
         crate::action::try_send_action(&self.tx, action);
+    }
+}
+
+/// Fetch the value page `snapshot` describes. Unless the user moved on
+/// meanwhile (`ValueState::generation` changed, checked under the lock), store
+/// it in `selected_value` and send `LoadSelectedValueIntoView`; on failure send
+/// `ValueLoadFailed` and an `Error`.
+async fn load_value(
+    storage: &Storage,
+    state: &SharedState,
+    tx: &ActionSender<Action>,
+    snapshot: ValueState,
+) {
+    let Some(key) = snapshot.key.clone() else {
+        return;
+    };
+    let generation = snapshot.generation;
+    match storage.fetch_value_page(snapshot).await {
+        Ok((swept, loaded)) => {
+            {
+                let mut value_state = state.value_state.lock();
+                if value_state.generation != generation {
+                    return;
+                }
+                value_state.apply(swept);
+                *state.selected_value.lock() = Some(loaded);
+            }
+            crate::action::try_send_action(tx, Action::LoadSelectedValueIntoView);
+        }
+        Err(err) => {
+            log::error!("FetchValue failed for {key}: {err:?}");
+            if state.value_state.lock().generation == generation {
+                crate::action::try_send_action(tx, Action::ValueLoadFailed);
+                crate::action::try_send_action(
+                    tx,
+                    Action::Error(format!("Failed to load value of {key}: {err}")),
+                );
+            }
+        }
     }
 }
