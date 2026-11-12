@@ -94,5 +94,8 @@
     "json": "#b45bcf",
     "stream": "#8be9fd",
     "unknown": "#f71638",
+    // A RedisJSON document (or field) above this many bytes shows a preview
+    // (its top-level fields, or the first 100 items) instead of the whole value.
+    "json_preview_bytes": 1048576,
   }
 }

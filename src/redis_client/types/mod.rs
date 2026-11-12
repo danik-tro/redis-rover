@@ -3,7 +3,9 @@ mod value;
 
 pub use keyspace::{KeyspaceState, SweepRequest, SweepResult};
 pub use value::{
-    zset_entry_json, LoadedValue, ScanSweep, ValuePageInfo, ValueState, STRING_PREVIEW_BYTES,
+    json_path, zset_entry_json, JsonField, JsonPreview, JsonPreviewKind, LoadedValue, ScanSweep,
+    ValuePageInfo, ValueState, DEFAULT_JSON_PREVIEW_BYTES, JSON_PREVIEW_ITEMS,
+    STRING_PREVIEW_BYTES,
 };
 
 use std::borrow::Cow;
@@ -121,8 +123,11 @@ pub enum KeyValue {
     Set(Vec<String>),
     Hash(Vec<(String, String)>),
     Zset(Vec<(String, f64)>), // Tuple of value and score
-    /// A `RedisJSON` document (`JSON.GET`).
+    /// A `RedisJSON` document (`JSON.GET`), or the opened field of one.
     Json(serde_json::Value),
+    /// The shape of a `RedisJSON` document (or field) above
+    /// `keyspace.json_preview_bytes`, read without fetching it whole (#49).
+    JsonPreview(JsonPreview),
     Unknown,
 }
 

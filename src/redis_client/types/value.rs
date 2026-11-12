@@ -35,7 +35,8 @@ impl KeyValue {
                     })
                     .collect(),
             ),
-            Self::Unknown => return None,
+            // Only a part of the document is loaded.
+            Self::JsonPreview(_) | Self::Unknown => return None,
         };
         serde_json::to_string_pretty(&json).ok()
     }
@@ -61,6 +62,60 @@ pub const DEFAULT_VALUE_SCAN_COUNT: usize = 100;
 
 /// How much of a STRING value is fetched (`GETRANGE 0 n-1`).
 pub const STRING_PREVIEW_BYTES: usize = 64 * 1024;
+
+/// Default `keyspace.json_preview_bytes`: a `RedisJSON` document (or field)
+/// larger than this is previewed instead of read whole.
+pub const DEFAULT_JSON_PREVIEW_BYTES: usize = 1 << 20;
+
+/// Items an array preview shows.
+pub const JSON_PREVIEW_ITEMS: usize = 100;
+
+/// The shape of a `RedisJSON` document (or opened field) above the preview
+/// limit (#49).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonPreview {
+    /// Its size in bytes (`MEMORY USAGE` / `JSON.DEBUG MEMORY`).
+    pub bytes: u64,
+    pub kind: JsonPreviewKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonPreviewKind {
+    /// An object: the current page of its top-level fields, out of `len`.
+    Object { len: usize, fields: Vec<JsonField> },
+    /// An array: its first [`JSON_PREVIEW_ITEMS`] items (a JSON array), out
+    /// of `len`.
+    Array {
+        len: usize,
+        items: serde_json::Value,
+    },
+    /// Nothing to preview: a scalar of type `json_type`, or `None` when the
+    /// server has no `$` paths (`RedisJSON` 1.x).
+    TooLarge { json_type: Option<String> },
+}
+
+/// One top-level field of an object preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonField {
+    pub name: String,
+    /// `JSON.TYPE`: `object`, `array`, `string`, `integer`, …
+    pub json_type: String,
+    /// `JSON.DEBUG MEMORY` of the field.
+    pub bytes: u64,
+}
+
+/// `JSONPath` of the field `path` names, from the root: `$`, `$["a"]["b"]`.
+/// Each name is quoted as a JSON string, so any character is allowed.
+pub fn json_path(path: &[String]) -> String {
+    let mut out = String::from("$");
+    for name in path {
+        out.push('[');
+        // A JSON string never fails to serialize.
+        out.push_str(&serde_json::Value::from(name.as_str()).to_string());
+        out.push(']');
+    }
+    out
+}
 
 /// Progress of an `HSCAN` / `SSCAN` sweep over one collection.
 ///
@@ -130,6 +185,14 @@ pub struct ValueState {
     /// Bumped on every key / page / rescan change, so the fetcher can drop
     /// results for a state the user already left.
     pub generation: u64,
+    /// `MEMORY USAGE` of the key, from its `KeyMeta` (`None` if unknown).
+    pub size: Option<u64>,
+    /// A JSON document or field above this many bytes is previewed
+    /// (`keyspace.json_preview_bytes`).
+    pub json_cap: usize,
+    /// Top-level fields opened from a JSON preview, outermost first. Empty
+    /// shows the document itself.
+    pub json_path: Vec<String>,
 }
 
 impl Default for ValueState {
@@ -143,6 +206,9 @@ impl Default for ValueState {
             total: None,
             sweep: ScanSweep::default(),
             generation: 0,
+            size: None,
+            json_cap: DEFAULT_JSON_PREVIEW_BYTES,
+            json_path: Vec::new(),
         }
     }
 }
@@ -160,7 +226,28 @@ impl ValueState {
         self.r_type = r_type;
         self.page = 0;
         self.total = None;
+        self.json_path.clear();
         self.rescan();
+    }
+
+    /// Open the top-level field `name` of the JSON value shown (#49).
+    pub fn open_json_field(&mut self, name: String) {
+        self.json_path.push(name);
+        self.page = 0;
+        self.total = None;
+        self.rescan();
+    }
+
+    /// Go back from an opened JSON field to the value it came from. Returns
+    /// `false` (and changes nothing) when no field is open.
+    pub fn close_json_field(&mut self) -> bool {
+        if self.json_path.pop().is_none() {
+            return false;
+        }
+        self.page = 0;
+        self.total = None;
+        self.rescan();
+        true
     }
 
     /// Forget the selected key (e.g. after a DB switch). Bumps `generation`
@@ -169,6 +256,8 @@ impl ValueState {
         self.key = None;
         self.page = 0;
         self.total = None;
+        self.size = None;
+        self.json_path.clear();
         self.rescan();
     }
 
@@ -328,6 +417,37 @@ mod tests {
         };
         state.select("k", r_type);
         state
+    }
+
+    #[test]
+    fn json_path_quotes_every_name() {
+        assert_eq!(json_path(&[]), "$");
+        assert_eq!(
+            json_path(&["a".into(), "we\"ird.key".into()]),
+            r#"$["a"]["we\"ird.key"]"#
+        );
+    }
+
+    #[test]
+    fn json_fields_open_and_close() {
+        let mut state = value_state(RedisType::Json, 10);
+        let generation = state.generation;
+        assert!(!state.close_json_field(), "nothing open");
+        state.page = 3;
+        state.open_json_field("orders".into());
+        assert_eq!(state.json_path, vec!["orders"]);
+        assert_eq!(state.page, 0);
+        assert!(state.generation > generation);
+
+        // Re-selecting the key (after a write) keeps the field open.
+        state.select("k", RedisType::Json);
+        assert_eq!(state.json_path, vec!["orders"]);
+        assert!(state.close_json_field());
+        assert!(state.json_path.is_empty());
+
+        state.open_json_field("orders".into());
+        state.select("other", RedisType::Json);
+        assert!(state.json_path.is_empty(), "another key starts at the root");
     }
 
     #[test]

@@ -13,7 +13,7 @@
                                      │ Refresh keyspace                    r       │
                                      │ Set filter pattern                  f       │
                                      │ Delete filter pattern               l       │
-                                     │ Enter value / confirm               Enter   │
+                                     │ Enter value / JSON field / confirm  Enter   │
                                      │ Add new key                         a       │
                                      │ Add item (in collection)            i       │
                                      │ Edit value / item (drill in first)  e       │

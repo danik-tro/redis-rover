@@ -135,7 +135,7 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::RefreshSpace, "Refresh keyspace"),
     (Command::SetPattern, "Set filter pattern"),
     (Command::DeletePattern, "Delete filter pattern"),
-    (Command::EnterValue, "Enter value / confirm"),
+    (Command::EnterValue, "Enter value / JSON field / confirm"),
     (Command::AddKey, "Add new key"),
     (Command::AddItem, "Add item (in collection)"),
     (Command::EditValue, "Edit value / item (drill in first)"),

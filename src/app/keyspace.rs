@@ -5,6 +5,7 @@ use crate::redis_client::{event::RedisEvent, types::RedisType};
 
 use crate::{
     action::{self, Action},
+    config,
     mode::Mode,
     widgets::keyspace::{OverlayRequest, PageInfo, ScrollOutcome},
 };
@@ -113,8 +114,36 @@ impl App {
         self.send_redis_event(event);
     }
 
+    /// Enter: focus the value, or, on a field of a JSON preview, open that
+    /// field (#49).
     pub(super) fn enter_value(&mut self) {
-        self.keyspace.enter_value();
+        let Some(field) = self.keyspace.selected_json_field() else {
+            self.keyspace.enter_value();
+            return;
+        };
+        self.json_rows
+            .push(self.keyspace.value_selected_row().unwrap_or(0));
+        self.state.value_state.lock().open_json_field(field);
+        self.load_json_level(0);
+    }
+
+    /// Esc on an opened JSON field: back to the preview it was opened from.
+    /// Returns `false` when no field is open.
+    pub(super) fn close_json_field(&mut self) -> bool {
+        if !self.state.value_state.lock().close_json_field() {
+            return false;
+        }
+        let row = self.json_rows.pop().unwrap_or(0);
+        self.load_json_level(row);
+        true
+    }
+
+    /// Fetch the JSON level just opened / closed, focusing `row` once it loads.
+    fn load_json_level(&mut self, row: usize) {
+        self.json_focus_row = Some(row);
+        self.page_turn_row = None;
+        self.keyspace.set_value_loading();
+        self.send_redis_event(RedisEvent::FetchValue);
     }
 
     /// `d`: delete. From the key list this deletes the whole selected key; while
@@ -286,15 +315,35 @@ impl App {
         let Some((key, r_type)) = self.keyspace.selected_key() else {
             return;
         };
-        self.state.value_state.lock().select(&key, r_type);
+        let size = self
+            .keyspace
+            .selected_size()
+            .filter(|&size| size > 0)
+            .and_then(|size| u64::try_from(size).ok());
+        {
+            let mut value_state = self.state.value_state.lock();
+            value_state.select(&key, r_type);
+            value_state.size = size;
+            value_state.json_cap = config::get().keyspace.json_preview_bytes();
+            if value_state.json_path.is_empty() {
+                self.json_rows.clear();
+            }
+        }
         self.page_turn_row = None;
+        self.json_focus_row = None;
         self.keyspace.set_value_loading();
         self.send_redis_event(RedisEvent::FetchValue);
     }
 
     pub(super) fn load_selected_value(&mut self) {
         let value = self.state.selected_value.lock().clone();
+        let json_path = self.state.value_state.lock().json_path.clone();
+        self.keyspace.set_json_path(json_path);
         self.keyspace.set_selected_value(value);
+
+        if let Some(row) = self.json_focus_row.take() {
+            self.keyspace.focus_value_at(row);
+        }
 
         if let Some(row) = self.page_turn_row.take() {
             if self.keyspace.is_value_focused() {

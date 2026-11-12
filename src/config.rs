@@ -347,6 +347,26 @@ pub struct KeyspaceConfig {
 
     #[serde_as(as = "DisplayFromStr")]
     pub unknown: Color,
+
+    /// A `RedisJSON` document (or field) above this many bytes is previewed
+    /// instead of read whole; see [`KeyspaceConfig::json_preview_bytes`].
+    #[serde(default = "default_json_preview_bytes")]
+    pub json_preview_bytes: usize,
+}
+
+fn default_json_preview_bytes() -> usize {
+    crate::redis_client::types::DEFAULT_JSON_PREVIEW_BYTES
+}
+
+impl KeyspaceConfig {
+    /// The JSON preview limit in bytes; 0 means the default (1 MiB).
+    pub fn json_preview_bytes(&self) -> usize {
+        if self.json_preview_bytes == 0 {
+            default_json_preview_bytes()
+        } else {
+            self.json_preview_bytes
+        }
+    }
 }
 
 impl Default for KeyspaceConfig {
@@ -360,6 +380,7 @@ impl Default for KeyspaceConfig {
             list: Color::from_str("#ffb86c").unwrap(),
             stream: Color::from_str("#8be9fd").unwrap(),
             unknown: Color::from_str("#f71638").unwrap(),
+            json_preview_bytes: default_json_preview_bytes(),
         }
     }
 }
@@ -529,6 +550,20 @@ mod tests {
         let cfg: Config = json5::from_str("{ keybindings: {} }").unwrap();
         assert_eq!(cfg.dashboard.interval_ms, 1000);
         assert_eq!(cfg.dashboard.history, 300);
+    }
+
+    #[test]
+    fn json_preview_bytes_defaults_and_zero() -> Result<()> {
+        let c = Config::new()?;
+        assert_eq!(c.keyspace.json_preview_bytes(), 1 << 20, "bundled config");
+
+        let mut k = KeyspaceConfig::default();
+        assert_eq!(k.json_preview_bytes(), 1 << 20);
+        k.json_preview_bytes = 0;
+        assert_eq!(k.json_preview_bytes(), 1 << 20, "0 means the default");
+        k.json_preview_bytes = 4096;
+        assert_eq!(k.json_preview_bytes(), 4096);
+        Ok(())
     }
 
     #[test]
