@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     clock::{Clock, SystemClock},
-    config,
+    config::{self, PreviewPolicy},
     redis_client::{event::RedisEvent, pubsub::PubSubCmd},
     state::{FrameData, SharedState},
     target::Environment,
@@ -108,6 +108,8 @@ pub struct App {
     environment: Environment,
     /// An open yes / no question, modal above every mode.
     pending: Option<confirm::PendingConfirm>,
+    /// `safety.preview`; Prod overrides it (`PreviewPolicy::on`).
+    preview: PreviewPolicy,
     clipboard: Clipboard,
     /// Short message drawn above every mode and popup.
     toast: Toast,
@@ -195,6 +197,7 @@ impl App {
             read_only: Arc::new(AtomicBool::new(false)),
             environment: Environment::Local,
             pending: None,
+            preview: config::get().safety.preview,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
             frame: FrameData::default(),

@@ -1,0 +1,16 @@
+
+
+
+
+
+
+
+
+╭──────────────────────────────── Run on PROD? ────────────────────────────────╮
+│ SET "session:7f3a9c" "{\"user\": \"ada\", \"bio\":                           │
+│ \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"…(2.9 KiB more)                   │
+│ SREM "tags" "old tag"                                                        │
+│ SADD "tags" "new\ttag"                                                       │
+│                                                                              │
+│                            y: run   n/Esc: cancel                            │
+╰──────────────────────────────────────────────────────────────────────────────╯

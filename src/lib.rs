@@ -137,6 +137,7 @@ pub mod internals {
     };
     pub use crate::state::{FrameData, SharedState};
     pub use crate::target::Environment;
+    pub use crate::widgets::confirm::ConfirmPopup;
     pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
     pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, PageInfo};
