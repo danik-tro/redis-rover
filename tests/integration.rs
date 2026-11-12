@@ -13,7 +13,9 @@
 mod support;
 
 use std::{
+    alloc::{GlobalAlloc, Layout, System},
     collections::HashSet,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -21,12 +23,67 @@ use clap::Parser;
 use redis::AsyncCommands;
 use redis_rover::{
     internals::{
-        Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, KeyItem, KeyValue, NewKeySpec,
-        PubSubCmd, RedisEvent, RedisType, Target,
+        Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyItem,
+        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Target,
     },
     Cli,
 };
 use support::{Harness, ValueDelay, WAIT};
+
+/// Counts live heap bytes and their peak, so AC3 can bound the memory a JSON
+/// preview takes (the heap part of RSS, measured the same on every OS).
+struct CountingAlloc;
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn grew(bytes: usize) {
+    let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+}
+
+// SAFETY: every call is forwarded to `System` unchanged; only counters change.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            grew(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            grew(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            grew(new_size);
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+/// Start measuring: the peak restarts from the live heap, which is returned.
+fn reset_peak() -> usize {
+    let live = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(live, Ordering::Relaxed);
+    live
+}
 
 /// Poll `check` every 50 ms until it holds, for up to `limit`.
 async fn eventually(what: &str, limit: Duration, check: impl Fn() -> bool) {
@@ -876,6 +933,226 @@ async fn fast_value_moves_show_only_the_last() {
     match h.state.selected_value.lock().as_ref().map(|l| &l.value) {
         Some(KeyValue::String { value, .. }) => assert_eq!(value, &format!("value of {last}")),
         other => panic!("expected the last key's value, got {other:?}"),
+    }
+    h.shutdown().await;
+}
+
+/// Select the JSON `key` (`size` as `MEMORY USAGE` reported it, `cap` as
+/// `keyspace.json_preview_bytes`) and load what the pane shows.
+async fn load_json(h: &mut Harness, key: &str, size: Option<u64>, cap: usize) -> KeyValue {
+    {
+        let mut value_state = h.state.value_state.lock();
+        value_state.select(key, RedisType::Json);
+        value_state.size = size;
+        value_state.json_cap = cap;
+    }
+    fetch_shown_value(h).await
+}
+
+/// `FetchValue` for the current `value_state`; the value once it lands.
+async fn fetch_shown_value(h: &mut Harness) -> KeyValue {
+    h.send(RedisEvent::FetchValue);
+    let action = h
+        .expect("the value or a failure", |a| {
+            matches!(
+                a,
+                Action::LoadSelectedValueIntoView | Action::ValueLoadFailed | Action::Error(_)
+            )
+        })
+        .await;
+    assert_eq!(action, Action::LoadSelectedValueIntoView, "FetchValue");
+    h.state
+        .selected_value
+        .lock()
+        .as_ref()
+        .map(|loaded| loaded.value.clone())
+        .expect("a loaded value")
+}
+
+async fn json_set(con: &mut redis::aio::ConnectionManager, key: &str, path: &str, json: &str) {
+    let () = redis::cmd("JSON.SET")
+        .arg(key)
+        .arg(path)
+        .arg(json)
+        .query_async(con)
+        .await
+        .expect("JSON.SET");
+}
+
+fn object_fields(value: &KeyValue) -> (usize, Vec<(String, String)>) {
+    match value {
+        KeyValue::JsonPreview(JsonPreview {
+            kind: JsonPreviewKind::Object { len, fields },
+            ..
+        }) => (
+            *len,
+            fields
+                .iter()
+                .map(|f| (f.name.clone(), f.json_type.clone()))
+                .collect(),
+        ),
+        other => panic!("expected an object preview, got {other:?}"),
+    }
+}
+
+/// #49 / AC4: under the cap a document is read whole; above it the pane
+/// shows its fields (paged), Enter opens one (the cap applies again), an
+/// array shows its first 100 items, a scalar only its size.
+#[tokio::test]
+#[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)] // one scenario, step by step
+async fn json_preview_pages_and_opens_fields() {
+    let server = support::start_redis_stack().await;
+    let mut admin = server.admin(0).await;
+    let prefix = support::prefix("json");
+    let doc = format!("{prefix}doc");
+    let mut fields = serde_json::Map::new();
+    fields.insert("a".into(), serde_json::json!({ "x": 1, "y": [true, null] }));
+    fields.insert("b".into(), serde_json::json!((0..300).collect::<Vec<_>>()));
+    fields.insert("we\"ird key".into(), serde_json::json!("quoted"));
+    for i in 0..147 {
+        fields.insert(format!("f{i:03}"), serde_json::json!(i));
+    }
+    json_set(
+        &mut admin,
+        &doc,
+        "$",
+        &serde_json::Value::Object(fields).to_string(),
+    )
+    .await;
+    let small = format!("{prefix}small");
+    json_set(&mut admin, &small, "$", r#"{"k":"v"}"#).await;
+    let scalar = format!("{prefix}scalar");
+    json_set(
+        &mut admin,
+        &scalar,
+        "$",
+        &format!("\"{}\"", "s".repeat(4096)),
+    )
+    .await;
+    let mut h = Harness::new(server.client(0), false).await;
+
+    // Under the cap: the whole document.
+    match load_json(&mut h, &small, None, 1 << 20).await {
+        KeyValue::Json(json) => assert_eq!(json, serde_json::json!({ "k": "v" })),
+        other => panic!("small doc: {other:?}"),
+    }
+
+    // Above a 1 KiB cap, size from JSON.DEBUG MEMORY: page 1 of the fields.
+    let cap = 1024;
+    let preview = load_json(&mut h, &doc, None, cap).await;
+    let (len, page1) = object_fields(&preview);
+    assert_eq!(len, 150);
+    assert_eq!(page1.len(), 100);
+    assert_eq!(page1[0], ("a".into(), "object".into()));
+    assert_eq!(page1[1], ("b".into(), "array".into()));
+    assert_eq!(page1[2], ("we\"ird key".into(), "string".into()));
+    assert_eq!(page1[3].1, "integer");
+
+    // n: page 2 reuses the field names (no second OBJKEYS needed).
+    assert!(h.state.value_state.lock().next_page());
+    let (_, page2) = object_fields(&fetch_shown_value(&mut h).await);
+    assert_eq!(page2.len(), 50);
+    assert!(page2
+        .iter()
+        .all(|(name, _)| !page1.iter().any(|(n, _)| n == name)));
+
+    // Enter on `a` (under the cap): its JSON. A quoted name works too.
+    h.state.value_state.lock().page = 0;
+    h.state.value_state.lock().open_json_field("a".into());
+    match fetch_shown_value(&mut h).await {
+        KeyValue::Json(json) => assert_eq!(json, serde_json::json!({ "x": 1, "y": [true, null] })),
+        other => panic!("field a: {other:?}"),
+    }
+    h.state.value_state.lock().close_json_field();
+    h.state
+        .value_state
+        .lock()
+        .open_json_field("we\"ird key".into());
+    match fetch_shown_value(&mut h).await {
+        KeyValue::Json(json) => assert_eq!(json, serde_json::json!("quoted")),
+        other => panic!("quoted field: {other:?}"),
+    }
+    h.state.value_state.lock().close_json_field();
+
+    // Enter on `b` (above the cap again): an array preview, 100 of 300.
+    h.state.value_state.lock().open_json_field("b".into());
+    match fetch_shown_value(&mut h).await {
+        KeyValue::JsonPreview(JsonPreview {
+            kind: JsonPreviewKind::Array { len, items },
+            ..
+        }) => {
+            assert_eq!(len, 300);
+            assert_eq!(items, serde_json::json!((0..100).collect::<Vec<_>>()));
+        }
+        other => panic!("field b: {other:?}"),
+    }
+
+    // A scalar above the cap: only its type and size.
+    match load_json(&mut h, &scalar, None, cap).await {
+        KeyValue::JsonPreview(JsonPreview {
+            bytes,
+            kind: JsonPreviewKind::TooLarge { json_type },
+        }) => {
+            assert_eq!(json_type.as_deref(), Some("string"));
+            assert!(bytes > 4096, "size {bytes}");
+        }
+        other => panic!("scalar: {other:?}"),
+    }
+    h.shutdown().await;
+}
+
+/// AC3 (#49): selecting a 50 MB `RedisJSON` document shows its preview in
+/// under 500 ms, and the heap grows by less than 20 MB (the whole document
+/// is never read).
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn json_50mb_preview_is_fast_and_small() {
+    let server = support::start_redis_stack().await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}big", support::prefix("json50"));
+    json_set(&mut admin, &key, "$", "{}").await;
+    let chunk = format!("\"{}\"", "x".repeat(1000));
+    for batch in 0..50 {
+        let mut pipe = redis::pipe();
+        for i in 0..1000 {
+            pipe.cmd("JSON.SET")
+                .arg(&key)
+                .arg(format!("$.f{batch:02}_{i:03}"))
+                .arg(&chunk)
+                .ignore();
+        }
+        let () = pipe.query_async(&mut admin).await.expect("seed 1 MB");
+    }
+    let size: u64 = redis::cmd("MEMORY")
+        .arg("USAGE")
+        .arg(&key)
+        .query_async(&mut admin)
+        .await
+        .expect("MEMORY USAGE");
+    assert!(size >= 50_000_000, "seeded only {size} bytes");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    // As the app does it: size from the key's MEMORY USAGE, default cap.
+    for (size, how) in [(Some(size), "MEMORY USAGE"), (None, "JSON.DEBUG MEMORY")] {
+        let before = reset_peak();
+        let started = Instant::now();
+        let value = load_json(&mut h, &key, size, 1 << 20).await;
+        let took = started.elapsed();
+        let grown = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+
+        let (len, fields) = object_fields(&value);
+        assert_eq!(len, 50_000, "{how}");
+        assert_eq!(fields.len(), 100, "{how}");
+        assert!(
+            took < Duration::from_millis(500),
+            "{how}: preview took {took:?}"
+        );
+        assert!(
+            grown < 20 << 20,
+            "{how}: heap grew by {grown} bytes during the preview"
+        );
+        println!("{how}: preview in {took:?}, heap peak +{} KiB", grown >> 10);
     }
     h.shutdown().await;
 }

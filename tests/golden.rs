@@ -20,9 +20,9 @@ use parking_lot::Mutex;
 use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
 use redis_rover::internals::{
     render_help, Clock, ConnStatus, Dashboard, DashboardWidget, FixedClock, FrameData, Info,
-    InfoSnapshot, InfoWidget, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
-    MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisInfo, RedisType, SharedState,
-    Target, Toast, ToastWidget, ValuePageInfo,
+    InfoSnapshot, InfoWidget, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
+    KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget,
+    RedisInfo, RedisType, SharedState, Target, Toast, ToastWidget, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -225,6 +225,46 @@ fn value_json() {
     });
     let mut keyspace = with_value("doc:settings", KeyValue::Json(doc));
     check("value_json", &draw_keyspace(&mut keyspace, 120, 20));
+}
+
+/// #49: a `RedisJSON` document above the preview limit, focused on its field
+/// table (page 1 of its top-level fields).
+#[test]
+fn value_json_preview() {
+    init();
+    let mut keys = key_rows();
+    keys[7].size = 52_428_800;
+    let mut keyspace = keyspace(keys, page(10, 10, None));
+    assert!(keyspace.select_key_by_name("doc:settings"));
+    let field = |name: &str, json_type: &str, bytes: u64| JsonField {
+        name: name.into(),
+        json_type: json_type.into(),
+        bytes,
+    };
+    let fields = vec![
+        field("orders", "array", 41_943_040),
+        field("customers", "object", 9_437_184),
+        field("schema_version", "integer", 16),
+        field("generated at", "string", 48),
+    ];
+    keyspace.set_selected_value(Some(LoadedValue {
+        value: KeyValue::JsonPreview(JsonPreview {
+            bytes: 52_428_800,
+            kind: JsonPreviewKind::Object {
+                len: 1_250,
+                fields: fields.clone(),
+            },
+        }),
+        page: ValuePageInfo {
+            start: 0,
+            len: fields.len(),
+            total: Some(1_250),
+            has_next: true,
+            has_prev: false,
+        },
+    }));
+    keyspace.enter_value();
+    check("value_json_preview", &draw_keyspace(&mut keyspace, 120, 20));
 }
 
 #[test]
