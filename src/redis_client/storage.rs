@@ -376,10 +376,10 @@ impl Storage {
         payload: &str,
     ) -> Result<i64, Box<dyn std::error::Error + Sync + Send>> {
         let mut manager = self.manager.clone();
-        Ok(redis::cmd("PUBLISH")
-            .arg(channel)
-            .arg(payload)
-            .query_async(&mut manager)
-            .await?)
+        let mut receivers = 0;
+        for cmd in super::write_cmd::publish(channel, payload) {
+            receivers = cmd.query_async(&mut manager).await?;
+        }
+        Ok(receivers)
     }
 }
