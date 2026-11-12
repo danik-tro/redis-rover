@@ -10,11 +10,27 @@ use crate::{action::Action, mode::Mode, tui};
 const HELP_TIMEOUT: Duration = Duration::from_secs(7);
 
 impl App {
+    /// Run `action`: the state change in [`Self::update`], then the terminal
+    /// work (`Render` draws, `Resize` resizes).
     pub(super) fn handle_action(
         &mut self,
         action: &Action,
         tui: &mut tui::Tui,
     ) -> Result<Option<Action>> {
+        self.update(action);
+        match *action {
+            Action::Resize(w, h) => Self::resize(tui, (w, h))?,
+            Action::Render => {
+                self.draw(tui)?;
+                self.sync_page_size();
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// The state change of `action`, without a terminal.
+    pub(super) fn update(&mut self, action: &Action) {
         if action != &Action::Tick && action != &Action::Render {
             log::debug!("{action:?}");
         }
@@ -29,11 +45,8 @@ impl App {
                 self.pubsub_tick(now, self.clock.wall());
             }
             Action::Quit => self.should_quit = true,
-            Action::Resize(w, h) => Self::resize(tui, (w, h))?,
-            Action::Render => {
-                self.draw(tui)?;
-                self.sync_page_size();
-            }
+            // `Resize` / `Render` are terminal work, done by `handle_action`.
+            Action::Resize(..) | Action::Render | Action::Refresh => {}
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
             Action::NextChart => self.dashboard.next_chart(),
@@ -110,10 +123,7 @@ impl App {
             | Action::PubSubChannelsLoaded
             | Action::PubSubToggleNotify
             | Action::Published { .. } => self.handle_pubsub_action(action),
-            Action::Refresh => {}
         }
-
-        Ok(None)
     }
 
     /// Actions of the Pub/Sub tab.
