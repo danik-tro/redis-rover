@@ -84,6 +84,12 @@
     "base0d": "#62d6e8",
     "base0e": "#b45bcf",
     "base0f": "#00f769",
+    // Environment colours (footer badge, top line). Override them in your
+    // own config's `colors`.
+    "env_local": "#00f769",
+    "env_staging": "#f1fa8c",
+    "env_prod": "#ff5555",
+    "env_unknown": "#ffb86c",
   },
   "keyspace": {
     "string": "#00f769",

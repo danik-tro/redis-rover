@@ -312,6 +312,11 @@ impl StatefulWidget for AppWidget {
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
         let [main, footer] = layout(area);
+        // The environment's colour as a line across the top margin row.
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(cfg.colors.env(state.environment))
+            .render(Rect { height: 1, ..area }, buf);
 
         StatefulWidget::render(
             InfoWidget {
@@ -496,6 +501,29 @@ impl App {
 
         Clear.render(popup_area, buf);
         Paragraph::new(lines).block(block).render(popup_area, buf);
+    }
+}
+
+#[cfg(test)]
+mod env_line_tests {
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+
+    use super::AppWidget;
+    use crate::{app::tests::app, config, target::Environment};
+
+    #[test]
+    fn top_row_is_a_line_in_the_environment_colour() {
+        for env in [Environment::Local, Environment::Prod] {
+            let mut app = app().environment(env);
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buf = Buffer::empty(area);
+            app.build_frame(area);
+            AppWidget.render(area, &mut buf, &mut app);
+            for x in [0, 40, 79] {
+                assert_eq!(buf[(x, 0)].symbol(), "─", "{env:?} x={x}");
+                assert_eq!(buf[(x, 0)].fg, config::get().colors.env(env), "{env:?}");
+            }
+        }
     }
 }
 

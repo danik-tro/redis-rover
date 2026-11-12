@@ -19,8 +19,8 @@ use std::{
 use parking_lot::Mutex;
 use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
 use redis_rover::internals::{
-    render_help, Clock, ConnStatus, Dashboard, DashboardWidget, FixedClock, FrameData, Info,
-    InfoSnapshot, InfoWidget, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
+    render_help, Clock, ConnStatus, Dashboard, DashboardWidget, Environment, FixedClock, FrameData,
+    Info, InfoSnapshot, InfoWidget, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
     KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget,
     RedisInfo, RedisType, SharedState, Target, Toast, ToastWidget, ValuePageInfo,
 };
@@ -325,20 +325,39 @@ fn sample_info() -> RedisInfo {
     ]))
 }
 
+/// The footer as `--read-only` on a local server draws it.
 #[test]
 fn footer_read_only() {
+    check("footer_read_only", &footer(Environment::Local, true));
+}
+
+/// The environment badge, one frame per environment with its default.
+#[test]
+fn footer_environments() {
+    for (name, env, read_only) in [
+        ("footer_local", Environment::Local, false),
+        ("footer_staging", Environment::Staging, false),
+        ("footer_prod_ro", Environment::Prod, true),
+        ("footer_unknown_ro", Environment::Unknown, true),
+    ] {
+        check(name, &footer(env, read_only));
+    }
+}
+
+fn footer(env: Environment, read_only: bool) -> Buffer {
     init();
     let shared = SharedState::default();
     *shared.info.lock() = Some(sample_info());
     let mut info = Info::new("redis://localhost:6379");
-    info.read_only = true;
+    info.environment = env;
+    info.read_only = read_only;
     info.hint = "o open  y yank  / filter  d db  ? help".into();
     let mut frame = FrameData::default();
     frame.refresh_footer(&shared);
 
     let mut buf = buffer(100, 5);
     InfoWidget { frame: &frame }.render(buf.area, &mut buf, &mut info);
-    check("footer_read_only", &buf);
+    buf
 }
 
 // ---- Dashboard ------------------------------------------------------------

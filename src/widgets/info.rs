@@ -11,13 +11,16 @@ use crate::{
     mode::Mode,
     redis_client::{metrics::MetricsHistory, types::RedisInfo},
     state::FrameData,
+    target::Environment,
 };
 
 pub struct Info {
     /// ` Info · redis://localhost:6379 `: the credential-free target.
     title: String,
-    /// `--read-only`: show the `RO` badge.
+    /// Read-only: the badge adds `· RO`.
     pub read_only: bool,
+    /// Names and colours the badge.
+    pub environment: Environment,
     /// One-line key-hint legend; follows the current mode.
     pub hint: String,
     /// Unread Pub/Sub messages over all subscriptions; badge when > 0.
@@ -128,6 +131,7 @@ impl Info {
         Self {
             title: format!(" Info · {target} "),
             read_only: false,
+            environment: Environment::Local,
             hint: String::new(),
             pubsub_unread: 0,
         }
@@ -145,15 +149,18 @@ impl StatefulWidget for InfoWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
         let mut title = vec![Span::raw(state.title.as_str())];
-        if state.read_only {
-            title.push(
-                Span::raw(" RO ")
-                    .fg(cfg.colors.base00)
-                    .bg(cfg.colors.base08)
-                    .bold(),
-            );
-            title.push(Span::raw(" "));
-        }
+        let badge = if state.read_only {
+            format!(" {} · RO ", state.environment.label())
+        } else {
+            format!(" {} ", state.environment.label())
+        };
+        title.push(
+            Span::raw(badge)
+                .fg(cfg.colors.base00)
+                .bg(cfg.colors.env(state.environment))
+                .bold(),
+        );
+        title.push(Span::raw(" "));
         if state.pubsub_unread > 0 {
             title.push(
                 Span::raw(format!(" PubSub {} ", state.pubsub_unread))
@@ -305,7 +312,7 @@ mod tests {
                 80,
                 true,
             [
-                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────── ? Help ╮",
+                "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────── ? Help ╮",
                 "│  Redis version: 7.2.4         db 0 · 1234 keys                       CPU: -  │",
                 "│  OS: Linux 6.8.0-1012-aws Connected clients: 3/100        RAM: 1.53M/15.47G  │",
                 "│                          j/k move  / filter  ? help                          │",
@@ -316,7 +323,7 @@ mod tests {
                 120,
                 true,
             [
-                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────────────────────────────────────────────── ? Help ╮",
+                "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────────────────────────────────────────────── ? Help ╮",
                 "│  Redis version: 7.2.4                             db 0 · 1234 keys                                           CPU: -  │",
                 "│  OS: Linux 6.8.0-1012-aws x86_64             Connected clients: 3/10000                           RAM: 1.53M/15.47G  │",
                 "│                                              j/k move  / filter  ? help                                              │",
@@ -327,7 +334,7 @@ mod tests {
                 80,
                 false,
             [
-                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────── ? Help ╮",
+                "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────── ? Help ╮",
                 "│  -                                  db 0                             CPU: -  │",
                 "│  -                                    -                                   -  │",
                 "│                          j/k move  / filter  ? help                          │",
@@ -338,7 +345,7 @@ mod tests {
                 120,
                 false,
             [
-                "╭ Info · redis://localhost:6379  RO   PubSub 3  ─────────────────────────────────────────────────────────────── ? Help ╮",
+                "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────────────────────────────────────────────── ? Help ╮",
                 "│  -                                                      db 0                                                 CPU: -  │",
                 "│  -                                                        -                                                       -  │",
                 "│                                              j/k move  / filter  ? help                                              │",

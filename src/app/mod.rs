@@ -20,6 +20,7 @@ use crate::{
     config,
     redis_client::{event::RedisEvent, pubsub::PubSubCmd},
     state::{FrameData, SharedState},
+    target::Environment,
 };
 use color_eyre::eyre::Result;
 use ratatui::crossterm::event::KeyEvent;
@@ -102,6 +103,8 @@ pub struct App {
     /// Read-only: refuse writes before any input is asked for. The same
     /// flag the runner checks (`Runner::read_only_flag`).
     read_only: Arc<AtomicBool>,
+    /// Sets the protections (preview, typed confirms) and the colours.
+    environment: Environment,
     clipboard: Clipboard,
     /// Short message drawn above every mode and popup.
     toast: Toast,
@@ -187,6 +190,7 @@ impl App {
             pubsub_tx,
             pubsub_return: Mode::KeySpace,
             read_only: Arc::new(AtomicBool::new(false)),
+            environment: Environment::Local,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
             frame: FrameData::default(),
@@ -206,6 +210,14 @@ impl App {
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.set_read_only(read_only);
+        self
+    }
+
+    /// The connection's environment: footer badge and top line colour.
+    #[must_use]
+    pub fn environment(mut self, environment: Environment) -> Self {
+        self.environment = environment;
+        self.summary.environment = environment;
         self
     }
 

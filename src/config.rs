@@ -6,7 +6,11 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{de::Deserializer, Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::{keybindings::KeyBindings, mode::Mode, target::Profile};
+use crate::{
+    keybindings::KeyBindings,
+    mode::Mode,
+    target::{Environment, Profile},
+};
 
 const CONFIG_PATH: &str = include_str!("../.config/config.json5");
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -226,7 +230,9 @@ impl Config {
             log::error!("No configuration file found. Application may not behave as expected");
         }
 
-        let mut cfg: Self = builder.build()?.try_deserialize()?;
+        let built = builder.build()?;
+        let env_colors: EnvColorOverrides = built.get("colors").unwrap_or_default();
+        let mut cfg: Self = built.try_deserialize()?;
 
         for (mode, default_bindings) in &default_config.keybindings.0 {
             let user_bindings = cfg.keybindings.entry(*mode).or_default();
@@ -242,6 +248,7 @@ impl Config {
         }
 
         cfg.colors = default_config.colors;
+        env_colors.apply(&mut cfg.colors)?;
 
         Ok(cfg)
     }
@@ -249,6 +256,7 @@ impl Config {
 
 #[serde_as]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Base16Palette {
     /// Default Background
     #[serde_as(as = "DisplayFromStr")]
@@ -313,6 +321,59 @@ pub struct Base16Palette {
     /// Deprecated, Opening/Closing Embedded Language Tags e.g., `<? ?>`
     #[serde_as(as = "DisplayFromStr")]
     pub base0f: Color,
+
+    /// Environment colours: footer badge and the top line.
+    #[serde_as(as = "DisplayFromStr")]
+    pub env_local: Color,
+    #[serde_as(as = "DisplayFromStr")]
+    pub env_staging: Color,
+    #[serde_as(as = "DisplayFromStr")]
+    pub env_prod: Color,
+    #[serde_as(as = "DisplayFromStr")]
+    pub env_unknown: Color,
+}
+
+impl Base16Palette {
+    /// The colour of `env`.
+    #[must_use]
+    pub fn env(&self, env: Environment) -> Color {
+        match env {
+            Environment::Local => self.env_local,
+            Environment::Staging => self.env_staging,
+            Environment::Prod => self.env_prod,
+            Environment::Unknown => self.env_unknown,
+        }
+    }
+}
+
+/// The user's `colors.env_*`, applied over the bundled palette. (The base16
+/// colours always come from the bundled config.)
+#[derive(Debug, Default, Deserialize)]
+#[allow(clippy::struct_field_names)] // the config keys
+struct EnvColorOverrides {
+    env_local: Option<String>,
+    env_staging: Option<String>,
+    env_prod: Option<String>,
+    env_unknown: Option<String>,
+}
+
+impl EnvColorOverrides {
+    fn apply(&self, palette: &mut Base16Palette) -> Result<(), config::ConfigError> {
+        let slots = [
+            (&self.env_local, &mut palette.env_local, "env_local"),
+            (&self.env_staging, &mut palette.env_staging, "env_staging"),
+            (&self.env_prod, &mut palette.env_prod, "env_prod"),
+            (&self.env_unknown, &mut palette.env_unknown, "env_unknown"),
+        ];
+        for (value, slot, name) in slots {
+            if let Some(value) = value {
+                *slot = Color::from_str(value).map_err(|e| {
+                    config::ConfigError::Message(format!("colors.{name} `{value}`: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Base16Palette {
@@ -334,6 +395,10 @@ impl Default for Base16Palette {
             base0d: Color::from_str("#c4a7e7").unwrap(),
             base0e: Color::from_str("#f6c177").unwrap(),
             base0f: Color::from_str("#524f67").unwrap(),
+            env_local: Color::from_str("#00f769").unwrap(),
+            env_staging: Color::from_str("#f1fa8c").unwrap(),
+            env_prod: Color::from_str("#ff5555").unwrap(),
+            env_unknown: Color::from_str("#ffb86c").unwrap(),
         }
     }
 }
@@ -541,6 +606,29 @@ mod tests {
     use crate::{command::Command, keybindings::parse_key_sequence};
 
     use super::*;
+
+    #[test]
+    fn env_colours_can_be_overridden() {
+        let mut palette = Base16Palette::default();
+        let overrides = EnvColorOverrides {
+            env_prod: Some("#123456".into()),
+            ..EnvColorOverrides::default()
+        };
+        overrides.apply(&mut palette).unwrap();
+        assert_eq!(palette.env(Environment::Prod), Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(palette.env_local, Base16Palette::default().env_local);
+
+        let bad = EnvColorOverrides {
+            env_local: Some("not-a-colour".into()),
+            ..EnvColorOverrides::default()
+        };
+        let err = bad.apply(&mut palette).unwrap_err().to_string();
+        assert!(err.contains("colors.env_local"), "{err}");
+
+        // A partial `colors` table parses (missing fields keep their default).
+        let cfg: Config = json5::from_str(r##"{ colors: { env_prod: "#ff0000" } }"##).unwrap();
+        assert_eq!(cfg.colors.env_prod, Color::Rgb(0xff, 0, 0));
+    }
 
     #[test]
     fn dashboard_config_defaults_and_clamps() {

@@ -30,6 +30,79 @@ pub struct Profile {
     /// Shell command that prints the password (`op read …`, `pass show …`).
     #[serde(alias = "passwordCommand")]
     pub password_command: Option<String>,
+    /// Inferred from the host when unset ([`Environment::infer`]).
+    pub environment: Option<Environment>,
+    /// Overrides the environment's default; `--read-only` / `--writable` win.
+    #[serde(alias = "readOnly")]
+    pub read_only: Option<bool>,
+}
+
+/// How much protection a connection gets: `Prod` and `Unknown` start
+/// read-only, `Prod` also asks for typed confirms.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Environment {
+    #[default]
+    Local,
+    Staging,
+    Prod,
+    Unknown,
+}
+
+impl Environment {
+    /// `Local` for a loopback host (`localhost`, `127.0.0.0/8`, `::1`) or a
+    /// unix socket, `Unknown` otherwise. An SSH tunnel to production on
+    /// `localhost` is inferred as `Local`: give such a profile an explicit
+    /// `environment`.
+    #[must_use]
+    pub fn infer(addr: &redis::ConnectionAddr) -> Self {
+        let host = match addr {
+            redis::ConnectionAddr::Tcp(host, _) | redis::ConnectionAddr::TcpTls { host, .. } => {
+                host
+            }
+            redis::ConnectionAddr::Unix(_) => return Self::Local,
+            #[allow(unreachable_patterns)]
+            _ => return Self::Unknown,
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            Self::Local
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Whether a session starts read-only without a flag or profile setting.
+    #[must_use]
+    pub fn default_read_only(self) -> bool {
+        matches!(self, Self::Prod | Self::Unknown)
+    }
+
+    /// Upper-case name for the footer badge.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL",
+            Self::Staging => "STAGING",
+            Self::Prod => "PROD",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+impl fmt::Display for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Local => "local",
+            Self::Staging => "staging",
+            Self::Prod => "prod",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 /// TLS settings of a profile. The `--tls-*` flags override them field by field.
@@ -56,6 +129,10 @@ pub enum Source {
     Url,
     /// Nothing set it.
     Default,
+    /// Inferred from the host (environment).
+    Inferred,
+    /// The environment's default (read-only).
+    Environment,
 }
 
 impl fmt::Display for Source {
@@ -66,6 +143,8 @@ impl fmt::Display for Source {
             Self::EnvVar => write!(f, "$REDIS_URL"),
             Self::Url => write!(f, "url"),
             Self::Default => write!(f, "default"),
+            Self::Inferred => write!(f, "inferred from host"),
+            Self::Environment => write!(f, "environment default"),
         }
     }
 }
@@ -131,6 +210,11 @@ pub struct Target {
     tls: TlsArgs,
     pub tls_source: Source,
     pub password: PasswordSource,
+    pub environment: Environment,
+    pub env_source: Source,
+    /// Whether the session starts read-only.
+    pub read_only: bool,
+    pub read_only_source: Source,
 }
 
 /// Resolve the target from the flags, the config's `profiles` and the value
@@ -213,8 +297,26 @@ pub fn resolve(
         PasswordSource::None
     };
 
+    let (environment, env_source) = match profile.and_then(|p| p.environment) {
+        Some(env) => (env, profile_source()),
+        None => (Environment::infer(info.addr()), Source::Inferred),
+    };
+    let (read_only, read_only_source) = if cli.read_only {
+        (true, Source::Flag("--read-only"))
+    } else if cli.writable {
+        (false, Source::Flag("--writable"))
+    } else if let Some(read_only) = profile.and_then(|p| p.read_only) {
+        (read_only, profile_source())
+    } else {
+        (environment.default_read_only(), Source::Environment)
+    };
+
     Ok(Target {
         profile: name.map(str::to_owned),
+        environment,
+        env_source,
+        read_only,
+        read_only_source,
         info,
         url_source,
         db_source,
@@ -370,6 +472,16 @@ impl Target {
             ),
         };
         rows.push(("password", password.0, password.1));
+        rows.push((
+            "environment",
+            self.environment.to_string(),
+            Some(self.env_source.to_string()),
+        ));
+        rows.push((
+            "read-only",
+            if self.read_only { "yes" } else { "no" }.to_owned(),
+            Some(self.read_only_source.to_string()),
+        ));
 
         let width = rows
             .iter()
@@ -644,6 +756,119 @@ mod tests {
     }
 
     #[test]
+    fn environment_is_inferred_from_the_host() {
+        use super::Environment::{Local, Unknown};
+        let cases = [
+            ("redis://localhost:6379", Local),
+            ("redis://LOCALHOST", Local),
+            ("redis://127.0.0.1", Local),
+            ("redis://127.8.9.10:7000", Local),
+            ("redis://[::1]:6379", Local),
+            ("unix:///tmp/redis.sock", Local),
+            ("rediss://localhost:6380", Local),
+            ("redis://10.0.0.5:6379", Unknown),
+            ("redis://redis.example.com", Unknown),
+            ("redis://localhost.example.com", Unknown),
+        ];
+        for (url, env) in cases {
+            let t = resolve(&cli(&["--url", url]), &HashMap::new(), None).unwrap();
+            assert_eq!(t.environment, env, "{url}");
+            assert_eq!(t.env_source, Source::Inferred, "{url}");
+        }
+    }
+
+    #[test]
+    fn read_only_resolution_order() {
+        use super::Environment;
+        let map = HashMap::from([
+            (
+                "prod".to_owned(),
+                Profile {
+                    url: Some("redis://localhost".into()),
+                    environment: Some(Environment::Prod),
+                    ..Profile::default()
+                },
+            ),
+            (
+                "staging".to_owned(),
+                Profile {
+                    url: Some("redis://10.0.0.5".into()),
+                    environment: Some(Environment::Staging),
+                    ..Profile::default()
+                },
+            ),
+            (
+                "pinned".to_owned(),
+                Profile {
+                    url: Some("redis://10.0.0.5".into()),
+                    read_only: Some(false),
+                    ..Profile::default()
+                },
+            ),
+        ]);
+        // (args, environment, read-only, source)
+        let cases: &[(&[&str], Environment, bool, Source)] = &[
+            (&[], Environment::Local, false, Source::Environment),
+            (
+                &["--url", "redis://10.0.0.5"],
+                Environment::Unknown,
+                true,
+                Source::Environment,
+            ),
+            (
+                &["--url", "redis://10.0.0.5", "--writable"],
+                Environment::Unknown,
+                false,
+                Source::Flag("--writable"),
+            ),
+            (&["prod"], Environment::Prod, true, Source::Environment),
+            (
+                &["prod", "--writable"],
+                Environment::Prod,
+                false,
+                Source::Flag("--writable"),
+            ),
+            (
+                &["prod", "--writable", "--read-only"],
+                Environment::Prod,
+                true,
+                Source::Flag("--read-only"),
+            ),
+            (
+                &["staging"],
+                Environment::Staging,
+                false,
+                Source::Environment,
+            ),
+            (
+                &["staging", "--read-only"],
+                Environment::Staging,
+                true,
+                Source::Flag("--read-only"),
+            ),
+            (
+                &["pinned"],
+                Environment::Unknown,
+                false,
+                Source::Profile("pinned".into()),
+            ),
+            // The profile's environment wins over the host, even with --url.
+            (
+                &["prod", "--url", "redis://127.0.0.1"],
+                Environment::Prod,
+                true,
+                Source::Environment,
+            ),
+        ];
+        for (args, env, read_only, source) in cases {
+            let t = resolve(&cli(args), &map, None).unwrap();
+            assert_eq!(t.environment, *env, "{args:?}");
+            assert_eq!(t.read_only, *read_only, "{args:?}");
+            assert_eq!(&t.read_only_source, source, "{args:?}");
+        }
+    }
+
+    #[test]
     fn unknown_profile_lists_the_defined_ones() {
         let err = resolve(&cli(&["nope"]), &profiles(), None).unwrap_err();
         assert_eq!(
@@ -683,6 +908,10 @@ mod tests {
         .unwrap();
         let prod = &p["prod"];
         assert_eq!(prod.password_command.as_deref(), Some("op read x"));
+        let env: Profile = json5::from_str(r#"{ environment: "prod", readOnly: false }"#).unwrap();
+        assert_eq!(env.environment, Some(super::Environment::Prod));
+        assert_eq!(env.read_only, Some(false));
+        assert!(json5::from_str::<Profile>(r#"{ environment: "production" }"#).is_err());
         assert!(prod.tls.as_ref().unwrap().insecure);
         // A typo is an error, not a silently ignored setting.
         assert!(json5::from_str::<Profile>(r#"{ urll: "redis://h" }"#).is_err());
@@ -704,7 +933,9 @@ mod tests {
              db          4                            (url)\n\
              tls         off                          (default)\n\
              user        alice\n\
-             password    ********                     (url)\n"
+             password    ********                     (url)\n\
+             environment unknown                      (inferred from host)\n\
+             read-only   yes                          (environment default)\n"
         );
 
         let t = resolve(&cli(&["prod"]), &profiles(), None).unwrap();
