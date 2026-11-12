@@ -547,6 +547,41 @@ async fn read_only_rejects_every_write() {
     h.shutdown().await;
 }
 
+/// The in-session toggle (`R`) moves the runner's guarantee: flipping the
+/// shared flag refuses, then allows, the same write.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn read_only_toggle_reaches_the_runner() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}k", support::prefix("rotoggle"));
+    let _: () = admin.set(&key, "before").await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+    let flag = h.read_only_flag();
+    let write = || RedisEvent::SetString {
+        key: key.clone(),
+        value: "after".into(),
+    };
+    let answer = |a: &Action| matches!(a, Action::Error(_) | Action::RefreshSpace);
+
+    flag.store(true, std::sync::atomic::Ordering::Release);
+    h.send(write());
+    match h.expect("the rejection", answer).await {
+        Action::Error(msg) => assert!(msg.contains("Read-only"), "{msg}"),
+        other => panic!("write went through while read-only: {other:?}"),
+    }
+    let value: String = admin.get(&key).await.expect("get");
+    assert_eq!(value, "before");
+
+    flag.store(false, std::sync::atomic::Ordering::Release);
+    h.send(write());
+    let action = h.expect("the write", answer).await;
+    assert!(matches!(action, Action::RefreshSpace), "{action:?}");
+    let value: String = admin.get(&key).await.expect("get");
+    assert_eq!(value, "after");
+    h.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "needs Docker"]
 #[allow(clippy::too_many_lines)] // one block per type, kept side by side

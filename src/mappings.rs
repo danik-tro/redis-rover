@@ -42,6 +42,7 @@ impl From<Command> for Action {
             Command::PubSubToggleNotify => Self::PubSubToggleNotify,
             Command::PubSubFocus => Self::PubSubFocus,
             Command::PubSubTogglePause => Self::PubSubTogglePause,
+            Command::ToggleReadOnly => Self::ToggleReadOnly,
         }
     }
 }

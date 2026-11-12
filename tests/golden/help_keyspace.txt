@@ -28,6 +28,7 @@
                                      │ Open metrics dashboard              m       │
                                      │ Open Pub/Sub                        b       │
                                      │ Close popup / overlay               Esc     │
+                                     │ Toggle read-only                    Shift-R │
                                      │ Toggle this help                    ?       │
                                      │ Quit                                Ctrl-c  │
                                      ╰─────────────────────────────────────────────╯

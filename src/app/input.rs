@@ -24,6 +24,11 @@ impl App {
             return self.handle_keybindings(key);
         }
 
+        // A yes / no question (lifting read-only) is modal above everything.
+        if self.pending.is_some() {
+            return self.handle_confirm_key(key);
+        }
+
         // The DB picker is modal: Enter switches, Esc cancels, the rest moves
         // the selection. Global bindings (Ctrl-c) still work.
         if self.db_picker.is_open() {
@@ -157,7 +162,7 @@ impl App {
     }
 
     /// `key` alone is the global quit binding (Ctrl-c).
-    fn is_quit_key(key: KeyEvent) -> bool {
+    pub(super) fn is_quit_key(key: KeyEvent) -> bool {
         config::get().keybindings.resolve(Mode::Common, &[key])
             == KeyResolution::Command(Command::Quit)
     }

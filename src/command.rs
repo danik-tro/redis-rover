@@ -42,4 +42,5 @@ pub enum Command {
     PubSubToggleNotify,
     PubSubFocus,
     PubSubTogglePause,
+    ToggleReadOnly,
 }

@@ -26,6 +26,7 @@
       "w": "ToggleWrap",
       "y": "YankValue",
       "<Shift-y>": "YankKey",
+      "<Shift-r>": "ToggleReadOnly",
       "?": "ToggleHelp",
     },
     "Dashboard": {
@@ -41,6 +42,7 @@
       "h": "PrevChart",
       "a": "ToggleAllCharts",
       "b": "TogglePubSub",
+      "<Shift-r>": "ToggleReadOnly",
       "?": "ToggleHelp",
     },
     "PubSub": {
@@ -64,6 +66,7 @@
       "w": "ToggleWrap",
       "<Left>": "ScrollLeft",
       "<Right>": "ScrollRight",
+      "<Shift-r>": "ToggleReadOnly",
       "?": "ToggleHelp",
     },
   },
