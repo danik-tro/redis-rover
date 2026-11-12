@@ -7,7 +7,13 @@ mod keyspace;
 mod pubsub;
 mod render;
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use crate::{
     clock::{Clock, SystemClock},
@@ -93,8 +99,9 @@ pub struct App {
     /// Where `b` / Esc in the Pub/Sub tab goes back to. Kept apart from
     /// `previous_mode`, which an error popup inside the tab overwrites.
     pubsub_return: Mode,
-    /// `--read-only`: refuse writes before any input is asked for.
-    read_only: bool,
+    /// Read-only: refuse writes before any input is asked for. The same
+    /// flag the runner checks (`Runner::read_only_flag`).
+    read_only: Arc<AtomicBool>,
     clipboard: Clipboard,
     /// Short message drawn above every mode and popup.
     toast: Toast,
@@ -179,7 +186,7 @@ impl App {
             pubsub,
             pubsub_tx,
             pubsub_return: Mode::KeySpace,
-            read_only: false,
+            read_only: Arc::new(AtomicBool::new(false)),
             clipboard: Clipboard::default(),
             toast: Toast::default(),
             frame: FrameData::default(),
@@ -195,12 +202,32 @@ impl App {
 
     /// Refuse every write (`--read-only`): show the `RO` badge and drop the
     /// write commands from the footer hint.
+    #[cfg(test)]
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
+        self.set_read_only(read_only);
+        self
+    }
+
+    /// Share the runner's read-only flag (`Runner::read_only_flag`), keeping
+    /// its current value.
+    #[must_use]
+    pub fn read_only_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.read_only = flag;
+        let read_only = self.is_read_only();
+        self.set_read_only(read_only);
+        self
+    }
+
+    pub(super) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
+    }
+
+    /// Set the shared flag, the `RO` badge and the footer hint.
+    pub(super) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::Release);
         self.summary.read_only = read_only;
         self.sync_hint();
-        self
     }
 
     /// Run the main event loop until quit.
@@ -280,10 +307,11 @@ impl App {
     /// In `--read-only` mode, show a notice and return `true` so the caller
     /// stops before opening any write UI.
     fn deny_write(&mut self) -> bool {
-        if self.read_only {
+        let read_only = self.is_read_only();
+        if read_only {
             self.keyspace.show_notice(READ_ONLY_NOTICE);
         }
-        self.read_only
+        read_only
     }
 
     /// The latest `INFO` sample says the server runs in cluster mode.

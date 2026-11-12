@@ -294,9 +294,10 @@ impl App {
             Mode::PubSub => (Mode::PubSub, PUBSUB_HINT_ENTRIES),
             _ => (Mode::KeySpace, KEYSPACE_HINT_ENTRIES),
         };
+        let read_only = self.is_read_only();
         let entries: Vec<(Command, &str)> = entries
             .iter()
-            .filter(|(cmd, _)| !(self.read_only && WRITE_COMMANDS.contains(cmd)))
+            .filter(|(cmd, _)| !(read_only && WRITE_COMMANDS.contains(cmd)))
             .copied()
             .collect();
         self.summary.hint = build_hint(&config::get().keybindings, mode, &entries);

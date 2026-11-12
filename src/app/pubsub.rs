@@ -331,7 +331,7 @@ mod tests {
             "{}",
             app.summary.hint
         );
-        app.pubsub.open_publish(app.read_only);
+        app.pubsub.open_publish(app.is_read_only());
         for c in "chan".chars() {
             app.handle_key_event(key(KeyCode::Char(c)));
         }

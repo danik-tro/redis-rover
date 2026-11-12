@@ -151,7 +151,7 @@ impl App {
                 }
             }
             Action::PubSubRefresh => self.fetch_pubsub_channels(),
-            Action::PubSubPublish => self.pubsub.open_publish(self.read_only),
+            Action::PubSubPublish => self.pubsub.open_publish(self.is_read_only()),
             Action::PubSubEnter => self.pubsub_enter(),
             Action::PubSubFocus => self.pubsub.toggle_focus(),
             Action::PubSubTogglePause => {
