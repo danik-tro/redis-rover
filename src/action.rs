@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use strum::Display;
+use strum::{Display, EnumIter};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Display, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Display, Deserialize, EnumIter)]
 pub enum Action {
     Tick,
     Render,

@@ -72,6 +72,17 @@ impl FooterText {
     pub fn key(&self) -> Option<(u64, i64)> {
         self.key
     }
+
+    /// Same text as `other`, whatever sample each was built for.
+    #[must_use]
+    pub fn same_text(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.os == other.os
+            && self.memory == other.memory
+            && self.clients == other.clients
+            && self.db_status == other.db_status
+            && self.cpu == other.cpu
+    }
 }
 
 /// Build the footer legend from the live keymap: `"{key} {label}"` per entry,

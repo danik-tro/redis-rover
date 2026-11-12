@@ -131,18 +131,21 @@ impl App {
     /// Notifier, on every `Tick`: count what each subscription received since
     /// the last tick into its unread badge, run its notification state
     /// machine, and toast the notices. The subscription open in the tab
-    /// stays read and never toasts.
-    pub(super) fn pubsub_tick(&mut self, now: Instant, wall: SystemTime) {
+    /// stays read and never toasts. Returns whether anything shown changed
+    /// (a badge, a mute, a toast).
+    pub(super) fn pubsub_tick(&mut self, now: Instant, wall: SystemTime) -> bool {
         let policy = config::get().pubsub.notify.policy();
         let open = self.open_subscription();
         let mut notices: Vec<Notice> = Vec::new();
         let mut unread = 0;
+        let mut changed = false;
         {
             let mut store = self.state.pubsub.lock();
             for (i, sub) in store.subs.iter_mut().enumerate() {
                 let new = sub.stats.total.saturating_sub(sub.seen_total);
                 sub.seen_total = sub.stats.total;
                 let rate = f64::from(sub.stats.rate_1s(wall));
+                let notify_before = std::mem::discriminant(&sub.notify);
                 let preview = (new > 0
                     && matches!(sub.notify, pubsub_notify::NotifyState::On { .. }))
                 .then(|| sub.newest_preview())
@@ -156,19 +159,25 @@ impl App {
                     now,
                     &policy,
                 );
+                changed |= notify_before != std::mem::discriminant(&sub.notify);
                 if open == Some(i) {
+                    changed |= sub.unread > 0;
                     sub.unread = 0;
                     continue;
                 }
+                changed |= new > 0;
                 sub.unread += new;
                 unread += sub.unread;
                 notices.extend(notice);
             }
         }
-        self.summary.pubsub_unread = if self.pubsub_visible() { 0 } else { unread };
+        let unread = if self.pubsub_visible() { 0 } else { unread };
+        changed |= self.summary.pubsub_unread != unread;
+        self.summary.pubsub_unread = unread;
         for msg in pubsub_notify::toasts(notices) {
-            self.toast.notify(msg, now);
+            changed |= self.toast.notify(msg, now);
         }
+        changed
     }
 
     fn send_pubsub_cmd(&self, cmd: PubSubCmd) {
