@@ -99,7 +99,7 @@ pub async fn run(args: Cli) -> Result<()> {
         args.tick_rate,
         args.frame_rate,
     )
-    .read_only(args.read_only);
+    .read_only_flag(watcher.read_only_flag());
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;

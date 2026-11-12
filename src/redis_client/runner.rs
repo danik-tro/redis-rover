@@ -1,5 +1,8 @@
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -47,7 +50,9 @@ pub struct Runner {
     /// from it, so TLS settings and credentials carry over.
     client: redis::Client,
     manager: ConnectionManager,
-    read_only: bool,
+    /// Refuse every write. Shared with `App`, so toggling it in the session
+    /// moves the guarantee too.
+    read_only: Arc<AtomicBool>,
 
     state: SharedState,
     info_task: JoinHandle<()>,
@@ -82,7 +87,7 @@ impl Runner {
             cancellation_token,
             client,
             manager,
-            read_only: false,
+            read_only: Arc::new(AtomicBool::new(false)),
             state,
             info_task,
             state_task,
@@ -102,9 +107,16 @@ impl Runner {
 
     /// Reject every write event (`--read-only`).
     #[must_use]
-    pub fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
+    pub fn read_only(self, read_only: bool) -> Self {
+        self.read_only.store(read_only, Ordering::Release);
         self
+    }
+
+    /// The read-only flag the runner checks before every write. `App`
+    /// holds the same `Arc`.
+    #[must_use]
+    pub fn read_only_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.read_only)
     }
 
     #[must_use]
@@ -173,7 +185,7 @@ impl Runner {
         let state = self.state.clone();
         let storage = Storage::new(manager);
         let client = self.client.clone();
-        let read_only = self.read_only;
+        let read_only = Arc::clone(&self.read_only);
 
         self.state_task = tokio::spawn(async move {
             // Values load over their own connection, so a large value reply
@@ -280,7 +292,7 @@ pub struct EventHandler {
     value_storage: Storage,
     /// Base client used to open a connection to another DB.
     client: redis::Client,
-    read_only: bool,
+    read_only: Arc<AtomicBool>,
     /// `ValueState::generation` of the last value fetch started.
     last_value_generation: Option<u64>,
     /// The running filter match count, if any. A new request aborts it.
@@ -310,7 +322,7 @@ impl EventHandler {
         storage: Storage,
         value_storage: Storage,
         client: redis::Client,
-        read_only: bool,
+        read_only: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state,
@@ -339,7 +351,7 @@ impl EventHandler {
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, event: RedisEvent) {
         // The UI also refuses writes up front; this is the guarantee.
-        if self.read_only && event.is_write() {
+        if event.is_write() && self.read_only.load(Ordering::Acquire) {
             log::warn!("Read-only mode: blocked {event:?}");
             self.action_hook(Action::Error(
                 "Read-only mode: writes are disabled".to_string(),
