@@ -45,6 +45,10 @@ First public release. Requires Rust 1.97 or newer.
 - Toasts now render above every mode and popup.
 - `?` help overlay and a key-hint footer that follow the configured key bindings.
 - Configurable key bindings, colors and styles (JSON5, JSON, YAML, TOML, INI).
+- RedisJSON preview: a document above `keyspace.json_preview_bytes` (1 MiB) is no longer
+  read whole. Objects list their top-level fields with type and size (100 per page, `Enter`
+  opens a field, `Esc` goes back), arrays show their first 100 items. A 50 MB document
+  previews in about 70 ms instead of freezing the pane. Needs RedisJSON 2 (`$` paths).
 
 ### Changed
 
@@ -54,6 +58,14 @@ First public release. Requires Rust 1.97 or newer.
   (1M keys: 108 MiB → 61 MiB; 10M keys: 1.2 GiB → 821 MiB).
 - The footer builds its text once per `INFO` sample instead of on every frame, and a loaded
   page of keys is moved into the key table instead of copied.
+- A slow value no longer holds up everything behind it: values load in their own task on
+  their own connection, so page turns and writes go ahead while a value is loading. Moving
+  through keys quickly cancels the fetches of the keys you passed, so only the last value is
+  shown.
+- The screen is redrawn only when something on it changed, not at every frame tick. An
+  idle key list draws about 6 frames a minute (the footer's CPU % at most every 10 s); the
+  dashboard redraws once per sample and the Pub/Sub tab on each new message and every
+  second. `frames_drawn` is logged at debug level once a minute.
 
 ### Fixed
 
