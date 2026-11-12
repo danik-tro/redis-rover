@@ -89,9 +89,14 @@ impl Server {
 /// Start Redis and wait until it answers `PING` (the log line the image
 /// waits for can come slightly before the port is reachable).
 pub async fn start_redis() -> Server {
+    start_redis_tag(REDIS_TAG).await
+}
+
+/// Like [`start_redis`], on another `redis` image tag (`5-alpine`).
+pub async fn start_redis_tag(tag: &str) -> Server {
     init();
     let container = Redis::default()
-        .with_tag(REDIS_TAG)
+        .with_tag(tag)
         .start()
         .await
         .expect("start redis container (is Docker running?)");
