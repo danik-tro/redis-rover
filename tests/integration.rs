@@ -1156,3 +1156,33 @@ async fn json_50mb_preview_is_fast_and_small() {
     }
     h.shutdown().await;
 }
+
+// ---- --probe ----------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn probe_reports_resp3_on_redis_7() {
+    let server = support::start_redis().await;
+    let report = redis_rover::internals::probe_report(&server.client(0), "test")
+        .await
+        .expect("probe");
+    eprintln!("{report}");
+    assert!(report.contains("PING      PONG"), "{report}");
+    assert!(report.contains("server    Redis 7."), "{report}");
+    assert!(report.contains("role      master"), "{report}");
+    assert!(report.contains("cluster   no"), "{report}");
+    assert!(report.contains("RESP3     yes"), "{report}");
+}
+
+/// A pre-6.0 server has no `HELLO`: the probe says so and still succeeds.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn probe_reports_no_resp3_on_redis_5() {
+    let server = support::start_redis_tag("5-alpine").await;
+    let report = redis_rover::internals::probe_report(&server.client(0), "test")
+        .await
+        .expect("probe succeeds on Redis 5");
+    eprintln!("{report}");
+    assert!(report.contains("server    Redis 5."), "{report}");
+    assert!(report.contains("RESP3     no"), "{report}");
+}

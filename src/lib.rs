@@ -13,6 +13,7 @@ mod config;
 mod keybindings;
 mod mappings;
 mod mode;
+mod probe;
 mod pubsub_notify;
 mod redis_client;
 mod state;
@@ -58,6 +59,15 @@ pub async fn run(args: Cli) -> Result<()> {
         print!("{}", resolve_target(&args)?.report()?);
         return Ok(());
     }
+    // rustls needs a process-wide crypto provider. This errors only if one is
+    // already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if args.probe {
+        let client = resolve_target(&args)?.client()?;
+        let label = cli::connection_label(client.get_connection_info());
+        print!("{}", probe::report(&client, &label).await?);
+        return Ok(());
+    }
 
     initialize_logging()?;
     initialize_panic_handler()?;
@@ -66,10 +76,6 @@ pub async fn run(args: Cli) -> Result<()> {
     let (tx, rx) = mpsc::channel(ACTION_CHANNEL_CAPACITY);
 
     let state = SharedState::default();
-
-    // rustls needs a process-wide crypto provider. This errors only if one is
-    // already installed, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let target = resolve_target(&args)?;
     let client = target.client()?;
@@ -118,6 +124,7 @@ pub mod internals {
     pub use crate::action::Action;
     pub use crate::clock::{Clock, FixedClock, SystemClock};
     pub use crate::mode::Mode;
+    pub use crate::probe::report as probe_report;
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
     pub use crate::redis_client::pubsub::PubSubCmd;
