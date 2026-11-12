@@ -12,7 +12,10 @@
 
 mod support;
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use redis::AsyncCommands;
@@ -23,7 +26,7 @@ use redis_rover::{
     },
     Cli,
 };
-use support::{Harness, WAIT};
+use support::{Harness, ValueDelay, WAIT};
 
 /// Poll `check` every 50 ms until it holds, for up to `limit`.
 async fn eventually(what: &str, limit: Duration, check: impl Fn() -> bool) {
@@ -799,4 +802,80 @@ async fn tls_needs_the_ca_or_insecure() {
     h.shutdown().await;
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AC1 (#48): a value that takes 3 s to load doesn't hold back a keys page
+/// turn sent after it.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn slow_value_fetch_does_not_block_paging() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let keys = support::seed_strings(&mut admin, &support::prefix("slow"), 30).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().set_page_size(10, 0);
+    assert_eq!(h.fetch_page().await.len(), 10);
+
+    let _delay = ValueDelay::set(3000);
+    h.state
+        .value_state
+        .lock()
+        .select(&keys[0], RedisType::String);
+    h.send(RedisEvent::FetchValue);
+    let started = Instant::now();
+    assert!(h.state.keyspace_state.lock().next_page());
+    let page = h.fetch_page().await;
+    let paged_in = started.elapsed();
+    assert_eq!(page.len(), 10);
+    assert!(
+        paged_in < Duration::from_secs(1),
+        "page turn waited for the value: {paged_in:?}"
+    );
+
+    h.expect("the slow value", |a| {
+        *a == Action::LoadSelectedValueIntoView
+    })
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(2900),
+        "the value can't load before its delay"
+    );
+    h.shutdown().await;
+}
+
+/// AC2 (#48): moving through 20 keys quickly shows only the last one's value;
+/// the earlier fetches are aborted and never land.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn fast_value_moves_show_only_the_last() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let prefix = support::prefix("moves");
+    let keys: Vec<String> = (0..20).map(|i| format!("{prefix}{i}")).collect();
+    let mut pipe = redis::pipe();
+    for key in &keys {
+        pipe.set(key, format!("value of {key}")).ignore();
+    }
+    let () = pipe.query_async(&mut admin).await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    // Each fetch waits longer than the gap between two moves, so they overlap.
+    let _delay = ValueDelay::set(100);
+    for key in &keys {
+        h.state.value_state.lock().select(key, RedisType::String);
+        h.send(RedisEvent::FetchValue);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let actions = h.drain(Duration::from_secs(1)).await;
+    let loads = actions
+        .iter()
+        .filter(|a| **a == Action::LoadSelectedValueIntoView)
+        .count();
+    assert_eq!(loads, 1, "only the last fetch lands: {actions:?}");
+    let last = keys.last().expect("20 keys");
+    match h.state.selected_value.lock().as_ref().map(|l| &l.value) {
+        Some(KeyValue::String { value, .. }) => assert_eq!(value, &format!("value of {last}")),
+        other => panic!("expected the last key's value, got {other:?}"),
+    }
+    h.shutdown().await;
 }
