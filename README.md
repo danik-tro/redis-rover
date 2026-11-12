@@ -15,6 +15,7 @@ A Redis terminal-ui client written in rust 🦀
 - Browse and filter Redis keys with type-colored badges; module types (`json`, `stream`, `MBbloom--`, ...) show their real name
 - Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes). A page turn costs the same on page 1 and page 10,000, even with 10M keys swept
 - View strings, lists, sets, hashes and sorted sets; add, edit and delete keys and items, with a confirm step on delete
+- RedisJSON documents pretty-printed; a document above 1 MiB opens as a preview (its top-level fields with type and size, or the first 100 items) instead of freezing the pane
 - Switch between logical databases (`s`) and see the key count of the current one
 - `--read-only` mode for browsing production safely
 - TLS (`rediss://`), including private CAs and mutual TLS
@@ -52,7 +53,7 @@ Connects to Redis at `localhost:6379` by default. Use `-u/--url` to pick a serve
 | `--token` | Prompt for the password (input is hidden). |
 | `--read-only` | Block every write. See [Read-only mode](#read-only-mode). |
 | `--tls-ca`, `--tls-cert`, `--tls-key`, `--insecure` | TLS options. See [TLS](#tls). |
-| `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. |
+| `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. A frame is drawn only when something on screen changed, so an idle key list redraws a few times a minute. |
 
 ### Read-only mode
 
@@ -65,6 +66,16 @@ With `--read-only`, every write is refused: add, edit, delete and TTL changes. T
 ### Databases
 
 Press `s` to open the DB picker. Move with `j`/`k` (or the arrow keys), or type the DB number, then press `Enter`. The footer shows the current DB and its key count, e.g. `db 3 · 120 keys`. You can also start on a DB with the URL path (`redis://host:6379/3`).
+
+### RedisJSON
+
+JSON keys show their document pretty-printed and coloured, like JSON strings. A document larger than `keyspace.json_preview_bytes` (1 MiB by default, measured with `MEMORY USAGE`) isn't read whole. The pane shows a preview instead:
+
+- an object lists its top-level fields with their type and size, 100 per page (`n`/`p`). `Enter` on a field opens it, and the same limit applies again, so a large field opens as its own preview. `Esc` goes back one level.
+- an array shows its first 100 items.
+- any other value shows only its type and size.
+
+The footer reads e.g. `14.21 MiB preview · fields 1–100 of 50,000 · n/p page · Enter opens`. `y` still copies the whole document, and asks first above 10 MiB. Previews use `$` paths and need RedisJSON 2 or later. With RedisJSON 1.x a document under the limit opens as usual, and a larger one shows only its size.
 
 ### Cluster
 
@@ -131,7 +142,7 @@ Press `?` in the app for the full list. Defaults:
 |---|---|
 | `j` / `k` | Scroll down / up |
 | `n` / `p` | Next / previous page (of keys, or of the open value) |
-| `Enter` | Open the selected value / confirm |
+| `Enter` | Open the selected value (or a field of a JSON preview) / confirm |
 | `Esc` | Close popup / leave the value pane |
 | `f` / `l` | Set / clear the filter pattern (glob, e.g. `user:*`) |
 | `r` | Refresh keyspace |
@@ -179,7 +190,15 @@ Press `?` in the app for the full list. Defaults:
 
 ### Configuration
 
-Key bindings, colors and styles can be overridden in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
+Key bindings, colors, styles and limits can be overridden in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
+
+For example, to preview RedisJSON documents only above 4 MiB:
+
+```json5
+{
+  "keyspace": { "json_preview_bytes": 4194304 },
+}
+```
 
 ---
 
