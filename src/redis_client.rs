@@ -6,3 +6,4 @@ pub mod pubsub_store;
 pub mod runner;
 pub mod storage;
 pub mod types;
+pub mod write_cmd;
