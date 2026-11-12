@@ -1,4 +1,7 @@
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use redis::aio::ConnectionManager;
 use tokio::{
@@ -30,6 +33,13 @@ const COUNT_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a DB switch may take to open its new connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Test hook: milliseconds each value fetch waits before it starts (0 = off).
+/// The integration suite uses it to make one value fetch slow without
+/// stalling the whole server (`DEBUG SLEEP` would). One atomic load in
+/// production.
+#[doc(hidden)]
+pub static VALUE_FETCH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 pub struct Runner {
     cancellation_token: CancellationToken,
@@ -166,7 +176,17 @@ impl Runner {
         let read_only = self.read_only;
 
         self.state_task = tokio::spawn(async move {
-            let mut event_handler = EventHandler::new(state, action_tx, storage, client, read_only);
+            // Values load over their own connection, so a large value reply
+            // never holds back a keys page queued behind it on the socket.
+            let value_storage = match open_connection(client.clone()).await {
+                Ok(manager) => Storage::new(manager),
+                Err(err) => {
+                    log::warn!("Opening the value connection failed, sharing the main one: {err}");
+                    storage.clone()
+                }
+            };
+            let mut event_handler =
+                EventHandler::new(state, action_tx, storage, value_storage, client, read_only);
             event_handler.load_db_count().await;
 
             loop {
@@ -256,17 +276,31 @@ pub struct EventHandler {
     state: SharedState,
     tx: ActionSender<Action>,
     storage: Storage,
+    /// Connection the value fetches use (see [`EventHandler::fetch_value`]).
+    value_storage: Storage,
     /// Base client used to open a connection to another DB.
     client: redis::Client,
     read_only: bool,
-    /// `ValueState::generation` of the last value fetch started. Queued
-    /// `FetchValue` events all read the latest state, so after the first one the
-    /// rest would refetch the same page.
+    /// `ValueState::generation` of the last value fetch started.
     last_value_generation: Option<u64>,
     /// The running filter match count, if any. A new request aborts it.
     count_task: Option<JoinHandle<()>>,
     /// The running full-value fetch for copying, if any. A new one aborts it.
     yank_task: Option<JoinHandle<()>>,
+    /// The running value page fetch, if any. A new one aborts it.
+    value_task: Option<JoinHandle<()>>,
+}
+
+impl Drop for EventHandler {
+    /// The spawned fetches outlive nothing: they stop with the state task.
+    fn drop(&mut self) {
+        for task in [&self.count_task, &self.yank_task, &self.value_task]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl EventHandler {
@@ -274,6 +308,7 @@ impl EventHandler {
         state: SharedState,
         tx: ActionSender<Action>,
         storage: Storage,
+        value_storage: Storage,
         client: redis::Client,
         read_only: bool,
     ) -> Self {
@@ -281,11 +316,13 @@ impl EventHandler {
             state,
             tx,
             storage,
+            value_storage,
             client,
             read_only,
             last_value_generation: None,
             count_task: None,
             yank_task: None,
+            value_task: None,
         }
     }
 
@@ -393,7 +430,7 @@ impl EventHandler {
                     }
                 }
             }
-            RedisEvent::FetchValue => self.fetch_value().await,
+            RedisEvent::FetchValue => self.fetch_value(),
             RedisEvent::FetchPubSubChannels => match self.storage.pubsub_channels().await {
                 Ok(channels) => {
                     self.state.pubsub.lock().set_server_channels(channels);
@@ -427,13 +464,17 @@ impl EventHandler {
     /// reconnects with the DB from its connection info, so after a dropped
     /// connection it would silently go back to the old DB.
     async fn select_db(&mut self, db: i64) {
-        match self.connect_db(db).await {
-            Ok(manager) => {
+        match tokio::try_join!(self.connect_db(db), self.connect_db(db)) {
+            Ok((manager, value_manager)) => {
                 self.abort_count();
-                if let Some(task) = self.yank_task.take() {
+                for task in [self.yank_task.take(), self.value_task.take()]
+                    .into_iter()
+                    .flatten()
+                {
                     task.abort();
                 }
                 self.storage = Storage::new(manager);
+                self.value_storage = Storage::new(value_manager);
                 *self.state.db.lock() = db;
                 self.state.keyspace_state.lock().reset_for_db();
                 self.state.value_state.lock().clear();
@@ -518,25 +559,38 @@ impl EventHandler {
         let info = self.client.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(db);
         let client = redis::Client::open(info.set_redis_settings(settings))?;
-        let manager = tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
-            .await
-            .map_err(|_| format!("timed out after {CONNECT_TIMEOUT:?}"))??;
-        Ok(manager)
+        open_connection(client).await
     }
 
-    /// Fetch the selected value's current page. Works on a snapshot so the lock
-    /// isn't held across `.await`, and drops the result if the user moved to
-    /// another key / page meanwhile (a newer `FetchValue` is then queued).
-    async fn fetch_value(&mut self) {
+    /// Fetch the selected value's current page in a separate task on the value
+    /// connection, so a slow value never delays the events queued behind it.
+    /// A newer request aborts the running one. Works on a snapshot so the lock
+    /// isn't held across `.await`; the task drops its result if the user moved
+    /// to another key / page meanwhile.
+    fn fetch_value(&mut self) {
         let snapshot = self.state.value_state.lock().clone();
         if snapshot.key.is_none() {
             return;
         }
+        // Queued `FetchValue`s all read the latest state: after the first,
+        // the rest would restart the same fetch.
         if self.last_value_generation == Some(snapshot.generation) {
             return;
         }
         self.last_value_generation = Some(snapshot.generation);
-        load_value(&self.storage, &self.state, &self.tx, snapshot).await;
+        if let Some(task) = self.value_task.take() {
+            task.abort();
+        }
+        let storage = self.value_storage.clone();
+        let state = self.state.clone();
+        let tx = self.tx.clone();
+        self.value_task = Some(tokio::spawn(async move {
+            let delay = VALUE_FETCH_DELAY_MS.load(Ordering::Relaxed);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            load_value(&storage, &state, &tx, snapshot).await;
+        }));
     }
 
     /// Load the current keyspace page into `state.keys` and send
@@ -594,6 +648,14 @@ impl EventHandler {
     fn action_hook(&self, action: Action) {
         crate::action::try_send_action(&self.tx, action);
     }
+}
+
+/// Open a connection manager for `client`, giving up after [`CONNECT_TIMEOUT`].
+async fn open_connection(client: redis::Client) -> Result<ConnectionManager, FetchError> {
+    let manager = tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
+        .await
+        .map_err(|_| format!("timed out after {CONNECT_TIMEOUT:?}"))??;
+    Ok(manager)
 }
 
 /// Fetch the value page `snapshot` describes. Unless the user moved on

@@ -102,7 +102,7 @@ pub mod internals {
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
-    pub use crate::redis_client::runner::Runner;
+    pub use crate::redis_client::runner::{Runner, VALUE_FETCH_DELAY_MS};
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, NewKeySpec,
         RedisInfo, RedisType, SweepResult, ValuePageInfo,
