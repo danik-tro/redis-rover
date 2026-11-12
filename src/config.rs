@@ -35,7 +35,7 @@ pub struct Config {
     #[serde(default)]
     pub colors: Base16Palette,
     #[serde(default)]
-    pub keyspace: KeyspacePalette,
+    pub keyspace: KeyspaceConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
     #[serde(default)]
@@ -323,7 +323,7 @@ impl Default for Base16Palette {
 
 #[serde_as]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-pub struct KeyspacePalette {
+pub struct KeyspaceConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub string: Color,
 
@@ -349,7 +349,7 @@ pub struct KeyspacePalette {
     pub unknown: Color,
 }
 
-impl Default for KeyspacePalette {
+impl Default for KeyspaceConfig {
     fn default() -> Self {
         Self {
             string: Color::from_str("#00f769").unwrap(),
