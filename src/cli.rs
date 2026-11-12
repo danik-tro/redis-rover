@@ -70,6 +70,12 @@ pub struct Cli {
 
     #[arg(
         long,
+        help = "Start writable on a prod or unknown host (they start read-only). --read-only wins"
+    )]
+    pub writable: bool,
+
+    #[arg(
+        long,
         help = "Print the resolved connection target (password masked) and exit without connecting"
     )]
     pub print_target: bool,

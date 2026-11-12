@@ -79,7 +79,7 @@ pub async fn run(args: Cli) -> Result<()> {
 
     let target = resolve_target(&args)?;
     let client = target.client()?;
-    let target = cli::connection_label(client.get_connection_info());
+    let label = cli::connection_label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
     let manager: ConnectionManager = ConnectionManager::new(client.clone())
         .await
@@ -87,7 +87,7 @@ pub async fn run(args: Cli) -> Result<()> {
 
     let mut watcher = Runner::new(client, manager.clone(), state.clone(), tx.clone())
         .cancellation_token(cancellation_token.clone())
-        .read_only(args.read_only);
+        .read_only(target.read_only);
 
     let mut app = App::new(
         state,
@@ -95,11 +95,12 @@ pub async fn run(args: Cli) -> Result<()> {
         rx,
         watcher.tx(),
         watcher.pubsub_tx(),
-        &target,
+        &label,
         args.tick_rate,
         args.frame_rate,
     )
-    .read_only_flag(watcher.read_only_flag());
+    .read_only_flag(watcher.read_only_flag())
+    .environment(target.environment);
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;
@@ -135,6 +136,7 @@ pub mod internals {
         KeyspaceState, LoadedValue, NewKeySpec, RedisInfo, RedisType, SweepResult, ValuePageInfo,
     };
     pub use crate::state::{FrameData, SharedState};
+    pub use crate::target::Environment;
     pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
     pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, PageInfo};

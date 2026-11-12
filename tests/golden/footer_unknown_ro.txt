@@ -1,0 +1,5 @@
+╭ Info · redis://localhost:6379  UNKNOWN · RO  ──────────────────────────────────────────── ? Help ╮
+│  Redis version: 7.2.4                   db 0 · 1234 keys                                 CPU: -  │
+│  OS: Linux 6.8.0-1012-aws x86_64   Connected clients: 3/10000                 RAM: 1.53M/15.47G  │
+│                              o open  y yank  / filter  d db  ? help                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
