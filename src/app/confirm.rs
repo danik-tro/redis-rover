@@ -1,29 +1,110 @@
-//! Yes / no questions the App asks itself, drawn above every mode: lifting
-//! read-only on Prod.
+//! Yes / no questions the App asks itself, drawn above every mode: the
+//! command preview before a write (`safety.preview`) and lifting read-only
+//! on Prod.
 
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    buffer::Buffer,
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
-    style::Stylize,
-    text::Line,
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap},
-};
-use unicode_width::UnicodeWidthStr;
+use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 use super::App;
-use crate::{action::Action, config, target::Environment};
+use crate::{
+    action::Action, redis_client::event::RedisEvent, target::Environment,
+    widgets::confirm::ConfirmPopup,
+};
 
 /// A modal question; `y` accepts, `n` / Esc cancels.
 #[derive(Debug)]
 pub(super) enum PendingConfirm {
     /// Allow writes on Prod.
     LiftReadOnly,
+    /// Send a write once its commands were seen.
+    Write(Box<PendingWrite>),
+}
+
+/// A write waiting for `y`, with what to do once it is sent.
+#[derive(Debug)]
+pub(super) struct PendingWrite {
+    event: RedisEvent,
+    /// `event.preview()`, built once.
+    lines: Vec<String>,
+    after: AfterWrite,
+}
+
+/// Cursor bookkeeping a write applies only when it is sent, so a cancelled
+/// preview leaves nothing behind.
+#[derive(Debug, Default)]
+pub(super) struct AfterWrite {
+    pub reselect: Reselect,
+    /// Sets `App::restore_value_row`.
+    pub restore_value_row: Option<usize>,
+}
+
+/// What a sent write does to `App::reselect_key`.
+#[derive(Debug, Default)]
+pub(super) enum Reselect {
+    /// Leave it (publish).
+    #[default]
+    Keep,
+    /// The key is gone: land on whatever fills its place.
+    Clear,
+    /// Put the cursor back on this key after the refresh.
+    Key(String),
+}
+
+impl AfterWrite {
+    /// Keep the cursor on `key` after the refresh.
+    pub(super) fn reselect(key: &str) -> Self {
+        Self {
+            reselect: Reselect::Key(key.to_owned()),
+            restore_value_row: None,
+        }
+    }
+
+    /// Keep the cursor on `key`, and inside its value on `row`.
+    pub(super) fn reselect_row(key: &str, row: usize) -> Self {
+        Self {
+            reselect: Reselect::Key(key.to_owned()),
+            restore_value_row: Some(row),
+        }
+    }
 }
 
 impl App {
+    /// Whether `event` shows its commands first (`safety.preview`; always
+    /// on Prod).
+    pub(super) fn previews(&self, event: &RedisEvent) -> bool {
+        self.preview.on(self.environment).previews(event)
+    }
+
+    /// Every write goes through here: shown in the preview popup when the
+    /// policy says so, sent at once otherwise.
+    pub(super) fn submit_write(&mut self, event: RedisEvent, after: AfterWrite) {
+        let lines = event.preview();
+        if lines.is_empty() || !self.previews(&event) {
+            // Nothing to show (a no-op edit) or no preview wanted.
+            self.send_write(event, after);
+            return;
+        }
+        self.pending = Some(PendingConfirm::Write(Box::new(PendingWrite {
+            event,
+            lines,
+            after,
+        })));
+    }
+
+    fn send_write(&mut self, event: RedisEvent, after: AfterWrite) {
+        match after.reselect {
+            Reselect::Keep => {}
+            Reselect::Clear => self.reselect_key = None,
+            Reselect::Key(key) => self.reselect_key = Some(key),
+        }
+        if let Some(row) = after.restore_value_row {
+            self.restore_value_row = Some(row);
+        }
+        self.send_redis_event(event);
+    }
+
     /// `R`: turn read-only on at once; lifting it on Prod asks first.
     pub(super) fn toggle_read_only(&mut self, now: Instant) {
         if !self.is_read_only() {
@@ -69,89 +150,224 @@ impl App {
         let now = self.clock.now();
         match self.pending.take() {
             Some(PendingConfirm::LiftReadOnly) => self.lift_read_only(now),
+            Some(PendingConfirm::Write(write)) => {
+                let PendingWrite { event, after, .. } = *write;
+                self.send_write(event, after);
+            }
             None => {}
         }
     }
 
     /// Draw the open question, centred in `area`.
     pub(super) fn render_confirm(&self, area: Rect, buf: &mut Buffer) {
-        let Some(pending) = &self.pending else {
-            return;
-        };
-        let cfg = config::get();
         let env = self.environment;
-        let (title, body, hint) = match pending {
-            PendingConfirm::LiftReadOnly => (
-                " Lift read-only ".to_owned(),
-                vec![Line::from(format!("Allow writes to {}?", env.label()))],
-                "y: allow writes   n/Esc: cancel",
-            ),
-        };
-        let mut lines = body;
-        lines.push(Line::from(""));
-        lines.push(Line::styled(hint, cfg.colors.base04).alignment(Alignment::Center));
-
-        let text_w = lines
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap_or(0)
-            .max(title.width());
-        let popup = centered(area, text_w, lines.len());
-        Clear.render(popup, buf);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(title)
-                    .title_alignment(Alignment::Center)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(cfg.colors.env(env))
-                    .bg(cfg.colors.base00)
-                    .fg(cfg.colors.base05),
-            )
-            .render(popup, buf);
+        match &self.pending {
+            Some(PendingConfirm::LiftReadOnly) => {
+                ConfirmPopup::lift_read_only(env).render(area, buf);
+            }
+            Some(PendingConfirm::Write(write)) => {
+                ConfirmPopup::write_preview(&write.lines, env).render(area, buf);
+            }
+            None => {}
+        }
     }
-}
-
-/// A box for `text_w` columns and `rows` lines (plus borders and padding),
-/// centred and clamped to `area`.
-pub(super) fn centered(area: Rect, text_w: usize, rows: usize) -> Rect {
-    let w = u16::try_from(text_w.saturating_add(4))
-        .unwrap_or(u16::MAX)
-        .max(30)
-        .min(area.width);
-    let h = u16::try_from(rows.saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .min(area.height);
-    let [_, row, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(h),
-        Constraint::Fill(1),
-    ])
-    .flex(Flex::Center)
-    .areas(area);
-    let [_, popup, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(w),
-        Constraint::Fill(1),
-    ])
-    .flex(Flex::Center)
-    .areas(row);
-    popup
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyEvent};
+    use tokio::sync::broadcast;
 
     use super::PendingConfirm;
     use crate::{
         action::Action,
-        app::tests::{app, key},
+        app::{
+            tests::{app, app_with_channels, key},
+            App,
+        },
+        config::PreviewPolicy,
+        redis_client::{
+            event::RedisEvent,
+            types::{
+                ItemDelete, ItemEdit, KeyMeta, KeyValue, LoadedValue, RedisType, ValuePageInfo,
+            },
+        },
         target::Environment,
     };
+
+    /// A key press as the event loop handles it: the key, then its action.
+    fn press(app: &mut App, k: KeyEvent) {
+        if let Some(action) = app.handle_key_event(k) {
+            app.update(&action);
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    /// An app on the hash `user:1` = {name: Bob}, drilled into its value.
+    fn on_hash(env: Environment, policy: PreviewPolicy) -> (App, broadcast::Receiver<RedisEvent>) {
+        let (app, _, events) = app_with_channels();
+        let mut app = app.environment(env);
+        app.preview = policy;
+        *app.state.keys.lock() = Some(vec![KeyMeta {
+            key: "user:1".into(),
+            r_type: RedisType::Hash,
+            size: 10,
+            ttl: -1,
+            value: KeyValue::Unknown,
+        }]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name("user:1"));
+        app.keyspace.set_selected_value(Some(LoadedValue {
+            value: KeyValue::Hash(vec![("name".into(), "Bob".into())]),
+            page: ValuePageInfo {
+                start: 0,
+                len: 1,
+                total: Some(1),
+                has_next: false,
+                has_prev: false,
+            },
+        }));
+        app.keyspace.enter_value();
+        (app, events)
+    }
+
+    fn drain(events: &mut broadcast::Receiver<RedisEvent>) -> Vec<RedisEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn writes(events: &mut broadcast::Receiver<RedisEvent>) -> Vec<RedisEvent> {
+        drain(events)
+            .into_iter()
+            .filter(RedisEvent::is_write)
+            .collect()
+    }
+
+    /// Edit `name` to `Ada` with `e`, then Enter.
+    fn edit_name_to_ada(app: &mut App) {
+        press(app, key(KeyCode::Char('e')));
+        for _ in 0..3 {
+            press(app, key(KeyCode::Backspace));
+        }
+        type_text(app, "Ada");
+        press(app, key(KeyCode::Enter));
+    }
+
+    /// AC3: editing a hash field shows `HSET "user:1" "name" "Ada"`, and
+    /// nothing is written before `y`.
+    #[test]
+    fn edit_waits_for_y_with_the_exact_command() {
+        let (mut app, mut events) = on_hash(Environment::Local, PreviewPolicy::Writes);
+        drain(&mut events);
+        edit_name_to_ada(&mut app);
+        let Some(PendingConfirm::Write(write)) = &app.pending else {
+            panic!("no preview: {:?}", app.pending);
+        };
+        assert_eq!(write.lines, vec![r#"HSET "user:1" "name" "Ada""#]);
+        assert!(writes(&mut events).is_empty(), "sent before y");
+
+        // Keys other than y / n / Esc do nothing; Enter doesn't confirm.
+        press(&mut app, key(KeyCode::Enter));
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(writes(&mut events).is_empty());
+        assert!(app.pending.is_some());
+
+        press(&mut app, key(KeyCode::Char('y')));
+        assert!(app.pending.is_none());
+        match writes(&mut events).as_slice() {
+            [RedisEvent::EditItem {
+                key,
+                edit: ItemEdit::HashSet { field, value },
+            }] => assert_eq!(
+                (key.as_str(), field.as_str(), value.as_str()),
+                ("user:1", "name", "Ada")
+            ),
+            other => panic!("expected one HSET edit, got {other:?}"),
+        }
+        assert_eq!(app.reselect_key.as_deref(), Some("user:1"));
+        assert_eq!(app.restore_value_row, Some(0));
+    }
+
+    #[test]
+    fn n_and_esc_cancel_without_side_effects() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+            let (mut app, mut events) = on_hash(Environment::Local, PreviewPolicy::Writes);
+            drain(&mut events);
+            edit_name_to_ada(&mut app);
+            press(&mut app, key(cancel));
+            assert!(app.pending.is_none(), "{cancel:?}");
+            assert!(writes(&mut events).is_empty(), "{cancel:?}");
+            assert_eq!(app.reselect_key, None, "{cancel:?}: no stale reselect");
+            assert_eq!(app.restore_value_row, None, "{cancel:?}");
+        }
+    }
+
+    #[test]
+    fn policy_off_sends_at_once_but_prod_still_previews() {
+        let (mut app, mut events) = on_hash(Environment::Local, PreviewPolicy::Off);
+        drain(&mut events);
+        edit_name_to_ada(&mut app);
+        assert!(app.pending.is_none());
+        assert_eq!(writes(&mut events).len(), 1);
+
+        let (mut app, mut events) = on_hash(Environment::Prod, PreviewPolicy::Off);
+        drain(&mut events);
+        edit_name_to_ada(&mut app);
+        assert!(matches!(app.pending, Some(PendingConfirm::Write(_))));
+        assert!(writes(&mut events).is_empty());
+
+        // "destructive": the edit goes straight through.
+        let (mut app, mut events) = on_hash(Environment::Staging, PreviewPolicy::Destructive);
+        drain(&mut events);
+        edit_name_to_ada(&mut app);
+        assert!(app.pending.is_none());
+        assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    /// With a preview, `d` goes straight to it (one confirmation, not two).
+    /// With `off`, the old "Delete item?" box asks instead.
+    #[test]
+    fn delete_previews_instead_of_the_old_box() {
+        let (mut app, mut events) = on_hash(Environment::Local, PreviewPolicy::Destructive);
+        drain(&mut events);
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(!app.keyspace.is_overlay_open());
+        let Some(PendingConfirm::Write(write)) = &app.pending else {
+            panic!("no preview");
+        };
+        assert_eq!(write.lines, vec![r#"HDEL "user:1" "name""#]);
+        press(&mut app, key(KeyCode::Char('y')));
+        assert!(matches!(
+            writes(&mut events).as_slice(),
+            [RedisEvent::DeleteItem {
+                delete: ItemDelete::HashField(f),
+                ..
+            }] if f == "name"
+        ));
+
+        let (mut app, mut events) = on_hash(Environment::Local, PreviewPolicy::Off);
+        drain(&mut events);
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(app.pending.is_none());
+        assert!(app.keyspace.is_overlay_open(), "the old confirm box");
+        press(&mut app, key(KeyCode::Enter));
+        assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    #[test]
+    fn read_only_never_reaches_the_preview() {
+        let (app, mut events) = on_hash(Environment::Prod, PreviewPolicy::Writes);
+        let mut app = app.read_only(true);
+        drain(&mut events);
+        press(&mut app, key(KeyCode::Char('d')));
+        press(&mut app, key(KeyCode::Char('e')));
+        assert!(app.pending.is_none());
+        assert!(writes(&mut events).is_empty());
+    }
 
     #[test]
     fn toggle_flips_read_only_and_the_hint() {

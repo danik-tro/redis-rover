@@ -1,7 +1,11 @@
 use super::App;
 use std::time::Instant;
 
-use crate::redis_client::{event::RedisEvent, types::RedisType};
+use super::confirm::{AfterWrite, Reselect};
+use crate::redis_client::{
+    event::RedisEvent,
+    types::{ItemDelete, RedisType},
+};
 
 use crate::{
     action::{self, Action},
@@ -37,8 +41,8 @@ impl App {
             self.keyspace.close_new_key();
             return;
         };
-        self.reselect_key = Some(key.clone());
-        self.send_redis_event(RedisEvent::CreateKey { key, spec });
+        let after = AfterWrite::reselect(&key);
+        self.submit_write(RedisEvent::CreateKey { key, spec }, after);
     }
 
     /// Finalize the in-collection add-item overlay into an `AddItem` event. On
@@ -53,9 +57,8 @@ impl App {
         // overlay but leaves value focus intact).
         let row = self.keyspace.value_selected_row().unwrap_or(0);
         if let Some((key, item)) = self.keyspace.take_add_item_request() {
-            self.reselect_key = Some(key.clone());
-            self.restore_value_row = Some(row);
-            self.send_redis_event(RedisEvent::AddItem { key, item });
+            let after = AfterWrite::reselect_row(&key, row);
+            self.submit_write(RedisEvent::AddItem { key, item }, after);
         }
     }
 
@@ -66,9 +69,8 @@ impl App {
     pub(super) fn confirm_edit_item(&mut self) {
         let row = self.keyspace.value_selected_row().unwrap_or(0);
         if let Some((key, edit)) = self.keyspace.take_edit_item_request() {
-            self.reselect_key = Some(key.clone());
-            self.restore_value_row = Some(row);
-            self.send_redis_event(RedisEvent::EditItem { key, edit });
+            let after = AfterWrite::reselect_row(&key, row);
+            self.submit_write(RedisEvent::EditItem { key, edit }, after);
         }
     }
 
@@ -89,32 +91,38 @@ impl App {
             return;
         };
 
-        let event = match request {
-            OverlayRequest::Delete => {
-                // The key is going away; let the refresh land on whatever fills
-                // its place (default top-of-page) rather than reselecting it.
-                self.reselect_key = None;
-                RedisEvent::DeleteKey { key }
-            }
-            OverlayRequest::DeleteItem(delete) => {
-                // The key survives; keep the user inside the collection on the
-                // same (clamped) row after the post-delete refresh.
-                self.reselect_key = Some(key.clone());
-                self.restore_value_row = Some(row);
-                RedisEvent::DeleteItem { key, delete }
-            }
+        let (event, after) = match request {
+            OverlayRequest::Delete => Self::delete_key_write(key),
+            OverlayRequest::DeleteItem(delete) => Self::delete_item_write(key, delete, row),
             OverlayRequest::SetString(value) => {
                 // Non-destructive: keep the cursor on this key after the refresh.
-                self.reselect_key = Some(key.clone());
-                RedisEvent::SetString { key, value }
+                let after = AfterWrite::reselect(&key);
+                (RedisEvent::SetString { key, value }, after)
             }
             OverlayRequest::SetTtl(secs) => {
-                self.reselect_key = Some(key.clone());
-                RedisEvent::SetTtl { key, secs }
+                let after = AfterWrite::reselect(&key);
+                (RedisEvent::SetTtl { key, secs }, after)
             }
             OverlayRequest::Yank { .. } => return,
         };
-        self.send_redis_event(event);
+        self.submit_write(event, after);
+    }
+
+    /// The key is going away: the refresh lands on whatever fills its place
+    /// (top of the page) rather than reselecting it.
+    fn delete_key_write(key: String) -> (RedisEvent, AfterWrite) {
+        let after = AfterWrite {
+            reselect: Reselect::Clear,
+            restore_value_row: None,
+        };
+        (RedisEvent::DeleteKey { key }, after)
+    }
+
+    /// The key survives: keep the user inside the collection on the same
+    /// (clamped) row after the refresh.
+    fn delete_item_write(key: String, delete: ItemDelete, row: usize) -> (RedisEvent, AfterWrite) {
+        let after = AfterWrite::reselect_row(&key, row);
+        (RedisEvent::DeleteItem { key, delete }, after)
     }
 
     /// Enter: focus the value, or, on a field of a JSON preview, open that
@@ -155,11 +163,30 @@ impl App {
         if self.keyspace.selected_key().is_none() || self.deny_write() {
             return;
         }
-        if self.keyspace.is_value_focused() {
-            self.keyspace.open_delete_item_confirm();
-        } else {
-            self.keyspace.open_delete_confirm();
+        let Some((key, _)) = self.keyspace.selected_key() else {
+            return;
+        };
+        // The preview is the confirmation; the old "Delete …?" box is
+        // only for `safety.preview = "off"`.
+        let probe = RedisEvent::DeleteKey { key: String::new() };
+        if !self.previews(&probe) {
+            if self.keyspace.is_value_focused() {
+                self.keyspace.open_delete_item_confirm();
+            } else {
+                self.keyspace.open_delete_confirm();
+            }
+            return;
         }
+        let (event, after) = if self.keyspace.is_value_focused() {
+            let Some(delete) = self.keyspace.selected_item_delete() else {
+                return;
+            };
+            let row = self.keyspace.value_selected_row().unwrap_or(0);
+            Self::delete_item_write(key, delete, row)
+        } else {
+            Self::delete_key_write(key)
+        };
+        self.submit_write(event, after);
     }
 
     pub(super) fn request_set_ttl(&mut self) {

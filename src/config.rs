@@ -9,6 +9,7 @@ use serde_with::{serde_as, DisplayFromStr};
 use crate::{
     keybindings::KeyBindings,
     mode::Mode,
+    redis_client::event::RedisEvent,
     target::{Environment, Profile},
 };
 
@@ -58,9 +59,55 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub pubsub: PubSubConfig,
+    /// Write safety: when the command preview shows.
+    #[serde(default)]
+    pub safety: SafetyConfig,
     /// Connection profiles: `rrover <name>` or `--profile <name>`.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+}
+
+/// Write safety settings.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SafetyConfig {
+    /// Which writes show their commands before they are sent.
+    pub preview: PreviewPolicy,
+}
+
+/// `safety.preview`: which writes ask `y` / `n` with their exact commands.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewPolicy {
+    /// Every write.
+    #[default]
+    Writes,
+    /// Only deletes (a key or an element).
+    Destructive,
+    /// None; deleting a key or element still asks "Delete …?".
+    Off,
+}
+
+impl PreviewPolicy {
+    /// The policy in force on `env`: Prod always previews every write.
+    #[must_use]
+    pub fn on(self, env: Environment) -> Self {
+        if env == Environment::Prod {
+            Self::Writes
+        } else {
+            self
+        }
+    }
+
+    /// Whether `event` is previewed under this policy.
+    #[must_use]
+    pub fn previews(self, event: &RedisEvent) -> bool {
+        match self {
+            Self::Writes => event.is_write(),
+            Self::Destructive => event.is_destructive(),
+            Self::Off => false,
+        }
+    }
 }
 
 /// Buffer limits of each Pub/Sub subscription.
@@ -606,6 +653,47 @@ mod tests {
     use crate::{command::Command, keybindings::parse_key_sequence};
 
     use super::*;
+
+    #[test]
+    fn preview_policy_parses_and_prod_forces_writes() {
+        let cfg: Config = json5::from_str(r#"{ safety: { preview: "off" } }"#).unwrap();
+        assert_eq!(cfg.safety.preview, PreviewPolicy::Off);
+        let cfg: Config = json5::from_str("{}").unwrap();
+        assert_eq!(cfg.safety.preview, PreviewPolicy::Writes);
+        assert!(json5::from_str::<Config>(r#"{ safety: { preview: "some" } }"#).is_err());
+
+        let del = RedisEvent::DeleteKey { key: "k".into() };
+        let set = RedisEvent::SetString {
+            key: "k".into(),
+            value: "v".into(),
+        };
+        let read = RedisEvent::FetchKeys;
+        for env in [
+            Environment::Local,
+            Environment::Staging,
+            Environment::Unknown,
+        ] {
+            assert_eq!(PreviewPolicy::Off.on(env), PreviewPolicy::Off);
+        }
+        assert_eq!(
+            PreviewPolicy::Off.on(Environment::Prod),
+            PreviewPolicy::Writes
+        );
+        assert_eq!(
+            PreviewPolicy::Destructive.on(Environment::Prod),
+            PreviewPolicy::Writes
+        );
+        let table = [
+            (PreviewPolicy::Writes, [true, true, false]),
+            (PreviewPolicy::Destructive, [true, false, false]),
+            (PreviewPolicy::Off, [false, false, false]),
+        ];
+        for (policy, [d, s, r]) in table {
+            assert_eq!(policy.previews(&del), d, "{policy:?}");
+            assert_eq!(policy.previews(&set), s, "{policy:?}");
+            assert_eq!(policy.previews(&read), r, "{policy:?}");
+        }
+    }
 
     #[test]
     fn env_colours_can_be_overridden() {

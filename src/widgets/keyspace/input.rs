@@ -238,6 +238,11 @@ impl KeySpace {
         });
     }
 
+    /// The deletion of the selected collection element, if one is focused.
+    pub fn selected_item_delete(&self) -> Option<ItemDelete> {
+        self.selected_element().map(SelectedElement::into_delete)
+    }
+
     /// Open a delete-confirmation prompt for the selected collection element.
     /// No-op unless a navigable element is currently focused.
     pub fn open_delete_item_confirm(&mut self) {

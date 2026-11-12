@@ -1,4 +1,5 @@
 pub mod client;
+pub mod escape;
 pub mod event;
 pub mod metrics;
 pub mod pubsub;

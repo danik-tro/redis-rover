@@ -75,7 +75,10 @@ impl App {
     /// with its notice (the runner would reject the write anyway).
     pub(super) fn confirm_publish(&mut self) {
         if let Some((channel, payload)) = self.pubsub.take_publish_request() {
-            self.send_redis_event(RedisEvent::Publish { channel, payload });
+            self.submit_write(
+                RedisEvent::Publish { channel, payload },
+                super::confirm::AfterWrite::default(),
+            );
         }
     }
 
@@ -311,6 +314,10 @@ mod tests {
         assert_eq!(app.handle_key_event(key(KeyCode::Tab)), None);
         assert_eq!(app.handle_key_event(key(KeyCode::Char('x'))), None);
         assert_eq!(app.handle_key_event(ctrl('s')), None);
+        // The preview shows the command; nothing is sent before `y`.
+        assert!(events.try_recv().is_err());
+        assert!(app.pending.is_some());
+        assert_eq!(app.handle_key_event(key(KeyCode::Char('y'))), None);
         match events.try_recv() {
             Ok(RedisEvent::Publish { channel, payload }) => {
                 assert_eq!((channel.as_str(), payload.as_str()), ("orders:new", "x"));

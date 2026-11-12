@@ -17,12 +17,17 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    widgets::{StatefulWidget, Widget},
+};
 use redis_rover::internals::{
-    render_help, Clock, ConnStatus, Dashboard, DashboardWidget, Environment, FixedClock, FrameData,
-    Info, InfoSnapshot, InfoWidget, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
-    KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget,
-    RedisInfo, RedisType, SharedState, Target, Toast, ToastWidget, ValuePageInfo,
+    render_help, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget, Environment,
+    FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview,
+    JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory,
+    Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Target,
+    Toast, ToastWidget, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -358,6 +363,52 @@ fn footer(env: Environment, read_only: bool) -> Buffer {
     let mut buf = buffer(100, 5);
     InfoWidget { frame: &frame }.render(buf.area, &mut buf, &mut info);
     buf
+}
+
+// ---- Write preview -------------------------------------------------------
+
+/// AC3: editing a hash field previews the exact `HSET`.
+#[test]
+fn preview_hset() {
+    init();
+    let lines = RedisEvent::EditItem {
+        key: "user:1".into(),
+        edit: ItemEdit::HashSet {
+            field: "name".into(),
+            value: "Ada".into(),
+        },
+    }
+    .preview();
+    for (name, w, h) in [("preview_hset_80", 80, 24), ("preview_hset_120", 120, 30)] {
+        let mut buf = buffer(w, h);
+        ConfirmPopup::write_preview(&lines, Environment::Local).render(buf.area, &mut buf);
+        check(name, &buf);
+    }
+}
+
+/// A long value is cut with its size, the line wraps inside the popup, and
+/// composite writes show every command.
+#[test]
+fn preview_long_and_composite() {
+    init();
+    let mut lines = RedisEvent::SetString {
+        key: "session:7f3a9c".into(),
+        value: format!("{{\"user\": \"ada\", \"bio\": \"{}\"}}", "x".repeat(3000)),
+    }
+    .preview();
+    lines.extend(
+        RedisEvent::EditItem {
+            key: "tags".into(),
+            edit: ItemEdit::SetReplace {
+                old: "old tag".into(),
+                new: "new\ttag".into(),
+            },
+        }
+        .preview(),
+    );
+    let mut buf = buffer(80, 24);
+    ConfirmPopup::write_preview(&lines, Environment::Prod).render(buf.area, &mut buf);
+    check("preview_long_80", &buf);
 }
 
 // ---- Dashboard ------------------------------------------------------------
