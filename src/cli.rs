@@ -9,6 +9,7 @@ use crate::utils::version;
 
 #[derive(Parser)]
 #[command(author, version = version(), about)]
+#[allow(clippy::struct_excessive_bools)] // independent clap flags
 pub struct Cli {
     #[arg(
         short,
@@ -28,15 +29,32 @@ pub struct Cli {
     )]
     pub frame_rate: f64,
 
+    /// Connection profile from the config file (same as `--profile`).
+    #[arg(value_name = "PROFILE", conflicts_with = "profile")]
+    pub profile_arg: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Connection profile from the config file's `profiles`"
+    )]
+    pub profile: Option<String>,
+
     #[arg(
         short,
         long,
         value_name = "URL",
-        help = "Redis connection URL (e.g. redis://localhost:6379)",
-        default_value = "redis://localhost:6379",
+        help = "Redis connection URL. Default: the profile's url, then $REDIS_URL, then redis://localhost:6379",
         value_parser = parse_redis_url,
     )]
-    pub url: String,
+    pub url: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Logical database; overrides the URL path"
+    )]
+    pub db: Option<i64>,
 
     #[arg(
         long,
@@ -49,6 +67,19 @@ pub struct Cli {
         help = "Block all writes (add, edit, delete, TTL). Safe for browsing production."
     )]
     pub read_only: bool,
+
+    #[arg(
+        long,
+        help = "Print the resolved connection target (password masked) and exit without connecting"
+    )]
+    pub print_target: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "print_target",
+        help = "Connect, print a short server report (PING, RESP3, INFO, role) and exit"
+    )]
+    pub probe: bool,
 
     #[command(flatten)]
     pub tls: TlsArgs,
@@ -92,16 +123,16 @@ pub struct TlsArgs {
 }
 
 impl TlsArgs {
-    fn any(&self) -> bool {
+    pub(crate) fn any(&self) -> bool {
         self.tls_ca.is_some() || self.tls_cert.is_some() || self.tls_key.is_some() || self.insecure
     }
 
-    fn has_certificates(&self) -> bool {
+    pub(crate) fn has_certificates(&self) -> bool {
         self.tls_ca.is_some() || self.tls_cert.is_some()
     }
 
     /// Reads the PEM files named by the flags.
-    fn load_certificates(&self) -> Result<TlsCertificates> {
+    pub(crate) fn load_certificates(&self) -> Result<TlsCertificates> {
         let root_cert = self
             .tls_ca
             .as_deref()
@@ -139,7 +170,7 @@ fn read_certs(flag: &str, path: &Path) -> Result<Vec<u8>> {
 
 /// Checks that TLS flags are only used with a `rediss://` URL and applies
 /// `--insecure` to the address.
-fn apply_tls_flags(info: ConnectionInfo, tls: &TlsArgs) -> Result<ConnectionInfo> {
+pub(crate) fn apply_tls_flags(info: ConnectionInfo, tls: &TlsArgs) -> Result<ConnectionInfo> {
     if !tls.any() {
         return Ok(info);
     }
@@ -196,50 +227,22 @@ pub fn connection_label(info: &ConnectionInfo) -> String {
 }
 
 impl Cli {
-    /// Builds typed [`ConnectionInfo`] from the parsed args, prompting for a
-    /// token if `--token` was passed.
-    ///
-    /// The prompt runs before the TUI is initialised so the terminal is still
-    /// in normal mode and the password can be entered safely. The token is set
-    /// on the typed `redis` settings, whose `Debug` impl redacts the password —
-    /// so it never leaks into logs or panic dumps (unlike embedding it in the
-    /// URL string).
-    ///
-    /// # Errors
-    ///
-    /// Fails if `--url` is not a valid Redis URL or the token prompt can't be read.
-    pub fn connection_info(&self) -> Result<ConnectionInfo> {
-        let conn_info = self
-            .url
-            .as_str()
-            .into_connection_info()
-            .map_err(|e| eyre!("Invalid Redis URL: {e}"))?;
-
-        if !self.token {
-            return Ok(conn_info);
-        }
-
-        let token = rpassword::prompt_password("Redis auth token: ")
-            .map_err(|e| eyre!("Failed to read token: {e}"))?;
-        let redis = conn_info.redis_settings().clone().set_password(token);
-
-        Ok(conn_info.set_redis_settings(redis))
+    /// The profile named by the positional `PROFILE` or `--profile`.
+    #[must_use]
+    pub fn profile_name(&self) -> Option<&str> {
+        self.profile_arg.as_deref().or(self.profile.as_deref())
     }
 
-    /// Builds the Redis client, including TLS settings from the flags.
+    /// Builds the Redis client from the flags alone (no profiles, no
+    /// `REDIS_URL`), prompting for a token if `--token` was passed.
     ///
     /// # Errors
     ///
-    /// Fails if the connection info can't be built, the TLS flags are used
-    /// without a `rediss://` URL, or a certificate / key file can't be read.
+    /// Fails if a profile is named, the URL is invalid, the TLS flags are
+    /// used without a `rediss://` URL, or a certificate / key file can't be
+    /// read.
     pub fn client(&self) -> Result<redis::Client> {
-        let info = apply_tls_flags(self.connection_info()?, &self.tls)?;
-        let client = if self.tls.has_certificates() {
-            redis::Client::build_with_tls(info, self.tls.load_certificates()?)
-        } else {
-            redis::Client::open(info)
-        };
-        client.map_err(|e| eyre!(e))
+        crate::target::resolve(self, &std::collections::HashMap::new(), None)?.client()
     }
 }
 

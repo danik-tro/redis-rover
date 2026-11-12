@@ -6,13 +6,27 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{de::Deserializer, Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::{keybindings::KeyBindings, mode::Mode};
+use crate::{keybindings::KeyBindings, mode::Mode, target::Profile};
 
 const CONFIG_PATH: &str = include_str!("../.config/config.json5");
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 pub fn get() -> &'static Config {
     CONFIG.get_or_init(|| Config::new().expect("Configuration file is not set."))
+}
+
+/// Load the configuration once, returning a load error instead of panicking
+/// like [`get`]. Called at startup, before anything else reads the config.
+///
+/// # Errors
+///
+/// The user's configuration file can't be read or deserialized.
+pub fn try_get() -> Result<&'static Config, config::ConfigError> {
+    if let Some(cfg) = CONFIG.get() {
+        return Ok(cfg);
+    }
+    let cfg = Config::new()?;
+    Ok(CONFIG.get_or_init(|| cfg))
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -40,6 +54,9 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub pubsub: PubSubConfig,
+    /// Connection profiles: `rrover <name>` or `--profile <name>`.
+    #[serde(default)]
+    pub profiles: HashMap<String, Profile>,
 }
 
 /// Buffer limits of each Pub/Sub subscription.
