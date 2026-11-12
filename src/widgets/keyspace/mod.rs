@@ -8,13 +8,14 @@ mod state;
 pub use format::format_bytes;
 pub(crate) use format::truncate_to_width;
 use format::{format_bytes_u128, format_ttl, format_ttl_detail, value_footer};
+pub(crate) use forms::{build_input_text_area, input_text};
 pub use input::OverlayRequest;
 pub use render::KeySpaceWidget;
 pub use state::{PageInfo, ScrollOutcome};
 
 use forms::{
-    add_item_pair_titles, build_input_text_area, input_text, ActionOverlay, ActiveField,
-    AddItemDraft, EditItemDraft, FilterPreview, NewKeyDraft, NewKeyStep, NewKind, OverlayKind,
+    add_item_pair_titles, ActionOverlay, ActiveField, AddItemDraft, EditItemDraft, FilterPreview,
+    NewKeyDraft, NewKeyStep, NewKind, OverlayKind,
 };
 use state::{Focus, KeySpaceMode, KeySpacePopupMode, SelectedElement};
 

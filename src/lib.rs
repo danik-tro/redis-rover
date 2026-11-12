@@ -145,6 +145,28 @@ pub mod internals {
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};
 
+    /// The typed confirm on Prod with `typed` in its input, as the App
+    /// draws it.
+    pub fn render_typed_confirm(
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        lines: &[String],
+        expected: &str,
+        typed: &str,
+    ) {
+        use ratatui::widgets::Widget;
+        let mut input = crate::widgets::confirm::typed_input(expected);
+        input.insert_str(typed);
+        ConfirmPopup::typed_delete(
+            lines,
+            Environment::Prod,
+            expected,
+            &input,
+            typed == expected,
+        )
+        .render(area, buf);
+    }
+
     /// The `?` help overlay for `mode`, as the App draws it.
     pub fn render_help(area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, mode: Mode) {
         crate::app::App::render_help_overlay(area, buf, mode);

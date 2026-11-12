@@ -23,11 +23,11 @@ use ratatui::{
     widgets::{StatefulWidget, Widget},
 };
 use redis_rover::internals::{
-    render_help, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget, Environment,
-    FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview,
-    JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue, MetricsHistory,
-    Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Target,
-    Toast, ToastWidget, ValuePageInfo,
+    render_help, render_typed_confirm, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget,
+    Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
+    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
+    MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
+    SharedState, Target, Toast, ToastWidget, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -409,6 +409,24 @@ fn preview_long_and_composite() {
     let mut buf = buffer(80, 24);
     ConfirmPopup::write_preview(&lines, Environment::Prod).render(buf.area, &mut buf);
     check("preview_long_80", &buf);
+}
+
+/// AC4: deleting `orders:2024` on Prod, before and after typing its name.
+#[test]
+fn typed_confirm_prod() {
+    init();
+    let lines = RedisEvent::DeleteKey {
+        key: "orders:2024".into(),
+    }
+    .preview();
+    for (name, typed) in [
+        ("typed_confirm_prod", ""),
+        ("typed_confirm_prod_match", "orders:2024"),
+    ] {
+        let mut buf = buffer(80, 24);
+        render_typed_confirm(buf.area, &mut buf, &lines, "orders:2024", typed);
+        check(name, &buf);
+    }
 }
 
 // ---- Dashboard ------------------------------------------------------------

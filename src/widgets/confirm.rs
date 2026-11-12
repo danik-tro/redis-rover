@@ -14,6 +14,17 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{config, target::Environment};
 
+/// The typed confirm's one-line input; `expected` is its placeholder.
+#[must_use]
+pub fn typed_input(expected: &str) -> TextArea<'static> {
+    let title = if expected == "delete" {
+        "Type delete"
+    } else {
+        "Type the key name"
+    };
+    crate::widgets::keyspace::build_input_text_area(title, expected, None)
+}
+
 /// Narrowest popup content, so short questions don't look cramped.
 const MIN_CONTENT_WIDTH: usize = 30;
 
@@ -24,6 +35,9 @@ pub struct ConfirmPopup<'a> {
     color: Color,
     /// The typed confirm's one-line input, between body and hint.
     input: Option<&'a TextArea<'static>>,
+    /// Content width the popup never goes below, so it doesn't jump when
+    /// the hint changes.
+    min_width: usize,
 }
 
 impl<'a> ConfirmPopup<'a> {
@@ -40,7 +54,35 @@ impl<'a> ConfirmPopup<'a> {
             hint: Line::from("y: run   n/Esc: cancel").fg(cfg.colors.base04),
             color: cfg.colors.env(env),
             input: None,
+            min_width: MIN_CONTENT_WIDTH,
         }
+    }
+
+    /// The typed confirm on Prod: the command, then an input that must
+    /// hold `expected` before Enter deletes.
+    #[must_use]
+    pub fn typed_delete(
+        lines: &'a [String],
+        env: Environment,
+        expected: &str,
+        input: &'a TextArea<'static>,
+        matches: bool,
+    ) -> Self {
+        let cfg = config::get();
+        let mut popup = Self::write_preview(lines, env);
+        popup.body.push(Line::from(""));
+        popup
+            .body
+            .push(Line::from(format!("Type {expected} to delete it.")).fg(cfg.colors.base05));
+        let waiting = Line::from("Enter: delete (type the name first)   Esc: cancel");
+        popup.min_width = waiting.width();
+        popup.hint = if matches {
+            Line::from("Enter: delete   Esc: cancel").fg(cfg.colors.base04)
+        } else {
+            waiting.fg(cfg.colors.base03)
+        };
+        popup.input = Some(input);
+        popup
     }
 
     /// Asked before writes are allowed on Prod.
@@ -53,6 +95,7 @@ impl<'a> ConfirmPopup<'a> {
             hint: Line::from("y: allow writes   n/Esc: cancel").fg(cfg.colors.base04),
             color: cfg.colors.env(env),
             input: None,
+            min_width: MIN_CONTENT_WIDTH,
         }
     }
 
@@ -64,7 +107,7 @@ impl<'a> ConfirmPopup<'a> {
             .chain([self.hint.width(), self.title.width()])
             .max()
             .unwrap_or(0)
-            .max(MIN_CONTENT_WIDTH);
+            .max(self.min_width);
         // Borders and one column of padding on each side.
         let room = usize::from(area.width.saturating_sub(4)).max(1);
         u16::try_from(widest.min(room)).unwrap_or(u16::MAX)
