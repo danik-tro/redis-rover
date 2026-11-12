@@ -1,5 +1,10 @@
 use super::App;
 
+use std::{
+    sync::atomic::Ordering,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
 use crate::{config, mode::PopupMode};
 use color_eyre::eyre::Result;
 use ratatui::prelude::Rect;
@@ -27,6 +32,16 @@ use crate::{
 };
 
 pub struct AppWidget;
+
+/// How often `frames_drawn` is logged.
+const FRAMES_LOG_INTERVAL: Duration = Duration::from_mins(1);
+/// Least time between frames drawn only because the footer text changed.
+const FOOTER_REDRAW_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whole seconds since the Unix epoch (0 before it).
+fn wall_sec(wall: SystemTime) -> u64 {
+    wall.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
 
 /// Keyspace hint entries that write; hidden in `--read-only` mode.
 const WRITE_COMMANDS: &[Command] = &[
@@ -188,18 +203,80 @@ impl App {
 
     /// Copy what this frame draws out of the shared state, each lock held
     /// only for its copy. Widgets then render from `self.frame` alone.
+    /// Records in `self.redraw` which data the frame shows.
     pub(super) fn build_frame(&mut self, area: Rect) {
         let [main, _] = layout(area);
         let (now, wall) = (self.clock.now(), self.clock.wall());
         self.frame.cluster = self.cluster_enabled();
         self.frame.refresh_footer(&self.state);
+        self.redraw.info_seq = self.frame.footer.key().map_or(0, |(seq, _)| seq);
         let mode = self.view_mode();
         self.frame.metrics = if mode == Mode::Dashboard {
             self.dashboard.live_window(main.width)
         } else {
             None
         };
-        self.frame.pubsub = (mode == Mode::PubSub).then(|| self.pubsub.build_view(main, now, wall));
+        self.frame.pubsub = (mode == Mode::PubSub).then(|| {
+            // Read before the view: a message landing in between is drawn
+            // now and again on the next frame, never skipped.
+            self.redraw.pubsub = self.state.pubsub.lock().version();
+            self.redraw.wall_sec = wall_sec(wall);
+            self.pubsub.build_view(main, now, wall)
+        });
+    }
+
+    /// Whether `Render` at `now` should draw (#50): something changed
+    /// (`dirty`), or data that changes on its own moved since the last
+    /// frame. A new `INFO` sample redraws the live dashboard. Elsewhere it
+    /// rebuilds the footer here, and a changed footer (or cluster flag)
+    /// draws at most once per [`FOOTER_REDRAW_INTERVAL`]: an idle server's
+    /// `CPU: x.x %` flickers on most samples. The Pub/Sub tab redraws on a
+    /// new message and once per wall-clock second, for its rates and ages.
+    pub(super) fn should_draw(&mut self, now: Instant) -> bool {
+        if self.redraw.dirty {
+            return true;
+        }
+        let mode = self.view_mode();
+        let seq = self.state.info_seq.load(Ordering::Acquire);
+        if seq != self.redraw.info_seq {
+            if mode == Mode::Dashboard && !self.dashboard.is_paused() {
+                return true;
+            }
+            let footer = self.frame.refresh_footer(&self.state);
+            let cluster = self.cluster_enabled() != self.frame.cluster;
+            self.redraw.footer_stale |= footer || cluster;
+            self.redraw.info_seq = seq;
+        }
+        if self.redraw.footer_stale
+            && self
+                .redraw
+                .drawn_at
+                .is_none_or(|at| now.duration_since(at) >= FOOTER_REDRAW_INTERVAL)
+        {
+            return true;
+        }
+        if mode == Mode::PubSub {
+            return self.state.pubsub.lock().version() != self.redraw.pubsub
+                || wall_sec(self.clock.wall()) != self.redraw.wall_sec;
+        }
+        false
+    }
+
+    /// After a `Render` at `now`: note the frame if it drew, and log the
+    /// frames drawn once a minute.
+    pub(super) fn count_frame(&mut self, drew: bool, now: Instant) {
+        if drew {
+            self.redraw.dirty = false;
+            self.redraw.footer_stale = false;
+            self.redraw.drawn_at = Some(now);
+            self.redraw.frames += 1;
+        }
+        let since = *self.redraw.since.get_or_insert(now);
+        if now.duration_since(since) >= FRAMES_LOG_INTERVAL {
+            log::debug!("frames_drawn: {} in the last minute", self.redraw.frames);
+            self.redraw.frames = 0;
+            self.redraw.since = Some(now);
+        }
     }
 
     /// The mode drawn under a popup: the one it was opened from.
@@ -428,8 +505,116 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::prelude::Rect;
 
-    use crate::app::tests::{app, render_screen};
+    use crate::action::Action;
+    use crate::app::tests::{app, app_on_orders, render_screen};
+    use crate::clock::{Clock, FixedClock};
     use crate::mode::Mode;
+    use std::sync::Arc;
+
+    /// An app on a fixed clock, with its first frame drawn.
+    fn drawn_app(mut app: super::App) -> (super::App, Arc<FixedClock>) {
+        let clock = Arc::new(FixedClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        app.clock = clock.clone();
+        let now = clock.now();
+        assert!(app.should_draw(now), "the first frame always draws");
+        draw(&mut app);
+        (app, clock)
+    }
+
+    /// What `Render` does, on a test screen.
+    fn draw(app: &mut super::App) {
+        render_screen(app);
+        let now = app.clock.now();
+        app.count_frame(true, now);
+    }
+
+    /// A new `INFO` sample landed.
+    fn bump_info(app: &super::App) {
+        app.state.info_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// A minute of 100 ms ticks on the key list with one `INFO` sample per
+    /// second; `flicker` changes the footer text on every sample, as an
+    /// idle server's CPU % does. Returns the frames drawn.
+    fn idle_minute(flicker: bool) -> usize {
+        let (mut app, clock) = drawn_app(app());
+        let mut frames = 0;
+        for tick in 1..=600 {
+            clock.advance(Duration::from_millis(100));
+            if tick % 10 == 0 {
+                if flicker {
+                    *app.state.db.lock() = tick / 10 % 2;
+                }
+                bump_info(&app);
+            }
+            app.update(&Action::Tick);
+            app.update(&Action::Render);
+            if app.should_draw(clock.now()) {
+                draw(&mut app);
+                frames += 1;
+            }
+        }
+        frames
+    }
+
+    /// #50 AC5: an idle key list draws nothing while the footer stays the
+    /// same, and under 10 frames a minute while it changes every second.
+    #[test]
+    fn idle_key_list_draws_almost_nothing() {
+        assert_eq!(idle_minute(false), 0);
+        assert_eq!(idle_minute(true), 6, "one per FOOTER_REDRAW_INTERVAL");
+    }
+
+    /// #50 AC6: the live dashboard draws once per `INFO` sample, and not
+    /// while paused.
+    #[test]
+    fn dashboard_draws_once_per_sample() {
+        let mut app = app();
+        app.toggle_dashboard();
+        let (mut app, _clock) = drawn_app(app);
+        assert!(!app.should_draw(app.clock.now()));
+        bump_info(&app);
+        assert!(app.should_draw(app.clock.now()));
+        draw(&mut app);
+        assert!(!app.should_draw(app.clock.now()));
+
+        app.dashboard.toggle_pause();
+        draw(&mut app);
+        bump_info(&app);
+        assert!(!app.should_draw(app.clock.now()), "paused, same footer");
+    }
+
+    /// #50 AC6: the Pub/Sub tab draws a new message on the next frame, and
+    /// once per wall-clock second for its rates and ages.
+    #[test]
+    fn pubsub_draws_new_messages_and_each_second() {
+        let (mut app, clock) = drawn_app(app_on_orders());
+        assert!(!app.should_draw(app.clock.now()));
+        let wall = app.clock.wall();
+        app.state
+            .pubsub
+            .lock()
+            .push("orders:new", Some("orders:*"), b"x", wall);
+        assert!(app.should_draw(app.clock.now()));
+        draw(&mut app);
+        assert!(!app.should_draw(app.clock.now()));
+        clock.advance(Duration::from_secs(1));
+        assert!(app.should_draw(app.clock.now()));
+    }
+
+    /// A footer that shows a new value draws, on any screen, but at most
+    /// once per `FOOTER_REDRAW_INTERVAL`.
+    #[test]
+    fn changed_footer_draws_at_most_every_interval() {
+        let (mut app, clock) = drawn_app(app());
+        *app.state.db.lock() = 3;
+        bump_info(&app);
+        assert!(!app.should_draw(clock.now()), "a frame was just drawn");
+        clock.advance(FOOTER_REDRAW_INTERVAL);
+        assert!(app.should_draw(clock.now()));
+        draw(&mut app);
+        assert!(!app.should_draw(clock.now()));
+    }
 
     #[test]
     fn help_box_fits_short_labels_with_long_keys() {

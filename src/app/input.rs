@@ -197,13 +197,14 @@ impl App {
     }
 
     /// Drop a partially typed chord once it has waited [`CHORD_TIMEOUT`].
-    pub(super) fn expire_pending_chord(&mut self, now: Instant) {
-        if self
+    pub(super) fn expire_pending_chord(&mut self, now: Instant) -> bool {
+        let expired = self
             .last_key_at
-            .is_some_and(|at| now.duration_since(at) >= CHORD_TIMEOUT)
-        {
+            .is_some_and(|at| now.duration_since(at) >= CHORD_TIMEOUT);
+        if expired {
             self.pending_keys.clear();
             self.last_key_at = None;
         }
+        expired
     }
 }

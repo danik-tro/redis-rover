@@ -592,6 +592,9 @@ pub struct PubSubStore {
     /// Last `PUBSUB CHANNELS` listing; `None` until the first one arrives.
     pub server: Option<ServerChannels>,
     limits: BufferLimits,
+    /// Bumped on every change but `status`, so the UI redraws only when
+    /// something new is stored (#50).
+    version: u64,
 }
 
 impl PubSubStore {
@@ -602,7 +605,15 @@ impl PubSubStore {
             status: ConnStatus::NotStarted,
             server: None,
             limits,
+            version: 0,
         }
+    }
+
+    /// Changes so far to the subscriptions, messages and server listing
+    /// (not `status`, which the tab redraws every second anyway).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     #[must_use]
@@ -617,6 +628,7 @@ impl PubSubStore {
             return (index, false);
         }
         self.subs.push(Subscription::new(target, self.limits));
+        self.version += 1;
         (self.subs.len() - 1, true)
     }
 
@@ -624,6 +636,7 @@ impl PubSubStore {
     pub fn remove(&mut self, target: &Target) -> bool {
         let before = self.subs.len();
         self.subs.retain(|s| &s.target != target);
+        self.version += 1;
         self.subs.len() != before
     }
 
@@ -635,6 +648,7 @@ impl PubSubStore {
             sub.seen_total = 0;
             sub.unread = 0;
         }
+        self.version += 1;
     }
 
     /// Every target, in the order added: what a (re)connect subscribes.
@@ -645,6 +659,7 @@ impl PubSubStore {
 
     pub fn set_server_channels(&mut self, server: ServerChannels) {
         self.server = Some(server);
+        self.version += 1;
     }
 
     /// Server channels without an exact subscription of ours: those are
@@ -669,6 +684,7 @@ impl PubSubStore {
                 sub.buffer.push_marker(now);
             }
         }
+        self.version += 1;
     }
 
     /// Store a message: `pattern` set means it came from `PSUBSCRIBE pattern`.
@@ -678,6 +694,7 @@ impl PubSubStore {
             sub.buffer.push(channel, payload, now);
             let concrete = sub.target.is_pattern().then_some(channel);
             sub.stats.record(payload.len(), now, concrete);
+            self.version += 1;
         }
     }
 

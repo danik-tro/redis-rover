@@ -21,28 +21,40 @@ impl App {
         match *action {
             Action::Resize(w, h) => Self::resize(tui, (w, h))?,
             Action::Render => {
-                self.draw(tui)?;
-                self.sync_page_size();
+                let now = self.clock.now();
+                let draw = self.should_draw(now);
+                if draw {
+                    self.draw(tui)?;
+                    self.sync_page_size();
+                }
+                self.count_frame(draw, now);
             }
             _ => {}
         }
         Ok(None)
     }
 
-    /// The state change of `action`, without a terminal.
+    /// The state change of `action`, without a terminal. Every action but
+    /// `Tick` / `Render` marks the screen dirty; `Tick` only when it changed
+    /// something shown.
     pub(super) fn update(&mut self, action: &Action) {
-        if action != &Action::Tick && action != &Action::Render {
+        let background = matches!(action, Action::Tick | Action::Render);
+        if !background {
             log::debug!("{action:?}");
+            self.redraw.dirty = true;
         }
         // One clock reading per action, passed down.
         let now = self.clock.now();
+        let help_open = self.help_is_open();
         self.maybe_dismiss_help(action, now);
         match *action {
             Action::Tick => {
-                self.expire_pending_chord(now);
-                self.request_filter_count(now);
-                self.toast.expire(now);
-                self.pubsub_tick(now, self.clock.wall());
+                let mut changed = help_open != self.help_is_open();
+                changed |= self.expire_pending_chord(now);
+                changed |= self.request_filter_count(now);
+                changed |= self.toast.expire(now);
+                changed |= self.pubsub_tick(now, self.clock.wall());
+                self.redraw.dirty |= changed;
             }
             Action::Quit => self.should_quit = true,
             // `Resize` / `Render` are terminal work, done by `handle_action`.
@@ -391,6 +403,50 @@ mod tests {
         app.close_popup();
         assert!(!app.keyspace.is_value_focused());
         assert!(redis_rx.try_recv().is_err(), "nothing to fetch");
+    }
+
+    /// #50: every action marks the screen dirty, so a new one can't leave a
+    /// stale frame up. `Tick` / `Render` are background noise: a `Tick`
+    /// marks it only when it changed something (not on an idle app).
+    #[test]
+    fn every_action_marks_dirty() {
+        use strum::IntoEnumIterator;
+        const BACKGROUND: [Action; 2] = [Action::Tick, Action::Render];
+        for action in Action::iter() {
+            let mut app = app();
+            app.redraw.dirty = false;
+            app.update(&action);
+            assert_eq!(
+                app.redraw.dirty,
+                !BACKGROUND.contains(&action),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// A `Tick` that closes the help or a toast marks the screen dirty.
+    #[test]
+    fn tick_marks_dirty_only_on_change() {
+        let mut app = app();
+        let clock = Arc::new(FixedClock::new(UNIX_EPOCH));
+        app.clock = clock.clone();
+        app.toast.show("Copied", false, clock.now());
+        app.toggle_help(clock.now());
+        app.redraw.dirty = false;
+
+        app.update(&Action::Tick);
+        assert!(!app.redraw.dirty, "nothing expired yet");
+
+        clock.advance(crate::widgets::toast::TOAST_TIMEOUT);
+        app.update(&Action::Tick);
+        assert!(app.redraw.dirty, "the toast went away");
+        assert_eq!(app.toast.message(), None);
+
+        app.redraw.dirty = false;
+        clock.advance(HELP_TIMEOUT);
+        app.update(&Action::Tick);
+        assert!(app.redraw.dirty, "the help went away");
+        assert!(!app.help_is_open());
     }
 
     #[test]

@@ -40,32 +40,39 @@ impl Toast {
 
     /// A background message (Pub/Sub notification). It never replaces the
     /// current toast (a sticky "Copying …" in particular): it waits in a
-    /// short queue, the oldest dropped when full.
-    pub fn notify(&mut self, msg: impl Into<String>, now: Instant) {
+    /// short queue, the oldest dropped when full. Returns whether it is
+    /// shown now.
+    pub fn notify(&mut self, msg: impl Into<String>, now: Instant) -> bool {
         if self.current.is_none() {
             self.show(msg, false, now);
-            return;
+            return true;
         }
         if self.queue.len() == QUEUE_CAP {
             self.queue.pop_front();
         }
         self.queue.push_back(msg.into());
+        false
     }
 
     /// Drop the toast once it has expired, then show the next queued one.
-    pub fn expire(&mut self, now: Instant) {
+    /// Returns whether what is shown changed.
+    pub fn expire(&mut self, now: Instant) -> bool {
+        let mut changed = false;
         if self
             .current
             .as_ref()
             .is_some_and(|(_, expires)| expires.is_some_and(|at| now >= at))
         {
             self.current = None;
+            changed = true;
         }
         if self.current.is_none() {
             if let Some(next) = self.queue.pop_front() {
                 self.current = Some((next, Some(now + TOAST_TIMEOUT)));
+                changed = true;
             }
         }
+        changed
     }
 
     #[must_use]

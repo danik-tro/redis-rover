@@ -102,6 +102,29 @@ pub struct App {
     frame: FrameData,
     /// Read once per action (and per frame) and passed down.
     clock: Arc<dyn Clock>,
+    /// When `Render` draws (#50).
+    redraw: Redraw,
+}
+
+/// What decides whether `Render` draws: `dirty`, or data that changes on
+/// its own having moved past what the last frame showed.
+#[derive(Debug, Default, Clone, Copy)]
+struct Redraw {
+    /// Something on screen changed since the last frame.
+    dirty: bool,
+    /// The footer text (or cluster flag) changed since the last frame.
+    footer_stale: bool,
+    /// When the last frame was drawn.
+    drawn_at: Option<Instant>,
+    /// `info_seq` of the `INFO` sample the last frame showed.
+    info_seq: u64,
+    /// `PubSubStore::version` the Pub/Sub tab showed.
+    pubsub: u64,
+    /// Wall-clock second of that frame (the tab shows rates and ages).
+    wall_sec: u64,
+    /// Frames drawn since `since`, logged at debug once a minute.
+    frames: u64,
+    since: Option<Instant>,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -161,6 +184,10 @@ impl App {
             toast: Toast::default(),
             frame: FrameData::default(),
             clock: Arc::new(SystemClock),
+            redraw: Redraw {
+                dirty: true,
+                ..Redraw::default()
+            },
         };
         app.sync_hint();
         app
@@ -226,6 +253,11 @@ impl App {
     }
 
     fn handle_event(&mut self, e: &tui::Event) -> Option<Action> {
+        // Keys often change the screen without an action (text typed into a
+        // popup, the DB picker), so every terminal event marks it dirty.
+        if !matches!(e, tui::Event::Tick | tui::Event::Render) {
+            self.redraw.dirty = true;
+        }
         match e {
             // Emitted once when the event task starts: trigger the initial
             // keyspace load so the screen is populated without a manual action.
@@ -404,6 +436,22 @@ mod tests {
 
     pub(super) fn tap(app: &mut App, code: KeyCode) {
         press(app, code, crossterm::event::KeyModifiers::empty());
+    }
+
+    /// #50: a key that changes the screen without an action (text typed
+    /// into the filter popup) still marks it dirty; ticks don't.
+    #[test]
+    fn terminal_events_mark_dirty() {
+        let mut app = app();
+        app.keyspace.enter_filter_pattern(std::time::Instant::now());
+        app.redraw.dirty = false;
+        assert_eq!(app.handle_event(&tui::Event::Tick), Some(Action::Tick));
+        assert!(!app.redraw.dirty);
+        assert_eq!(
+            app.handle_event(&tui::Event::Key(key(KeyCode::Char('a')))),
+            None
+        );
+        assert!(app.redraw.dirty);
     }
 
     /// The tab open on `orders:*` with three JSON messages.

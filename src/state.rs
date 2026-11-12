@@ -85,14 +85,19 @@ pub struct FrameData {
 impl FrameData {
     /// Rebuild the footer text if a new `INFO` sample landed or the DB
     /// changed since the last frame. `info_seq` is bumped by the info task
-    /// after each sample.
-    pub fn refresh_footer(&mut self, state: &SharedState) {
+    /// after each sample. Returns whether the text changed.
+    pub fn refresh_footer(&mut self, state: &SharedState) -> bool {
         let key = (state.info_seq.load(Ordering::Acquire), *state.db.lock());
         if self.footer.key() == Some(key) {
-            return;
+            return false;
         }
-        let info = state.info.lock();
-        let metrics = state.metrics.lock();
-        self.footer = FooterText::build(key, info.as_ref(), &metrics);
+        let footer = {
+            let info = state.info.lock();
+            let metrics = state.metrics.lock();
+            FooterText::build(key, info.as_ref(), &metrics)
+        };
+        let changed = !footer.same_text(&self.footer);
+        self.footer = footer;
+        changed
     }
 }

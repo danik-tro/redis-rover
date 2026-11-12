@@ -19,10 +19,13 @@ impl App {
 
     /// Ask the runner to count the filter popup's matches once its text has
     /// settled (#24).
-    pub(super) fn request_filter_count(&mut self, now: Instant) {
-        if let Some(pattern) = self.keyspace.filter_count_request(now) {
-            self.send_redis_event(RedisEvent::CountMatches { pattern });
-        }
+    /// Returns whether a count was requested (the popup shows it counting).
+    pub(super) fn request_filter_count(&mut self, now: Instant) -> bool {
+        let Some(pattern) = self.keyspace.filter_count_request(now) else {
+            return false;
+        };
+        self.send_redis_event(RedisEvent::CountMatches { pattern });
+        true
     }
 
     /// Finalize the add-key wizard into a `CreateKey` event. Keeps the cursor on
