@@ -7,10 +7,17 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
+use ratatui_textarea::TextArea;
+
 use super::App;
 use crate::{
-    action::Action, redis_client::event::RedisEvent, target::Environment,
-    widgets::confirm::ConfirmPopup,
+    action::Action,
+    redis_client::event::RedisEvent,
+    target::Environment,
+    widgets::{
+        confirm::{typed_input, ConfirmPopup},
+        keyspace::input_text,
+    },
 };
 
 /// A modal question; `y` accepts, `n` / Esc cancels.
@@ -29,6 +36,44 @@ pub(super) struct PendingWrite {
     /// `event.preview()`, built once.
     lines: Vec<String>,
     after: AfterWrite,
+    /// On Prod, deleting a key needs its name typed first.
+    typed: Option<TypedConfirm>,
+}
+
+/// Key names longer than this are confirmed by typing `delete` instead.
+const TYPED_NAME_MAX: usize = 40;
+
+/// The typed confirm: Enter runs the write only once `input` holds
+/// `expected`. Every other key goes into the input (so `y` is a letter).
+#[derive(Debug)]
+pub(super) struct TypedConfirm {
+    expected: String,
+    input: TextArea<'static>,
+}
+
+impl TypedConfirm {
+    /// The typed confirm `event` needs on `env`: deleting a key on Prod.
+    fn for_event(event: &RedisEvent, env: Environment) -> Option<Self> {
+        let RedisEvent::DeleteKey { key } = event else {
+            return None;
+        };
+        if env != Environment::Prod {
+            return None;
+        }
+        let expected = if key.chars().count() > TYPED_NAME_MAX {
+            "delete".to_owned()
+        } else {
+            key.clone()
+        };
+        Some(Self {
+            input: typed_input(&expected),
+            expected,
+        })
+    }
+
+    fn matches(&self) -> bool {
+        input_text(&self.input) == self.expected
+    }
 }
 
 /// Cursor bookkeeping a write applies only when it is sent, so a cancelled
@@ -86,10 +131,12 @@ impl App {
             self.send_write(event, after);
             return;
         }
+        let typed = TypedConfirm::for_event(&event, self.environment);
         self.pending = Some(PendingConfirm::Write(Box::new(PendingWrite {
             event,
             lines,
             after,
+            typed,
         })));
     }
 
@@ -127,6 +174,9 @@ impl App {
     /// Keys while a question is open. Popup-local like Enter / Esc in the
     /// other popups: `y` accepts, `n` / Esc cancels, the quit binding quits.
     pub(super) fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if matches!(&self.pending, Some(PendingConfirm::Write(w)) if w.typed.is_some()) {
+            return self.handle_typed_key(key);
+        }
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         match key.code {
             KeyCode::Char('y') if plain => {
@@ -144,6 +194,32 @@ impl App {
             _ if Self::is_quit_key(key) => Some(Action::Quit),
             _ => None,
         }
+    }
+
+    /// Keys in the typed confirm: Enter deletes once the text matches, Esc
+    /// cancels, the quit binding quits, everything else is typed.
+    fn handle_typed_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.code == KeyCode::Esc {
+            self.pending = None;
+            return None;
+        }
+        if Self::is_quit_key(key) {
+            return Some(Action::Quit);
+        }
+        let Some(PendingConfirm::Write(write)) = &mut self.pending else {
+            return None;
+        };
+        let Some(typed) = &mut write.typed else {
+            return None;
+        };
+        if key.code == KeyCode::Enter {
+            if typed.matches() {
+                self.accept_confirm();
+            }
+            return None;
+        }
+        typed.input.input(key);
+        None
     }
 
     fn accept_confirm(&mut self) {
@@ -165,9 +241,17 @@ impl App {
             Some(PendingConfirm::LiftReadOnly) => {
                 ConfirmPopup::lift_read_only(env).render(area, buf);
             }
-            Some(PendingConfirm::Write(write)) => {
-                ConfirmPopup::write_preview(&write.lines, env).render(area, buf);
-            }
+            Some(PendingConfirm::Write(write)) => match &write.typed {
+                Some(typed) => ConfirmPopup::typed_delete(
+                    &write.lines,
+                    env,
+                    &typed.expected,
+                    &typed.input,
+                    typed.matches(),
+                )
+                .render(area, buf),
+                None => ConfirmPopup::write_preview(&write.lines, env).render(area, buf),
+            },
             None => {}
         }
     }
@@ -356,6 +440,86 @@ mod tests {
         assert!(app.keyspace.is_overlay_open(), "the old confirm box");
         press(&mut app, key(KeyCode::Enter));
         assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    /// An app on the key list with `name` selected.
+    fn on_key(env: Environment, name: &str) -> (App, broadcast::Receiver<RedisEvent>) {
+        let (app, _, mut events) = app_with_channels();
+        let mut app = app.environment(env);
+        *app.state.keys.lock() = Some(vec![crate::app::tests::meta(name)]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(name));
+        drain(&mut events);
+        (app, events)
+    }
+
+    /// AC4: on Prod, `d` needs the key name typed; a wrong name keeps
+    /// Enter (and `y`, which is just a letter here) from deleting.
+    #[test]
+    fn prod_delete_needs_the_name_typed() {
+        let (mut app, mut events) = on_key(Environment::Prod, "orders:2024");
+        press(&mut app, key(KeyCode::Char('d')));
+        let Some(PendingConfirm::Write(write)) = &app.pending else {
+            panic!("no confirm");
+        };
+        assert_eq!(
+            write.typed.as_ref().map(|t| t.expected.as_str()),
+            Some("orders:2024")
+        );
+
+        // `y` is typed, not a confirm; Enter on a wrong name does nothing.
+        press(&mut app, key(KeyCode::Char('y')));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(writes(&mut events).is_empty());
+        assert!(app.pending.is_some());
+        press(&mut app, key(KeyCode::Backspace));
+        type_text(&mut app, "orders:2023");
+        press(&mut app, key(KeyCode::Enter));
+        assert!(writes(&mut events).is_empty(), "wrong name deleted");
+
+        press(&mut app, key(KeyCode::Backspace));
+        press(&mut app, key(KeyCode::Char('4')));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(app.pending.is_none());
+        assert!(matches!(
+            writes(&mut events).as_slice(),
+            [RedisEvent::DeleteKey { key }] if key == "orders:2024"
+        ));
+    }
+
+    #[test]
+    fn long_names_are_confirmed_with_delete_and_esc_cancels() {
+        let long = format!("cache:{}", "x".repeat(40));
+        let (mut app, mut events) = on_key(Environment::Prod, &long);
+        press(&mut app, key(KeyCode::Char('d')));
+        type_text(&mut app, "delete");
+        press(&mut app, key(KeyCode::Esc));
+        assert!(app.pending.is_none());
+        assert!(writes(&mut events).is_empty());
+
+        press(&mut app, key(KeyCode::Char('d')));
+        type_text(&mut app, "delete");
+        press(&mut app, key(KeyCode::Enter));
+        assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    /// Local, staging and unknown never ask for typing: `y` deletes.
+    #[test]
+    fn typed_confirm_is_prod_only() {
+        for env in [
+            Environment::Local,
+            Environment::Staging,
+            Environment::Unknown,
+        ] {
+            let (mut app, mut events) = on_key(env, "orders:2024");
+            press(&mut app, key(KeyCode::Char('d')));
+            let Some(PendingConfirm::Write(write)) = &app.pending else {
+                panic!("{env:?}: no preview");
+            };
+            assert!(write.typed.is_none(), "{env:?}");
+            press(&mut app, key(KeyCode::Char('y')));
+            assert_eq!(writes(&mut events).len(), 1, "{env:?}");
+        }
     }
 
     #[test]

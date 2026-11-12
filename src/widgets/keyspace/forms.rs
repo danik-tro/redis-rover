@@ -549,13 +549,13 @@ impl KeySpace {
 }
 
 /// Read the first line of a single-line input text-area.
-pub(super) fn input_text(text_area: &TextArea<'static>) -> String {
+pub(crate) fn input_text(text_area: &TextArea<'static>) -> String {
     text_area.lines().first().cloned().unwrap_or_default()
 }
 
 /// Build a single-line bordered input box matching the keyspace style,
 /// optionally seeded with `initial` content.
-pub(super) fn build_input_text_area(
+pub(crate) fn build_input_text_area(
     title: &str,
     placeholder: &str,
     initial: Option<&str>,
