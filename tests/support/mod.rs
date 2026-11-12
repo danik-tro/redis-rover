@@ -338,6 +338,11 @@ impl Harness {
     }
 
     /// Send a `RedisEvent`, as `App` does through its broadcast sender.
+    /// The runner's read-only flag, as `App` shares it (the `R` toggle).
+    pub fn read_only_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.runner.read_only_flag()
+    }
+
     pub fn send(&self, event: RedisEvent) {
         self.events.send(event).expect("runner is listening");
     }

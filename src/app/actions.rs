@@ -115,6 +115,7 @@ impl App {
                 self.fetch_keys();
             }
             Action::Help => self.toggle_help(now),
+            Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::FilterMatchCount {
                 ref pattern,

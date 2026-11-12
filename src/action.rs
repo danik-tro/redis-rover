@@ -86,6 +86,8 @@ pub enum Action {
     PubSubFocus,
     /// Space in the tab: pause / follow the log.
     PubSubTogglePause,
+    /// `R`: toggle read-only (lifting it on Prod asks first).
+    ToggleReadOnly,
     /// A server channel listing is waiting in `SharedState::pubsub`.
     PubSubChannelsLoaded,
     /// `PUBLISH` went through and reached `receivers` subscribers.

@@ -121,6 +121,7 @@ const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
         "Toggle notifications (also un-mutes)",
     ),
     (Command::PubSubRefresh, "Refresh server channels"),
+    (Command::ToggleReadOnly, "Toggle read-only"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -134,6 +135,7 @@ const DASHBOARD_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::PrevChart, "Previous chart"),
     (Command::ToggleAllCharts, "Toggle all charts"),
     (Command::TogglePubSub, "Open Pub/Sub"),
+    (Command::ToggleReadOnly, "Toggle read-only"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -165,6 +167,7 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleDashboard, "Open metrics dashboard"),
     (Command::TogglePubSub, "Open Pub/Sub"),
     (Command::ClosePopup, "Close popup / overlay"),
+    (Command::ToggleReadOnly, "Toggle read-only"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -336,6 +339,7 @@ impl StatefulWidget for AppWidget {
             };
             App::render_help_overlay(area, buf, mode);
         }
+        state.render_confirm(main, buf);
         // Last: above every mode, popup and overlay.
         StatefulWidget::render(ToastWidget, main, buf, &mut state.toast);
     }

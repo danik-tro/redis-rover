@@ -1,5 +1,6 @@
 mod actions;
 mod clipboard;
+mod confirm;
 mod dashboard;
 mod db;
 mod input;
@@ -105,6 +106,8 @@ pub struct App {
     read_only: Arc<AtomicBool>,
     /// Sets the protections (preview, typed confirms) and the colours.
     environment: Environment,
+    /// An open yes / no question, modal above every mode.
+    pending: Option<confirm::PendingConfirm>,
     clipboard: Clipboard,
     /// Short message drawn above every mode and popup.
     toast: Toast,
@@ -191,6 +194,7 @@ impl App {
             pubsub_return: Mode::KeySpace,
             read_only: Arc::new(AtomicBool::new(false)),
             environment: Environment::Local,
+            pending: None,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
             frame: FrameData::default(),
