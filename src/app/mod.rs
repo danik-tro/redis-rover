@@ -146,6 +146,9 @@ struct LiveLink {
     status: Option<Liveness>,
     /// `Pause(true)` was sent last.
     paused: bool,
+    /// The value being fetched is a live refetch of the open key: its
+    /// changed rows get highlighted.
+    refetching: bool,
 }
 
 /// What decides whether `Render` draws: `dirty`, or data that changes on

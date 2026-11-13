@@ -222,6 +222,8 @@ fn render_detail(detail: &mut Detail, area: Rect, buf: &mut Buffer) {
             header,
             paging: false,
             close: Some("y copy · Esc close"),
+            changed: &[],
+            highlight: Style::new(),
         },
         None,
         true,

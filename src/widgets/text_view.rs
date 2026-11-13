@@ -5,7 +5,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::Stylize,
+    style::{Style, Stylize},
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
@@ -264,6 +264,7 @@ fn json_scalar(value: &serde_json::Value) -> Span<'static> {
 }
 
 /// How the viewer is labelled and which keys its footer advertises.
+#[derive(Default)]
 pub struct TextLabels<'a> {
     /// Header, e.g. `Value` (` · JSON` is added for JSON).
     pub header: &'a str,
@@ -271,6 +272,10 @@ pub struct TextLabels<'a> {
     pub paging: bool,
     /// Extra key hint at the end of the focused footer, e.g. `Esc close`.
     pub close: Option<&'a str>,
+    /// Line numbers to highlight (sorted), drawn in `highlight`: lines a
+    /// live refetch changed.
+    pub changed: &'a [usize],
+    pub highlight: Style,
 }
 
 /// A header, the scrollable text, and a footer with the shown line range,
@@ -301,8 +306,24 @@ pub fn render(
 
     let height = usize::from(body_area.height);
     let width = usize::from(body_area.width);
+    let mark = |i: usize, line: &Line<'static>| -> Line<'static> {
+        if labels.changed.binary_search(&i).is_err() {
+            return line.clone();
+        }
+        let mut line = line.clone();
+        for span in &mut line.spans {
+            span.style = span.style.patch(labels.highlight);
+        }
+        line.patch_style(labels.highlight)
+    };
     let paragraph = if view.wrap {
-        Paragraph::new(cache.lines.clone()).wrap(Wrap { trim: false })
+        let lines: Vec<Line<'static>> = cache
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| mark(i, line))
+            .collect();
+        Paragraph::new(lines).wrap(Wrap { trim: false })
     } else {
         Paragraph::new(cache.lines.clone())
     };
@@ -337,9 +358,10 @@ pub fn render(
         let rows: Vec<Line<'static>> = cache
             .lines
             .iter()
+            .enumerate()
             .skip(view.top)
             .take(height)
-            .cloned()
+            .map(|(i, line)| mark(i, line))
             .collect();
         Paragraph::new(rows)
             .scroll((0, to_u16(view.left)))
@@ -454,6 +476,7 @@ mod tests {
             header: "Value",
             paging: true,
             close: None,
+            ..TextLabels::default()
         };
         assert_eq!(
             text_footer(None, &keyspace, &view, 5, true),
@@ -463,6 +486,7 @@ mod tests {
             header: "Payload",
             paging: false,
             close: Some("Esc close"),
+            ..TextLabels::default()
         };
         assert_eq!(
             text_footer(Some("note".into()), &detail, &view, 5, true),

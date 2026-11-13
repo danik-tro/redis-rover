@@ -1,6 +1,6 @@
 use super::{
-    format::format_count, format_bytes_u128, format_ttl, format_ttl_detail, truncate_to_width,
-    value_footer, Focus, KeySpace, CLUSTER_BANNER,
+    format::format_count, format_bytes_u128, format_ttl, format_ttl_detail, live,
+    truncate_to_width, value_footer, Focus, KeySpace, CLUSTER_BANNER,
 };
 
 use byte_unit::{Byte, UnitType};
@@ -140,6 +140,8 @@ impl KeySpaceWidget {
                     header: "Value",
                     paging: true,
                     close: None,
+                    changed: &state.live.changed,
+                    highlight: live::changed_style(),
                 },
                 footer,
                 state.focus == Focus::Text,
@@ -162,35 +164,39 @@ impl KeySpaceWidget {
             None => view_area,
         };
 
-        Self::render_value(&loaded.value, view_area, buf, &mut state.value_table);
+        let mut rows = Rows {
+            table: &mut state.value_table,
+            changed: &state.live.changed,
+        };
+        Self::render_value(&loaded.value, view_area, buf, &mut rows);
     }
 
-    fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, table_state: &mut TableState) {
+    fn render_value(value: &KeyValue, area: Rect, buf: &mut Buffer, rows: &mut Rows<'_>) {
         match value {
             KeyValue::List(items) => {
-                Self::render_single_column_table("Item", items, area, buf, table_state);
+                Self::render_single_column_table("Item", items, area, buf, rows);
             }
             KeyValue::Set(members) => {
-                Self::render_single_column_table("Member", members, area, buf, table_state);
+                Self::render_single_column_table("Member", members, area, buf, rows);
             }
             KeyValue::Hash(entries) => {
                 let pairs: Vec<(String, String)> = entries
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                Self::render_two_column_table("Field", "Value", &pairs, area, buf, table_state);
+                Self::render_two_column_table("Field", "Value", &pairs, area, buf, rows);
             }
             KeyValue::Zset(entries) => {
                 let pairs: Vec<(String, String)> = entries
                     .iter()
                     .map(|(member, score)| (member.clone(), score.to_string()))
                     .collect();
-                Self::render_two_column_table("Member", "Score", &pairs, area, buf, table_state);
+                Self::render_two_column_table("Member", "Score", &pairs, area, buf, rows);
             }
             KeyValue::JsonPreview(JsonPreview {
                 kind: JsonPreviewKind::Object { fields, .. },
                 ..
-            }) => Self::render_json_fields(fields, area, buf, table_state),
+            }) => Self::render_json_fields(fields, area, buf, rows),
             // STRING / JSON go through `text_view::render`.
             KeyValue::String { .. }
             | KeyValue::Json(_)
@@ -206,12 +212,7 @@ impl KeySpaceWidget {
     }
 
     /// The fields of a JSON object preview: name, type and size.
-    fn render_json_fields(
-        fields: &[JsonField],
-        area: Rect,
-        buf: &mut Buffer,
-        table_state: &mut TableState,
-    ) {
+    fn render_json_fields(fields: &[JsonField], area: Rect, buf: &mut Buffer, rows: &mut Rows<'_>) {
         let cfg = config::get();
         let widths = [
             Constraint::Fill(1),
@@ -222,21 +223,24 @@ impl KeySpaceWidget {
             .bottom_margin(1)
             .fg(cfg.colors.base03)
             .bold();
-        let rows = fields.iter().map(|field| {
-            Row::new([
-                Cell::from(field.name.as_str()).fg(cfg.colors.base05),
-                Cell::from(field.json_type.as_str()).fg(cfg.colors.base04),
-                Cell::from(format_bytes_u128(u128::from(field.bytes))).fg(cfg.colors.base04),
-            ])
+        let table_rows = fields.iter().enumerate().map(|(i, field)| {
+            rows.row(
+                i,
+                [
+                    Cell::from(field.name.as_str()).fg(cfg.colors.base05),
+                    Cell::from(field.json_type.as_str()).fg(cfg.colors.base04),
+                    Cell::from(format_bytes_u128(u128::from(field.bytes))).fg(cfg.colors.base04),
+                ],
+            )
         });
-        let table = Table::new(rows, widths)
+        let table = Table::new(table_rows, widths)
             .header(header)
             .column_spacing(2)
             .highlight_symbol(highlight_symbol())
             .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, area, buf, table_state);
+        StatefulWidget::render(table, area, buf, rows.table);
         render_header_rule(area, buf);
     }
 
@@ -245,7 +249,7 @@ impl KeySpaceWidget {
         rows_data: &[String],
         area: Rect,
         buf: &mut Buffer,
-        table_state: &mut TableState,
+        rows: &mut Rows<'_>,
     ) {
         let cfg = config::get();
         let widths = [Constraint::Percentage(100)];
@@ -254,16 +258,17 @@ impl KeySpaceWidget {
             .fg(cfg.colors.base03)
             .bold();
 
-        let rows = rows_data
+        let table_rows = rows_data
             .iter()
-            .map(|item| Row::new([Cell::from(item.as_str())]).fg(cfg.colors.base05));
-        let table = Table::new(rows, widths)
+            .enumerate()
+            .map(|(i, item)| rows.row(i, [Cell::from(item.as_str()).fg(cfg.colors.base05)]));
+        let table = Table::new(table_rows, widths)
             .header(header)
             .highlight_symbol(highlight_symbol())
             .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, area, buf, table_state);
+        StatefulWidget::render(table, area, buf, rows.table);
         render_header_rule(area, buf);
     }
 
@@ -273,7 +278,7 @@ impl KeySpaceWidget {
         rows_data: &[(String, String)],
         area: Rect,
         buf: &mut Buffer,
-        table_state: &mut TableState,
+        rows: &mut Rows<'_>,
     ) {
         let cfg = config::get();
         let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
@@ -282,21 +287,42 @@ impl KeySpaceWidget {
             .fg(cfg.colors.base03)
             .bold();
 
-        let rows = rows_data.iter().map(|(left, right)| {
-            Row::new([
-                Cell::from(left.as_str()).fg(cfg.colors.base05),
-                Cell::from(right.as_str()).fg(cfg.colors.base04),
-            ])
+        let table_rows = rows_data.iter().enumerate().map(|(i, (left, right))| {
+            rows.row(
+                i,
+                [
+                    Cell::from(left.as_str()).fg(cfg.colors.base05),
+                    Cell::from(right.as_str()).fg(cfg.colors.base04),
+                ],
+            )
         });
-        let table = Table::new(rows, widths)
+        let table = Table::new(table_rows, widths)
             .header(header)
             .column_spacing(2)
             .highlight_symbol(highlight_symbol())
             .row_highlight_style(selected_row_style())
             .highlight_spacing(HighlightSpacing::Always);
 
-        StatefulWidget::render(table, area, buf, table_state);
+        StatefulWidget::render(table, area, buf, rows.table);
         render_header_rule(area, buf);
+    }
+}
+
+/// A value table's cursor and the rows a live refetch changed.
+struct Rows<'a> {
+    table: &'a mut TableState,
+    changed: &'a [usize],
+}
+
+impl Rows<'_> {
+    /// Row `i` of the table, highlighted when it changed (the cells'
+    /// own colours give way to the highlight).
+    fn row<'c, const N: usize>(&self, i: usize, cells: [Cell<'c>; N]) -> Row<'c> {
+        if self.changed.binary_search(&i).is_err() {
+            return Row::new(cells);
+        }
+        let style = live::changed_style();
+        Row::new(cells.map(|cell| cell.style(style))).style(style)
     }
 }
 
@@ -439,21 +465,37 @@ impl StatefulWidget for KeySpaceWidget {
         let table_area = space_block.inner(t_area);
         space_block.render(t_area, buf);
 
-        Block::new()
+        let values_title = if value_focused {
+            " Values · focused "
+        } else {
+            " Values "
+        };
+        let mut values_block = Block::new()
             .bg(cfg.colors.base00)
             .fg(cfg.colors.base04)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(values_border)
             .borders(Borders::all())
-            .title(pane_title(
-                if value_focused {
-                    " Values · focused "
-                } else {
-                    " Values "
-                },
-                value_focused,
-            ))
-            .render(view_area, buf);
+            .title(pane_title(values_title, value_focused));
+        // Liveness belongs to the open key: shown only while one is.
+        let key_shown = state.table.selected().and_then(|row| state.key_at(row));
+        if let (Some(status), Some(_)) = (state.live.status.as_ref(), key_shown) {
+            // Inside the corners, one column apart from the pane's title.
+            let room = usize::from(view_area.width).saturating_sub(2 + values_title.width() + 1);
+            if let Some(label) = live::liveness_label(status, room) {
+                values_block = values_block.title(label);
+            }
+        }
+        let gone = state.gone_label().map(str::to_owned);
+        if let Some(label) = &gone {
+            values_block = values_block.title_bottom(
+                Line::from(label.clone())
+                    .fg(cfg.colors.base08)
+                    .bold()
+                    .left_aligned(),
+            );
+        }
+        values_block.render(view_area, buf);
 
         let [filter_area, banner_area, rule_area, table_area] = Layout::vertical([
             Constraint::Length(1),
@@ -632,6 +674,11 @@ impl StatefulWidget for KeySpaceWidget {
         }
 
         Self::render_key_view(state, view_area, buf);
+        if gone.is_some() {
+            // The last value stays readable, dimmed.
+            let inner = Block::new().borders(Borders::ALL).inner(view_area);
+            buf.set_style(inner, Style::new().fg(cfg.colors.base03));
+        }
 
         if state.is_popup() {
             Self::render_confirm_popup(state, area, buf);

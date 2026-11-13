@@ -169,6 +169,8 @@ impl KeySpace {
         }
         self.selected_value = value;
         self.value_loading = false;
+        // Changed rows belong to the page they were found on.
+        self.live.clear_changed();
         // A reloaded page may be shorter; keep the cursor on a real row.
         if self.is_value_focused() {
             match self.value_row_count() {
@@ -196,6 +198,8 @@ impl KeySpace {
 
     pub fn clear_selected_value(&mut self) {
         self.selected_value = None;
+        self.live.clear_changed();
+        self.live.gone = None;
         self.text_cache = None;
         self.text_view = TextView {
             wrap: self.text_view.wrap,

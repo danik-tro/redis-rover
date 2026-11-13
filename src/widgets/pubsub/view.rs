@@ -17,7 +17,7 @@ use crate::{
         ConnStatus, EntryKind, MessageBuffer, PubSubMessage, PubSubStore, Subscription,
     },
     utils::{fmt_bytes, group_thousands},
-    widgets::keyspace::truncate_to_width,
+    widgets::{keyspace::truncate_to_width, local_time},
 };
 
 /// One frame of the tab, built under one short lock of the store; part of
@@ -356,33 +356,7 @@ fn log_line(msg: &PubSubMessage, width: usize) -> Line<'static> {
 /// Local wall-clock time `HH:MM:SS.mmm`.
 pub(super) fn clock(t: SystemTime) -> String {
     let since = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let (h, m, s) = local_hms(since.as_secs());
-    format!("{h:02}:{m:02}:{s:02}.{:03}", since.subsec_millis())
-}
-
-#[cfg(unix)]
-fn local_hms(secs: u64) -> (u64, u64, u64) {
-    let Ok(t) = libc::time_t::try_from(secs) else {
-        return utc_hms(secs);
-    };
-    // SAFETY: `tm` is plain data; `localtime_r` only writes into it and is
-    // thread-safe (unlike `localtime`).
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return utc_hms(secs);
-    }
-    let part = |v: libc::c_int| u64::try_from(v).unwrap_or(0);
-    (part(tm.tm_hour), part(tm.tm_min), part(tm.tm_sec))
-}
-
-#[cfg(not(unix))]
-fn local_hms(secs: u64) -> (u64, u64, u64) {
-    utc_hms(secs)
-}
-
-fn utc_hms(secs: u64) -> (u64, u64, u64) {
-    let day = secs % 86_400;
-    (day / 3600, day % 3600 / 60, day % 60)
+    format!("{}.{:03}", local_time::hms(t), since.subsec_millis())
 }
 
 #[cfg(test)]
@@ -390,7 +364,6 @@ mod tests {
 
     use super::*;
 
-    use pretty_assertions::assert_eq;
     use std::time::UNIX_EPOCH;
 
     use ratatui::{buffer::Buffer, layout::Rect};
@@ -428,9 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn utc_clock_parts() {
-        assert_eq!(utc_hms(0), (0, 0, 0));
-        assert_eq!(utc_hms(86_400 + 3_723), (1, 2, 3));
+    fn clock_has_millis() {
         let t = UNIX_EPOCH + std::time::Duration::from_millis(5_042);
         assert!(clock(t).ends_with(".042"));
     }
