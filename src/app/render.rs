@@ -154,6 +154,7 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::DeletePattern, "Delete filter pattern"),
     (Command::OpenSortMenu, "Sort by key / type / TTL / size"),
     (Command::TypeFilter, "Show only some types"),
+    (Command::ToggleTree, "Tree view (←/→ fold, Enter opens)"),
     (Command::EnterValue, "Enter value / JSON field / confirm"),
     (Command::AddKey, "Add new key"),
     (Command::AddItem, "Add item (in collection)"),

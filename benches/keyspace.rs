@@ -261,6 +261,28 @@ fn bench_merge_sorted(c: &mut Criterion) {
     group.finish();
 }
 
+/// Building the tree's visible rows over an `n`-key name order, as a fold
+/// does: open the first top-level group (a quarter of the keys, 1,000-key
+/// subgroups), then close it again. Two rebuilds per iteration.
+fn bench_tree_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tree_build");
+    group.sample_size(10);
+    for (n, label) in sizes() {
+        let mut state = unsorted(n);
+        state.set_sort(None);
+        state.toggle_tree(":");
+        let job = state.sort_job().expect("name order pending");
+        assert!(state.install_sorted(job.run()));
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                assert!(state.set_group(0, Some(true)).is_some());
+                assert!(state.set_group(0, Some(false)).is_some());
+            });
+        });
+    }
+    group.finish();
+}
+
 fn main() {
     support::use_default_config();
     let mut c = Criterion::default().configure_from_args();
@@ -269,5 +291,6 @@ fn main() {
     bench_sort_names(&mut c);
     bench_sort_snapshot(&mut c);
     bench_merge_sorted(&mut c);
+    bench_tree_build(&mut c);
     c.final_summary();
 }

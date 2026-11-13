@@ -178,6 +178,11 @@ impl KeySpace {
         self.value_table.select(None);
     }
 
+    /// Focus is on the key list.
+    pub fn is_keys_focused(&self) -> bool {
+        self.focus == Focus::Keys
+    }
+
     pub fn is_value_focused(&self) -> bool {
         self.focus == Focus::Value
     }

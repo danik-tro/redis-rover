@@ -312,13 +312,23 @@ impl App {
     }
 
     pub(super) fn load_new_keys(&mut self) {
-        let page_info = PageInfo::from(&*self.state.keyspace_state.lock());
+        // Keys and tree rows are taken together under the keyspace lock,
+        // the way the runner writes them.
+        let (page_info, page) = {
+            let keyspace_state = self.state.keyspace_state.lock();
+            let keys = self.state.keys.lock().take();
+            let rows = self.state.page_rows.lock().take();
+            (
+                PageInfo::from(&*keyspace_state),
+                keys.map(|keys| (keys, rows)),
+            )
+        };
         self.keyspace.set_page_info(page_info);
         // Move, don't copy. `None` means an earlier LoadKeysIntoKeySpace
         // already took this page (two fetches finished back to back), so the
         // table already shows it.
-        if let Some(keys) = self.state.keys.lock().take() {
-            self.keyspace.set_keys(keys);
+        if let Some((keys, rows)) = page {
+            self.keyspace.set_page(keys, rows);
         }
         self.keyspace.clear_selected_value();
 
@@ -449,6 +459,62 @@ impl App {
         }
     }
 
+    /// `v`: flat list ↔ prefix tree, from page 1. The tree groups the keys
+    /// loaded so far; the cursor stays on the selected key if it is shown.
+    pub(super) fn toggle_tree(&mut self) {
+        let separator = config::get().keyspace.separator.clone();
+        self.state.keyspace_state.lock().toggle_tree(&separator);
+        self.reselect_key = self.keyspace.selected_key().map(|(key, _)| key);
+        self.fetch_keys();
+    }
+
+    /// Row of the list (all pages) the cursor is on.
+    fn cursor_position(&self) -> Option<usize> {
+        let row = self.keyspace.selected_row()?;
+        Some(self.state.keyspace_state.lock().page_range().start + row)
+    }
+
+    /// `←` / `→` on the key list in tree mode: close the group (or the one
+    /// the cursor is in) / open it. Returns `false` when it isn't for the
+    /// tree (flat list, focus on the value), so the arrow pans instead.
+    pub(super) fn fold_tree(&mut self, open: bool) -> bool {
+        if !self.keyspace.is_keys_focused() || !self.state.keyspace_state.lock().is_tree() {
+            return false;
+        }
+        let Some(position) = self.cursor_position() else {
+            return true;
+        };
+        let prefix = {
+            let mut keyspace_state = self.state.keyspace_state.lock();
+            if open {
+                keyspace_state.set_group(position, Some(true))
+            } else {
+                keyspace_state.fold(position)
+            }
+        };
+        if let Some(prefix) = prefix {
+            self.reselect_key = Some(prefix);
+            self.fetch_keys();
+        }
+        true
+    }
+
+    /// Enter on a group row: open or close it. Returns `false` for a key.
+    pub(super) fn toggle_group(&mut self) -> bool {
+        if !self.keyspace.is_keys_focused() || self.keyspace.selected_group().is_none() {
+            return false;
+        }
+        let Some(position) = self.cursor_position() else {
+            return false;
+        };
+        let prefix = self.state.keyspace_state.lock().set_group(position, None);
+        if let Some(prefix) = prefix {
+            self.reselect_key = Some(prefix);
+            self.fetch_keys();
+        }
+        true
+    }
+
     /// Start the metadata backfill if the sort still lacks some (the runner
     /// ignores it while one runs).
     pub(super) fn request_backfill(&mut self) {
@@ -483,12 +549,13 @@ impl App {
     /// metadata is drawn from it with no round trip, keeping the cursor (and
     /// the open value) on the same key; otherwise the page is fetched again.
     pub(super) fn meta_backfilled(&mut self) {
-        let (info, names, rows) = {
+        let (info, names, rows, tree_rows) = {
             let state = self.state.keyspace_state.lock();
             (
                 PageInfo::from(&*state),
                 state.page_keys(),
                 state.page_from_meta(),
+                state.page_rows(),
             )
         };
         self.keyspace.set_page_info(info);
@@ -497,7 +564,7 @@ impl App {
         }
         let selected = self.keyspace.selected_key().map(|(key, _)| key);
         if let Some(rows) = rows {
-            self.keyspace.set_keys(rows);
+            self.keyspace.set_page(rows, tree_rows);
             let kept = selected
                 .as_deref()
                 .is_some_and(|key| self.keyspace.select_key_by_name(key));
@@ -593,6 +660,72 @@ impl App {
 mod tests {
 
     use crate::app::tests::{app, meta};
+
+    /// What the runner does for a `FetchKeys`, without Redis: build the
+    /// order, hand over the page (and its tree rows), load it.
+    fn serve_page(app: &mut super::App) {
+        {
+            let mut keyspace_state = app.state.keyspace_state.lock();
+            keyspace_state.rebuild_view();
+            *app.state.page_rows.lock() = keyspace_state.page_rows();
+            *app.state.keys.lock() =
+                Some(keyspace_state.page_keys().iter().map(|k| meta(k)).collect());
+        }
+        app.load_new_keys();
+    }
+
+    #[test]
+    fn tree_arrows_and_enter_fold_groups_on_the_key_list() {
+        use crate::action::Action;
+
+        let mut app = app();
+        app.state.keyspace_state.lock().merge_batch(
+            0,
+            ["user:1:name", "user:1:email", "order:9", "solo"]
+                .map(String::from)
+                .to_vec(),
+        );
+        serve_page(&mut app);
+        assert!(!app.fold_tree(true), "flat list: the arrows pan");
+
+        app.update(&Action::ToggleTree);
+        serve_page(&mut app);
+        assert!(app.keyspace.select_key_by_name("user:"));
+        assert_eq!(app.keyspace.selected_key(), None, "a group is not a key");
+        assert_eq!(app.keyspace.selected_group(), Some(("user:", false)));
+
+        app.update(&Action::ScrollRight);
+        serve_page(&mut app);
+        assert_eq!(
+            app.keyspace.selected_group(),
+            Some(("user:", true)),
+            "cursor kept"
+        );
+
+        // Enter on the group closes it; on a key it doesn't.
+        app.update(&Action::EnterValue);
+        serve_page(&mut app);
+        assert_eq!(app.keyspace.selected_group(), Some(("user:", false)));
+
+        app.update(&Action::ScrollRight);
+        serve_page(&mut app);
+        assert!(app.keyspace.select_key_by_name("user:1:"));
+        app.update(&Action::ScrollRight);
+        serve_page(&mut app);
+        assert!(app.keyspace.select_key_by_name("user:1:name"));
+        assert!(!app.toggle_group(), "Enter on a key opens it as before");
+
+        // ← on a key closes its group and moves the cursor there.
+        app.update(&Action::ScrollLeft);
+        serve_page(&mut app);
+        assert_eq!(app.keyspace.selected_group(), Some(("user:1:", false)));
+
+        // Back to the flat list.
+        app.update(&Action::ToggleTree);
+        serve_page(&mut app);
+        assert_eq!(app.keyspace.selected_group(), None);
+        assert!(app.keyspace.select_key_by_name("order:9"));
+    }
 
     #[test]
     fn load_new_keys_moves_the_page_once() {

@@ -479,6 +479,7 @@ mod tests {
             Action::TogglePubSub => app.toggle_pubsub(),
             Action::OpenSortMenu => app.keyspace.open_sort_menu(),
             Action::OpenTypeFilter => app.open_type_filter(),
+            Action::ToggleTree => app.toggle_tree(),
             other => panic!("unexpected action {other:?}"),
         }
     }

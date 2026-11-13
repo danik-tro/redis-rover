@@ -10,7 +10,7 @@ use crate::{
     redis_client::{
         metrics::MetricsHistory,
         pubsub_store::PubSubStore,
-        types::{KeyMeta, KeyspaceState, LoadedValue, RedisInfo, ValueState},
+        types::{KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
     widgets::{info::FooterText, pubsub::PubSubView},
 };
@@ -25,6 +25,9 @@ pub struct SharedState {
     /// The keyspace page the runner loaded last, until the App moves it into
     /// the key table (`None` once taken).
     pub keys: Arc<Mutex<Option<Vec<KeyMeta>>>>,
+    /// In tree mode, the rows of the page in `keys` (groups and one `Leaf`
+    /// per key). Written with `keys` under the keyspace lock; taken with it.
+    pub page_rows: Arc<Mutex<Option<Vec<PageRow>>>>,
     pub keyspace_state: Arc<Mutex<KeyspaceState>>,
     /// Paging state for the selected key's value.
     pub value_state: Arc<Mutex<ValueState>>,
@@ -50,6 +53,7 @@ impl Default for SharedState {
             info: Arc::new(Mutex::new(None)),
             info_seq: Arc::new(AtomicU64::new(0)),
             keys: Arc::new(Mutex::new(None)),
+            page_rows: Arc::new(Mutex::new(None)),
             keyspace_state: Arc::new(Mutex::new(KeyspaceState::default())),
             value_state: Arc::new(Mutex::new(ValueState::default())),
             selected_value: Arc::new(Mutex::new(None)),

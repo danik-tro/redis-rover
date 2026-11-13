@@ -3,7 +3,6 @@
 
 
 
-
                                      ╭─────────────────── Help ────────────────────╮
                                      │ Scroll down                         j       │
                                      │ Scroll up                           k       │
@@ -14,6 +13,7 @@
                                      │ Delete filter pattern               l       │
                                      │ Sort by key / type / TTL / size     o       │
                                      │ Show only some types                Shift-T │
+                                     │ Tree view (←/→ fold, Enter opens)   v       │
                                      │ Enter value / JSON field / confirm  Enter   │
                                      │ Add new key                         a       │
                                      │ Add item (in collection)            i       │

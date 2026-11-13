@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use hashbrown::HashTable;
 
 use super::{
+    tree::{PageRow, Tree, TreeRow},
     type_filter::{TypeFilter, TypeScan},
     view::{KeyView, MetaColumns, Sort, SortJob, SortedOrder, Swept, SYNC_SORT_MAX},
     KeyMeta,
@@ -65,6 +66,10 @@ pub struct KeyspaceState {
     type_filter: TypeFilter,
     /// The server accepts `SCAN … TYPE` (until it rejects it once).
     server_type_scan: bool,
+    /// Tree mode: raw keys to load. The tree groups what is loaded and
+    /// never scans just to fill a page with groups; `n` past the last row
+    /// raises it by a page.
+    tree_target: usize,
 }
 
 /// Keys whose metadata the backfill fetches next, copied out under the lock.
@@ -149,7 +154,20 @@ impl KeyspaceState {
     /// Number of keys the list shows over the loaded part of the sweep.
     #[must_use]
     pub fn view_len(&self) -> usize {
-        self.scanned.len()
+        match self.view.tree() {
+            Some(tree) if self.view.order().is_some() => tree.rows().len(),
+            _ => self.scanned.len(),
+        }
+    }
+
+    /// What the sweep's progress is measured in: raw keys in tree mode,
+    /// rows otherwise.
+    fn loaded(&self) -> usize {
+        if self.view.tree().is_some() {
+            self.scanned.len()
+        } else {
+            self.view_len()
+        }
     }
 
     /// Positions in the list (display order) covered by the current page,
@@ -165,13 +183,17 @@ impl KeyspaceState {
     /// Number of key names the sweep must have found to fill the current page.
     #[must_use]
     pub fn keys_needed(&self) -> usize {
-        (self.page + 1) * self.page_size
+        if self.view.tree().is_some() {
+            self.tree_target
+        } else {
+            (self.page + 1) * self.page_size
+        }
     }
 
     /// The sweep still needs to `SCAN` further to fill the current page.
     #[must_use]
     pub fn needs_scan(&self) -> bool {
-        !self.sweep_done && self.view_len() < self.keys_needed()
+        !self.sweep_done && self.loaded() < self.keys_needed()
     }
 
     #[must_use]
@@ -185,11 +207,17 @@ impl KeyspaceState {
     }
 
     /// Advance one page. Returns `false` (and changes nothing) on the last page.
+    /// In tree mode, past the last row it loads another page of raw keys
+    /// instead (the page stays).
     pub fn next_page(&mut self) -> bool {
         if !self.has_next_page() {
             return false;
         }
-        self.page += 1;
+        if self.view.tree().is_some() && self.view_len() <= self.page_range().end {
+            self.tree_target = self.scanned.len() + self.page_size;
+        } else {
+            self.page += 1;
+        }
         self.generation += 1;
         true
     }
@@ -229,22 +257,29 @@ impl KeyspaceState {
         self.generation += 1;
         self.sweep_epoch += 1;
         self.view.reset();
+        self.refresh_tree();
         if let Some(meta) = self.meta.as_mut() {
             meta.clear();
         }
+        self.tree_target = self.tree_target.max(self.page_size);
+    }
+
+    /// Back to page 1 of a new sweep (pattern, type filter, DB).
+    fn restart_from_top(&mut self) {
+        self.page = 0;
+        self.tree_target = self.page_size;
+        self.rescan();
     }
 
     /// Start over after a DB switch: keep the filter, go back to page 1 and
     /// drop the old DB's sweep (bumps `generation`).
     pub fn reset_for_db(&mut self) {
-        self.page = 0;
-        self.rescan();
+        self.restart_from_top();
     }
 
     pub fn set_pattern(&mut self, pattern: Option<String>) {
         self.pattern = pattern;
-        self.page = 0;
-        self.rescan();
+        self.restart_from_top();
     }
 
     pub fn delete_pattern(&mut self) {
@@ -263,8 +298,7 @@ impl KeyspaceState {
             return false;
         }
         self.type_filter = filter;
-        self.page = 0;
-        self.rescan();
+        self.restart_from_top();
         true
     }
 
@@ -325,6 +359,7 @@ impl KeyspaceState {
             .merge_new(&input, first_new as u32, self.scanned.len() as u32);
         self.sweep_cursor = cursor;
         self.sweep_done = cursor == 0 || full;
+        self.refresh_tree();
     }
 
     /// The next `SCAN` work the current page needs, or `None` when the sweep
@@ -338,7 +373,7 @@ impl KeyspaceState {
             pattern: self.pattern.clone(),
             cursor: self.sweep_cursor,
             scan_count: self.scan_count,
-            need: self.keys_needed() - self.view_len(),
+            need: self.keys_needed() - self.loaded(),
             types: self.type_scan(),
             generation: self.generation,
             epoch: self.sweep_epoch,
@@ -367,6 +402,15 @@ impl KeyspaceState {
     #[must_use]
     pub fn page_keys(&self) -> Vec<String> {
         let range = self.page_range();
+        if let (Some(tree), Some(_)) = (self.view.tree(), self.view.order()) {
+            return tree.rows()[range]
+                .iter()
+                .filter_map(|row| match *row {
+                    TreeRow::Leaf { index, .. } => Some(self.scanned[index as usize].clone()),
+                    TreeRow::Group { .. } => None,
+                })
+                .collect();
+        }
         match self.view.order() {
             Some(order) => order[range]
                 .iter()
@@ -396,6 +440,103 @@ impl KeyspaceState {
         self.view.set_sort(sort);
         self.page = 0;
         self.generation += 1;
+        self.refresh_tree();
+    }
+
+    /// Tree mode is on.
+    #[must_use]
+    pub fn is_tree(&self) -> bool {
+        self.view.tree().is_some()
+    }
+
+    /// Switch between the flat list and the prefix tree (keys grouped by
+    /// `separator`), from page 1. The tree groups the keys loaded so far.
+    pub fn toggle_tree(&mut self, separator: &str) {
+        let tree = (!self.is_tree()).then(|| Tree::new(separator));
+        self.view.set_tree(tree);
+        self.page = 0;
+        self.tree_target = self.scanned.len().max(self.page_size);
+        self.generation += 1;
+        self.refresh_tree();
+    }
+
+    /// The current page's rows in tree mode (`None` in the flat list):
+    /// groups, and a `Leaf` per key of [`Self::page_keys`].
+    #[must_use]
+    pub fn page_rows(&self) -> Option<Vec<PageRow>> {
+        let tree = self.view.tree()?;
+        self.view.order()?;
+        Some(
+            tree.rows()[self.page_range()]
+                .iter()
+                .map(|row| match *row {
+                    TreeRow::Group {
+                        start, end, depth, ..
+                    } => {
+                        let prefix = self.group_prefix(row).unwrap_or_default().to_owned();
+                        PageRow::Group {
+                            expanded: tree.is_expanded(&prefix),
+                            prefix,
+                            count: (end - start) as usize,
+                            depth,
+                        }
+                    }
+                    TreeRow::Leaf { depth, .. } => PageRow::Leaf { depth },
+                })
+                .collect(),
+        )
+    }
+
+    fn group_prefix(&self, row: &TreeRow) -> Option<&str> {
+        let TreeRow::Group {
+            start, prefix_len, ..
+        } = *row
+        else {
+            return None;
+        };
+        let index = self.view.order()?[start as usize];
+        Some(&self.scanned[index as usize][..prefix_len as usize])
+    }
+
+    /// Open (`Some(true)`), close (`Some(false)`) or toggle (`None`) the
+    /// group on row `position` of the list. Returns its prefix if it
+    /// changed, so the caller can keep the cursor on it.
+    pub fn set_group(&mut self, position: usize, open: Option<bool>) -> Option<String> {
+        let row = *self.view.tree()?.rows().get(position)?;
+        let prefix = self.group_prefix(&row)?.to_owned();
+        let tree = self.view.tree_mut()?;
+        let open = open.unwrap_or(!tree.is_expanded(&prefix));
+        if !tree.set_expanded(&prefix, open) {
+            return None;
+        }
+        self.refresh_tree();
+        self.generation += 1;
+        Some(prefix)
+    }
+
+    /// `Left` in the tree: close the group on row `position`, or if it is
+    /// a key or a closed group, the group it sits in. Moves to the page
+    /// that shows the closed group and returns its prefix.
+    pub fn fold(&mut self, position: usize) -> Option<String> {
+        let rows = self.view.tree()?.rows();
+        let row = *rows.get(position)?;
+        let open_group = self
+            .group_prefix(&row)
+            .is_some_and(|prefix| self.view.tree().is_some_and(|t| t.is_expanded(prefix)));
+        let target = if open_group {
+            position
+        } else {
+            let depth = match row {
+                TreeRow::Group { depth, .. } | TreeRow::Leaf { depth, .. } => depth,
+            };
+            let parent = depth.checked_sub(1)?;
+            rows[..position]
+                .iter()
+                .rposition(|r| matches!(*r, TreeRow::Group { depth, .. } if depth == parent))?
+        };
+        let prefix = self.set_group(target, Some(false))?;
+        self.page = target / self.page_size.max(1);
+        Some(prefix)
     }
 
     /// The active sort needs metadata the backfill hasn't fetched yet:
@@ -426,7 +567,19 @@ impl KeyspaceState {
         }
         let meta = self.meta.as_ref()?;
         let order = self.view.order()?;
-        let start = self.page_range().start.min(order.len());
+        // Tree rows aren't order positions: start from the page's first
+        // group (its keys are next to it in the name order).
+        let start = match self.view.tree() {
+            Some(tree) => tree.rows()[self.page_range()]
+                .iter()
+                .find_map(|row| match *row {
+                    TreeRow::Group { start, .. } => Some(start as usize),
+                    TreeRow::Leaf { .. } => None,
+                })
+                .unwrap_or(0),
+            None => self.page_range().start,
+        }
+        .min(order.len());
         let mut indices = Vec::with_capacity(max.min(loaded - known));
         let (mut down, mut up) = (start, start);
         while indices.len() < max && (up < order.len() || down > 0) {
@@ -474,6 +627,7 @@ impl KeyspaceState {
             meta: self.meta.as_ref(),
         };
         self.view.reposition(&input, &newly_known);
+        self.refresh_tree();
         true
     }
 
@@ -483,10 +637,18 @@ impl KeyspaceState {
     pub fn page_from_meta(&self) -> Option<Vec<KeyMeta>> {
         let meta = self.meta.as_ref()?;
         let order = self.view.order()?;
-        order[self.page_range()]
-            .iter()
-            .map(|&index| meta.key_meta(index, &self.scanned[index as usize]))
-            .collect()
+        let row = |index: u32| meta.key_meta(index, &self.scanned[index as usize]);
+        match self.view.tree() {
+            Some(tree) => tree.rows()[self.page_range()]
+                .iter()
+                .filter_map(|row| match *row {
+                    TreeRow::Leaf { index, .. } => Some(index),
+                    TreeRow::Group { .. } => None,
+                })
+                .map(row)
+                .collect(),
+            None => order[self.page_range()].iter().map(|&i| row(i)).collect(),
+        }
     }
 
     /// Build a pending sort order. Small sweeps (up to [`SYNC_SORT_MAX`]
@@ -503,9 +665,18 @@ impl KeyspaceState {
                 meta: self.meta.as_ref(),
             };
             self.view.rebuild(&input, len);
+            self.refresh_tree();
             return None;
         }
         self.sort_job()
+    }
+
+    fn refresh_tree(&mut self) {
+        let input = Swept {
+            names: &self.scanned,
+            meta: self.meta.as_ref(),
+        };
+        self.view.refresh_tree(&input);
     }
 
     /// A copy of what a full re-sort needs, whatever the sweep's size.
@@ -531,7 +702,11 @@ impl KeyspaceState {
             names: &self.scanned,
             meta: self.meta.as_ref(),
         };
-        self.view.install(sorted, &input, len)
+        let installed = self.view.install(sorted, &input, len);
+        if installed {
+            self.refresh_tree();
+        }
+        installed
     }
 
     // `merge_batch` never lets `scanned` outgrow `u32`.
@@ -570,6 +745,7 @@ impl Default for KeyspaceState {
             backfill_paused: false,
             type_filter: TypeFilter::default(),
             server_type_scan: true,
+            tree_target: DEFAULT_PAGE_SIZE,
         }
     }
 }
@@ -578,7 +754,7 @@ impl Default for KeyspaceState {
 mod tests {
     use super::*;
 
-    use crate::redis_client::types::tests::keys;
+    use crate::redis_client::types::{tests::keys, SortKey};
 
     #[test]
     fn type_filter_restarts_the_sweep_and_picks_how_to_scan() {
@@ -612,6 +788,118 @@ mod tests {
             TypeScan::Client(TypeFilter::new(["json"])),
             "after the server rejected SCAN TYPE"
         );
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    fn row_labels(state: &KeyspaceState) -> Vec<String> {
+        let mut keys = state.page_keys().into_iter();
+        state
+            .page_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| match row {
+                PageRow::Group {
+                    prefix,
+                    count,
+                    expanded,
+                    ..
+                } => format!("{} {prefix} ({count})", if expanded { '▾' } else { '▸' }),
+                PageRow::Leaf { .. } => keys.next().unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tree_folds_unfolds_and_pages_over_rows() {
+        let mut state = state_with(10);
+        state.merge_batch(
+            0,
+            names(&[
+                "user:1:name",
+                "order:9",
+                "user:2:name",
+                "user:1:email",
+                "solo",
+            ]),
+        );
+        state.toggle_tree(":");
+        assert!(state.is_tree());
+        assert!(state.rebuild_view().is_none(), "small: sorted inline");
+        assert_eq!(row_labels(&state), ["▸ order: (1)", "▸ user: (3)", "solo"]);
+        assert_eq!(state.view_len(), 3);
+
+        assert_eq!(state.set_group(1, None).as_deref(), Some("user:"));
+        assert_eq!(
+            row_labels(&state),
+            [
+                "▸ order: (1)",
+                "▾ user: (3)",
+                "▸ user:1: (2)",
+                "user:2:name",
+                "solo"
+            ]
+        );
+        assert_eq!(state.set_group(3, Some(true)), None, "a key is no group");
+        state.set_group(2, Some(true));
+        assert_eq!(
+            row_labels(&state)[2..5],
+            ["▾ user:1: (2)", "user:1:email", "user:1:name"]
+        );
+
+        // ← on a key closes the group it is in; on an open group, that one.
+        assert_eq!(state.fold(4).as_deref(), Some("user:1:"));
+        assert_eq!(state.fold(1).as_deref(), Some("user:"));
+        assert_eq!(row_labels(&state), ["▸ order: (1)", "▸ user: (3)", "solo"]);
+        assert_eq!(state.fold(0), None, "nothing above the top level");
+
+        // Back to the flat list: SCAN order, every key.
+        state.toggle_tree(":");
+        assert!(state.page_rows().is_none());
+        assert_eq!(state.view_len(), 5);
+        assert_eq!(state.page_keys()[0], "user:1:name");
+    }
+
+    #[test]
+    fn tree_loads_raw_keys_not_rows() {
+        let mut state = state_with(3);
+        state.toggle_tree(":");
+        assert_eq!(state.sweep_request().unwrap().need, 3);
+        state.merge_batch(7, names(&["a:1", "a:2", "a:3"]));
+        state.rebuild_view();
+        assert_eq!(row_labels(&state), ["▸ a: (3)"]);
+        assert!(
+            !state.needs_scan(),
+            "one group fills no page, but 3 keys are loaded"
+        );
+
+        // `n` past the last row loads another page of keys, same page.
+        assert!(state.next_page());
+        assert_eq!(state.page, 0);
+        assert_eq!(state.sweep_request().unwrap().need, 3);
+    }
+
+    #[test]
+    fn tree_keeps_the_sort_inside_groups_and_survives_rescan() {
+        let mut state = state_with(10);
+        state.toggle_tree(":");
+        state.set_sort(Some(Sort {
+            key: SortKey::Name,
+            descending: true,
+        }));
+        state.merge_batch(0, names(&["b", "a", "g:1"]));
+        state.rebuild_view();
+        assert_eq!(row_labels(&state), ["▸ g: (1)", "b", "a"]);
+        state.set_group(0, Some(true));
+
+        state.rescan();
+        state.merge_batch(0, names(&["g:1", "g:2"]));
+        state.rebuild_view();
+        assert_eq!(row_labels(&state), ["▾ g: (2)", "g:2", "g:1"], "kept open");
+        state.reset_for_db();
+        assert!(state.is_tree());
     }
 
     #[test]

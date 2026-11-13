@@ -514,6 +514,7 @@ impl EventHandler {
                 self.state.keyspace_state.lock().reset_for_db();
                 self.state.value_state.lock().clear();
                 *self.state.keys.lock() = None;
+                *self.state.page_rows.lock() = None;
                 *self.state.selected_value.lock() = None;
                 self.last_value_generation = None;
                 self.action_hook(Action::DbSwitched);
@@ -752,10 +753,10 @@ impl EventHandler {
         }
         self.build_view().await?;
 
-        let (generation, page) = {
+        let (generation, page, rows) = {
             let mut state = self.state.keyspace_state.lock();
             state.clamp_page();
-            (state.generation, state.page_keys())
+            (state.generation, state.page_keys(), state.page_rows())
         };
         let keys = self.storage.fetch_meta(&page).await?;
 
@@ -763,6 +764,7 @@ impl EventHandler {
         if state.generation != generation {
             return Ok(false);
         }
+        *self.state.page_rows.lock() = rows;
         *self.state.keys.lock() = Some(keys);
         Ok(true)
     }
