@@ -1,6 +1,6 @@
 //! Yes / no questions the App asks itself, drawn above every mode: the
-//! command preview before a write (`safety.preview`) and lifting read-only
-//! on Prod.
+//! command preview before a write (`safety.preview`), lifting read-only
+//! on Prod, loading a large keyspace and clearing a filter for `g o`.
 
 use std::time::Instant;
 
@@ -27,6 +27,10 @@ pub(super) enum PendingConfirm {
     LiftReadOnly,
     /// Send a write once its commands were seen.
     Write(Box<PendingWrite>),
+    /// `Shift-a` on a large DB: `keys` keys, about `bytes` once loaded.
+    LoadAll { db: i64, keys: u64, bytes: u64 },
+    /// `g o`: the filter hides the open key; clear it and go there.
+    ClearFilterFor(String),
 }
 
 /// A write waiting for `y`, with what to do once it is sent.
@@ -226,6 +230,8 @@ impl App {
         let now = self.clock.now();
         match self.pending.take() {
             Some(PendingConfirm::LiftReadOnly) => self.lift_read_only(now),
+            Some(PendingConfirm::LoadAll { .. }) => self.start_load(None),
+            Some(PendingConfirm::ClearFilterFor(key)) => self.clear_filter_for(key),
             Some(PendingConfirm::Write(write)) => {
                 let PendingWrite { event, after, .. } = *write;
                 self.send_write(event, after);
@@ -252,6 +258,12 @@ impl App {
                 .render(area, buf),
                 None => ConfirmPopup::write_preview(&write.lines, env).render(area, buf),
             },
+            Some(PendingConfirm::LoadAll { db, keys, bytes }) => {
+                ConfirmPopup::load_all(*db, *keys, *bytes, env).render(area, buf);
+            }
+            Some(PendingConfirm::ClearFilterFor(key)) => {
+                ConfirmPopup::clear_filter_for(key, env).render(area, buf);
+            }
             None => {}
         }
     }

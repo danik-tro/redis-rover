@@ -1500,3 +1500,124 @@ async fn probe_reports_no_resp3_on_redis_5() {
     assert!(report.contains("server    Redis 5."), "{report}");
     assert!(report.contains("RESP3     no"), "{report}");
 }
+
+/// The keyspace's key names as a set, asserting the sweep holds no
+/// duplicates.
+fn swept_set(h: &Harness) -> HashSet<String> {
+    let state = h.state.keyspace_state.lock();
+    let set: HashSet<String> = state.scanned.iter().cloned().collect();
+    assert_eq!(set.len(), state.scanned.len(), "duplicates in the sweep");
+    set
+}
+
+/// `LoadAll` sweeps to the end on its own connection while a page fetch
+/// races it; every key is loaded once.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn load_all_reaches_the_end_of_the_sweep() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("load_all");
+    let keys = support::seed_strings(&mut admin, &p, 20_000).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    h.fetch_page().await;
+
+    h.send(RedisEvent::LoadAll { until: None });
+    h.state.keyspace_state.lock().page = 300;
+    h.send(RedisEvent::FetchKeys);
+    let mut done = None;
+    let mut page = false;
+    while done.is_none() || !page {
+        match h
+            .expect("LoadAllDone and the page", |a| {
+                matches!(
+                    a,
+                    Action::LoadAllDone { .. }
+                        | Action::LoadKeysIntoKeySpace
+                        | Action::KeysLoadAborted
+                        | Action::Error(_)
+                )
+            })
+            .await
+        {
+            Action::LoadAllDone { complete } => done = Some(complete),
+            Action::LoadKeysIntoKeySpace => page = true,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(done, Some(true));
+    assert!(h.state.keyspace_state.lock().sweep_done);
+    let expected: HashSet<String> = keys.into_iter().collect();
+    assert_eq!(swept_set(&h), expected);
+    h.shutdown().await;
+}
+
+/// Stopping a load leaves a sweep that later page fetches and loads
+/// continue without gaps or duplicates.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stopped_load_all_leaves_a_consistent_sweep() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("load_stop");
+    let keys = support::seed_strings(&mut admin, &p, 30_000).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    h.fetch_page().await;
+
+    h.send(RedisEvent::LoadAll { until: None });
+    h.send(RedisEvent::StopLoadAll);
+    let after = h.drain(Duration::from_millis(300)).await;
+    assert!(
+        !after
+            .iter()
+            .any(|a| matches!(a, Action::LoadAllDone { .. })),
+        "a stopped load sends no Done: {after:?}"
+    );
+    let partial = swept_set(&h);
+    assert!(partial.len() < keys.len(), "stopped before the end");
+
+    let loaded = partial.len();
+    h.state.keyspace_state.lock().page = loaded / 10 + 2;
+    h.fetch_page().await;
+    h.send(RedisEvent::LoadAll { until: None });
+    let done = h
+        .expect("LoadAllDone", |a| matches!(a, Action::LoadAllDone { .. }))
+        .await;
+    assert_eq!(done, Action::LoadAllDone { complete: true });
+    let expected: HashSet<String> = keys.into_iter().collect();
+    assert_eq!(swept_set(&h), expected);
+    h.shutdown().await;
+}
+
+/// `g o`'s search stops once the key is loaded, and ends `complete` for a
+/// key that doesn't exist.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn load_until_a_key_stops_there() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("seek");
+    let keys = support::seed_strings(&mut admin, &p, 20_000).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    h.fetch_page().await;
+
+    let target = keys[12_345].clone();
+    h.send(RedisEvent::LoadAll {
+        until: Some(target.clone()),
+    });
+    let done = h
+        .expect("LoadAllDone", |a| matches!(a, Action::LoadAllDone { .. }))
+        .await;
+    assert_eq!(done, Action::LoadAllDone { complete: false });
+    assert!(h.state.keyspace_state.lock().index_of(&target).is_some());
+
+    h.send(RedisEvent::LoadAll {
+        until: Some(format!("{p}missing")),
+    });
+    let done = h
+        .expect("LoadAllDone", |a| matches!(a, Action::LoadAllDone { .. }))
+        .await;
+    assert_eq!(done, Action::LoadAllDone { complete: true });
+    assert_eq!(swept_set(&h).len(), keys.len());
+    h.shutdown().await;
+}

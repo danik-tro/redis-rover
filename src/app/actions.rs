@@ -82,6 +82,10 @@ impl App {
                 self.request_backfill();
             }
             Action::KeyMetaBackfilled => self.meta_backfilled(),
+            Action::LoadAll => self.request_load_all(),
+            Action::LoadAllProgress(loaded) => self.load_progress(loaded),
+            Action::LoadAllDone { complete } => self.load_done(complete),
+            Action::GoToOpenKey => self.go_to_open_key(),
             Action::OpenSortMenu => self.keyspace.open_sort_menu(),
             Action::OpenTypeFilter => self.open_type_filter(),
             Action::ToggleTree => self.toggle_tree(),
@@ -116,21 +120,14 @@ impl App {
             Action::DiscardKeyspacePopup => self.close_popup(),
             Action::ConfirmKeyspacePopup => self.confirm_popup(),
             Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
-            Action::EnterValue => {
-                if !self.toggle_group() {
-                    self.enter_value();
-                }
-            }
+            Action::EnterValue => self.enter(),
             Action::RequestDeleteKey => self.request_delete_key(),
             Action::RequestSetTtl => self.request_set_ttl(),
             Action::RequestEditValue => self.request_edit_value(),
             Action::RequestAddKey => self.request_add_key(),
             Action::RequestAddItem => self.request_add_item(),
             Action::OpenDbPicker => self.open_db_picker(),
-            Action::DbSwitched => {
-                self.finish_keys_fetch();
-                self.fetch_keys();
-            }
+            Action::DbSwitched => self.db_switched(),
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
@@ -256,6 +253,22 @@ impl App {
     /// Esc backs out one modal layer at a time, in precedence order:
     /// help overlay → action overlay (delete/edit/TTL/notice) → value focus →
     /// filter popup.
+    /// Enter: open or close a tree group, else open the value (and
+    /// remember its key for `g o`).
+    fn enter(&mut self) {
+        if !self.toggle_group() {
+            self.enter_value();
+            self.remember_open_key();
+        }
+    }
+
+    /// The runner switched DB: load the new DB's first page.
+    fn db_switched(&mut self) {
+        self.forget_load_and_open_key();
+        self.finish_keys_fetch();
+        self.fetch_keys();
+    }
+
     fn close_popup(&mut self) {
         if self.help_is_open() {
             self.help_opened_at = None;
@@ -294,6 +307,8 @@ impl App {
         }
 
         if !self.keyspace.is_popup() {
+            // Esc on the key list stops a running load.
+            self.stop_load();
             return;
         }
 

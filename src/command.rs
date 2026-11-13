@@ -46,4 +46,6 @@ pub enum Command {
     OpenSortMenu,
     TypeFilter,
     ToggleTree,
+    LoadAll,
+    GoToOpenKey,
 }

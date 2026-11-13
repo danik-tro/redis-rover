@@ -155,6 +155,8 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::OpenSortMenu, "Sort by key / type / TTL / size"),
     (Command::TypeFilter, "Show only some types"),
     (Command::ToggleTree, "Tree view (←/→ fold, Enter opens)"),
+    (Command::LoadAll, "Load all keys (Esc stops)"),
+    (Command::GoToOpenKey, "Go to the open key"),
     (Command::EnterValue, "Enter value / JSON field / confirm"),
     (Command::AddKey, "Add new key"),
     (Command::AddItem, "Add item (in collection)"),

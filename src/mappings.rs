@@ -46,6 +46,8 @@ impl From<Command> for Action {
             Command::OpenSortMenu => Self::OpenSortMenu,
             Command::TypeFilter => Self::OpenTypeFilter,
             Command::ToggleTree => Self::ToggleTree,
+            Command::LoadAll => Self::LoadAll,
+            Command::GoToOpenKey => Self::GoToOpenKey,
         }
     }
 }

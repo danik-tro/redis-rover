@@ -37,6 +37,17 @@ pub enum Action {
     /// The metadata backfill stored another batch: the sort order (and the
     /// page) may have changed.
     KeyMetaBackfilled,
+    /// `Shift-a`: load the whole keyspace in the background.
+    LoadAll,
+    /// A running load stored more keys: this many are loaded now.
+    LoadAllProgress(usize),
+    /// The load stopped by itself: the sweep ended (`complete`), the key
+    /// it looked for is loaded, or it failed.
+    LoadAllDone {
+        complete: bool,
+    },
+    /// `g o`: move the cursor back to the key whose value was opened.
+    GoToOpenKey,
     /// `o`: open the sort menu.
     OpenSortMenu,
     /// `Shift-t`: open the type filter checklist.

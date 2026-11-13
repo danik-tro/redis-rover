@@ -1,9 +1,11 @@
+mod glob;
 mod keyspace;
 mod tree;
 mod type_filter;
 mod value;
 mod view;
 
+pub use glob::glob_match;
 pub use keyspace::{KeyspaceState, SweepApply, SweepRequest, SweepResult};
 pub use tree::{PageRow, DEFAULT_SEPARATOR};
 pub use type_filter::{TypeFilter, TypeScan, STANDARD_TYPES};

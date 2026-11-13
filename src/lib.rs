@@ -141,7 +141,7 @@ pub mod internals {
     pub use crate::widgets::confirm::ConfirmPopup;
     pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
     pub use crate::widgets::info::{Info, InfoWidget};
-    pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, PageInfo};
+    pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, LoadProgress, PageInfo};
     pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};

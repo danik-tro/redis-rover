@@ -39,6 +39,9 @@ const BACKFILL_BATCH: usize = 1000;
 /// Least time between two `KeyMetaBackfilled` actions (redraws).
 const BACKFILL_NOTIFY: Duration = Duration::from_millis(250);
 
+/// Least time between two `LoadAllProgress` actions.
+const LOAD_NOTIFY: Duration = Duration::from_millis(250);
+
 /// How long a DB switch may take to open its new connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -311,6 +314,10 @@ pub struct EventHandler {
     /// The backfill's own connection, opened on its first run (and again
     /// after a DB switch), so its pipelines never queue in front of a page.
     backfill_storage: Option<Storage>,
+    /// The running load-all (or `g o` search), if any.
+    load_task: Option<JoinHandle<()>>,
+    /// The load-all's own connection, opened like `backfill_storage`.
+    load_storage: Option<Storage>,
 }
 
 impl Drop for EventHandler {
@@ -321,6 +328,7 @@ impl Drop for EventHandler {
             &self.yank_task,
             &self.value_task,
             &self.backfill_task,
+            &self.load_task,
         ]
         .into_iter()
         .flatten()
@@ -352,6 +360,8 @@ impl EventHandler {
             value_task: None,
             backfill_task: None,
             backfill_storage: None,
+            load_task: None,
+            load_storage: None,
         }
     }
 
@@ -485,6 +495,8 @@ impl EventHandler {
             }
             RedisEvent::FetchKeys => self.fetch_keys().await,
             RedisEvent::BackfillMeta => self.backfill_meta().await,
+            RedisEvent::LoadAll { until } => self.load_all(until).await,
+            RedisEvent::StopLoadAll => self.stop_load_all(),
         }
     }
 
@@ -501,6 +513,7 @@ impl EventHandler {
                     self.yank_task.take(),
                     self.value_task.take(),
                     self.backfill_task.take(),
+                    self.load_task.take(),
                 ]
                 .into_iter()
                 .flatten()
@@ -510,6 +523,7 @@ impl EventHandler {
                 self.storage = Storage::new(manager);
                 self.value_storage = Storage::new(value_manager);
                 self.backfill_storage = None;
+                self.load_storage = None;
                 *self.state.db.lock() = db;
                 self.state.keyspace_state.lock().reset_for_db();
                 self.state.value_state.lock().clear();
@@ -610,18 +624,11 @@ impl EventHandler {
         let storage = if let Some(storage) = self.backfill_storage.clone() {
             storage
         } else {
-            let db = *self.state.db.lock();
-            match self.connect_db(db).await {
-                Ok(manager) => {
-                    let storage = Storage::new(manager);
-                    self.backfill_storage = Some(storage.clone());
-                    storage
-                }
-                Err(err) => {
-                    log::warn!("Opening the backfill connection failed: {err}");
-                    return;
-                }
-            }
+            let Some(storage) = self.open_side_storage("backfill").await else {
+                return;
+            };
+            self.backfill_storage = Some(storage.clone());
+            storage
         };
         let state = self.state.clone();
         let tx = self.tx.clone();
@@ -656,6 +663,51 @@ impl EventHandler {
                 crate::action::try_send_action(&tx, Action::KeyMetaBackfilled);
             }
         }));
+    }
+
+    /// A connection of its own on the current DB, for a background task
+    /// whose commands should never queue in front of a page.
+    async fn open_side_storage(&self, what: &str) -> Option<Storage> {
+        let db = *self.state.db.lock();
+        match self.connect_db(db).await {
+            Ok(manager) => Some(Storage::new(manager)),
+            Err(err) => {
+                log::warn!("Opening the {what} connection failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Sweep the rest of the keyspace in its own task, on its own
+    /// connection: SCAN steps of `COUNT 1000` merged one by one, so
+    /// page turns (which may race it, see `SweepApply::Raced`) stay quick.
+    /// With `until`, stop once that key is loaded. Sends
+    /// `LoadAllProgress` at most every [`LOAD_NOTIFY`] and `LoadAllDone`
+    /// when it stops by itself; a sweep restart (rescan, filter, DB) stops
+    /// it too. Replaces a load already running.
+    async fn load_all(&mut self, until: Option<String>) {
+        self.stop_load_all();
+        let storage = if let Some(storage) = self.load_storage.clone() {
+            storage
+        } else if let Some(storage) = self.open_side_storage("load-all").await {
+            self.load_storage = Some(storage.clone());
+            storage
+        } else {
+            self.action_hook(Action::LoadAllDone { complete: false });
+            return;
+        };
+        let state = self.state.clone();
+        let tx = self.tx.clone();
+        self.load_task = Some(tokio::spawn(async move {
+            let complete = sweep_to_end(&storage, &state, &tx, until.as_deref()).await;
+            crate::action::try_send_action(&tx, Action::LoadAllDone { complete });
+        }));
+    }
+
+    fn stop_load_all(&mut self) {
+        if let Some(task) = self.load_task.take() {
+            task.abort();
+        }
     }
 
     fn abort_count(&mut self) {
@@ -755,6 +807,7 @@ impl EventHandler {
 
         let (generation, page, rows) = {
             let mut state = self.state.keyspace_state.lock();
+            state.apply_reveal();
             state.clamp_page();
             (state.generation, state.page_keys(), state.page_rows())
         };
@@ -785,6 +838,56 @@ impl EventHandler {
 
     fn action_hook(&self, action: Action) {
         crate::action::try_send_action(&self.tx, action);
+    }
+}
+
+/// The load-all loop. Returns `true` when the sweep reached its end.
+async fn sweep_to_end(
+    storage: &Storage,
+    state: &SharedState,
+    tx: &ActionSender<Action>,
+    until: Option<&str>,
+) -> bool {
+    let mut last_notice = std::time::Instant::now();
+    loop {
+        let request = {
+            let keyspace = state.keyspace_state.lock();
+            if until.is_some_and(|key| keyspace.index_of(key).is_some()) {
+                return false;
+            }
+            match keyspace.load_request() {
+                Some(request) => request,
+                None => return true,
+            }
+        };
+        let result = match storage.scan_until(&request).await {
+            Ok(result) => result,
+            Err(err) if err.is::<TypeScanRejected>() => {
+                state.keyspace_state.lock().disable_server_type_scan();
+                continue;
+            }
+            Err(err) => {
+                log::error!("Load all failed: {err:?}");
+                crate::action::try_send_action(
+                    tx,
+                    Action::Error(format!("Loading all keys failed: {err}")),
+                );
+                return false;
+            }
+        };
+        let loaded = {
+            let mut keyspace = state.keyspace_state.lock();
+            // `Stale`: the sweep restarted (rescan, filter, DB); stop.
+            // `Raced`: a page fetch moved the sweep first; go on from there.
+            if keyspace.apply_result(&request, result) == SweepApply::Stale {
+                return false;
+            }
+            keyspace.scanned.len()
+        };
+        if last_notice.elapsed() >= LOAD_NOTIFY {
+            last_notice = std::time::Instant::now();
+            crate::action::try_send_action(tx, Action::LoadAllProgress(loaded));
+        }
     }
 }
 

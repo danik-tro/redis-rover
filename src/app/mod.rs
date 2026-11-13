@@ -5,6 +5,7 @@ mod dashboard;
 mod db;
 mod input;
 mod keyspace;
+mod load;
 mod pubsub;
 mod render;
 
@@ -19,7 +20,7 @@ use std::{
 use crate::{
     clock::{Clock, SystemClock},
     config::{self, PreviewPolicy},
-    redis_client::{event::RedisEvent, pubsub::PubSubCmd},
+    redis_client::{event::RedisEvent, pubsub::PubSubCmd, types::RedisType},
     state::{FrameData, SharedState},
     target::Environment,
 };
@@ -119,6 +120,10 @@ pub struct App {
     clock: Arc<dyn Clock>,
     /// When `Render` draws (#50).
     redraw: Redraw,
+    /// A `Shift-a` load or a `g o` search is running.
+    loading: Option<load::Loading>,
+    /// The key last opened with Enter, for `g o`.
+    open_key: Option<(String, RedisType)>,
 }
 
 /// What decides whether `Render` draws: `dirty`, or data that changes on
@@ -197,6 +202,8 @@ impl App {
             read_only: Arc::new(AtomicBool::new(false)),
             environment: Environment::Local,
             pending: None,
+            loading: None,
+            open_key: None,
             preview: config::get().safety.preview,
             clipboard: Clipboard::default(),
             toast: Toast::default(),

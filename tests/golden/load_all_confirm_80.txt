@@ -1,0 +1,12 @@
+
+
+
+
+
+             ╭────────────────── Load all keys? ──────────────────╮
+             │ DB 0 holds 3,000,000 keys.                         │
+             │ Loading them all takes about 306.13 MiB of memory. │
+             │ Esc stops the load at any time.                    │
+             │                                                    │
+             │               y: load   n/Esc: cancel              │
+             ╰────────────────────────────────────────────────────╯
