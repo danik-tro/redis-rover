@@ -128,6 +128,11 @@ impl App {
             Action::RequestAddItem => self.request_add_item(),
             Action::OpenDbPicker => self.open_db_picker(),
             Action::DbSwitched => self.db_switched(),
+            Action::OpenKeyChanged {
+                ref key,
+                ref change,
+            } => self.open_key_changed(key, change),
+            Action::LiveStatus(ref status) => self.set_liveness(status),
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
@@ -237,6 +242,8 @@ impl App {
             | Action::DiscardKeyspacePopup
             | Action::KeysLoadAborted
             | Action::DbSwitched
+            | Action::OpenKeyChanged { .. }
+            | Action::LiveStatus(_)
             | Action::ValueLoadFailed
             | Action::FilterMatchCount { .. }
             | Action::YankReady
@@ -265,6 +272,7 @@ impl App {
     /// The runner switched DB: load the new DB's first page.
     fn db_switched(&mut self) {
         self.forget_load_and_open_key();
+        self.track_open_key();
         self.finish_keys_fetch();
         self.fetch_keys();
     }

@@ -100,6 +100,7 @@ pub async fn run(args: Cli) -> Result<()> {
         args.frame_rate,
     )
     .read_only_flag(watcher.read_only_flag())
+    .live_tx(watcher.live_tx())
     .environment(target.environment);
 
     watcher.start();
@@ -127,6 +128,7 @@ pub mod internals {
     pub use crate::mode::Mode;
     pub use crate::probe::report as probe_report;
     pub use crate::redis_client::event::RedisEvent;
+    pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
+use crate::redis_client::live::{KeyChange, Liveness};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Display, Deserialize, EnumIter)]
 pub enum Action {
     Tick,
@@ -79,6 +81,14 @@ pub enum Action {
     OpenDbPicker,
     /// The runner connected to the newly selected DB; reload the keyspace.
     DbSwitched,
+    /// Another client changed (or deleted) the open key; the live task
+    /// already re-armed it.
+    OpenKeyChanged {
+        key: String,
+        change: KeyChange,
+    },
+    /// The open key's liveness changed (live, polling, not live).
+    LiveStatus(Liveness),
     /// Live match count for the filter popup. `complete` is false when the
     /// count stopped early (budget hit), so `count` is a lower bound.
     FilterMatchCount {

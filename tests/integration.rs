@@ -23,9 +23,9 @@ use clap::Parser;
 use redis::AsyncCommands;
 use redis_rover::{
     internals::{
-        Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyItem,
-        KeyValue, NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target,
-        TypeFilter,
+        Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind,
+        KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, NewKeySpec, PageRow, PubSubCmd,
+        RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
     },
     Cli,
 };
@@ -1624,5 +1624,273 @@ async fn load_until_a_key_stops_there() {
         .await;
     assert_eq!(done, Action::LoadAllDone { complete: true });
     assert_eq!(swept_set(&h).len(), keys.len());
+    h.shutdown().await;
+}
+
+// --- Live updates of the open key -----------------------------------------
+
+/// Open `key` the way `App` does: select it, load its value, track it. The
+/// `first` key waits until the live task reports it armed (`Live`); a later
+/// one, with the status already `Live`, gives the arming a moment.
+async fn open_live(
+    h: &mut Harness,
+    key: &str,
+    r_type: RedisType,
+    db: i64,
+    first: bool,
+) -> KeyValue {
+    h.state.value_state.lock().select(key, r_type);
+    let value = fetch_shown_value(h).await;
+    h.live(LiveCmd::Track {
+        key: key.to_owned(),
+        db,
+    });
+    if first {
+        h.expect("live", |a| *a == Action::LiveStatus(Liveness::Live))
+            .await;
+    } else {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    value
+}
+
+/// Wait for `OpenKeyChanged` on `key`, then refetch in place as `App` does.
+async fn follow_change(h: &mut Harness, key: &str) -> (KeyChange, KeyValue) {
+    let action = h
+        .expect(
+            "OpenKeyChanged",
+            |a| matches!(a, Action::OpenKeyChanged { key: k, .. } if k == key),
+        )
+        .await;
+    let Action::OpenKeyChanged { change, .. } = action else {
+        unreachable!()
+    };
+    h.state.value_state.lock().rescan();
+    (change, fetch_shown_value(h).await)
+}
+
+fn hash_value(value: &KeyValue, field: &str) -> Option<String> {
+    match value {
+        KeyValue::Hash(entries) => entries
+            .iter()
+            .find(|(f, _)| f == field)
+            .map(|(_, v)| v.clone()),
+        _ => None,
+    }
+}
+
+/// An `HSET` from another client shows up without a keypress, fast.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_tracks_open_hash() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}user:1", support::prefix("live_tracks_open_hash"));
+    let () = admin.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    let value = open_live(&mut h, &key, RedisType::Hash, 0, true).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Ann"));
+
+    let start = Instant::now();
+    let () = admin.hset(&key, "name", "Bob").await.unwrap();
+    let (change, value) = follow_change(&mut h, &key).await;
+    let took = start.elapsed();
+    assert_eq!(
+        change,
+        KeyChange::Changed {
+            r_type: "hash".into()
+        }
+    );
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
+    assert!(took < Duration::from_millis(200), "took {took:?}");
+    h.shutdown().await;
+}
+
+/// Each invalidation re-arms the key: every change is seen, and a burst
+/// ends on the last value.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_rearms_after_each_change() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}user:1", support::prefix("live_rearms"));
+    let () = admin.hset(&key, "n", 0).await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_live(&mut h, &key, RedisType::Hash, 0, true).await;
+
+    for n in 1..=3 {
+        let () = admin.hset(&key, "n", n).await.unwrap();
+        let (_, value) = follow_change(&mut h, &key).await;
+        assert_eq!(hash_value(&value, "n"), Some(n.to_string()), "change {n}");
+    }
+
+    // A burst: however the pushes group, the last refetch shows the end.
+    for n in 4..=6 {
+        let () = admin.hset(&key, "n", n).await.unwrap();
+    }
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, value) = follow_change(&mut h, &key).await;
+        if hash_value(&value, "n").as_deref() == Some("6") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never showed the last change");
+    }
+    h.shutdown().await;
+}
+
+/// Deleting the open key says so; recreating it is seen too.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_reports_deleted_and_expired() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let prefix = support::prefix("live_deleted");
+    let key = format!("{prefix}user:1");
+    let () = admin.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_live(&mut h, &key, RedisType::Hash, 0, true).await;
+
+    let () = admin.del(&key).await.unwrap();
+    let (change, _) = follow_change(&mut h, &key).await;
+    assert_eq!(change, KeyChange::Deleted);
+
+    let () = admin.set(&key, "back").await.unwrap();
+    let action = h
+        .expect("recreated", |a| matches!(a, Action::OpenKeyChanged { .. }))
+        .await;
+    assert_eq!(
+        action,
+        Action::OpenKeyChanged {
+            key: key.clone(),
+            change: KeyChange::Changed {
+                r_type: "string".into()
+            }
+        },
+        "tracked while gone"
+    );
+
+    let short = format!("{prefix}short");
+    let () = admin.set_ex(&short, "v", 2).await.unwrap();
+    open_live(&mut h, &short, RedisType::String, 0, false).await;
+    let (change, _) = follow_change(&mut h, &short).await;
+    assert_eq!(change, KeyChange::Expired);
+    h.shutdown().await;
+}
+
+/// The id of the live task's connection, from `CLIENT LIST`.
+async fn live_client_id(admin: &mut redis::aio::ConnectionManager) -> Option<i64> {
+    let list: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query_async(admin)
+        .await
+        .unwrap();
+    list.lines().find_map(|line| {
+        let mut id = None;
+        let mut named = false;
+        for field in line.split(' ') {
+            match field.split_once('=') {
+                Some(("id", v)) => id = v.parse().ok(),
+                Some(("name", "rrover-live")) => named = true,
+                _ => {}
+            }
+        }
+        id.filter(|_| named)
+    })
+}
+
+/// A lost connection says `reconnecting`, comes back live, and refetches
+/// once: a change made in the gap is shown.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_reconnects_and_refetches() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}user:1", support::prefix("live_reconnects"));
+    let () = admin.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_live(&mut h, &key, RedisType::Hash, 0, true).await;
+
+    let id = live_client_id(&mut admin)
+        .await
+        .expect("the live connection");
+    let () = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(id)
+        .query_async::<i64>(&mut admin)
+        .await
+        .map(|_| ())
+        .unwrap();
+    h.expect("reconnecting", |a| {
+        *a == Action::LiveStatus(Liveness::NotLive("reconnecting".into()))
+    })
+    .await;
+    // In the gap: no connection tracks the key.
+    let () = admin.hset(&key, "name", "Gap").await.unwrap();
+    h.expect("live again", |a| *a == Action::LiveStatus(Liveness::Live))
+        .await;
+    let (_, value) = follow_change(&mut h, &key).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Gap"));
+
+    // Armed again after the reconnect.
+    let () = admin.hset(&key, "name", "After").await.unwrap();
+    let (_, value) = follow_change(&mut h, &key).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("After"));
+    h.shutdown().await;
+}
+
+/// After opening another key, changes to the first one trigger nothing.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_other_key_untracked() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let prefix = support::prefix("live_other_key");
+    let (one, two) = (format!("{prefix}user:1"), format!("{prefix}user:2"));
+    let () = admin.hset(&one, "name", "Ann").await.unwrap();
+    let () = admin.hset(&two, "name", "Eve").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_live(&mut h, &one, RedisType::Hash, 0, true).await;
+    h.state.value_state.lock().select(&two, RedisType::Hash);
+    fetch_shown_value(&mut h).await;
+    h.live(LiveCmd::Track {
+        key: two.clone(),
+        db: 0,
+    });
+
+    for n in 0..3 {
+        let () = admin.hset(&one, "name", n).await.unwrap();
+    }
+    let seen = h.drain(Duration::from_millis(500)).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Action::OpenKeyChanged { .. })),
+        "{seen:?}"
+    );
+
+    let () = admin.hset(&two, "name", "Bob").await.unwrap();
+    let (_, value) = follow_change(&mut h, &two).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
+    h.shutdown().await;
+}
+
+/// After a DB switch the key is armed on the new DB.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_db_switch_rearms() {
+    let server = support::start_redis().await;
+    let mut db3 = server.admin(3).await;
+    let key = format!("{}user:1", support::prefix("live_db_switch"));
+    let () = db3.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    h.send(RedisEvent::SelectDb(3));
+    h.expect("switched", |a| *a == Action::DbSwitched).await;
+    open_live(&mut h, &key, RedisType::Hash, 3, true).await;
+
+    let () = db3.hset(&key, "name", "Bob").await.unwrap();
+    let (_, value) = follow_change(&mut h, &key).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
     h.shutdown().await;
 }

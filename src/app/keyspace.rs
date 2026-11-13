@@ -373,6 +373,7 @@ impl App {
         self.json_focus_row = None;
         self.keyspace.set_value_loading();
         self.send_redis_event(RedisEvent::FetchValue);
+        self.track_open_key();
     }
 
     pub(super) fn load_selected_value(&mut self) {
