@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use hashbrown::HashTable;
 
 use super::{
+    type_filter::{TypeFilter, TypeScan},
     view::{KeyView, MetaColumns, Sort, SortJob, SortedOrder, Swept, SYNC_SORT_MAX},
     KeyMeta,
 };
@@ -60,6 +61,10 @@ pub struct KeyspaceState {
     meta: Option<MetaColumns>,
     /// The metadata backfill waits while the user is on another screen.
     backfill_paused: bool,
+    /// Only keys of these types enter the sweep (empty: all).
+    type_filter: TypeFilter,
+    /// The server accepts `SCAN … TYPE` (until it rejects it once).
+    server_type_scan: bool,
 }
 
 /// Keys whose metadata the backfill fetches next, copied out under the lock.
@@ -105,6 +110,8 @@ pub struct SweepRequest {
     /// New keys the current page still needs. The runner can't dedup against
     /// keys it doesn't hold, so it stops once it has this many raw keys.
     pub need: usize,
+    /// How the SCAN steps apply the type filter.
+    pub types: TypeScan,
     /// `KeyspaceState::generation` when the request was made.
     pub generation: u64,
     epoch: u64,
@@ -244,6 +251,39 @@ impl KeyspaceState {
         self.set_pattern(None);
     }
 
+    #[must_use]
+    pub fn type_filter(&self) -> &TypeFilter {
+        &self.type_filter
+    }
+
+    /// Show only keys of these types (empty: all). Restarts the sweep from
+    /// page 1, like a new pattern. Returns `false` when nothing changed.
+    pub fn set_type_filter(&mut self, filter: TypeFilter) -> bool {
+        if self.type_filter == filter {
+            return false;
+        }
+        self.type_filter = filter;
+        self.page = 0;
+        self.rescan();
+        true
+    }
+
+    /// The server rejected `SCAN … TYPE` (before Redis 6): filter on the
+    /// client from now on.
+    pub fn disable_server_type_scan(&mut self) {
+        self.server_type_scan = false;
+    }
+
+    fn type_scan(&self) -> TypeScan {
+        if self.type_filter.is_empty() {
+            return TypeScan::All;
+        }
+        match self.type_filter.scan_type() {
+            Some(scan_type) if self.server_type_scan => TypeScan::Server(scan_type.to_owned()),
+            _ => TypeScan::Client(self.type_filter.clone()),
+        }
+    }
+
     /// Merge one `SCAN` step into the sweep, skipping keys already seen (SCAN
     /// may return a key more than once). A returned cursor of 0 ends the sweep.
     pub fn merge_batch(&mut self, cursor: usize, keys: Vec<String>) {
@@ -299,6 +339,7 @@ impl KeyspaceState {
             cursor: self.sweep_cursor,
             scan_count: self.scan_count,
             need: self.keys_needed() - self.view_len(),
+            types: self.type_scan(),
             generation: self.generation,
             epoch: self.sweep_epoch,
         })
@@ -527,6 +568,8 @@ impl Default for KeyspaceState {
             view: KeyView::default(),
             meta: None,
             backfill_paused: false,
+            type_filter: TypeFilter::default(),
+            server_type_scan: true,
         }
     }
 }
@@ -536,6 +579,53 @@ mod tests {
     use super::*;
 
     use crate::redis_client::types::tests::keys;
+
+    #[test]
+    fn type_filter_restarts_the_sweep_and_picks_how_to_scan() {
+        let mut state = state_with(10);
+        state.merge_batch(5, keys(0..15));
+        state.next_page();
+        assert_eq!(state.sweep_request().unwrap().types, TypeScan::All);
+
+        assert!(state.set_type_filter(TypeFilter::new(["hash"])));
+        assert_eq!(state.page, 0);
+        assert!(state.scanned.is_empty(), "the sweep restarts");
+        assert!(
+            !state.set_type_filter(TypeFilter::new(["hash"])),
+            "unchanged"
+        );
+        assert_eq!(
+            state.sweep_request().unwrap().types,
+            TypeScan::Server("hash".into())
+        );
+
+        state.set_type_filter(TypeFilter::new(["hash", "zset"]));
+        assert_eq!(
+            state.sweep_request().unwrap().types,
+            TypeScan::Client(TypeFilter::new(["hash", "zset"]))
+        );
+
+        state.set_type_filter(TypeFilter::new(["json"]));
+        state.disable_server_type_scan();
+        assert_eq!(
+            state.sweep_request().unwrap().types,
+            TypeScan::Client(TypeFilter::new(["json"])),
+            "after the server rejected SCAN TYPE"
+        );
+    }
+
+    #[test]
+    fn type_filter_survives_rescan_and_db_switch() {
+        let mut state = state_with(10);
+        state.set_type_filter(TypeFilter::new(["hash"]));
+        state.rescan();
+        state.reset_for_db();
+        assert_eq!(state.type_filter(), &TypeFilter::new(["hash"]));
+        assert_eq!(
+            state.sweep_request().unwrap().types,
+            TypeScan::Server("hash".into())
+        );
+    }
 
     #[test]
     fn reset_for_db_keeps_pattern_and_goes_to_first_page() {

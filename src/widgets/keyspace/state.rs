@@ -30,6 +30,8 @@ pub struct PageInfo {
     /// `(known, loaded)` keys with metadata while a type / TTL / size sort
     /// still lacks some; `None` otherwise.
     pub meta_progress: Option<(usize, usize)>,
+    /// Picked types as `hash,zset` (empty: every type).
+    pub types: String,
 }
 
 impl From<&KeyspaceState> for PageInfo {
@@ -48,6 +50,7 @@ impl From<&KeyspaceState> for PageInfo {
             meta_progress: state
                 .meta_progress()
                 .filter(|&(known, loaded)| known < loaded),
+            types: state.type_filter().label(),
         }
     }
 }

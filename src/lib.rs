@@ -134,7 +134,7 @@ pub mod internals {
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyMeta, KeyValue,
         KeyspaceState, LoadedValue, NewKeySpec, RedisInfo, RedisType, Sort, SortKey, SweepApply,
-        SweepResult, ValuePageInfo,
+        SweepResult, TypeFilter, TypeScan, ValuePageInfo,
     };
     pub use crate::state::{FrameData, SharedState};
     pub use crate::target::Environment;

@@ -24,7 +24,7 @@ use redis::AsyncCommands;
 use redis_rover::{
     internals::{
         Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyItem,
-        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target,
+        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
     },
     Cli,
 };
@@ -357,6 +357,97 @@ async fn deep_paging_stays_fast() {
          p99 {p99:?}, max {max:?}; sweep holds {swept} keys"
     );
     assert!(max < LIMIT, "slowest page took {max:?}");
+    h.shutdown().await;
+}
+
+/// `TYPE` calls the server has run since the last `CONFIG RESETSTAT`.
+async fn type_calls(admin: &mut redis::aio::ConnectionManager) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(admin)
+        .await
+        .expect("INFO commandstats");
+    info.lines()
+        .find_map(|line| line.strip_prefix("cmdstat_type:calls="))
+        .and_then(|rest| rest.split(',').next())
+        .map_or(0, |calls| calls.parse().expect("calls is a number"))
+}
+
+/// Pick hashes in the type filter and page through everything: only the
+/// seeded hashes are listed. `server_side`: the server filtered (`SCAN …
+/// TYPE`), so `TYPE` ran only for the listed rows' metadata, not for every
+/// scanned key.
+async fn hashes_only(server: &support::Server, server_side: bool) {
+    let p = support::prefix("types");
+    let mut admin = server.admin(0).await;
+    let seeded = support::seed(&mut admin, &p, 20).await;
+    let hashes: HashSet<String> = seeded.hashes.iter().cloned().collect();
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_type_filter(TypeFilter::new(["hash"]));
+    let () = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut admin)
+        .await
+        .expect("CONFIG RESETSTAT");
+
+    let shown: HashSet<String> = h.fetch_all_pages().await.into_iter().collect();
+    assert_eq!(shown, hashes);
+    let calls = type_calls(&mut admin).await;
+    if server_side {
+        assert_eq!(calls, 20, "TYPE only for the page's metadata");
+    } else {
+        assert!(calls > 100, "TYPE for every scanned key: {calls}");
+    }
+
+    // Several types are filtered on the client, on any version.
+    h.state
+        .keyspace_state
+        .lock()
+        .set_type_filter(TypeFilter::new(["hash", "zset"]));
+    let shown: HashSet<String> = h.fetch_all_pages().await.into_iter().collect();
+    let expected: HashSet<String> = seeded.hashes.iter().chain(&seeded.zsets).cloned().collect();
+    assert_eq!(shown, expected);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn type_filter_scans_by_type_on_redis_7() {
+    hashes_only(&support::start_redis().await, true).await;
+}
+
+/// Redis 5 rejects `SCAN … TYPE`; the runner falls back to the client
+/// filter and lists the same keys.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn type_filter_falls_back_to_the_client_on_redis_5() {
+    hashes_only(&support::start_redis_tag("5-alpine").await, false).await;
+}
+
+/// The type filter stays after a rescan and a DB switch.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn type_filter_survives_rescan_and_db_switch() {
+    let server = support::start_redis().await;
+    let p = support::prefix("types-db");
+    support::seed(&mut server.admin(0).await, &format!("{p}db0:"), 5).await;
+    let db3 = support::seed(&mut server.admin(3).await, &format!("{p}db3:"), 7).await;
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_type_filter(TypeFilter::new(["zset"]));
+    assert_eq!(h.fetch_all_pages().await.len(), 5, "db 0 zsets");
+    h.send(RedisEvent::SelectDb(3));
+    h.expect("DbSwitched", |a| *a == Action::DbSwitched).await;
+    let shown: HashSet<String> = h.fetch_all_pages().await.into_iter().collect();
+    assert_eq!(shown, db3.zsets.iter().cloned().collect(), "db 3 zsets");
+    h.state.keyspace_state.lock().rescan();
+    assert_eq!(h.fetch_all_pages().await.len(), 7, "after a rescan");
     h.shutdown().await;
 }
 

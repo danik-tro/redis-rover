@@ -478,6 +478,7 @@ mod tests {
             Action::ScrollUp => app.scroll_up(),
             Action::TogglePubSub => app.toggle_pubsub(),
             Action::OpenSortMenu => app.keyspace.open_sort_menu(),
+            Action::OpenTypeFilter => app.open_type_filter(),
             other => panic!("unexpected action {other:?}"),
         }
     }

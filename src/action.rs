@@ -39,6 +39,8 @@ pub enum Action {
     KeyMetaBackfilled,
     /// `o`: open the sort menu.
     OpenSortMenu,
+    /// `Shift-t`: open the type filter checklist.
+    OpenTypeFilter,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
     /// A value fetch failed. Only clears the value's loading indicator.

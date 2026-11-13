@@ -83,6 +83,7 @@ impl App {
             }
             Action::KeyMetaBackfilled => self.meta_backfilled(),
             Action::OpenSortMenu => self.keyspace.open_sort_menu(),
+            Action::OpenTypeFilter => self.open_type_filter(),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(),

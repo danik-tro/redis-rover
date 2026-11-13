@@ -11,9 +11,39 @@ use super::{
     pubsub_store::ServerChannels,
     types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
-        SweepRequest, SweepResult, ValueState,
+        SweepRequest, SweepResult, TypeScan, ValueState,
     },
 };
+
+/// The server rejected `SCAN … TYPE` (it predates Redis 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeScanRejected;
+
+impl std::fmt::Display for TypeScanRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server doesn't support SCAN ... TYPE")
+    }
+}
+
+impl std::error::Error for TypeScanRejected {}
+
+/// `SCAN cursor MATCH pattern COUNT count [TYPE t]`.
+fn scan_cmd(
+    cursor: usize,
+    pattern: Option<&str>,
+    count: usize,
+    scan_type: Option<&str>,
+) -> redis::Cmd {
+    let mut options = ScanOptions::default()
+        .with_pattern(pattern.unwrap_or("*"))
+        .with_count(count);
+    if let Some(scan_type) = scan_type {
+        options = options.with_type(scan_type);
+    }
+    let mut cmd = redis::cmd("SCAN");
+    cmd.arg(cursor).arg(options);
+    cmd
+}
 
 /// `SCAN ... COUNT` hint for the match counter: bigger steps than browsing,
 /// since it walks the whole keyspace.
@@ -32,9 +62,9 @@ impl Storage {
         Self { manager }
     }
 
-    /// Run a single `SCAN cursor MATCH pattern COUNT count` step and return the
-    /// next cursor plus the keys in this batch (possibly empty, possibly
-    /// repeating keys from earlier batches).
+    /// Run a single `SCAN cursor MATCH pattern COUNT count [TYPE t]` step and
+    /// return the next cursor plus the keys in this batch (possibly empty,
+    /// possibly repeating keys from earlier batches).
     ///
     /// A single step rather than `AsyncCommands::scan_match`: the latter always
     /// restarts at cursor 0 and drains the whole keyspace, while the sweep only
@@ -48,26 +78,24 @@ impl Storage {
         cursor: usize,
         pattern: Option<&str>,
         count: usize,
-    ) -> Result<(usize, Vec<String>), Box<dyn std::error::Error + Sync + Send>> {
+        scan_type: Option<&str>,
+    ) -> redis::RedisResult<(usize, Vec<String>)> {
         let mut manager = self.manager.clone();
-        let options = ScanOptions::default()
-            .with_pattern(pattern.unwrap_or("*"))
-            .with_count(count);
-        let batch = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg(options)
+        scan_cmd(cursor, pattern, count, scan_type)
             .query_async(&mut manager)
-            .await?;
-        Ok(batch)
+            .await
     }
 
     /// Answer a [`SweepRequest`]: run `SCAN` steps from its cursor until they
     /// returned at least `need` keys or the sweep ended. Keys are returned raw
-    /// (possibly repeating earlier ones); the caller merges them.
+    /// (possibly repeating earlier ones); the caller merges them. A type
+    /// filter is applied by the server (`TYPE t`) or, for several types, by
+    /// asking `TYPE` for each batch and keeping the matching keys.
     ///
     /// # Errors
     ///
-    /// Returns an error if a SCAN step fails.
+    /// Returns [`TypeScanRejected`] if the server doesn't know `SCAN … TYPE`
+    /// (before Redis 6), and any other error if a step fails.
     pub async fn scan_until(
         &self,
         request: &SweepRequest,
@@ -76,20 +104,62 @@ impl Storage {
             cursor: request.cursor,
             batch: Vec::new(),
         };
+        let scan_type = match &request.types {
+            TypeScan::Server(scan_type) => Some(scan_type.as_str()),
+            TypeScan::All | TypeScan::Client(_) => None,
+        };
         loop {
-            let (cursor, keys) = self
+            let step = self
                 .scan_batch(
                     result.cursor,
                     request.pattern.as_deref(),
                     request.scan_count,
+                    scan_type,
                 )
-                .await?;
+                .await;
+            let (cursor, keys) = match step {
+                Ok(step) => step,
+                // A server reply error (not I/O): the server can't do TYPE.
+                Err(err) if scan_type.is_some() && err.code().is_some() => {
+                    log::info!("SCAN TYPE rejected ({err}); filtering types on the client");
+                    return Err(Box::new(TypeScanRejected));
+                }
+                Err(err) => return Err(err.into()),
+            };
             result.cursor = cursor;
-            result.batch.extend(keys);
+            match &request.types {
+                TypeScan::Client(filter) => {
+                    let types = self.fetch_types(&keys).await?;
+                    result.batch.extend(
+                        keys.into_iter()
+                            .zip(types)
+                            .filter(|(_, r_type)| filter.matches(r_type))
+                            .map(|(key, _)| key),
+                    );
+                }
+                TypeScan::All | TypeScan::Server(_) => result.batch.extend(keys),
+            }
             if result.done() || result.batch.len() >= request.need {
                 return Ok(result);
             }
         }
+    }
+
+    /// `TYPE` of every key, in one pipeline (`none` for a key gone meanwhile).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline fails.
+    pub async fn fetch_types(&self, keys: &[String]) -> redis::RedisResult<Vec<String>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for key in keys {
+            pipe.cmd("TYPE").arg(key);
+        }
+        let mut manager = self.manager.clone();
+        pipe.query_async(&mut manager).await
     }
 
     /// Count the keys matching `pattern` with a full `SCAN` sweep, stopping
@@ -116,7 +186,7 @@ impl Storage {
         let mut cursor = 0;
         for _ in 0..max_steps {
             let (next, batch) = self
-                .scan_batch(cursor, Some(pattern), COUNT_SCAN_HINT)
+                .scan_batch(cursor, Some(pattern), COUNT_SCAN_HINT, None)
                 .await?;
             seen.extend(batch);
             if next == 0 {
@@ -381,5 +451,31 @@ impl Storage {
             receivers = cmd.query_async(&mut manager).await?;
         }
         Ok(receivers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_cmd;
+
+    fn args(cmd: &redis::Cmd) -> Vec<String> {
+        cmd.args_iter()
+            .map(|arg| match arg {
+                redis::Arg::Simple(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => "<cursor>".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_adds_type_only_when_asked() {
+        assert_eq!(
+            args(&scan_cmd(7, Some("user:*"), 100, None)),
+            ["SCAN", "7", "MATCH", "user:*", "COUNT", "100"]
+        );
+        assert_eq!(
+            args(&scan_cmd(0, None, 100, Some("hash"))),
+            ["SCAN", "0", "MATCH", "*", "COUNT", "100", "TYPE", "hash"]
+        );
     }
 }

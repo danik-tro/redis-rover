@@ -433,18 +433,22 @@ impl StatefulWidget for KeySpaceWidget {
                 .spacing(u16::from(note_width > 0))
                 .areas(filter_area);
         let label = "filter ";
-        let room = usize::from(pattern_area.width).saturating_sub(label.len());
+        // The type filter (` · hash,zset`) keeps its room; the pattern is cut.
+        let types = (!state.page.types.is_empty()).then(|| format!(" · {}", state.page.types));
+        let room = usize::from(pattern_area.width)
+            .saturating_sub(label.len())
+            .saturating_sub(types.as_deref().map_or(0, UnicodeWidthStr::width));
         let pattern = match state.page.pattern.as_deref() {
             Some(p) => Span::from(truncate_to_width(p, room).into_owned())
                 .fg(cfg.colors.base0d)
                 .bold(),
             None => Span::from("*").fg(cfg.colors.base03),
         };
-        Paragraph::new(Line::from(vec![
-            Span::from(label).fg(cfg.colors.base03),
-            pattern,
-        ]))
-        .render(pattern_area, buf);
+        let mut spans = vec![Span::from(label).fg(cfg.colors.base03), pattern];
+        if let Some(types) = types {
+            spans.push(Span::from(types).fg(cfg.colors.base0e).bold());
+        }
+        Paragraph::new(Line::from(spans)).render(pattern_area, buf);
         if let Some(note) = note {
             Paragraph::new(Line::from(note).fg(cfg.colors.base03))
                 .alignment(Alignment::Right)
@@ -552,6 +556,9 @@ impl StatefulWidget for KeySpaceWidget {
 
         if state.is_sort_menu_open() {
             Self::render_sort_menu(state, area, buf);
+        }
+        if let Some(menu) = state.type_menu.as_ref() {
+            Self::render_type_menu(menu, area, buf);
         }
 
         if state.is_wizard_active() {

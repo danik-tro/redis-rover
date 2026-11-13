@@ -1,0 +1,20 @@
+╭ Keys ────────────────────╮╭ Values ──────────────────────────────────────────╮
+│ filter *                 ││                                                  │
+│ ──────────────────────── ││                                                  │
+│   Ty      TTL       Size ││                                                  │
+│ ──────────────────────── ││                                                  │
+│   ha        ∞      312 B ╭ Show types ────────────╮                          │
+│   ha        ∞      296 B │   [ ] string           │                          │
+│   st       1h       96 B │   [ ] list             │                          │
+│   li        ∞   2.00 KiB │   [ ] set              │                          │
+│   se        ∞      540 B │   [x] zset             │                          │
+│   zs       1d   1.17 KiB │ › [x] hash             │· Enter to open           │
+│   st        ∞   8.00 KiB │   [ ] stream           │                          │
+│   js        ∞      420 B │   [ ] json             │                          │
+│   st       2m  14.65 KiB │   [ ] MBbloom--        │                          │
+│   MB        ∞   1.00 KiB ╰ Space · x none · Enter ╯                          │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
