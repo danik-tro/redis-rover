@@ -59,7 +59,7 @@ With no flags, `rrover` connects to `$REDIS_URL` if it is set, else to `localhos
 | `--read-only` | Block every write. Always wins. See [Read-only mode](#read-only-mode). |
 | `--writable` | Start writable on a `prod` or `unknown` server, which start read-only. See [Environments](#environments). |
 | `--print-target` | Print where `rrover` would connect, and where each setting came from, then exit. Opens no connection. |
-| `--probe` | Connect, print a short report (PING, server version, role, cluster, RESP3), then exit. |
+| `--probe` | Connect, print a short report (PING, server version, role, cluster, RESP3, live updates), then exit. |
 | `--tls-ca`, `--tls-cert`, `--tls-key`, `--insecure` | TLS options. See [TLS](#tls). |
 | `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. A frame is drawn only when something on screen changed, so an idle key list redraws a few times a minute. |
 
@@ -92,6 +92,7 @@ server    Redis 7.4.1 (standalone)
 role      master
 cluster   no
 RESP3     yes
+live      tracking
 ```
 
 `--probe` exits 0 even when the server is older than 6.0 (`RESP3: no`). It exits 1 if it can't connect. An unknown profile, a failing `password_command` or an invalid config file exits with code 3.
@@ -174,6 +175,33 @@ Keys come in SCAN order by default. Every view below works over the keys loaded 
 - **Go to the open key** (`g o`): moves the cursor back to the last key opened with `Enter`, unfolding its groups. If the filter hides it, it asks before clearing the filter; if it isn't loaded yet, it loads keys until it shows up.
 
 The sort, type filter and tree stay on after `r` and after switching DBs.
+
+### Live updates
+
+The open key follows changes made by other clients. When `HSET user:1 name Bob` runs elsewhere, the value pane shows `Bob` without a keypress, and the rows that changed are highlighted for 1.5 s. The page, the cursor and the scroll position stay where they were.
+
+The value pane's title says how the key is followed:
+
+- `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN NOLOOP` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
+- `◌ polling 2s`: servers without RESP3 (Redis 5 and older), or that refuse `CLIENT TRACKING` (some proxies and managed services), are polled every `live.poll_interval_ms` instead. Each check is one pipeline: `TYPE` + `PTTL` + `DUMP` for keys up to 64 KiB, otherwise the visible page. The value is fetched again only when that changed. Polling pauses on the dashboard and Pub/Sub tabs.
+- `✕ not live (reason)`: the connection was lost (`reconnecting`, retried with backoff up to 30 s), or `live.mode = "tracking"` on a server that can't track. After a reconnect the key is fetched again, so a change made in the gap still shows.
+
+If another client deletes the key, or its TTL runs out, the last value stays on screen, dimmed, with `key deleted · 14:22:07` (or `key expired · …`) below it. The cursor doesn't move. If the key is created again, it is shown again.
+
+Only the open key is followed; the key list still needs `r` to show new or removed keys. `rrover --probe` prints what a server supports (`live      tracking`, or `live      polling 2s (no RESP3)`).
+
+To choose the mode, or turn it off:
+
+```json5
+{
+  "live": {
+    "mode": "auto",          // auto | tracking | poll | off
+    "poll_interval_ms": 2000, // at least 250
+  },
+}
+```
+
+`off` opens no extra connection and the title shows nothing about liveness.
 
 ### Databases
 
