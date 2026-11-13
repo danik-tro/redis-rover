@@ -1,5 +1,5 @@
-//! Keyspace sweep benches: merging SCAN batches and a deep page turn.
-//! Synthetic key names, no Redis.
+//! Keyspace sweep benches: merging SCAN batches, a deep page turn, and
+//! sorting the loaded keys. Synthetic key names, no Redis.
 //!
 //! 10M keys runs only with `RROVER_BENCH_LARGE=1` (slow, about 2 GB of RAM).
 
@@ -11,7 +11,7 @@ use std::{
 };
 
 use criterion::{BatchSize, Criterion, Throughput};
-use redis_rover::internals::{KeyspaceState, SweepResult};
+use redis_rover::internals::{KeyspaceState, Sort, SortKey, SweepApply, SweepResult};
 
 #[global_allocator]
 static ALLOC: support::Counting = support::Counting;
@@ -81,7 +81,8 @@ fn page_turn(state: &mut KeyspaceState, batch: Vec<String>) -> Vec<String> {
     assert!(state.next_page());
     if let Some(request) = state.sweep_request() {
         let cursor = request.cursor + 1;
-        assert!(state.apply_result(&request, SweepResult { cursor, batch }));
+        let applied = state.apply_result(&request, SweepResult { cursor, batch });
+        assert_eq!(applied, SweepApply::Applied);
     }
     state.page_keys()
 }
@@ -166,10 +167,107 @@ fn bench_page_turn_deep(c: &mut Criterion) {
     group.finish();
 }
 
+const BY_NAME: Sort = Sort {
+    key: SortKey::Name,
+    descending: false,
+};
+
+/// A finished `n`-key sweep with a name sort set but not built yet.
+fn unsorted(n: usize) -> KeyspaceState {
+    let mut state = merge_all(batches(n), true);
+    state.set_sort(Some(BY_NAME));
+    state
+}
+
+/// A full re-sort by name of an `n`-key sweep, as the runner does it: copy
+/// the names under the lock (`sort_job`), sort off it, install the order.
+fn bench_sort_names(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_names");
+    group.sample_size(10);
+    for (n, label) in sizes() {
+        let base = unsorted(n);
+        if support::is_bench_run() {
+            let mut state = base.clone();
+            let ((), mem) = support::measure(|| {
+                let job = state.sort_job().expect("sort pending");
+                assert!(state.install_sorted(job.run()));
+            });
+            support::record(&format!("sort_names/{label}"), mem, "retained = the order");
+        }
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || base.clone(),
+                |mut state| {
+                    let job = state.sort_job().expect("sort pending");
+                    assert!(state.install_sorted(job.run()));
+                    state
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// The part of a re-sort that holds the keyspace lock: copying the names.
+fn bench_sort_snapshot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_snapshot");
+    group.sample_size(10);
+    for (n, label) in sizes() {
+        let base = unsorted(n);
+        group.bench_function(label, |b| {
+            b.iter(|| black_box(base.sort_job()));
+        });
+    }
+    group.finish();
+}
+
+/// One 1,000-key SCAN answer merged into a name-sorted `n`-key sweep: dedup,
+/// then the sorted run merged into the order. Each sample starts from a clone
+/// of the sorted base and merges `iters` fresh batches.
+fn bench_merge_sorted(c: &mut Criterion) {
+    const BATCH: usize = 1000;
+    let mut group = c.benchmark_group("merge_sorted_1000");
+    group.sample_size(10);
+    for (n, label) in sizes() {
+        let mut base = unsorted(n);
+        let job = base.sort_job().expect("sort pending");
+        assert!(base.install_sorted(job.run()));
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                let mut state = base.clone();
+                let count = usize::try_from(iters).expect("iters fits in usize");
+                let first = state.scanned.len();
+                let batches: Vec<Vec<String>> = (0..count)
+                    .map(|b| {
+                        let from = first + b * BATCH;
+                        (from..from + BATCH)
+                            .map(|i| format!("order:{}:x{i}", i % 997))
+                            .collect()
+                    })
+                    .collect();
+                state.scanned.reserve(count * BATCH);
+                let mut elapsed = Duration::ZERO;
+                for batch in batches {
+                    let started = Instant::now();
+                    black_box(&mut state).merge_batch(1, batch);
+                    elapsed += started.elapsed();
+                }
+                elapsed
+            });
+        });
+    }
+    group.finish();
+}
+
 fn main() {
     support::use_default_config();
     let mut c = Criterion::default().configure_from_args();
     bench_merge_batch(&mut c);
     bench_page_turn_deep(&mut c);
+    bench_sort_names(&mut c);
+    bench_sort_snapshot(&mut c);
+    bench_merge_sorted(&mut c);
     c.final_summary();
 }

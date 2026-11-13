@@ -22,7 +22,7 @@ use super::{
     event::RedisEvent,
     pubsub::{self, PubSubCmd},
     storage::Storage,
-    types::{RedisType, ValueState},
+    types::{RedisType, SweepApply, ValueState},
 };
 
 type FetchError = Box<dyn std::error::Error + Sync + Send>;
@@ -637,10 +637,16 @@ impl EventHandler {
             let mut state = self.state.keyspace_state.lock();
             // Merge even after a page turn (the sweep is still valid), but
             // leave the newer page to the newer FetchKeys.
-            if !state.apply_result(&request, result) || state.generation != request.generation {
-                return Ok(false);
+            // `Raced`: another SCAN moved the sweep first; ask again from there.
+            match state.apply_result(&request, result) {
+                SweepApply::Stale => return Ok(false),
+                SweepApply::Applied if state.generation != request.generation => {
+                    return Ok(false);
+                }
+                SweepApply::Applied | SweepApply::Raced => {}
             }
         }
+        self.build_view().await?;
 
         let (generation, page) = {
             let mut state = self.state.keyspace_state.lock();
@@ -655,6 +661,20 @@ impl EventHandler {
         }
         *self.state.keys.lock() = Some(keys);
         Ok(true)
+    }
+
+    /// Build a pending sort order. A large one is sorted in
+    /// `spawn_blocking` on a copy of the names, so the keyspace lock is held
+    /// only to copy them and to install the result.
+    async fn build_view(&self) -> Result<(), FetchError> {
+        let Some(job) = self.state.keyspace_state.lock().rebuild_view() else {
+            return Ok(());
+        };
+        let sorted = tokio::task::spawn_blocking(move || job.run()).await?;
+        // A sweep restart or sort change meanwhile drops it; the FetchKeys
+        // that follows such a change builds the order again.
+        self.state.keyspace_state.lock().install_sorted(sorted);
+        Ok(())
     }
 
     fn action_hook(&self, action: Action) {
