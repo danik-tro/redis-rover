@@ -20,6 +20,7 @@ use crate::{action::Action, config, state::SharedState};
 use super::{
     client,
     event::RedisEvent,
+    live::{self, LiveCmd},
     pubsub::{self, PubSubCmd},
     storage::{Storage, TypeScanRejected},
     types::{RedisType, SweepApply, ValueState},
@@ -70,6 +71,12 @@ pub struct Runner {
     pubsub_tx: UnboundedSender<PubSubCmd>,
     /// Taken by `start` when the Pub/Sub task is spawned.
     pubsub_rx: Option<UnboundedReceiver<PubSubCmd>>,
+    /// Follows the open key (`live.mode`); not spawned when it is `off`.
+    live_task: JoinHandle<()>,
+    live_tx: UnboundedSender<LiveCmd>,
+    /// Taken by `start` (and dropped with `live.mode = "off"`, so sends fail
+    /// instead of queueing).
+    live_rx: Option<UnboundedReceiver<LiveCmd>>,
 
     action_tx: ActionSender<Action>,
     tx: BroadcastSender<RedisEvent>,
@@ -87,6 +94,8 @@ impl Runner {
         let state_task = tokio::spawn(async {});
         let pubsub_task = tokio::spawn(async {});
         let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
+        let live_task = tokio::spawn(async {});
+        let (live_tx, live_rx) = mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -102,6 +111,9 @@ impl Runner {
             pubsub_task,
             pubsub_tx,
             pubsub_rx: Some(pubsub_rx),
+            live_task,
+            live_tx,
+            live_rx: Some(live_rx),
             action_tx,
             tx,
         }
@@ -138,10 +150,36 @@ impl Runner {
         self.pubsub_tx.clone()
     }
 
+    /// Control channel of the live task.
+    #[must_use]
+    pub fn live_tx(&self) -> UnboundedSender<LiveCmd> {
+        self.live_tx.clone()
+    }
+
     pub fn start(&mut self) {
         self.launch_refresh_info_task();
         self.launch_refresh_state_task();
         self.launch_pubsub_task();
+        self.launch_live_task();
+    }
+
+    /// Spawn the live task unless `live.mode` is `off`. It opens its
+    /// connection on the first `Track`.
+    fn launch_live_task(&mut self) {
+        let Some(cmd_rx) = self.live_rx.take() else {
+            return;
+        };
+        let config = config::get().live;
+        if config.mode == crate::config::LiveMode::Off {
+            return;
+        }
+        self.live_task = tokio::spawn(live::run(
+            self.client.clone(),
+            config,
+            cmd_rx,
+            self.action_tx.clone(),
+            self.cancellation_token.clone(),
+        ));
     }
 
     /// Spawn the Pub/Sub task. It idles until the first subscribe, so no
@@ -169,10 +207,16 @@ impl Runner {
         let info_abort = self.info_task.abort_handle();
         let state_abort = self.state_task.abort_handle();
         let pubsub_abort = self.pubsub_task.abort_handle();
+        let live_abort = self.live_task.abort_handle();
 
         let timeout = Duration::from_secs(2);
         if tokio::time::timeout(timeout, async {
-            let _ = tokio::join!(self.info_task, self.state_task, self.pubsub_task);
+            let _ = tokio::join!(
+                self.info_task,
+                self.state_task,
+                self.pubsub_task,
+                self.live_task
+            );
         })
         .await
         .is_err()
@@ -181,6 +225,7 @@ impl Runner {
             info_abort.abort();
             state_abort.abort();
             pubsub_abort.abort();
+            live_abort.abort();
         }
     }
 

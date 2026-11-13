@@ -5,6 +5,7 @@ mod dashboard;
 mod db;
 mod input;
 mod keyspace;
+mod live;
 mod load;
 mod pubsub;
 mod render;
@@ -20,7 +21,12 @@ use std::{
 use crate::{
     clock::{Clock, SystemClock},
     config::{self, PreviewPolicy},
-    redis_client::{event::RedisEvent, pubsub::PubSubCmd, types::RedisType},
+    redis_client::{
+        event::RedisEvent,
+        live::{LiveCmd, Liveness},
+        pubsub::PubSubCmd,
+        types::RedisType,
+    },
     state::{FrameData, SharedState},
     target::Environment,
 };
@@ -124,6 +130,20 @@ pub struct App {
     loading: Option<load::Loading>,
     /// The key last opened with Enter, for `g o`.
     open_key: Option<(String, RedisType)>,
+    /// Live updates of the open key.
+    live: LiveLink,
+}
+
+/// The App's side of the live task.
+#[derive(Debug, Default)]
+struct LiveLink {
+    /// Control channel; `None` until `App::live_tx` (tests, `live.mode = off`
+    /// still passes one, whose receiver is gone).
+    tx: Option<UnboundedSender<LiveCmd>>,
+    /// The key (and DB) last sent as `Track`.
+    tracked: Option<(String, i64)>,
+    /// The task's last status; `None` before the first one.
+    status: Option<Liveness>,
 }
 
 /// What decides whether `Render` draws: `dirty`, or data that changes on
@@ -204,6 +224,7 @@ impl App {
             pending: None,
             loading: None,
             open_key: None,
+            live: LiveLink::default(),
             preview: config::get().safety.preview,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
@@ -232,6 +253,13 @@ impl App {
     pub fn environment(mut self, environment: Environment) -> Self {
         self.environment = environment;
         self.summary.environment = environment;
+        self
+    }
+
+    /// The live task's control channel (`Runner::live_tx`).
+    #[must_use]
+    pub fn live_tx(mut self, tx: UnboundedSender<LiveCmd>) -> Self {
+        self.live.tx = Some(tx);
         self
     }
 

@@ -1,12 +1,36 @@
-//! Live updates of the open key: which way the app follows it
-//! (`CLIENT TRACKING`, polling, or not at all).
+//! Live updates of the open key.
+//!
+//! A background task owns one connection of its own. On a RESP3 server it
+//! runs `CLIENT TRACKING ON OPTIN NOLOOP` and arms the open key with
+//! `CLIENT CACHING YES` + `TYPE` (+ `PTTL`); the server then pushes one
+//! `invalidate` when the key changes. The task re-arms the key right away,
+//! before telling the App (`Action::OpenKeyChanged`), so a change that lands
+//! while the App refetches is never missed. The value itself is still
+//! fetched by the value task (`FetchValue`).
+//!
+//! A lost connection is reconnected with the Pub/Sub task's [`backoff`]; the
+//! key is re-armed and refetched once, since changes in the gap were missed.
 
 use std::time::Duration;
 
-use redis::{aio::MultiplexedConnection, AsyncConnectionConfig, ProtocolVersion, PushInfo};
-use tokio::sync::mpsc::UnboundedSender;
+use redis::{
+    aio::MultiplexedConnection, AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
 
-use crate::config::{LiveConfig, LiveMode};
+use super::pubsub::backoff;
+use crate::{
+    action::{try_send_action, Action},
+    config::{LiveConfig, LiveMode},
+};
+
+/// A key gone within this long of its known expiry counts as expired.
+const EXPIRY_SLACK: Duration = Duration::from_secs(1);
 
 /// How long opening the live connection (and each setup command) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +84,337 @@ pub fn choose(mode: LiveMode, capability: Option<&Capability>) -> Plan {
 /// Whether `mode` needs the RESP3 / `CLIENT TRACKING` check at all.
 pub fn needs_capability(mode: LiveMode) -> bool {
     matches!(mode, LiveMode::Auto | LiveMode::Tracking)
+}
+
+/// Control messages from the App.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveCmd {
+    /// Follow `key` on DB `db` (the key whose value is open).
+    Track { key: String, db: i64 },
+    /// No key is open.
+    Untrack,
+    /// The key list isn't on screen (`true`) or is again (`false`).
+    Pause(bool),
+}
+
+/// Whether the open key is live, as the value pane shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Liveness {
+    /// The server pushes changes (`CLIENT TRACKING`).
+    Live,
+    /// Polled every this many milliseconds.
+    Polling { every_ms: u64 },
+    /// Not following changes, and why.
+    NotLive(String),
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self::NotLive("connecting".to_owned())
+    }
+}
+
+/// What happened to the open key.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum KeyChange {
+    /// It changed (or the server can't tell, after a reconnect); `r_type` is
+    /// its `TYPE` now.
+    Changed { r_type: String },
+    /// It no longer exists.
+    #[default]
+    Deleted,
+    /// It no longer exists and its TTL had just run out.
+    Expired,
+}
+
+/// Run the live task until `cancel` fires or the command channel closes.
+/// The connection opens on the first `Track`.
+pub async fn run(
+    client: redis::Client,
+    config: LiveConfig,
+    mut cmd_rx: UnboundedReceiver<LiveCmd>,
+    action_tx: Sender<Action>,
+    cancel: CancellationToken,
+) {
+    let db = client.get_connection_info().redis_settings().db();
+    let mut task = LiveTask {
+        client,
+        config,
+        action_tx,
+        conn: None,
+        db,
+        key: None,
+        expires_at: None,
+        retry: None,
+        status: None,
+        no_tracking: false,
+    };
+    loop {
+        let retry_at = task.retry.map(|(_, at)| at);
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(cmd) => task.apply(cmd).await,
+                None => break,
+            },
+            push = next_push(task.conn.as_mut()) => task.on_push(push).await,
+            () = sleep_until(retry_at) => task.reconnect().await,
+            () = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// The tracking connection and the pushes it delivers.
+struct Tracked {
+    conn: MultiplexedConnection,
+    pushes: UnboundedReceiver<PushInfo>,
+}
+
+/// Next push of the open connection (`None`: its sender is gone, so the
+/// connection is too); never resolves without a connection.
+async fn next_push(conn: Option<&mut Tracked>) -> Option<PushInfo> {
+    match conn {
+        Some(tracked) => tracked.pushes.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Sleep until `at`; never resolves without one.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+struct LiveTask {
+    /// The client the app started with; the connection is built from it
+    /// with the tracked key's DB.
+    client: redis::Client,
+    config: LiveConfig,
+    action_tx: Sender<Action>,
+    conn: Option<Tracked>,
+    /// DB the connection is (or will be) opened on.
+    db: i64,
+    /// The open key.
+    key: Option<String>,
+    /// When the open key expires, from the `PTTL` read when it was armed.
+    expires_at: Option<Instant>,
+    /// Pending reconnect: attempt number and when it starts.
+    retry: Option<(u32, Instant)>,
+    /// The status last sent to the App.
+    status: Option<Liveness>,
+    /// The server can't track; don't ask again on every key.
+    no_tracking: bool,
+}
+
+impl LiveTask {
+    async fn apply(&mut self, cmd: LiveCmd) {
+        match cmd {
+            LiveCmd::Track { key, db } => {
+                let same_db = db == self.db;
+                self.db = db;
+                self.key = Some(key);
+                self.expires_at = None;
+                if self.retry.is_some() || self.no_tracking {
+                    // Down: armed on reconnect.
+                    return;
+                }
+                if self.conn.is_some() && !same_db {
+                    // Tracking needs the arming read on the key's DB.
+                    self.conn = None;
+                }
+                if self.conn.is_none() {
+                    // A fresh connection: the App is fetching the value
+                    // already, so only arm it.
+                    self.connect(false).await;
+                } else {
+                    self.arm().await;
+                }
+            }
+            LiveCmd::Untrack => {
+                self.key = None;
+                self.expires_at = None;
+            }
+            LiveCmd::Pause(_) => {}
+        }
+    }
+
+    /// Open the connection on `self.db` and arm the open key. With
+    /// `refetch`, tell the App the key may have changed (after a reconnect).
+    async fn connect(&mut self, refetch: bool) {
+        let (push_tx, pushes) = mpsc::unbounded_channel();
+        let opened = match self.db_client() {
+            Ok(client) => open_tracking(&client, Some(push_tx)).await,
+            Err(err) => Err(err),
+        };
+        match opened {
+            Ok((Capability::Tracking, Some(conn))) => {
+                self.conn = Some(Tracked { conn, pushes });
+                // `arm` reports `Live` once the key is armed.
+                if refetch {
+                    self.key_changed().await;
+                } else {
+                    self.arm().await;
+                }
+            }
+            Ok((capability, _)) => {
+                let reason = match choose(self.config.mode, Some(&capability)) {
+                    Plan::Poll { reason } => reason,
+                    Plan::NotLive(reason) => Some(reason),
+                    Plan::Track | Plan::Off => None,
+                };
+                log::info!("Live updates: no CLIENT TRACKING ({capability:?})");
+                self.no_tracking = true;
+                self.set_status(Liveness::NotLive(
+                    reason.unwrap_or_else(|| "no tracking".to_owned()),
+                ));
+            }
+            Err(err) => {
+                log::warn!("Opening the live connection failed: {err}");
+                self.schedule(1);
+            }
+        }
+    }
+
+    fn db_client(&self) -> redis::RedisResult<redis::Client> {
+        let info = self.client.get_connection_info().clone();
+        let settings = info.redis_settings().clone().set_db(self.db);
+        redis::Client::open(info.set_redis_settings(settings))
+    }
+
+    /// Make the server track the open key: `CLIENT CACHING YES` applies to
+    /// the next command, `TYPE`. Returns the key's type (`none` when it is
+    /// gone), or `None` without a key or when the connection was lost.
+    async fn arm(&mut self) -> Option<String> {
+        let key = self.key.clone()?;
+        let tracked = self.conn.as_mut()?;
+        let reply: redis::RedisResult<(String, i64)> = redis::pipe()
+            .cmd("CLIENT")
+            .arg("CACHING")
+            .arg("YES")
+            .ignore()
+            .cmd("TYPE")
+            .arg(&key)
+            .cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut tracked.conn)
+            .await;
+        match reply {
+            Ok((r_type, pttl)) => {
+                self.expires_at = u64::try_from(pttl)
+                    .ok()
+                    .map(|ms| Instant::now() + Duration::from_millis(ms));
+                // Only now: a change before this point would be missed.
+                self.set_status(Liveness::Live);
+                Some(r_type)
+            }
+            Err(err) if is_connection_error(&err) => {
+                self.lost(&err.to_string());
+                None
+            }
+            Err(err) => {
+                // Not armed: say so rather than look live.
+                log::warn!("Arming {key} for tracking failed: {err}");
+                self.set_status(Liveness::NotLive(err.to_string()));
+                None
+            }
+        }
+    }
+
+    async fn on_push(&mut self, push: Option<PushInfo>) {
+        let Some(push) = push else {
+            self.lost("the connection closed");
+            return;
+        };
+        match push.kind {
+            PushKind::Disconnection => self.lost("the connection closed"),
+            PushKind::Invalidate
+                if self
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| invalidates(&push.data, key)) =>
+            {
+                self.key_changed().await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The open key changed (or may have): re-arm it, then tell the App
+    /// what it is now.
+    async fn key_changed(&mut self) {
+        let expired_by = self.expires_at;
+        let Some(r_type) = self.arm().await else {
+            return;
+        };
+        let Some(key) = self.key.clone() else {
+            return;
+        };
+        let change = if r_type == "none" {
+            if expired_by.is_some_and(|at| at <= Instant::now() + EXPIRY_SLACK) {
+                KeyChange::Expired
+            } else {
+                KeyChange::Deleted
+            }
+        } else {
+            KeyChange::Changed { r_type }
+        };
+        try_send_action(&self.action_tx, Action::OpenKeyChanged { key, change });
+    }
+
+    /// A reconnect attempt is due.
+    async fn reconnect(&mut self) {
+        let Some((attempt, _)) = self.retry.take() else {
+            return;
+        };
+        if self.key.is_none() {
+            // Nothing open: connect again on the next `Track`.
+            return;
+        }
+        self.connect(true).await;
+        if self.retry.is_some() {
+            // `connect` scheduled attempt 1 again; keep counting.
+            self.schedule(attempt.saturating_add(1));
+        } else {
+            log::info!("Live connection back after {attempt} attempt(s)");
+        }
+    }
+
+    /// Plan reconnect attempt `attempt` after its [`backoff`].
+    fn schedule(&mut self, attempt: u32) {
+        self.retry = Some((attempt, Instant::now() + backoff(attempt)));
+        self.set_status(Liveness::NotLive("reconnecting".to_owned()));
+    }
+
+    /// The connection is gone: say so, then reconnect.
+    fn lost(&mut self, reason: &str) {
+        if self.conn.take().is_none() {
+            return;
+        }
+        log::warn!("Live connection lost: {reason}");
+        self.schedule(1);
+    }
+
+    fn set_status(&mut self, status: Liveness) {
+        if self.status.as_ref() != Some(&status) {
+            self.status = Some(status.clone());
+            try_send_action(&self.action_tx, Action::LiveStatus(status));
+        }
+    }
+}
+
+/// Whether an `invalidate` push's data names `key`. A nil payload is a
+/// flush (`FLUSHDB` / `FLUSHALL`), which invalidates every key.
+fn invalidates(data: &[Value], key: &str) -> bool {
+    match data.first() {
+        Some(Value::Nil) | None => true,
+        Some(Value::Array(keys) | Value::Set(keys)) => keys.iter().any(|k| match k {
+            Value::BulkString(bytes) => bytes == key.as_bytes(),
+            Value::SimpleString(s) => s == key,
+            _ => false,
+        }),
+        Some(_) => false,
+    }
 }
 
 /// Check the server and, if it can, open a RESP3 connection with
@@ -188,6 +543,24 @@ mod tests {
         assert!(needs_capability(LiveMode::Tracking));
         assert!(!needs_capability(LiveMode::Poll));
         assert!(!needs_capability(LiveMode::Off));
+    }
+
+    #[test]
+    fn invalidate_names_the_key_or_flushes() {
+        let keys = |names: &[&str]| {
+            vec![Value::Array(
+                names
+                    .iter()
+                    .map(|n| Value::BulkString(n.as_bytes().to_vec()))
+                    .collect(),
+            )]
+        };
+        assert!(invalidates(&keys(&["user:1"]), "user:1"));
+        assert!(invalidates(&keys(&["a", "user:1"]), "user:1"));
+        assert!(!invalidates(&keys(&["user:2"]), "user:1"));
+        assert!(!invalidates(&keys(&["user:10"]), "user:1"));
+        assert!(invalidates(&[Value::Nil], "user:1"), "a flush");
+        assert!(!invalidates(&[Value::Int(1)], "user:1"));
     }
 
     #[test]
