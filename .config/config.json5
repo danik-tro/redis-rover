@@ -113,5 +113,13 @@
     "json_preview_bytes": 1048576,
     // The tree view (v) groups key names at this separator.
     "separator": ":",
+  },
+  "live": {
+    // How the open key follows changes made by other clients:
+    // "auto" (CLIENT TRACKING on Redis 6+, else polling), "tracking",
+    // "poll" or "off".
+    "mode": "auto",
+    // How often polling checks the open key, in milliseconds (250 or more).
+    "poll_interval_ms": 2000,
   }
 }

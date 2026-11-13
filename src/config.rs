@@ -62,6 +62,9 @@ pub struct Config {
     /// Write safety: when the command preview shows.
     #[serde(default)]
     pub safety: SafetyConfig,
+    /// Live updates of the open key.
+    #[serde(default)]
+    pub live: LiveConfig,
     /// Connection profiles: `rrover <name>` or `--profile <name>`.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
@@ -207,6 +210,46 @@ impl PubSubConfig {
             payload: self.max_payload(),
         }
     }
+}
+
+/// `live`: how the open key follows changes made by other clients.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LiveConfig {
+    pub mode: LiveMode,
+    /// Polling interval in milliseconds; see [`LiveConfig::poll_interval`].
+    pub poll_interval_ms: u64,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            mode: LiveMode::Auto,
+            poll_interval_ms: 2000,
+        }
+    }
+}
+
+impl LiveConfig {
+    /// Polling interval, at least 250 ms.
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms.max(250))
+    }
+}
+
+/// `live.mode`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveMode {
+    /// `CLIENT TRACKING` where the server offers it, else polling.
+    #[default]
+    Auto,
+    /// `CLIENT TRACKING` only; without it the key is not live.
+    Tracking,
+    /// Always poll.
+    Poll,
+    /// No live updates.
+    Off,
 }
 
 /// Settings for the live-metrics dashboard.
@@ -663,6 +706,23 @@ mod tests {
     use crate::{command::Command, keybindings::parse_key_sequence};
 
     use super::*;
+
+    #[test]
+    fn live_config_parses_with_defaults() {
+        let cfg: Config = json5::from_str("{}").unwrap();
+        assert_eq!(cfg.live, LiveConfig::default());
+        assert_eq!(cfg.live.mode, LiveMode::Auto);
+        assert_eq!(cfg.live.poll_interval(), Duration::from_secs(2));
+
+        let cfg: Config =
+            json5::from_str(r#"{ live: { mode: "poll", poll_interval_ms: 10 } }"#).unwrap();
+        assert_eq!(cfg.live.mode, LiveMode::Poll);
+        assert_eq!(cfg.live.poll_interval(), Duration::from_millis(250));
+        assert!(json5::from_str::<Config>(r#"{ live: { mode: "push" } }"#).is_err());
+
+        let bundled: Config = json5::from_str(CONFIG_PATH).unwrap();
+        assert_eq!(bundled.live, LiveConfig::default());
+    }
 
     #[test]
     fn preview_policy_parses_and_prod_forces_writes() {
