@@ -24,7 +24,7 @@ use redis::AsyncCommands;
 use redis_rover::{
     internals::{
         Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyItem,
-        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Target,
+        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target,
     },
     Cli,
 };
@@ -357,6 +357,68 @@ async fn deep_paging_stays_fast() {
          p99 {p99:?}, max {max:?}; sweep holds {swept} keys"
     );
     assert!(max < LIMIT, "slowest page took {max:?}");
+    h.shutdown().await;
+}
+
+/// A name sort pages through the loaded keys in name order, whether it was
+/// set before the sweep (batches merged into the order) or after a large
+/// sweep (re-sorted off the keyspace lock).
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn sorted_pages_list_names_in_order() {
+    const KEYS: usize = 60_000;
+    const PAGE: usize = 1_000;
+    let by_name = Sort {
+        key: SortKey::Name,
+        descending: false,
+    };
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("sorted");
+    let mut pipe = redis::pipe();
+    for keys in (0..KEYS).collect::<Vec<_>>().chunks(1_000) {
+        let mut mset = redis::cmd("MSET");
+        for i in keys {
+            // Not in name order: `n:7` before `n:10`.
+            mset.arg(format!("{p}n:{}", (i * 7_919) % KEYS)).arg("v");
+        }
+        pipe.add_command(mset).ignore();
+    }
+    let () = pipe.query_async(&mut admin).await.expect("seed MSET");
+    let mut expected: Vec<String> = (0..KEYS).map(|i| format!("{p}n:{i}")).collect();
+    expected.sort();
+
+    let mut h = Harness::new(server.client(0), false).await;
+    // Sorted from the start: every SCAN batch is merged into the order.
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        ks.set_page_size(PAGE, 0);
+        ks.set_sort(Some(by_name));
+    }
+    loop {
+        h.fetch_page().await;
+        let mut ks = h.state.keyspace_state.lock();
+        if ks.sweep_done || !ks.next_page() {
+            break;
+        }
+    }
+    h.state.keyspace_state.lock().page = 0;
+    assert_eq!(h.fetch_page().await, expected[..PAGE]);
+
+    // Sorted after the sweep: 60k keys are above the inline limit.
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        assert!(ks.sweep_done);
+        ks.set_sort(Some(Sort {
+            descending: true,
+            ..by_name
+        }));
+    }
+    let mut descending = expected.clone();
+    descending.reverse();
+    assert_eq!(h.fetch_page().await, descending[..PAGE]);
+    h.state.keyspace_state.lock().page = KEYS / PAGE - 1;
+    assert_eq!(h.fetch_page().await, descending[KEYS - PAGE..]);
     h.shutdown().await;
 }
 

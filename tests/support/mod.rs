@@ -431,11 +431,7 @@ impl Harness {
                 range.len(),
                 "page {expected_page}: rows vs range"
             );
-            assert_eq!(
-                keys,
-                ks.scanned[range].to_vec(),
-                "page shows the sweep's keys"
-            );
+            assert_eq!(keys, ks.page_keys(), "page shows the sweep's keys");
             shown.extend(keys);
             if !ks.next_page() {
                 break;

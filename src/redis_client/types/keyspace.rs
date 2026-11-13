@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 
 use hashbrown::HashTable;
 
+use super::view::{KeyView, Sort, SortJob, SortedOrder, SYNC_SORT_MAX};
+
 /// Default number of keys shown per page.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
 
@@ -48,6 +50,8 @@ pub struct KeyspaceState {
     /// A SCAN result from the same epoch still extends the sweep even if the
     /// user turned the page meanwhile.
     sweep_epoch: u64,
+    /// Display order of the loaded keys (SCAN order unless sorted).
+    view: KeyView,
 }
 
 /// One `KeyspaceState::seen` entry: where the name sits in `scanned`, plus
@@ -98,6 +102,18 @@ pub struct SweepResult {
     pub batch: Vec<String>,
 }
 
+/// What [`KeyspaceState::apply_result`] did with a SCAN answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepApply {
+    /// Merged into the sweep.
+    Applied,
+    /// The sweep restarted (rescan, new pattern, DB switch): dropped.
+    Stale,
+    /// The same sweep moved on without this answer (another SCAN advanced
+    /// it first): dropped, ask again from the new cursor.
+    Raced,
+}
+
 impl SweepResult {
     /// SCAN returned cursor 0: the sweep is over.
     #[must_use]
@@ -107,11 +123,19 @@ impl SweepResult {
 }
 
 impl KeyspaceState {
-    /// Range of `scanned` covered by the current page (clamped to what's known).
+    /// Number of keys the list shows over the loaded part of the sweep.
+    #[must_use]
+    pub fn view_len(&self) -> usize {
+        self.scanned.len()
+    }
+
+    /// Positions in the list (display order) covered by the current page,
+    /// clamped to what's loaded. In SCAN order these are indices into
+    /// `scanned`.
     #[must_use]
     pub fn page_range(&self) -> std::ops::Range<usize> {
-        let start = (self.page * self.page_size).min(self.scanned.len());
-        let end = (start + self.page_size).min(self.scanned.len());
+        let start = (self.page * self.page_size).min(self.view_len());
+        let end = (start + self.page_size).min(self.view_len());
         start..end
     }
 
@@ -124,12 +148,12 @@ impl KeyspaceState {
     /// The sweep still needs to `SCAN` further to fill the current page.
     #[must_use]
     pub fn needs_scan(&self) -> bool {
-        !self.sweep_done && self.scanned.len() < self.keys_needed()
+        !self.sweep_done && self.view_len() < self.keys_needed()
     }
 
     #[must_use]
     pub fn has_next_page(&self) -> bool {
-        self.scanned.len() > self.page_range().end || !self.sweep_done
+        self.view_len() > self.page_range().end || !self.sweep_done
     }
 
     #[must_use]
@@ -181,6 +205,7 @@ impl KeyspaceState {
         self.sweep_done = false;
         self.generation += 1;
         self.sweep_epoch += 1;
+        self.view.reset();
     }
 
     /// Start over after a DB switch: keep the filter, go back to page 1 and
@@ -204,6 +229,7 @@ impl KeyspaceState {
     /// may return a key more than once). A returned cursor of 0 ends the sweep.
     pub fn merge_batch(&mut self, cursor: usize, keys: Vec<String>) {
         let mut full = false;
+        let first_new = self.scanned.len();
         for key in keys {
             let hash = (self.hash)(&key);
             let scanned = &self.scanned;
@@ -227,6 +253,13 @@ impl KeyspaceState {
                 });
             self.scanned.push(key);
         }
+        // Both fit: every index went through `u32::try_from` above.
+        #[allow(clippy::cast_possible_truncation)]
+        self.view.merge_new(
+            self.scanned.as_slice(),
+            first_new as u32,
+            self.scanned.len() as u32,
+        );
         self.sweep_cursor = cursor;
         self.sweep_done = cursor == 0 || full;
     }
@@ -242,31 +275,100 @@ impl KeyspaceState {
             pattern: self.pattern.clone(),
             cursor: self.sweep_cursor,
             scan_count: self.scan_count,
-            need: self.keys_needed() - self.scanned.len(),
+            need: self.keys_needed() - self.view_len(),
             generation: self.generation,
             epoch: self.sweep_epoch,
         })
     }
 
-    /// Merge the runner's answer to `request`. Returns `false`, and changes
-    /// nothing, when the sweep moved on meanwhile: it restarted (rescan, new
-    /// pattern, DB switch), ended, or no longer sits at the request's cursor.
-    /// A page turn alone doesn't make the result stale.
-    pub fn apply_result(&mut self, request: &SweepRequest, result: SweepResult) -> bool {
-        if request.epoch != self.sweep_epoch
-            || self.sweep_done
-            || request.cursor != self.sweep_cursor
-        {
-            return false;
+    /// Merge the runner's answer to `request`. Changes nothing unless it
+    /// returns [`SweepApply::Applied`]: the sweep restarted (rescan, new
+    /// pattern, DB switch) is `Stale`; the same sweep ended or moved past the
+    /// request's cursor is `Raced`. A page turn alone doesn't make the result
+    /// stale.
+    pub fn apply_result(&mut self, request: &SweepRequest, result: SweepResult) -> SweepApply {
+        if request.epoch != self.sweep_epoch {
+            return SweepApply::Stale;
+        }
+        if self.sweep_done || request.cursor != self.sweep_cursor {
+            return SweepApply::Raced;
         }
         self.merge_batch(result.cursor, result.batch);
-        true
+        SweepApply::Applied
     }
 
-    /// Copy of the current page's key names: at most `page_size` of them.
+    /// Copy of the current page's key names, in display order: at most
+    /// `page_size` of them. An order still waiting for its rebuild falls back
+    /// to SCAN order.
     #[must_use]
     pub fn page_keys(&self) -> Vec<String> {
-        self.scanned[self.page_range()].to_vec()
+        let range = self.page_range();
+        match self.view.order() {
+            Some(order) => order[range]
+                .iter()
+                .map(|&index| self.scanned[index as usize].clone())
+                .collect(),
+            None => self.scanned[range].to_vec(),
+        }
+    }
+
+    /// The active sort, if any (`None`: SCAN order).
+    #[must_use]
+    pub fn sort(&self) -> Option<Sort> {
+        self.view.sort()
+    }
+
+    /// Sort the list (or go back to SCAN order with `None`), from page 1.
+    /// The order is built by the next page fetch (bumps `generation`).
+    pub fn set_sort(&mut self, sort: Option<Sort>) {
+        if self.view.sort() == sort {
+            return;
+        }
+        self.view.set_sort(sort);
+        self.page = 0;
+        self.generation += 1;
+    }
+
+    /// Build a pending sort order. Small sweeps (up to [`SYNC_SORT_MAX`]
+    /// keys) are sorted here; for a larger one this returns a [`SortJob`] to
+    /// run off the lock and hand back to [`Self::install_sorted`].
+    pub fn rebuild_view(&mut self) -> Option<SortJob> {
+        if !self.view.needs_rebuild() {
+            return None;
+        }
+        if self.scanned.len() <= SYNC_SORT_MAX {
+            let len = self.scanned_len_u32();
+            self.view.rebuild(self.scanned.as_slice(), len);
+            return None;
+        }
+        self.sort_job()
+    }
+
+    /// A copy of what a full re-sort needs, whatever the sweep's size.
+    /// `None` unless the order is waiting for a rebuild.
+    #[must_use]
+    pub fn sort_job(&self) -> Option<SortJob> {
+        if !self.view.needs_rebuild() {
+            return None;
+        }
+        self.view.job(&self.scanned, self.sweep_epoch)
+    }
+
+    /// Install a finished [`SortJob`]. Returns `false`, and changes nothing,
+    /// when the sweep restarted or the sort changed meanwhile. Keys merged
+    /// since the job was made are merged into the order.
+    pub fn install_sorted(&mut self, sorted: SortedOrder) -> bool {
+        if sorted.epoch != self.sweep_epoch {
+            return false;
+        }
+        let len = self.scanned_len_u32();
+        self.view.install(sorted, self.scanned.as_slice(), len)
+    }
+
+    // `merge_batch` never lets `scanned` outgrow `u32`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn scanned_len_u32(&self) -> u32 {
+        self.scanned.len() as u32
     }
 
     /// If the finished sweep doesn't reach the current page (keys were deleted
@@ -275,7 +377,7 @@ impl KeyspaceState {
         if !self.sweep_done || self.page_size == 0 {
             return;
         }
-        let last_page = self.scanned.len().saturating_sub(1) / self.page_size;
+        let last_page = self.view_len().saturating_sub(1) / self.page_size;
         self.page = self.page.min(last_page);
     }
 }
@@ -294,6 +396,7 @@ impl Default for KeyspaceState {
             sweep_done: false,
             generation: 0,
             sweep_epoch: 0,
+            view: KeyView::default(),
         }
     }
 }
@@ -425,14 +528,20 @@ mod tests {
     fn apply_result_merges_and_moves_cursor() {
         let mut state = state_with(10);
         let request = state.sweep_request().expect("empty sweep needs keys");
-        assert!(state.apply_result(&request, result(17, keys(0..12))));
+        assert_eq!(
+            SweepApply::Applied,
+            state.apply_result(&request, result(17, keys(0..12)))
+        );
         assert_eq!(state.sweep_cursor, 17);
         assert!(!state.sweep_done);
         assert_eq!(state.page_range(), 0..10);
         assert_eq!(state.sweep_request(), None);
 
         // Applying the same answer twice is refused: the cursor moved.
-        assert!(!state.apply_result(&request, result(99, keys(50..60))));
+        assert_eq!(
+            SweepApply::Raced,
+            state.apply_result(&request, result(99, keys(50..60)))
+        );
         assert_eq!(state.scanned.len(), 12);
     }
 
@@ -442,14 +551,20 @@ mod tests {
         let request = state.sweep_request().expect("needs keys");
         // The user changes the filter while the SCAN is in flight.
         state.set_pattern(Some("user:*".into()));
-        assert!(!state.apply_result(&request, result(5, keys(0..10))));
+        assert_eq!(
+            SweepApply::Stale,
+            state.apply_result(&request, result(5, keys(0..10)))
+        );
         assert!(state.scanned.is_empty());
         assert_eq!(state.sweep_cursor, 0);
 
         let mut state = state_with(10);
         let request = state.sweep_request().expect("needs keys");
         state.rescan();
-        assert!(!state.apply_result(&request, result(5, keys(0..10))));
+        assert_eq!(
+            SweepApply::Stale,
+            state.apply_result(&request, result(5, keys(0..10)))
+        );
         assert!(state.scanned.is_empty());
     }
 
@@ -463,7 +578,10 @@ mod tests {
         assert!(state.next_page());
         assert_ne!(state.generation, request.generation);
 
-        assert!(state.apply_result(&request, result(8, keys(10..20))));
+        assert_eq!(
+            SweepApply::Applied,
+            state.apply_result(&request, result(8, keys(10..20)))
+        );
         assert_eq!(state.scanned.len(), 20);
         assert_eq!(state.sweep_cursor, 8);
         let next = state.sweep_request().expect("page 3 still needs keys");
@@ -482,13 +600,19 @@ mod tests {
         assert_eq!(request.need, 10);
         let mut batch = keys(0..6);
         batch.extend(keys(10..14));
-        assert!(state.apply_result(&request, result(9, batch)));
+        assert_eq!(
+            SweepApply::Applied,
+            state.apply_result(&request, result(9, batch))
+        );
         assert_eq!(state.scanned.len(), 14, "repeats are merged once");
 
         let again = state.sweep_request().expect("page 2 is still short");
         assert_eq!(again.cursor, 9);
         assert_eq!(again.need, 6);
-        assert!(state.apply_result(&again, result(0, keys(10..20))));
+        assert_eq!(
+            SweepApply::Applied,
+            state.apply_result(&again, result(0, keys(10..20)))
+        );
         assert_eq!(state.page_keys(), keys(10..20));
         assert_eq!(state.sweep_request(), None);
     }
@@ -602,5 +726,79 @@ mod tests {
         state.merge_batch(9, keys(0..15));
         state.clamp_page();
         assert_eq!(state.page, 3);
+    }
+
+    const BY_NAME: Sort = Sort {
+        key: super::super::view::SortKey::Name,
+        descending: false,
+    };
+
+    #[test]
+    fn sorted_pages_follow_the_order_and_merge_new_batches() {
+        let mut state = state_with(3);
+        state.merge_batch(7, ["d", "b", "f"].map(String::from).to_vec());
+        state.set_sort(Some(BY_NAME));
+        assert_eq!(state.page_keys(), ["d", "b", "f"], "SCAN order until built");
+        assert!(state.rebuild_view().is_none(), "small sweeps sort inline");
+        assert_eq!(state.page_keys(), ["b", "d", "f"]);
+
+        // A later batch is merged into the built order.
+        state.merge_batch(0, ["a", "e", "c"].map(String::from).to_vec());
+        assert_eq!(state.page_keys(), ["a", "b", "c"]);
+        assert!(state.next_page());
+        assert_eq!(state.page_keys(), ["d", "e", "f"]);
+    }
+
+    #[test]
+    fn set_sort_goes_to_page_one_and_bumps_generation() {
+        let mut state = state_with(10);
+        state.merge_batch(0, keys(0..30));
+        state.next_page();
+        let generation = state.generation;
+        state.set_sort(Some(BY_NAME));
+        assert_eq!(state.page, 0);
+        assert!(state.generation > generation);
+
+        let generation = state.generation;
+        state.set_sort(Some(BY_NAME));
+        assert_eq!(state.generation, generation, "same sort is a no-op");
+    }
+
+    #[test]
+    fn rescan_keeps_the_sort_and_rebuilds() {
+        let mut state = state_with(10);
+        state.set_sort(Some(BY_NAME));
+        state.merge_batch(5, ["b", "a"].map(String::from).to_vec());
+        assert!(state.rebuild_view().is_none());
+        state.rescan();
+        assert_eq!(state.sort(), Some(BY_NAME));
+        state.merge_batch(0, ["z", "y"].map(String::from).to_vec());
+        assert!(state.rebuild_view().is_none());
+        assert_eq!(state.page_keys(), ["y", "z"]);
+    }
+
+    #[test]
+    fn off_lock_sort_installs_with_late_keys() {
+        let mut state = state_with(4);
+        state.set_sort(Some(BY_NAME));
+        state.merge_batch(5, ["c", "a"].map(String::from).to_vec());
+        let job = state.sort_job().expect("order pending");
+        // The page fetch merges another batch while the job runs.
+        state.merge_batch(0, ["d", "b"].map(String::from).to_vec());
+        assert!(state.install_sorted(job.run()));
+        assert_eq!(state.page_keys(), ["a", "b", "c", "d"]);
+        assert!(state.sort_job().is_none(), "built");
+    }
+
+    #[test]
+    fn off_lock_sort_from_an_old_sweep_is_dropped() {
+        let mut state = state_with(4);
+        state.set_sort(Some(BY_NAME));
+        state.merge_batch(5, ["c", "a"].map(String::from).to_vec());
+        let job = state.sort_job().expect("order pending");
+        state.rescan();
+        state.merge_batch(0, ["x"].map(String::from).to_vec());
+        assert!(!state.install_sorted(job.run()));
+        assert!(state.sort_job().is_some(), "still pending");
     }
 }

@@ -1,12 +1,14 @@
 mod keyspace;
 mod value;
+mod view;
 
-pub use keyspace::{KeyspaceState, SweepRequest, SweepResult};
+pub use keyspace::{KeyspaceState, SweepApply, SweepRequest, SweepResult};
 pub use value::{
     json_path, zset_entry_json, JsonField, JsonPreview, JsonPreviewKind, LoadedValue, ScanSweep,
     ValuePageInfo, ValueState, DEFAULT_JSON_PREVIEW_BYTES, JSON_PREVIEW_ITEMS,
     STRING_PREVIEW_BYTES,
 };
+pub use view::{Sort, SortKey};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
