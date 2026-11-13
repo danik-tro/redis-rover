@@ -3,7 +3,10 @@ use std::sync::LazyLock;
 
 use hashbrown::HashTable;
 
-use super::view::{KeyView, Sort, SortJob, SortedOrder, SYNC_SORT_MAX};
+use super::{
+    view::{KeyView, MetaColumns, Sort, SortJob, SortedOrder, Swept, SYNC_SORT_MAX},
+    KeyMeta,
+};
 
 /// Default number of keys shown per page.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
@@ -52,6 +55,19 @@ pub struct KeyspaceState {
     sweep_epoch: u64,
     /// Display order of the loaded keys (SCAN order unless sorted).
     view: KeyView,
+    /// Type / TTL / size per key, parallel to `scanned`. Allocated the first
+    /// time the user sorts by one of them.
+    meta: Option<MetaColumns>,
+    /// The metadata backfill waits while the user is on another screen.
+    backfill_paused: bool,
+}
+
+/// Keys whose metadata the backfill fetches next, copied out under the lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillRequest {
+    pub indices: Vec<u32>,
+    pub names: Vec<String>,
+    epoch: u64,
 }
 
 /// One `KeyspaceState::seen` entry: where the name sits in `scanned`, plus
@@ -206,6 +222,9 @@ impl KeyspaceState {
         self.generation += 1;
         self.sweep_epoch += 1;
         self.view.reset();
+        if let Some(meta) = self.meta.as_mut() {
+            meta.clear();
+        }
     }
 
     /// Start over after a DB switch: keep the filter, go back to page 1 and
@@ -254,12 +273,16 @@ impl KeyspaceState {
             self.scanned.push(key);
         }
         // Both fit: every index went through `u32::try_from` above.
+        if let Some(meta) = self.meta.as_mut() {
+            meta.grow(self.scanned.len());
+        }
+        let input = Swept {
+            names: &self.scanned,
+            meta: self.meta.as_ref(),
+        };
         #[allow(clippy::cast_possible_truncation)]
-        self.view.merge_new(
-            self.scanned.as_slice(),
-            first_new as u32,
-            self.scanned.len() as u32,
-        );
+        self.view
+            .merge_new(&input, first_new as u32, self.scanned.len() as u32);
         self.sweep_cursor = cursor;
         self.sweep_done = cursor == 0 || full;
     }
@@ -324,9 +347,105 @@ impl KeyspaceState {
         if self.view.sort() == sort {
             return;
         }
+        if sort.is_some_and(|sort| sort.key.needs_meta()) && self.meta.is_none() {
+            let mut meta = MetaColumns::default();
+            meta.grow(self.scanned.len());
+            self.meta = Some(meta);
+        }
         self.view.set_sort(sort);
         self.page = 0;
         self.generation += 1;
+    }
+
+    /// The active sort needs metadata the backfill hasn't fetched yet:
+    /// `(known, loaded)`. `None` for SCAN order or a name sort.
+    #[must_use]
+    pub fn meta_progress(&self) -> Option<(usize, usize)> {
+        if !self.view.sort()?.key.needs_meta() {
+            return None;
+        }
+        let known = self.meta.as_ref().map_or(0, MetaColumns::known);
+        Some((known, self.scanned.len()))
+    }
+
+    /// Pause / resume the metadata backfill (the user left / came back).
+    pub fn set_backfill_paused(&mut self, paused: bool) {
+        self.backfill_paused = paused;
+    }
+
+    /// Up to `max` keys without metadata for the backfill, nearest to the
+    /// current page first (outwards from it, in display order). `None` when
+    /// the sort doesn't need metadata, everything is known, the order is
+    /// still being built, or the backfill is paused.
+    #[must_use]
+    pub fn backfill_request(&self, max: usize) -> Option<BackfillRequest> {
+        let (known, loaded) = self.meta_progress()?;
+        if self.backfill_paused || known >= loaded || self.view.needs_rebuild() {
+            return None;
+        }
+        let meta = self.meta.as_ref()?;
+        let order = self.view.order()?;
+        let start = self.page_range().start.min(order.len());
+        let mut indices = Vec::with_capacity(max.min(loaded - known));
+        let (mut down, mut up) = (start, start);
+        while indices.len() < max && (up < order.len() || down > 0) {
+            for pos in [Some(up).filter(|&p| p < order.len()), down.checked_sub(1)]
+                .into_iter()
+                .flatten()
+            {
+                if indices.len() < max && !meta.is_known(order[pos]) {
+                    indices.push(order[pos]);
+                }
+            }
+            up += 1;
+            down = down.saturating_sub(1);
+        }
+        let names = indices
+            .iter()
+            .map(|&index| self.scanned[index as usize].clone())
+            .collect();
+        Some(BackfillRequest {
+            indices,
+            names,
+            epoch: self.sweep_epoch,
+        })
+    }
+
+    /// Store the backfill's answer to `request` (`metas` in its order) and
+    /// move those keys to their place. Returns `false`, and changes nothing,
+    /// when the sweep restarted meanwhile.
+    pub fn record_meta(&mut self, request: &BackfillRequest, metas: &[KeyMeta]) -> bool {
+        if request.epoch != self.sweep_epoch {
+            return false;
+        }
+        let Some(meta) = self.meta.as_mut() else {
+            return false;
+        };
+        let newly_known: Vec<u32> = request
+            .indices
+            .iter()
+            .zip(metas)
+            .filter(|(&index, row)| meta.set(index, row))
+            .map(|(&index, _)| index)
+            .collect();
+        let input = Swept {
+            names: &self.scanned,
+            meta: self.meta.as_ref(),
+        };
+        self.view.reposition(&input, &newly_known);
+        true
+    }
+
+    /// The current page as table rows from the columns, if every key on it
+    /// has its metadata (so the page can be redrawn without a round trip).
+    #[must_use]
+    pub fn page_from_meta(&self) -> Option<Vec<KeyMeta>> {
+        let meta = self.meta.as_ref()?;
+        let order = self.view.order()?;
+        order[self.page_range()]
+            .iter()
+            .map(|&index| meta.key_meta(index, &self.scanned[index as usize]))
+            .collect()
     }
 
     /// Build a pending sort order. Small sweeps (up to [`SYNC_SORT_MAX`]
@@ -338,7 +457,11 @@ impl KeyspaceState {
         }
         if self.scanned.len() <= SYNC_SORT_MAX {
             let len = self.scanned_len_u32();
-            self.view.rebuild(self.scanned.as_slice(), len);
+            let input = Swept {
+                names: &self.scanned,
+                meta: self.meta.as_ref(),
+            };
+            self.view.rebuild(&input, len);
             return None;
         }
         self.sort_job()
@@ -351,7 +474,8 @@ impl KeyspaceState {
         if !self.view.needs_rebuild() {
             return None;
         }
-        self.view.job(&self.scanned, self.sweep_epoch)
+        self.view
+            .job(&self.scanned, self.meta.as_ref(), self.sweep_epoch)
     }
 
     /// Install a finished [`SortJob`]. Returns `false`, and changes nothing,
@@ -362,7 +486,11 @@ impl KeyspaceState {
             return false;
         }
         let len = self.scanned_len_u32();
-        self.view.install(sorted, self.scanned.as_slice(), len)
+        let input = Swept {
+            names: &self.scanned,
+            meta: self.meta.as_ref(),
+        };
+        self.view.install(sorted, &input, len)
     }
 
     // `merge_batch` never lets `scanned` outgrow `u32`.
@@ -397,6 +525,8 @@ impl Default for KeyspaceState {
             generation: 0,
             sweep_epoch: 0,
             view: KeyView::default(),
+            meta: None,
+            backfill_paused: false,
         }
     }
 }
@@ -800,5 +930,100 @@ mod tests {
         state.merge_batch(0, ["x"].map(String::from).to_vec());
         assert!(!state.install_sorted(job.run()));
         assert!(state.sort_job().is_some(), "still pending");
+    }
+
+    fn by_size() -> Sort {
+        Sort {
+            key: super::super::view::SortKey::Size,
+            descending: true,
+        }
+    }
+
+    fn sized(name: &str, size: u128) -> KeyMeta {
+        KeyMeta {
+            key: name.into(),
+            r_type: super::super::RedisType::String,
+            size,
+            ttl: -1,
+            value: super::super::KeyValue::Unknown,
+        }
+    }
+
+    /// Answer `request` with sizes taken from the key number (`k7` → 7).
+    fn answer(request: &BackfillRequest) -> Vec<KeyMeta> {
+        request
+            .names
+            .iter()
+            .map(|name| sized(name, name[1..].parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn backfill_fills_the_page_first_then_sorts_it() {
+        let mut state = state_with(3);
+        state.merge_batch(0, keys(0..10));
+        assert_eq!(state.backfill_request(5), None, "no sort");
+        state.set_sort(Some(by_size()));
+        assert_eq!(state.meta_progress(), Some((0, 10)));
+        assert_eq!(state.backfill_request(5), None, "order not built yet");
+        assert!(state.rebuild_view().is_none());
+
+        state.page = 2; // positions 6..9
+        let request = state.backfill_request(3).expect("sizes missing");
+        assert_eq!(request.indices, [6, 5, 7], "outwards from the page");
+        assert!(state.record_meta(&request, &answer(&request)));
+        assert_eq!(state.meta_progress(), Some((3, 10)));
+        // Known sizes moved to the front, largest first.
+        state.page = 0;
+        assert_eq!(state.page_keys(), ["k7", "k6", "k5"]);
+        assert_eq!(
+            state
+                .page_from_meta()
+                .unwrap()
+                .iter()
+                .map(|m| m.size)
+                .collect::<Vec<_>>(),
+            [7, 6, 5]
+        );
+        state.page = 1;
+        assert_eq!(
+            state.page_from_meta().map(|rows| rows.len()),
+            None,
+            "unknown rows"
+        );
+
+        while let Some(request) = state.backfill_request(4) {
+            assert!(state.record_meta(&request, &answer(&request)));
+        }
+        assert_eq!(state.meta_progress(), Some((10, 10)));
+        state.page = 0;
+        assert_eq!(state.page_keys(), ["k9", "k8", "k7"]);
+    }
+
+    #[test]
+    fn backfill_waits_while_paused_and_drops_old_sweeps() {
+        let mut state = state_with(3);
+        state.merge_batch(0, keys(0..4));
+        state.set_sort(Some(by_size()));
+        assert!(state.rebuild_view().is_none());
+        state.set_backfill_paused(true);
+        assert_eq!(state.backfill_request(10), None);
+        state.set_backfill_paused(false);
+        let request = state.backfill_request(10).expect("sizes missing");
+
+        state.rescan();
+        state.merge_batch(0, keys(0..4));
+        assert!(!state.record_meta(&request, &answer(&request)));
+        assert_eq!(state.meta_progress(), Some((0, 4)), "columns restarted too");
+    }
+
+    #[test]
+    fn name_sort_needs_no_metadata() {
+        let mut state = state_with(3);
+        state.merge_batch(0, keys(0..4));
+        state.set_sort(Some(BY_NAME));
+        assert_eq!(state.meta_progress(), None);
+        assert!(state.rebuild_view().is_none());
+        assert_eq!(state.backfill_request(10), None);
     }
 }

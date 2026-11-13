@@ -14,10 +14,13 @@ use ratatui::{
         Widget, Wrap,
     },
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config,
-    redis_client::types::{JsonField, JsonPreview, JsonPreviewKind, KeyValue, TYPE_BADGE_WIDTH},
+    redis_client::types::{
+        JsonField, JsonPreview, JsonPreviewKind, KeyValue, SortKey, TYPE_BADGE_WIDTH,
+    },
     widgets::text_view::{self, TextLabels},
 };
 
@@ -419,15 +422,34 @@ impl StatefulWidget for KeySpaceWidget {
         .horizontal_margin(1)
         .areas(table_area);
 
+        // While a type / TTL / size sort still lacks metadata, the right end
+        // says how much is known (`size 41k/120k`).
+        let note = state.page.sort_note();
+        let note_width = note
+            .as_deref()
+            .map_or(0, |n| u16::try_from(n.width()).unwrap_or(u16::MAX));
+        let [pattern_area, note_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(note_width)])
+                .spacing(u16::from(note_width > 0))
+                .areas(filter_area);
+        let label = "filter ";
+        let room = usize::from(pattern_area.width).saturating_sub(label.len());
         let pattern = match state.page.pattern.as_deref() {
-            Some(p) => Span::from(p).fg(cfg.colors.base0d).bold(),
+            Some(p) => Span::from(truncate_to_width(p, room).into_owned())
+                .fg(cfg.colors.base0d)
+                .bold(),
             None => Span::from("*").fg(cfg.colors.base03),
         };
         Paragraph::new(Line::from(vec![
-            Span::from("filter ").fg(cfg.colors.base03),
+            Span::from(label).fg(cfg.colors.base03),
             pattern,
         ]))
-        .render(filter_area, buf);
+        .render(pattern_area, buf);
+        if let Some(note) = note {
+            Paragraph::new(Line::from(note).fg(cfg.colors.base03))
+                .alignment(Alignment::Right)
+                .render(note_area, buf);
+        }
         if state.cluster_mode {
             Paragraph::new(Line::from(CLUSTER_BANNER).fg(cfg.colors.base0b).bold())
                 .render(banner_area, buf);
@@ -442,11 +464,20 @@ impl StatefulWidget for KeySpaceWidget {
             Constraint::Length(7),
             Constraint::Length(10),
         ];
+        // The sorted column carries its direction: `Key ▲`, `Size ▼`.
+        let title = |name: &'static str, key: SortKey| -> String {
+            match state.page.sort {
+                Some(sort) if sort.key == key => {
+                    format!("{name} {}", if sort.descending { '▼' } else { '▲' })
+                }
+                _ => name.to_owned(),
+            }
+        };
         let header: Row<'_> = Row::new([
-            Cell::from("Type"),
-            Cell::from("Key"),
-            Cell::from(Line::from("TTL").right_aligned()),
-            Cell::from(Line::from("Size").right_aligned()),
+            Cell::from(title("Type", SortKey::Type)),
+            Cell::from(title("Key", SortKey::Name)),
+            Cell::from(Line::from(title("TTL", SortKey::Ttl)).right_aligned()),
+            Cell::from(Line::from(title("Size", SortKey::Size)).right_aligned()),
         ])
         .bottom_margin(1)
         .fg(cfg.colors.base03)
@@ -517,6 +548,10 @@ impl StatefulWidget for KeySpaceWidget {
 
         if state.is_overlay_open() {
             Self::render_action_overlay(state, area, buf);
+        }
+
+        if state.is_sort_menu_open() {
+            Self::render_sort_menu(state, area, buf);
         }
 
         if state.is_wizard_active() {

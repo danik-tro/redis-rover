@@ -4,7 +4,6 @@
 
 
 
-
                                      ╭─────────────────── Help ────────────────────╮
                                      │ Scroll down                         j       │
                                      │ Scroll up                           k       │
@@ -13,6 +12,7 @@
                                      │ Refresh keyspace                    r       │
                                      │ Set filter pattern                  f       │
                                      │ Delete filter pattern               l       │
+                                     │ Sort by key / type / TTL / size     o       │
                                      │ Enter value / JSON field / confirm  Enter   │
                                      │ Add new key                         a       │
                                      │ Add item (in collection)            i       │

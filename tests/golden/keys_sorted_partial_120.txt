@@ -1,0 +1,20 @@
+╭ Keys ──────────────────────────────────╮╭ Values ────────────────────────────────────────────────────────────────────╮
+│ filter *                 size 41k/120k ││                                                                            │
+│ ────────────────────────────────────── ││                                                                            │
+│   Type   Key            TTL     Size ▼ ││                                                                            │
+│ ────────────────────────────────────── ││                                                                            │
+│   str    cache:pag…      2m  14.65 KiB ││                                                                            │
+│   stream events:or…       ∞   8.00 KiB ││                                                                            │
+│   list   queue:jobs       ∞   2.00 KiB ││                                                                            │
+│   zset   leaderboa…      1d   1.17 KiB ││                                                                            │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││                                                                            │
+│   set    tags:popu…       ∞      540 B ││                        Select a key · Enter to open                        │
+│   json   doc:setti…       ∞      420 B ││                                                                            │
+│   hash   user:1001        ∞      312 B ││                                                                            │
+│   hash   user:1002        ∞      296 B ││                                                                            │
+│   str    session:7…      1h       96 B ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+╰ Page 1 · 1–10 of 12 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯

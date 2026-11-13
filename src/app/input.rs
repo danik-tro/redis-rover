@@ -1,7 +1,7 @@
 use super::App;
 use std::time::{Duration, Instant};
 
-use crate::{config, mode::PopupMode};
+use crate::{config, mode::PopupMode, widgets::keyspace::SORT_MENU};
 use crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
 
@@ -60,6 +60,21 @@ impl App {
                 return None;
             }
             return self.handle_keybindings(key);
+        }
+
+        // The sort menu takes one letter (or Esc); Ctrl-c still quits.
+        if self.keyspace.is_sort_menu_open() {
+            if Self::is_quit_key(key) {
+                return Some(Action::Quit);
+            }
+            if is_cancel {
+                self.keyspace.close_sort_menu();
+            } else if let KeyCode::Char(c) = key.code {
+                if let Some(choice) = SORT_MENU.iter().find(|item| item.0 == c) {
+                    self.pick_sort(choice.1);
+                }
+            }
+            return None;
         }
 
         // While the filter popup is open, raw keys feed its text-area; only

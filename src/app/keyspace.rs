@@ -4,7 +4,7 @@ use std::time::Instant;
 use super::confirm::{AfterWrite, Reselect};
 use crate::redis_client::{
     event::RedisEvent,
-    types::{ItemDelete, RedisType},
+    types::{ItemDelete, RedisType, Sort, SortKey},
 };
 
 use crate::{
@@ -420,6 +420,82 @@ impl App {
         self.fetch_keys();
     }
 
+    /// A choice in the sort menu (`None` = SCAN order): the active column
+    /// again reverses it. Closes the menu and shows page 1.
+    pub(super) fn pick_sort(&mut self, key: Option<SortKey>) {
+        self.keyspace.close_sort_menu();
+        let current = self.state.keyspace_state.lock().sort();
+        let next = Sort::pick(current, key);
+        if next == current {
+            return;
+        }
+        self.state.keyspace_state.lock().set_sort(next);
+        self.fetch_keys();
+        self.request_backfill();
+    }
+
+    /// Start the metadata backfill if the sort still lacks some (the runner
+    /// ignores it while one runs).
+    pub(super) fn request_backfill(&mut self) {
+        let missing = self
+            .state
+            .keyspace_state
+            .lock()
+            .meta_progress()
+            .is_some_and(|(known, loaded)| known < loaded);
+        if missing && !self.backfill_paused() {
+            self.send_redis_event(RedisEvent::BackfillMeta);
+        }
+    }
+
+    /// The backfill waits while the user is on the dashboard or Pub/Sub.
+    fn backfill_paused(&self) -> bool {
+        matches!(self.mode, Mode::Dashboard | Mode::PubSub)
+    }
+
+    /// The mode changed: pause the backfill on another screen, resume it on
+    /// the way back.
+    pub(super) fn sync_backfill_pause(&mut self) {
+        let paused = self.backfill_paused();
+        self.state.keyspace_state.lock().set_backfill_paused(paused);
+        if !paused {
+            self.request_backfill();
+        }
+    }
+
+    /// The backfill stored a batch: update the progress note and, if the
+    /// page now holds other keys, show them. A page whose keys all have
+    /// metadata is drawn from it with no round trip, keeping the cursor (and
+    /// the open value) on the same key; otherwise the page is fetched again.
+    pub(super) fn meta_backfilled(&mut self) {
+        let (info, names, rows) = {
+            let state = self.state.keyspace_state.lock();
+            (
+                PageInfo::from(&*state),
+                state.page_keys(),
+                state.page_from_meta(),
+            )
+        };
+        self.keyspace.set_page_info(info);
+        if self.keys_in_flight > 0 || self.keyspace.shows_keys(&names) {
+            return;
+        }
+        let selected = self.keyspace.selected_key().map(|(key, _)| key);
+        if let Some(rows) = rows {
+            self.keyspace.set_keys(rows);
+            let kept = selected
+                .as_deref()
+                .is_some_and(|key| self.keyspace.select_key_by_name(key));
+            if !kept {
+                self.keyspace.refresh();
+                self.keyspace.clear_selected_value();
+            }
+        } else {
+            self.reselect_key = selected;
+            self.fetch_keys();
+        }
+    }
+
     pub(super) fn load_keyspace(&mut self) {
         self.fetch_keys();
     }
@@ -516,5 +592,83 @@ mod tests {
         app.load_new_keys();
         assert!(app.keyspace.select_key_by_name("a"));
         assert!(app.keyspace.select_key_by_name("b"));
+    }
+
+    #[test]
+    fn o_opens_the_sort_menu_and_a_letter_picks() {
+        use crate::app::tests::press;
+        use crate::redis_client::types::SortKey;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, _cmds, _redis_rx) = crate::app::tests::app_with_channels();
+        app.mode = crate::mode::Mode::KeySpace;
+        let none = KeyModifiers::empty();
+
+        press(&mut app, KeyCode::Char('o'), none);
+        assert!(app.keyspace.is_sort_menu_open());
+        press(&mut app, KeyCode::Char('j'), none);
+        assert!(app.keyspace.is_sort_menu_open(), "other keys do nothing");
+        press(&mut app, KeyCode::Char('s'), none);
+        assert!(!app.keyspace.is_sort_menu_open());
+        let sort = app.state.keyspace_state.lock().sort().unwrap();
+        assert_eq!((sort.key, sort.descending), (SortKey::Size, true));
+
+        press(&mut app, KeyCode::Char('o'), none);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(!app.keyspace.is_sort_menu_open());
+        assert!(app.state.keyspace_state.lock().sort().is_some());
+
+        press(&mut app, KeyCode::Char('o'), none);
+        press(&mut app, KeyCode::Char('x'), none);
+        assert_eq!(app.state.keyspace_state.lock().sort(), None);
+    }
+
+    #[test]
+    fn sort_menu_picks_reverses_resets_and_starts_the_backfill() {
+        use crate::redis_client::{event::RedisEvent, types::SortKey};
+
+        let (mut app, _cmds, mut redis_rx) = crate::app::tests::app_with_channels();
+        app.state
+            .keyspace_state
+            .lock()
+            .merge_batch(0, vec!["a".into(), "b".into()]);
+
+        app.keyspace.open_sort_menu();
+        app.pick_sort(Some(SortKey::Name));
+        assert!(!app.keyspace.is_sort_menu_open());
+        let sort = app.state.keyspace_state.lock().sort().unwrap();
+        assert_eq!((sort.key, sort.descending), (SortKey::Name, false));
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchKeys)));
+        assert!(
+            redis_rx.try_recv().is_err(),
+            "a name sort needs no metadata"
+        );
+
+        app.pick_sort(Some(SortKey::Name));
+        assert!(app.state.keyspace_state.lock().sort().unwrap().descending);
+        while redis_rx.try_recv().is_ok() {}
+        app.pick_sort(Some(SortKey::Ttl));
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchKeys)));
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::BackfillMeta)));
+
+        // On the dashboard the backfill waits; back on the keys it resumes.
+        app.mode = crate::mode::Mode::Dashboard;
+        app.sync_backfill_pause();
+        assert!(app
+            .state
+            .keyspace_state
+            .lock()
+            .backfill_request(1)
+            .is_none());
+        app.mode = crate::mode::Mode::KeySpace;
+        app.sync_backfill_pause();
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::BackfillMeta)));
+
+        while redis_rx.try_recv().is_ok() {}
+        app.pick_sort(None);
+        assert_eq!(app.state.keyspace_state.lock().sort(), None);
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchKeys)));
+        app.pick_sort(None);
+        assert!(redis_rx.try_recv().is_err(), "already in SCAN order");
     }
 }

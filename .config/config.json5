@@ -27,6 +27,7 @@
       "y": "YankValue",
       "<Shift-y>": "YankKey",
       "<Shift-r>": "ToggleReadOnly",
+      "o": "OpenSortMenu",
       "?": "ToggleHelp",
     },
     "Dashboard": {

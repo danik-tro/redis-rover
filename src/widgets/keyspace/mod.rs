@@ -24,7 +24,7 @@ use ratatui_textarea::TextArea;
 
 use crate::{
     redis_client::types::{
-        zset_entry_json, KeyMeta, KeyValue, KeyspaceState, LoadedValue, RedisType,
+        zset_entry_json, KeyMeta, KeyValue, KeyspaceState, LoadedValue, RedisType, SortKey,
     },
     widgets::text_view::{TextCache, TextView},
 };
@@ -66,7 +66,18 @@ pub struct KeySpace {
     visible_rows: usize,
     /// JSON field opened from a preview that the loaded value shows.
     json_path: Vec<String>,
+    /// The `o` sort menu is open.
+    sort_menu: bool,
 }
+
+/// The sort menu's letters (`None` = SCAN order), in the order shown.
+pub const SORT_MENU: [(char, Option<SortKey>, &str); 5] = [
+    ('x', None, "SCAN order"),
+    ('k', Some(SortKey::Name), "Key"),
+    ('t', Some(SortKey::Type), "Type"),
+    ('l', Some(SortKey::Ttl), "TTL"),
+    ('s', Some(SortKey::Size), "Size"),
+];
 
 /// Banner shown above the key table in cluster mode.
 const CLUSTER_BANNER: &str = "⚠ cluster: SCAN sees only this node";
@@ -96,6 +107,7 @@ impl KeySpace {
             cluster_mode: false,
             visible_rows: 0,
             json_path: Vec::new(),
+            sort_menu: false,
         }
     }
 
@@ -149,6 +161,18 @@ impl KeySpace {
         });
     }
 
+    pub fn open_sort_menu(&mut self) {
+        self.sort_menu = true;
+    }
+
+    pub fn close_sort_menu(&mut self) {
+        self.sort_menu = false;
+    }
+
+    pub fn is_sort_menu_open(&self) -> bool {
+        self.sort_menu
+    }
+
     /// Key rows that fit in the table, as measured by the last render.
     pub fn visible_rows(&self) -> usize {
         self.visible_rows
@@ -163,6 +187,16 @@ impl KeySpace {
         let idx = self.table.selected()?;
         let meta = self.keys.get(idx)?;
         Some((meta.key.clone(), meta.r_type.clone()))
+    }
+
+    /// The table lists exactly `names`, in this order.
+    pub fn shows_keys(&self, names: &[String]) -> bool {
+        self.keys.len() == names.len()
+            && self
+                .keys
+                .iter()
+                .zip(names)
+                .all(|(row, name)| row.key == *name)
     }
 
     /// Re-select the row whose key matches `name`, if it's still present in the

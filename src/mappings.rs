@@ -43,6 +43,7 @@ impl From<Command> for Action {
             Command::PubSubFocus => Self::PubSubFocus,
             Command::PubSubTogglePause => Self::PubSubTogglePause,
             Command::ToggleReadOnly => Self::ToggleReadOnly,
+            Command::OpenSortMenu => Self::OpenSortMenu,
         }
     }
 }

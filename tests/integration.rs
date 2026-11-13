@@ -422,6 +422,77 @@ async fn sorted_pages_list_names_in_order() {
     h.shutdown().await;
 }
 
+/// Size ▼ over a loaded sweep: the backfill fetches every size (in batches
+/// of 1,000 on its own connection) and the largest keys end up first.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn size_sort_backfills_every_key() {
+    const FILLERS: usize = 3_000;
+    // Doubling sizes, so allocator size classes can't make two equal.
+    const BIG: usize = 8;
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("sized");
+    support::seed_strings(&mut admin, &format!("{p}small:"), FILLERS).await;
+    let mut pipe = redis::pipe();
+    let mut big: Vec<String> = Vec::new();
+    for i in 0..BIG {
+        let key = format!("{p}big:{i:02}");
+        pipe.set(&key, "x".repeat(1_000 << i)).ignore();
+        big.push(key);
+    }
+    let () = pipe.query_async(&mut admin).await.expect("seed big keys");
+    big.reverse(); // largest first
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().set_page_size(500, 0);
+    loop {
+        h.fetch_page().await;
+        let mut ks = h.state.keyspace_state.lock();
+        if ks.sweep_done || !ks.next_page() {
+            break;
+        }
+    }
+    h.state.keyspace_state.lock().set_sort(Some(Sort {
+        key: SortKey::Size,
+        descending: true,
+    }));
+    h.state.keyspace_state.lock().set_page_size(BIG, 0);
+    h.fetch_page().await;
+    h.send(RedisEvent::BackfillMeta);
+    let total = FILLERS + BIG;
+    loop {
+        h.expect("a backfilled batch", |a| *a == Action::KeyMetaBackfilled)
+            .await;
+        let progress = h.state.keyspace_state.lock().meta_progress();
+        if progress == Some((total, total)) {
+            break;
+        }
+    }
+    let rows = h
+        .state
+        .keyspace_state
+        .lock()
+        .page_from_meta()
+        .expect("the first page is known");
+    let names: Vec<String> = rows.iter().map(|row| row.key.clone()).collect();
+    assert_eq!(names, big);
+    assert_eq!(h.fetch_page().await, big, "a fetched page agrees");
+
+    // A rescan keeps the sort; the columns start over and fill again.
+    h.state.keyspace_state.lock().rescan();
+    h.fetch_page().await;
+    assert_eq!(
+        h.state
+            .keyspace_state
+            .lock()
+            .meta_progress()
+            .map(|(k, _)| k),
+        Some(0)
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "needs Docker"]
 async fn db_switch_survives_a_reconnect() {
