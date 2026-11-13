@@ -13,7 +13,10 @@ use std::{
 use color_eyre::eyre::{eyre, Result};
 use redis::{aio::MultiplexedConnection, RedisResult, Value};
 
-use crate::redis_client::client::parse_info;
+use crate::redis_client::{
+    client::parse_info,
+    live::{self, Capability},
+};
 
 /// How long connecting (and each command) may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,15 +48,8 @@ pub async fn report(client: &redis::Client, label: &str) -> Result<String> {
             .query_async::<String>(&mut conn),
     )
     .await;
-    // `HELLO 3` switches the connection to RESP3, so it gets one of its own.
-    let hello = match connect(client).await {
-        Ok(mut conn) => timed(redis::cmd("HELLO").arg(3).query_async::<Value>(&mut conn)).await,
-        Err(e) => Err(redis::RedisError::from((
-            redis::ErrorKind::Io,
-            "connect",
-            e.to_string(),
-        ))),
-    };
+    let resp3 = resp3_supported(client).await.unwrap_or(false);
+    let live = live_line(client, resp3).await;
 
     let rows = [
         ("target", label.to_owned()),
@@ -67,7 +63,8 @@ pub async fn report(client: &redis::Client, label: &str) -> Result<String> {
         ("server", server_line(info.as_deref())),
         ("role", role_line(&role)),
         ("cluster", cluster_line(&cluster)),
-        ("RESP3", resp3_line(&hello).to_owned()),
+        ("RESP3", resp3_line(resp3).to_owned()),
+        ("live", live),
     ];
     let mut out = String::new();
     for (name, value) in rows {
@@ -129,10 +126,51 @@ fn cluster_line(cluster: &RedisResult<String>) -> String {
     }
 }
 
-/// Any error from `HELLO 3` (unknown command before 6.0, `NOPROTO`) means
-/// the server speaks RESP2 only.
-fn resp3_line(hello: &RedisResult<Value>) -> &'static str {
-    if hello.is_ok() {
+/// What `live.mode` would do on this server: `tracking`, `polling 2s (…)`.
+async fn live_line(client: &redis::Client, resp3: bool) -> String {
+    let config = crate::config::try_get()
+        .map(|cfg| cfg.live)
+        .unwrap_or_default();
+    let capability = if !live::needs_capability(config.mode) {
+        None
+    } else if !resp3 {
+        Some(Capability::Resp2)
+    } else {
+        match live::open_tracking(client, None).await {
+            Ok((capability, _)) => Some(capability),
+            Err(e) => return format!("n/a ({e})"),
+        }
+    };
+    live::plan_line(&config, &live::choose(config.mode, capability.as_ref()))
+}
+
+/// Whether the server speaks RESP3: `HELLO 3` on a scratch connection
+/// (`HELLO` switches the connection's protocol, so it gets one of its own).
+/// Any error reply (unknown command before 6.0, `NOPROTO`) means RESP2 only.
+///
+/// # Errors
+///
+/// The scratch connection can't be opened, or `HELLO` times out or loses
+/// the connection.
+pub async fn resp3_supported(client: &redis::Client) -> RedisResult<bool> {
+    let mut conn = connect(client)
+        .await
+        .map_err(|e| redis::RedisError::from((redis::ErrorKind::Io, "connect", e.to_string())))?;
+    hello_means_resp3(timed(redis::cmd("HELLO").arg(3).query_async::<Value>(&mut conn)).await)
+}
+
+/// A reply means RESP3; an error reply means RESP2 only; a lost or timed
+/// out connection says nothing and stays an error.
+fn hello_means_resp3(hello: RedisResult<Value>) -> RedisResult<bool> {
+    match hello {
+        Ok(_) => Ok(true),
+        Err(e) if e.is_io_error() || e.is_connection_dropped() || e.is_timeout() => Err(e),
+        Err(_) => Ok(false),
+    }
+}
+
+fn resp3_line(resp3: bool) -> &'static str {
+    if resp3 {
         "yes"
     } else {
         "no"
@@ -143,7 +181,7 @@ fn resp3_line(hello: &RedisResult<Value>) -> &'static str {
 mod tests {
     use redis::{ErrorKind, RedisError, Value};
 
-    use super::{cluster_line, resp3_line, role_line, server_line};
+    use super::{cluster_line, hello_means_resp3, resp3_line, role_line, server_line};
 
     fn server_err(msg: &'static str) -> RedisError {
         RedisError::from((
@@ -157,8 +195,14 @@ mod tests {
     fn old_servers_are_reported_not_fatal() {
         // Redis 5: HELLO is an unknown command.
         let hello = Err(server_err("unknown command `HELLO`"));
-        assert_eq!(resp3_line(&hello), "no");
-        assert_eq!(resp3_line(&Ok(Value::Nil)), "yes");
+        assert!(!hello_means_resp3(hello).unwrap());
+        assert!(
+            !hello_means_resp3(Err(server_err("NOPROTO unsupported protocol version"))).unwrap()
+        );
+        assert!(hello_means_resp3(Ok(Value::Nil)).unwrap());
+        let io = RedisError::from((ErrorKind::Io, "timed out"));
+        assert!(hello_means_resp3(Err(io)).is_err());
+        assert_eq!(resp3_line(false), "no");
 
         let cluster = Err(server_err("This instance has cluster support disabled"));
         assert_eq!(cluster_line(&cluster), "no");

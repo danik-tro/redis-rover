@@ -1486,6 +1486,7 @@ async fn probe_reports_resp3_on_redis_7() {
     assert!(report.contains("role      master"), "{report}");
     assert!(report.contains("cluster   no"), "{report}");
     assert!(report.contains("RESP3     yes"), "{report}");
+    assert!(report.contains("live      tracking"), "{report}");
 }
 
 /// A pre-6.0 server has no `HELLO`: the probe says so and still succeeds.
@@ -1499,6 +1500,10 @@ async fn probe_reports_no_resp3_on_redis_5() {
     eprintln!("{report}");
     assert!(report.contains("server    Redis 5."), "{report}");
     assert!(report.contains("RESP3     no"), "{report}");
+    assert!(
+        report.contains("live      polling 2s (no RESP3)"),
+        "{report}"
+    );
 }
 
 /// The keyspace's key names as a set, asserting the sweep holds no
