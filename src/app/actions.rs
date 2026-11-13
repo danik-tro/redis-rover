@@ -51,6 +51,7 @@ impl App {
         self.apply(action, now, help_open);
         if self.mode != mode {
             self.sync_backfill_pause();
+            self.sync_live_pause();
         }
     }
 

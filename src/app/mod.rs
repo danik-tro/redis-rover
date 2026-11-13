@@ -144,6 +144,8 @@ struct LiveLink {
     tracked: Option<(String, i64)>,
     /// The task's last status; `None` before the first one.
     status: Option<Liveness>,
+    /// `Pause(true)` was sent last.
+    paused: bool,
 }
 
 /// What decides whether `Render` draws: `dirty`, or data that changes on

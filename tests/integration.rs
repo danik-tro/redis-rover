@@ -1894,3 +1894,84 @@ async fn live_db_switch_rearms() {
     assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
     h.shutdown().await;
 }
+
+/// Open `key` on a server without tracking: the live task polls. Waits for
+/// `Polling` and gives the first check (the baseline) a moment.
+async fn open_polled(h: &mut Harness, key: &str, r_type: RedisType, size: Option<u64>) {
+    {
+        let mut value_state = h.state.value_state.lock();
+        value_state.select(key, r_type);
+        value_state.size = size;
+    }
+    fetch_shown_value(h).await;
+    h.live(LiveCmd::Track {
+        key: key.to_owned(),
+        db: 0,
+    });
+    h.expect("polling", |a| {
+        *a == Action::LiveStatus(Liveness::Polling { every_ms: 2000 })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Redis 5 has no RESP3: rrover connects, polls every 2 s, and a change
+/// shows up within about that.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_polls_on_redis_5() {
+    let server = support::start_redis_tag("5-alpine").await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}user:1", support::prefix("live_polls"));
+    let () = admin.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_polled(&mut h, &key, RedisType::Hash, Some(100)).await;
+
+    // Nothing changed: no notice.
+    let quiet = h.drain(Duration::from_millis(2500)).await;
+    assert!(
+        !quiet
+            .iter()
+            .any(|a| matches!(a, Action::OpenKeyChanged { .. })),
+        "{quiet:?}"
+    );
+
+    let start = Instant::now();
+    let () = admin.hset(&key, "name", "Bob").await.unwrap();
+    let (change, value) = follow_change(&mut h, &key).await;
+    assert_eq!(
+        change,
+        KeyChange::Changed {
+            r_type: "hash".into()
+        }
+    );
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
+    assert!(
+        start.elapsed() < Duration::from_millis(2600),
+        "{:?}",
+        start.elapsed()
+    );
+
+    let () = admin.del(&key).await.unwrap();
+    let (change, _) = follow_change(&mut h, &key).await;
+    assert_eq!(change, KeyChange::Deleted);
+    h.shutdown().await;
+}
+
+/// A key above the `DUMP` limit is fingerprinted by the page on screen: a
+/// change on that page is seen.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_polls_a_large_key_by_its_page() {
+    let server = support::start_redis_tag("5-alpine").await;
+    let mut admin = server.admin(0).await;
+    let key = format!("{}big", support::prefix("live_polls_large"));
+    let () = admin.hset(&key, "name", "Ann").await.unwrap();
+    let mut h = Harness::new(server.client(0), false).await;
+    open_polled(&mut h, &key, RedisType::Hash, Some(1 << 20)).await;
+
+    let () = admin.hset(&key, "name", "Bob").await.unwrap();
+    let (_, value) = follow_change(&mut h, &key).await;
+    assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
+    h.shutdown().await;
+}
