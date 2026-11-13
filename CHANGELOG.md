@@ -66,6 +66,17 @@ First public release. Requires Rust 1.97 or newer.
   every write.
 - On `prod`, deleting a key needs its name typed first.
 - `Shift-r` toggles read-only during the session (asks first on `prod`).
+- Sort the key list (`o`): a menu picks SCAN order, key, type, TTL or size, and picking
+  the active column again reverses it. Metadata of keys never shown on a page is filled
+  in the background; keys still unknown sort last.
+- Type filter (`Shift-t`): show only some types. One type uses `SCAN … TYPE` on Redis 6+;
+  older servers and several types are filtered on the client.
+- Tree view (`v`): keys grouped by a separator (`keyspace.separator`, `:` by default),
+  with group counts; `←` / `→` fold and unfold, `Enter` toggles a group.
+- Load all (`Shift-a`): loads the rest of the keyspace in the background with a progress
+  counter; `Esc` stops it. Above 2M keys it asks first, with a memory estimate.
+- Go to the open key (`g o`): back to the last key opened with `Enter`, unfolding its
+  groups, offering to clear a filter that hides it, and loading keys until it appears.
 - `--print-target` prints the resolved target and where each setting came from (password
   masked), without connecting. `--probe` connects and reports PING, server version, role,
   cluster and RESP3 support. A pre-6.0 server reports `RESP3: no` and still exits 0.
