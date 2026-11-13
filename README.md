@@ -14,6 +14,7 @@ A Redis terminal-ui client written in rust 🦀
 
 - Browse and filter Redis keys with type-colored badges; module types (`json`, `stream`, `MBbloom--`, ...) show their real name
 - Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes). A page turn costs the same on page 1 and page 10,000, even with 10M keys swept
+- Sort the key list by name, type, TTL or size, show only some types, or browse it as a prefix tree (`user:` → `user:1:`); load the whole keyspace in the background (`Shift-a`) and jump back to the open key (`g o`)
 - View strings, lists, sets, hashes and sorted sets; add, edit and delete keys and items, with a confirm step on delete
 - RedisJSON documents pretty-printed; a document above 1 MiB opens as a preview (its top-level fields with type and size, or the first 100 items) instead of freezing the pane
 - Switch between logical databases (`s`) and see the key count of the current one
@@ -162,6 +163,18 @@ In read-only mode every write is refused: add, edit, delete, TTL changes and pub
 
 `Shift-r` toggles read-only during the session. On `prod`, turning it off asks first ("Allow writes to PROD?"). The runner's check follows the toggle.
 
+### Sorting, type filter and tree view
+
+Keys come in SCAN order by default. Every view below works over the keys loaded so far, and the key list says how many that is.
+
+- **Sort** (`o`): a menu picks SCAN order (`x`), key (`k`), type (`t`), TTL (`l`) or size (`s`); picking the active column again reverses it. Sorting by type, TTL or size fills in the metadata of keys that were never on a page in the background (the filter row shows `size 41k/120k` while it runs). Keys still unknown sort last.
+- **Type filter** (`Shift-t`): a checklist of types (`Space` toggles, `Enter` applies). One type uses `SCAN … TYPE` on Redis 6+, otherwise the types are checked on the client.
+- **Tree view** (`v`): keys are grouped at `keyspace.separator` (`:` by default), e.g. `▸ user: (3)`. `→` / `←` unfold and fold a group, `Enter` on a group toggles it and on a key opens it.
+- **Load all** (`Shift-a`): loads the rest of the keyspace in the background, with a counter on the key list's bottom border (`loading 1.2M keys… Esc to stop`). `Esc` stops it and keeps what was loaded. Above 2M keys it asks first, with an estimate of the memory it needs.
+- **Go to the open key** (`g o`): moves the cursor back to the last key opened with `Enter`, unfolding its groups. If the filter hides it, it asks before clearing the filter; if it isn't loaded yet, it loads keys until it shows up.
+
+The sort, type filter and tree stay on after `r` and after switching DBs.
+
 ### Databases
 
 Press `s` to open the DB picker. Move with `j`/`k` (or the arrow keys), or type the DB number, then press `Enter`. The footer shows the current DB and its key count, e.g. `db 3 · 120 keys`. You can also start on a DB with the URL path (`redis://host:6379/3`).
@@ -242,8 +255,13 @@ Press `?` in the app for the full list. Defaults:
 | `j` / `k` | Scroll down / up |
 | `n` / `p` | Next / previous page (of keys, or of the open value) |
 | `Enter` | Open the selected value (or a field of a JSON preview) / confirm |
-| `Esc` | Close popup / leave the value pane |
+| `Esc` | Close popup / leave the value pane / stop loading keys |
 | `f` / `l` | Set / clear the filter pattern (glob, e.g. `user:*`) |
+| `o` | Sort by key, type, TTL or size |
+| `Shift-t` | Show only some types |
+| `v` | Tree view (`←` / `→` fold and unfold) |
+| `Shift-a` | Load all keys (`Esc` stops) |
+| `g o` | Go to the open key |
 | `r` | Refresh keyspace |
 | `a` | Add a new key |
 | `i` | Add an item to the open collection |
