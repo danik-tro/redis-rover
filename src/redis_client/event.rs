@@ -7,6 +7,10 @@ use super::{
 #[derive(Clone, Debug)]
 pub enum RedisEvent {
     FetchKeys,
+    /// Fetch `TYPE` / `TTL` / `MEMORY USAGE` of loaded keys that lack them,
+    /// for a type / TTL / size sort. Runs in its own task, one pipeline of
+    /// 1,000 keys at a time; a second request while it runs is ignored.
+    BackfillMeta,
     /// Switch the browsing connection to logical database `n`.
     SelectDb(i64),
     /// Fetch the page of the selected value described by
@@ -74,6 +78,7 @@ impl RedisEvent {
     pub fn is_write(&self) -> bool {
         match self {
             Self::FetchKeys
+            | Self::BackfillMeta
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -100,6 +105,7 @@ impl RedisEvent {
     pub fn is_destructive(&self) -> bool {
         match self {
             Self::FetchKeys
+            | Self::BackfillMeta
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -125,6 +131,7 @@ impl RedisEvent {
     pub fn preview(&self) -> Vec<String> {
         let cmds = match self {
             Self::FetchKeys
+            | Self::BackfillMeta
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -339,6 +346,7 @@ mod tests {
     fn reads_preview_nothing() {
         let reads = [
             RedisEvent::FetchKeys,
+            RedisEvent::BackfillMeta,
             RedisEvent::FetchValue,
             RedisEvent::SelectDb(1),
             RedisEvent::CountMatches {
@@ -375,6 +383,7 @@ mod tests {
     #[test]
     fn reads_and_writes_are_classified() {
         assert!(!RedisEvent::FetchKeys.is_write());
+        assert!(!RedisEvent::BackfillMeta.is_write());
         assert!(!RedisEvent::FetchValue.is_write());
         assert!(!RedisEvent::SelectDb(3).is_write());
         assert!(!RedisEvent::CountMatches {

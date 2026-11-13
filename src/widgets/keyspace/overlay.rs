@@ -1,6 +1,6 @@
 use super::{
     add_item_pair_titles, format_bytes_u128, ActiveField, KeySpace, KeySpaceWidget, NewKeyDraft,
-    NewKeyStep, NewKind, OverlayKind,
+    NewKeyStep, NewKind, OverlayKind, SORT_MENU,
 };
 
 use ratatui::{
@@ -148,6 +148,60 @@ impl KeySpaceWidget {
 
     /// Center a popup of `height` rows in `area`, returning the inner Rect (after
     /// clearing it). Mirrors the centering used by the other overlays.
+    /// The `o` menu: one row per choice, the active one marked with `›` and
+    /// its direction; the letters pick, the active letter again reverses.
+    pub(super) fn render_sort_menu(state: &KeySpace, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let current = state.page.sort;
+        let width = 26.min(area.width);
+        // One row per choice plus the borders.
+        let height = 7.min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        Clear.render(popup, buf);
+        let lines: Vec<Line> = SORT_MENU
+            .iter()
+            .map(|&(letter, key, label)| {
+                let active = current.map(|sort| sort.key) == key;
+                let arrow = match current {
+                    Some(sort) if active => {
+                        if sort.descending {
+                            "▼"
+                        } else {
+                            "▲"
+                        }
+                    }
+                    _ => " ",
+                };
+                let text = format!(
+                    " {} {letter}  {label:<11}{arrow}",
+                    if active { "›" } else { " " }
+                );
+                if active {
+                    Line::from(text).fg(cfg.colors.base0d).bold()
+                } else {
+                    Line::from(text)
+                }
+            })
+            .collect();
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Sort by ")
+                    .title_bottom(Line::from(" again = reverse · Esc ").fg(cfg.colors.base04))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(cfg.colors.base04)
+                    .bg(cfg.colors.base00)
+                    .fg(cfg.colors.base05),
+            )
+            .render(popup, buf);
+    }
+
     fn centered_popup(area: Rect, height: u16, buf: &mut Buffer) -> Rect {
         let [_, popup_area, _] = Layout::vertical([
             Constraint::Percentage(30),

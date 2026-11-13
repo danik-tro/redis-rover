@@ -34,6 +34,11 @@ const COUNT_MAX_STEPS: usize = 200;
 /// Time budget for one filter match count.
 const COUNT_BUDGET: Duration = Duration::from_secs(2);
 
+/// Keys per metadata backfill pipeline (3 commands each).
+const BACKFILL_BATCH: usize = 1000;
+/// Least time between two `KeyMetaBackfilled` actions (redraws).
+const BACKFILL_NOTIFY: Duration = Duration::from_millis(250);
+
 /// How long a DB switch may take to open its new connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -301,14 +306,24 @@ pub struct EventHandler {
     yank_task: Option<JoinHandle<()>>,
     /// The running value page fetch, if any. A new one aborts it.
     value_task: Option<JoinHandle<()>>,
+    /// The running metadata backfill, if any.
+    backfill_task: Option<JoinHandle<()>>,
+    /// The backfill's own connection, opened on its first run (and again
+    /// after a DB switch), so its pipelines never queue in front of a page.
+    backfill_storage: Option<Storage>,
 }
 
 impl Drop for EventHandler {
     /// The spawned fetches outlive nothing: they stop with the state task.
     fn drop(&mut self) {
-        for task in [&self.count_task, &self.yank_task, &self.value_task]
-            .into_iter()
-            .flatten()
+        for task in [
+            &self.count_task,
+            &self.yank_task,
+            &self.value_task,
+            &self.backfill_task,
+        ]
+        .into_iter()
+        .flatten()
         {
             task.abort();
         }
@@ -335,6 +350,8 @@ impl EventHandler {
             count_task: None,
             yank_task: None,
             value_task: None,
+            backfill_task: None,
+            backfill_storage: None,
         }
     }
 
@@ -467,6 +484,7 @@ impl EventHandler {
                 }
             }
             RedisEvent::FetchKeys => self.fetch_keys().await,
+            RedisEvent::BackfillMeta => self.backfill_meta().await,
         }
     }
 
@@ -479,14 +497,19 @@ impl EventHandler {
         match tokio::try_join!(self.connect_db(db), self.connect_db(db)) {
             Ok((manager, value_manager)) => {
                 self.abort_count();
-                for task in [self.yank_task.take(), self.value_task.take()]
-                    .into_iter()
-                    .flatten()
+                for task in [
+                    self.yank_task.take(),
+                    self.value_task.take(),
+                    self.backfill_task.take(),
+                ]
+                .into_iter()
+                .flatten()
                 {
                     task.abort();
                 }
                 self.storage = Storage::new(manager);
                 self.value_storage = Storage::new(value_manager);
+                self.backfill_storage = None;
                 *self.state.db.lock() = db;
                 self.state.keyspace_state.lock().reset_for_db();
                 self.state.value_state.lock().clear();
@@ -558,6 +581,79 @@ impl EventHandler {
                 }
             };
             crate::action::try_send_action(&tx, action);
+        }));
+    }
+
+    /// Start the metadata backfill unless it is already running. It fetches
+    /// metadata for the keys the sort still lacks, 1,000 per pipeline, the
+    /// keys nearest the current page first, until all are known, the sort no
+    /// longer needs it, or the App pauses it (another screen). Each batch is
+    /// merged into the order; `KeyMetaBackfilled` tells the App to redraw.
+    async fn backfill_meta(&mut self) {
+        if self
+            .backfill_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        if self
+            .state
+            .keyspace_state
+            .lock()
+            .backfill_request(1)
+            .is_none()
+        {
+            return;
+        }
+        let storage = if let Some(storage) = self.backfill_storage.clone() {
+            storage
+        } else {
+            let db = *self.state.db.lock();
+            match self.connect_db(db).await {
+                Ok(manager) => {
+                    let storage = Storage::new(manager);
+                    self.backfill_storage = Some(storage.clone());
+                    storage
+                }
+                Err(err) => {
+                    log::warn!("Opening the backfill connection failed: {err}");
+                    return;
+                }
+            }
+        };
+        let state = self.state.clone();
+        let tx = self.tx.clone();
+        self.backfill_task = Some(tokio::spawn(async move {
+            let mut last_notice: Option<std::time::Instant> = None;
+            // A batch was stored since the last notice.
+            let mut unseen = false;
+            loop {
+                let Some(request) = state.keyspace_state.lock().backfill_request(BACKFILL_BATCH)
+                else {
+                    break;
+                };
+                let metas = match storage.fetch_meta(&request.names).await {
+                    Ok(metas) => metas,
+                    Err(err) => {
+                        log::warn!("Metadata backfill stopped: {err}");
+                        break;
+                    }
+                };
+                if !state.keyspace_state.lock().record_meta(&request, &metas) {
+                    continue;
+                }
+                unseen = true;
+                if last_notice.is_none_or(|at| at.elapsed() >= BACKFILL_NOTIFY) {
+                    last_notice = Some(std::time::Instant::now());
+                    unseen = false;
+                    crate::action::try_send_action(&tx, Action::KeyMetaBackfilled);
+                }
+            }
+            // The last batch always shows.
+            if unseen {
+                crate::action::try_send_action(&tx, Action::KeyMetaBackfilled);
+            }
         }));
     }
 

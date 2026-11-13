@@ -34,6 +34,11 @@ pub enum Action {
     /// A keyspace fetch ended without new keys (failed, or superseded by a
     /// newer fetch). Only clears the loading indicator.
     KeysLoadAborted,
+    /// The metadata backfill stored another batch: the sort order (and the
+    /// page) may have changed.
+    KeyMetaBackfilled,
+    /// `o`: open the sort menu.
+    OpenSortMenu,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
     /// A value fetch failed. Only clears the value's loading indicator.

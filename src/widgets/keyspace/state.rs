@@ -3,6 +3,7 @@ use super::KeySpace;
 use crate::{
     redis_client::types::{
         ItemDelete, JsonPreview, JsonPreviewKind, KeyMeta, KeyValue, KeyspaceState, LoadedValue,
+        Sort,
     },
     widgets::text_view::{TextCache, TextView},
 };
@@ -24,6 +25,11 @@ pub struct PageInfo {
     /// Raw cursor of the next SCAN step (debug detail).
     pub scan_cursor: usize,
     pub pattern: Option<String>,
+    /// Active sort (`None`: SCAN order).
+    pub sort: Option<Sort>,
+    /// `(known, loaded)` keys with metadata while a type / TTL / size sort
+    /// still lacks some; `None` otherwise.
+    pub meta_progress: Option<(usize, usize)>,
 }
 
 impl From<&KeyspaceState> for PageInfo {
@@ -38,11 +44,26 @@ impl From<&KeyspaceState> for PageInfo {
             page_size: state.page_size,
             scan_cursor: state.sweep_cursor,
             pattern: state.pattern.clone(),
+            sort: state.sort(),
+            meta_progress: state
+                .meta_progress()
+                .filter(|&(known, loaded)| known < loaded),
         }
     }
 }
 
 impl PageInfo {
+    /// `size 41k/120k` while the active sort still lacks metadata.
+    pub(super) fn sort_note(&self) -> Option<String> {
+        let (known, loaded) = self.meta_progress?;
+        let key = self.sort?.key.label();
+        Some(format!(
+            "{key} {}/{}",
+            super::format::format_count(known),
+            super::format::format_count(loaded)
+        ))
+    }
+
     /// `Page 3 · 21–30 of 57+` (`+` while the sweep is unfinished).
     pub(super) fn summary(&self) -> String {
         let page = self.page + 1;

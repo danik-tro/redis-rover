@@ -27,7 +27,7 @@ use redis_rover::internals::{
     Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
     JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
     MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Target, Toast, ToastWidget, ValuePageInfo,
+    SharedState, Sort, SortKey, Target, Toast, ToastWidget, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -146,6 +146,8 @@ fn page(keys: usize, known_total: usize, pattern: Option<&str>) -> PageInfo {
         page_size: 10,
         scan_cursor: 0,
         pattern: pattern.map(Into::into),
+        sort: None,
+        meta_progress: None,
     }
 }
 
@@ -197,6 +199,64 @@ fn keys_filtered() {
         .collect::<Vec<_>>();
     let mut keyspace = keyspace(users, page(2, 2, Some("user:*")));
     check("keys_filtered", &draw_keyspace(&mut keyspace, 120, 12));
+}
+
+#[test]
+fn keys_sorted_80() {
+    init();
+    // TTL ▲: soonest expiry first, keys without one after.
+    let mut rows = key_rows();
+    rows.sort_by_key(|k| (k.ttl < 0, k.ttl, k.key.clone()));
+    let info = PageInfo {
+        sort: Some(Sort {
+            key: SortKey::Ttl,
+            descending: false,
+        }),
+        ..page(10, 10, None)
+    };
+    let mut keyspace = keyspace(rows, info);
+    check("keys_sorted_80", &draw_keyspace(&mut keyspace, 80, 20));
+}
+
+/// Size ▼ while the backfill has sizes for 41k of 120k loaded keys.
+#[test]
+fn keys_sorted_partial_120() {
+    init();
+    let mut rows = key_rows();
+    rows.sort_by_key(|k| std::cmp::Reverse(k.size));
+    let info = PageInfo {
+        sort: Some(Sort {
+            key: SortKey::Size,
+            descending: true,
+        }),
+        meta_progress: Some((41_000, 120_000)),
+        known_total: 120_000,
+        complete: false,
+        ..page(10, 10, None)
+    };
+    let mut keyspace = keyspace(rows, info);
+    check(
+        "keys_sorted_partial_120",
+        &draw_keyspace(&mut keyspace, 120, 20),
+    );
+}
+
+/// The `o` menu over a list sorted by size ▼, at 80 columns.
+#[test]
+fn sort_menu_80() {
+    init();
+    let mut rows = key_rows();
+    rows.sort_by_key(|k| std::cmp::Reverse(k.size));
+    let info = PageInfo {
+        sort: Some(Sort {
+            key: SortKey::Size,
+            descending: true,
+        }),
+        ..page(10, 10, None)
+    };
+    let mut keyspace = keyspace(rows, info);
+    keyspace.open_sort_menu();
+    check("sort_menu_80", &draw_keyspace(&mut keyspace, 80, 20));
 }
 
 #[test]

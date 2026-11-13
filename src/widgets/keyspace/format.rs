@@ -163,6 +163,19 @@ pub(super) fn display_json_path(path: &[String]) -> String {
     out
 }
 
+/// Short count for narrow places: `950`, `4.1k`, `41k`, `1.2M`.
+pub(super) fn format_count(n: usize) -> String {
+    // Display only: the precision lost in the casts doesn't show.
+    #[allow(clippy::cast_precision_loss)]
+    let x = n as f64;
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..10_000 => format!("{:.1}k", x / 1e3),
+        10_000..1_000_000 => format!("{}k", n / 1_000),
+        _ => format!("{:.1}M", x / 1e6),
+    }
+}
+
 /// Human byte size, matching the Size field (`64.00 KiB`).
 pub fn format_bytes(n: usize) -> String {
     format_bytes_u128(u128::try_from(n).unwrap_or(u128::MAX))
@@ -372,5 +385,13 @@ mod tests {
         assert_eq!(truncate_to_width("キーキー", 4), "キ…");
         assert_eq!(truncate_to_width("abc", 1), "…");
         assert_eq!(truncate_to_width("abc", 0), "");
+    }
+
+    #[test]
+    fn counts_stay_short() {
+        assert_eq!(format_count(950), "950");
+        assert_eq!(format_count(4_130), "4.1k");
+        assert_eq!(format_count(41_000), "41k");
+        assert_eq!(format_count(1_234_567), "1.2M");
     }
 }

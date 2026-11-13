@@ -46,7 +46,15 @@ impl App {
         // One clock reading per action, passed down.
         let now = self.clock.now();
         let help_open = self.help_is_open();
+        let mode = self.mode;
         self.maybe_dismiss_help(action, now);
+        self.apply(action, now, help_open);
+        if self.mode != mode {
+            self.sync_backfill_pause();
+        }
+    }
+
+    fn apply(&mut self, action: &Action, now: Instant, help_open: bool) {
         match *action {
             Action::Tick => {
                 let mut changed = help_open != self.help_is_open();
@@ -71,7 +79,10 @@ impl App {
             Action::LoadKeysIntoKeySpace => {
                 self.finish_keys_fetch();
                 self.load_new_keys();
+                self.request_backfill();
             }
+            Action::KeyMetaBackfilled => self.meta_backfilled(),
+            Action::OpenSortMenu => self.keyspace.open_sort_menu(),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(),
