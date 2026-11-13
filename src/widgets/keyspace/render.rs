@@ -390,6 +390,32 @@ impl StatefulWidget for KeySpaceWidget {
         } else {
             format!("Page {} · loading…", state.page.page + 1)
         };
+        // The page summary sits bottom left, a running load (else the raw
+        // SCAN cursor, a dim debug detail) bottom right. A load that doesn't
+        // fit beside the summary takes the whole border.
+        let mut summary = Some(
+            Line::from(format!(" {page_summary} "))
+                .fg(cfg.colors.base05)
+                .left_aligned(),
+        );
+        let room = usize::from(t_area.width.saturating_sub(2));
+        let right = match state.load_progress {
+            Some(progress) => {
+                let used = summary.as_ref().map_or(0, Line::width) + 1;
+                let mut label = progress.label(room.saturating_sub(used));
+                if label.chars().count() + used > room {
+                    summary = None;
+                    label = progress.label(room);
+                }
+                Line::from(label).fg(cfg.colors.base0a).right_aligned()
+            }
+            None => Line::from(format!(
+                " {}/page · cursor {} ",
+                state.page.page_size, state.page.scan_cursor
+            ))
+            .fg(cfg.colors.base03)
+            .right_aligned(),
+        };
         let space_block = Block::new()
             .bg(cfg.colors.base00)
             .fg(cfg.colors.base04)
@@ -404,21 +430,11 @@ impl StatefulWidget for KeySpaceWidget {
                 },
                 !value_focused,
             ))
-            // Paging status lives on the bottom border.
-            .title_bottom(
-                Line::from(format!(" {page_summary} "))
-                    .fg(cfg.colors.base05)
-                    .left_aligned(),
-            )
-            // Raw SCAN cursor: secondary/debug detail, kept dim.
-            .title_bottom(
-                Line::from(format!(
-                    " {}/page · cursor {} ",
-                    state.page.page_size, state.page.scan_cursor
-                ))
-                .fg(cfg.colors.base03)
-                .right_aligned(),
-            );
+            .title_bottom(right);
+        let space_block = match summary {
+            Some(summary) => space_block.title_bottom(summary),
+            None => space_block,
+        };
 
         let table_area = space_block.inner(t_area);
         space_block.render(t_area, buf);

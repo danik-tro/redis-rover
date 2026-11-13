@@ -77,6 +77,45 @@ pub struct KeySpace {
     /// Tree mode: one row per entry of `keys`. A group's entry in `keys` is
     /// a stand-in named after its prefix, never treated as a key.
     tree_rows: Option<Vec<PageRow>>,
+    /// A background load is running (`Shift-a`, or `g o` searching).
+    load_progress: Option<LoadProgress>,
+}
+
+/// What the Keys pane's bottom border says while a load runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadProgress {
+    /// Keys loaded so far.
+    pub loaded: usize,
+    /// `g o` is searching for the open key, not loading everything.
+    pub seeking: bool,
+}
+
+impl LoadProgress {
+    /// The longest of ` loading 1.2M keys… Esc to stop `, ` loading 1.2M…
+    /// Esc stops `, ` 1.2M… Esc ` that fits in `width` columns (else the
+    /// shortest).
+    #[must_use]
+    pub fn label(&self, width: usize) -> String {
+        let loaded = format::format_count(self.loaded);
+        let labels = if self.seeking {
+            [
+                format!(" finding the key · {loaded} loaded… Esc to stop "),
+                " finding the key… Esc stops ".to_owned(),
+                format!(" {loaded}… Esc "),
+            ]
+        } else {
+            [
+                format!(" loading {loaded} keys… Esc to stop "),
+                format!(" loading {loaded}… Esc stops "),
+                format!(" {loaded}… Esc "),
+            ]
+        };
+        let [long, medium, short] = labels;
+        [long, medium]
+            .into_iter()
+            .find(|label| label.chars().count() <= width)
+            .unwrap_or(short)
+    }
 }
 
 /// The sort menu's letters (`None` = SCAN order), in the order shown.
@@ -119,6 +158,7 @@ impl KeySpace {
             sort_menu: false,
             type_menu: None,
             tree_rows: None,
+            load_progress: None,
         }
     }
 

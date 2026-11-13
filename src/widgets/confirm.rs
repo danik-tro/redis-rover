@@ -12,7 +12,7 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{config, target::Environment};
+use crate::{config, target::Environment, utils::group_thousands, widgets::keyspace::format_bytes};
 
 /// The typed confirm's one-line input; `expected` is its placeholder.
 #[must_use]
@@ -93,6 +93,46 @@ impl<'a> ConfirmPopup<'a> {
             title: " Lift read-only ".to_owned(),
             body: vec![Line::from(format!("Allow writes to {}?", env.label()))],
             hint: Line::from("y: allow writes   n/Esc: cancel").fg(cfg.colors.base04),
+            color: cfg.colors.env(env),
+            input: None,
+            min_width: MIN_CONTENT_WIDTH,
+        }
+    }
+
+    /// `Shift-a` on a DB above 2M keys: how many, and the memory they take.
+    #[must_use]
+    pub fn load_all(db: i64, keys: u64, bytes: u64, env: Environment) -> Self {
+        let cfg = config::get();
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let keys = group_thousands(usize::try_from(keys).unwrap_or(usize::MAX));
+        Self {
+            title: " Load all keys? ".to_owned(),
+            body: vec![
+                Line::from(format!("DB {db} holds {keys} keys.")),
+                Line::from(format!(
+                    "Loading them all takes about {} of memory.",
+                    format_bytes(bytes)
+                )),
+                Line::from("Esc stops the load at any time.").fg(cfg.colors.base04),
+            ],
+            hint: Line::from("y: load   n/Esc: cancel").fg(cfg.colors.base04),
+            color: cfg.colors.env(env),
+            input: None,
+            min_width: MIN_CONTENT_WIDTH,
+        }
+    }
+
+    /// `g o` while the filter hides the open key.
+    #[must_use]
+    pub fn clear_filter_for(key: &str, env: Environment) -> Self {
+        let cfg = config::get();
+        Self {
+            title: " Clear the filter? ".to_owned(),
+            body: vec![
+                Line::from(format!("The filter hides {key}.")),
+                Line::from("Clear it and go to the key?"),
+            ],
+            hint: Line::from("y: clear and go   n/Esc: cancel").fg(cfg.colors.base04),
             color: cfg.colors.env(env),
             input: None,
             min_width: MIN_CONTENT_WIDTH,

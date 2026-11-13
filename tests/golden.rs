@@ -26,9 +26,10 @@ use ratatui::{
 use redis_rover::internals::{
     render_help, render_typed_confirm, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget,
     Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
-    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
-    MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo,
-    RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadProgress,
+    LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent,
+    RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter,
+    ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -359,6 +360,40 @@ fn tree_unfolded_120() {
     keyspace.set_page_info(info);
     keyspace.select_key_by_name("user:1:name");
     check("tree_unfolded_120", &draw_keyspace(&mut keyspace, 120, 14));
+}
+
+#[test]
+fn load_all_progress_80() {
+    init();
+    let mut keyspace = keyspace(key_rows(), page(10, 1_234_567, None));
+    keyspace.set_load_progress(Some(LoadProgress {
+        loaded: 1_234_567,
+        seeking: false,
+    }));
+    check(
+        "load_all_progress_80",
+        &draw_keyspace(&mut keyspace, 80, 20),
+    );
+    keyspace.set_load_progress(Some(LoadProgress {
+        loaded: 48_000,
+        seeking: true,
+    }));
+    check(
+        "go_to_open_key_search_120",
+        &draw_keyspace(&mut keyspace, 120, 20),
+    );
+}
+
+#[test]
+fn load_all_confirm_80() {
+    init();
+    let mut buf = buffer(80, 16);
+    ConfirmPopup::load_all(0, 3_000_000, 3_000_000 * 107, Environment::Local)
+        .render(buf.area, &mut buf);
+    check("load_all_confirm_80", &buf);
+    let mut buf = buffer(80, 16);
+    ConfirmPopup::clear_filter_for("user:1:name", Environment::Local).render(buf.area, &mut buf);
+    check("clear_filter_confirm_80", &buf);
 }
 
 #[test]

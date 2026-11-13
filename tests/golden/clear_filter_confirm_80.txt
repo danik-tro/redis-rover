@@ -1,0 +1,11 @@
+
+
+
+
+
+                       ╭─────── Clear the filter? ───────╮
+                       │ The filter hides user:1:name.   │
+                       │ Clear it and go to the key?     │
+                       │                                 │
+                       │ y: clear and go   n/Esc: cancel │
+                       ╰─────────────────────────────────╯

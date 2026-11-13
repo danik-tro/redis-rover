@@ -11,6 +11,14 @@ pub enum RedisEvent {
     /// for a type / TTL / size sort. Runs in its own task, one pipeline of
     /// 1,000 keys at a time; a second request while it runs is ignored.
     BackfillMeta,
+    /// Sweep the rest of the keyspace in its own task (`A`), or, with
+    /// `until`, only until that key is loaded (`g o`). Sends
+    /// `LoadAllProgress` a few times a second, then `LoadAllDone`.
+    LoadAll {
+        until: Option<String>,
+    },
+    /// Stop a running `LoadAll`; the keys loaded so far stay.
+    StopLoadAll,
     /// Switch the browsing connection to logical database `n`.
     SelectDb(i64),
     /// Fetch the page of the selected value described by
@@ -79,6 +87,8 @@ impl RedisEvent {
         match self {
             Self::FetchKeys
             | Self::BackfillMeta
+            | Self::LoadAll { .. }
+            | Self::StopLoadAll
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -106,6 +116,8 @@ impl RedisEvent {
         match self {
             Self::FetchKeys
             | Self::BackfillMeta
+            | Self::LoadAll { .. }
+            | Self::StopLoadAll
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -132,6 +144,8 @@ impl RedisEvent {
         let cmds = match self {
             Self::FetchKeys
             | Self::BackfillMeta
+            | Self::LoadAll { .. }
+            | Self::StopLoadAll
             | Self::FetchValue
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
@@ -347,6 +361,11 @@ mod tests {
         let reads = [
             RedisEvent::FetchKeys,
             RedisEvent::BackfillMeta,
+            RedisEvent::LoadAll { until: None },
+            RedisEvent::LoadAll {
+                until: Some("k".into()),
+            },
+            RedisEvent::StopLoadAll,
             RedisEvent::FetchValue,
             RedisEvent::SelectDb(1),
             RedisEvent::CountMatches {

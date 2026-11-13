@@ -17,6 +17,9 @@ pub const DEFAULT_PAGE_SIZE: usize = 10;
 /// `MATCH` pattern on a big keyspace needs fewer round trips per page.
 pub const DEFAULT_SCAN_COUNT: usize = 100;
 
+/// `COUNT` of each SCAN step a load-all takes (at least `scan_count`).
+pub const LOAD_ALL_COUNT: usize = 1000;
+
 /// Keyspace browsing state: pattern plus client-side paging over a single
 /// `SCAN` sweep.
 ///
@@ -70,6 +73,9 @@ pub struct KeyspaceState {
     /// never scans just to fill a page with groups; `n` past the last row
     /// raises it by a page.
     tree_target: usize,
+    /// A key to bring on screen once the order is built
+    /// ([`Self::reveal`]).
+    reveal: Option<String>,
 }
 
 /// Keys whose metadata the backfill fetches next, copied out under the lock.
@@ -394,6 +400,78 @@ impl KeyspaceState {
         }
         self.merge_batch(result.cursor, result.batch);
         SweepApply::Applied
+    }
+
+    /// The next SCAN step of a load-all, from the sweep's cursor whatever
+    /// the page needs. `None` once the sweep has ended.
+    #[must_use]
+    pub fn load_request(&self) -> Option<SweepRequest> {
+        if self.sweep_done {
+            return None;
+        }
+        Some(SweepRequest {
+            pattern: self.pattern.clone(),
+            cursor: self.sweep_cursor,
+            scan_count: self.scan_count.max(LOAD_ALL_COUNT),
+            need: 1,
+            types: self.type_scan(),
+            generation: self.generation,
+            epoch: self.sweep_epoch,
+        })
+    }
+
+    /// `name`'s index in `scanned`, if the sweep has loaded it.
+    #[must_use]
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        let hash = (self.hash)(name);
+        let scanned = &self.scanned;
+        self.seen
+            .find(table_hash(hash), |slot| {
+                slot.hash == hash && scanned[slot.index as usize] == name
+            })
+            .map(|slot| slot.index)
+    }
+
+    /// Bring `name` on screen: once the order is built
+    /// ([`Self::apply_reveal`], run by the runner), go to the page that
+    /// shows it, opening the tree groups it sits in. Bumps `generation`.
+    pub fn reveal(&mut self, name: String) {
+        self.reveal = Some(name);
+        self.generation += 1;
+    }
+
+    /// Go to the page of the key [`Self::reveal`] asked for. Needs the order
+    /// built; a key no longer loaded leaves the page as it is.
+    pub fn apply_reveal(&mut self) {
+        let Some(name) = self.reveal.take() else {
+            return;
+        };
+        let Some(index) = self.index_of(&name) else {
+            return;
+        };
+        if let Some(tree) = self.view.tree_mut() {
+            tree.expand_path(&name);
+            self.refresh_tree();
+        }
+        let position = match (self.view.tree(), self.view.order()) {
+            (Some(tree), Some(_)) => tree
+                .rows()
+                .iter()
+                .position(|row| matches!(*row, TreeRow::Leaf { index: i, .. } if i == index)),
+            (None, Some(order)) => order.iter().position(|&i| i == index),
+            (_, None) => Some(index as usize),
+        };
+        if let Some(position) = position {
+            self.page = position / self.page_size.max(1);
+        }
+    }
+
+    /// Average length of the loaded names (from the first 1,000), for
+    /// a load-all memory estimate. `None` before any key is loaded.
+    #[must_use]
+    pub fn average_name_len(&self) -> Option<usize> {
+        let sample = &self.scanned[..self.scanned.len().min(1000)];
+        (!sample.is_empty()).then(|| sample.iter().map(String::len).sum::<usize>() / sample.len())
     }
 
     /// Copy of the current page's key names, in display order: at most
@@ -746,6 +824,7 @@ impl Default for KeyspaceState {
             type_filter: TypeFilter::default(),
             server_type_scan: true,
             tree_target: DEFAULT_PAGE_SIZE,
+            reveal: None,
         }
     }
 }
@@ -900,6 +979,65 @@ mod tests {
         assert_eq!(row_labels(&state), ["▾ g: (2)", "g:2", "g:1"], "kept open");
         state.reset_for_db();
         assert!(state.is_tree());
+    }
+
+    #[test]
+    fn load_request_runs_to_the_end_whatever_the_page_needs() {
+        let mut state = state_with(10);
+        state.merge_batch(5, names(&["a", "b", "c"]));
+        let request = state.load_request().expect("sweep not done");
+        assert_eq!(request.cursor, 5);
+        assert_eq!(request.scan_count, LOAD_ALL_COUNT);
+        assert_eq!(request.need, 1);
+        // A page fetch moved the sweep first: the load asks again from there.
+        state.merge_batch(9, names(&["d"]));
+        assert_eq!(
+            state.apply_result(&request, result(0, names(&["x"]))),
+            SweepApply::Raced
+        );
+        let request = state.load_request().unwrap();
+        assert_eq!(
+            state.apply_result(&request, result(0, names(&["e"]))),
+            SweepApply::Applied
+        );
+        assert!(state.load_request().is_none(), "the sweep ended");
+        assert_eq!(state.index_of("e"), Some(4));
+        assert_eq!(state.index_of("x"), None);
+    }
+
+    #[test]
+    fn reveal_goes_to_the_page_of_the_key() {
+        let mut state = state_with(2);
+        state.merge_batch(0, names(&["d", "c", "b", "a", "e"]));
+        state.reveal("a".into());
+        state.apply_reveal();
+        assert_eq!(state.page, 1, "SCAN order: a is 4th");
+
+        state.set_sort(Some(Sort {
+            key: SortKey::Name,
+            descending: false,
+        }));
+        state.rebuild_view();
+        state.reveal("e".into());
+        state.apply_reveal();
+        assert_eq!(state.page, 2, "by name: e is 5th");
+
+        state.reveal("gone".into());
+        state.apply_reveal();
+        assert_eq!(state.page, 2, "an unknown key leaves the page");
+    }
+
+    #[test]
+    fn reveal_opens_the_groups_of_the_key() {
+        let mut state = state_with(3);
+        state.merge_batch(0, names(&["user:1:name", "user:1:email", "order:9", "a"]));
+        state.toggle_tree(":");
+        state.rebuild_view();
+        state.reveal("user:1:name".into());
+        state.apply_reveal();
+        // Rows: order:, user:, user:1:, its two keys, a.
+        assert_eq!(state.page, 1);
+        assert_eq!(row_labels(&state), ["user:1:email", "user:1:name", "a"]);
     }
 
     #[test]

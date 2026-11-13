@@ -71,7 +71,7 @@ impl KeyBindings {
                     .iter()
                     .map(key_event_to_string)
                     .collect_vec()
-                    .join("")
+                    .join(" ")
             })
             .collect_vec()
     }

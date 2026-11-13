@@ -1,4 +1,4 @@
-use super::KeySpace;
+use super::{KeySpace, LoadProgress};
 
 use crate::{
     redis_client::types::{
@@ -210,6 +210,15 @@ impl KeySpace {
 
     pub fn refresh(&mut self) {
         self.table.select(None);
+    }
+
+    pub fn set_load_progress(&mut self, progress: Option<LoadProgress>) {
+        self.load_progress = progress;
+    }
+
+    #[must_use]
+    pub fn load_progress(&self) -> Option<&LoadProgress> {
+        self.load_progress.as_ref()
     }
 
     pub fn set_page_info(&mut self, page: PageInfo) {

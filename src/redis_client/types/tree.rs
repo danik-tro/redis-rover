@@ -97,6 +97,16 @@ impl Tree {
         }
     }
 
+    /// Open every group `name` sits in (`user:`, `user:1:` for
+    /// `user:1:name`), so its row shows.
+    pub fn expand_path(&mut self, name: &str) {
+        let mut end = 0;
+        while let Some(at) = name[end..].find(&self.separator) {
+            end += at + self.separator.len();
+            self.expanded.insert(name[..end].to_owned());
+        }
+    }
+
     /// Rebuild the visible rows over `by_name` (sweep indices sorted by
     /// name, ascending). Keys directly in a group follow `sort`.
     pub fn rebuild<I: SortInput + ?Sized>(
@@ -290,5 +300,23 @@ mod tests {
             ["▸ a:: (2)", "  a::", "  a::b", "a:b"]
         );
         assert_eq!(Tree::new("").separator, ":");
+    }
+
+    #[test]
+    fn expand_path_opens_every_ancestor() {
+        let (names, by_name) = setup(&["user:1:name", "user:1:email", "order:9"]);
+        let mut tree = Tree::new(":");
+        tree.expand_path("user:1:name");
+        tree.rebuild(names.as_slice(), &by_name, None);
+        assert_eq!(
+            labels(&tree, &names, &by_name),
+            [
+                "▸ order: (1)",
+                "▸ user: (2)",
+                "  ▸ user:1: (2)",
+                "    user:1:email",
+                "    user:1:name"
+            ]
+        );
     }
 }

@@ -30,6 +30,8 @@
       "o": "OpenSortMenu",
       "<Shift-t>": "TypeFilter",
       "v": "ToggleTree",
+      "<Shift-a>": "LoadAll",
+      "<g><o>": "GoToOpenKey",
       "?": "ToggleHelp",
     },
     "Dashboard": {
