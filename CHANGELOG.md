@@ -77,6 +77,14 @@ First public release. Requires Rust 1.97 or newer.
   counter; `Esc` stops it. Above 2M keys it asks first, with a memory estimate.
 - Go to the open key (`g o`): back to the last key opened with `Enter`, unfolding its
   groups, offering to clear a filter that hides it, and loading keys until it appears.
+- Live updates of the open key: changes from other clients show up without a keypress,
+  with the changed rows highlighted for 1.5 s. On Redis 6+ it uses `CLIENT TRACKING` on
+  one extra connection; older servers, or ones that refuse it, are polled every
+  `live.poll_interval_ms` (2 s). The value pane's title shows `● live`, `◌ polling 2s`
+  or `✕ not live (reason)`, and a lost connection reconnects with backoff and fetches the
+  key again. A deleted or expired key stays on screen, dimmed, with `key deleted ·
+  HH:MM:SS`, and the cursor stays. `live.mode` (`auto`, `tracking`, `poll`, `off`) picks
+  the mode or turns it off, and `--probe` reports what the server supports.
 - `--print-target` prints the resolved target and where each setting came from (password
   masked), without connecting. `--probe` connects and reports PING, server version, role,
   cluster and RESP3 support. A pre-6.0 server reports `RESP3: no` and still exits 0.
