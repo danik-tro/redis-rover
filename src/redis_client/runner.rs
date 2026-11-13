@@ -176,6 +176,7 @@ impl Runner {
         self.live_task = tokio::spawn(live::run(
             self.client.clone(),
             config,
+            self.state.value_state.clone(),
             cmd_rx,
             self.action_tx.clone(),
             self.cancellation_token.clone(),

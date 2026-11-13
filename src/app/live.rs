@@ -8,6 +8,7 @@ use crate::redis_client::{
 };
 
 use super::App;
+use crate::mode::Mode;
 
 impl App {
     /// Tell the live task which key is open now, if that changed.
@@ -29,6 +30,16 @@ impl App {
             None => LiveCmd::Untrack,
         };
         self.send_live(cmd);
+    }
+
+    /// Polling waits while the key list is off screen (dashboard,
+    /// Pub/Sub), like the metadata backfill.
+    pub(super) fn sync_live_pause(&mut self) {
+        let paused = matches!(self.mode, Mode::Dashboard | Mode::PubSub);
+        if paused != self.live.paused {
+            self.live.paused = paused;
+            self.send_live(LiveCmd::Pause(paused));
+        }
     }
 
     pub(super) fn send_live(&self, cmd: LiveCmd) {
@@ -185,6 +196,17 @@ mod tests {
             change: KeyChange::Deleted,
         });
         assert_eq!(app.state.value_state.lock().generation, generation);
+    }
+
+    #[test]
+    fn polling_pauses_off_the_key_list() {
+        let (mut app, mut rx) = live_app();
+        app.update(&Action::ToggleDashboard);
+        app.update(&Action::ToggleDashboard);
+        assert_eq!(
+            sent(&mut rx),
+            vec![LiveCmd::Pause(true), LiveCmd::Pause(false)]
+        );
     }
 
     #[test]

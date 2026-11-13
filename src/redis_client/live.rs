@@ -10,11 +10,27 @@
 //!
 //! A lost connection is reconnected with the Pub/Sub task's [`backoff`]; the
 //! key is re-armed and refetched once, since changes in the gap were missed.
+//!
+//! Without tracking (RESP2, a refused `CLIENT TRACKING`, or
+//! `live.mode = "poll"`) the task polls instead: every `poll_interval_ms`,
+//! while the key list is on screen, it takes a cheap fingerprint of the open
+//! key ([`fingerprint`]) and reports a change only when it differs.
+//!
+//! Notices are spaced at least [`NOTICE_GAP`] apart (the last one always
+//! goes out), so a key written many times a second doesn't restart the
+//! value fetch on every write.
 
-use std::time::Duration;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
+
+use parking_lot::Mutex;
 
 use redis::{
-    aio::MultiplexedConnection, AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
+    aio::{ConnectionManager, MultiplexedConnection},
+    AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -23,7 +39,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::pubsub::backoff;
+use super::{client, pubsub::backoff, types::ValueState};
 use crate::{
     action::{try_send_action, Action},
     config::{LiveConfig, LiveMode},
@@ -31,6 +47,13 @@ use crate::{
 
 /// A key gone within this long of its known expiry counts as expired.
 const EXPIRY_SLACK: Duration = Duration::from_secs(1);
+
+/// Least time between two `OpenKeyChanged` notices.
+pub const NOTICE_GAP: Duration = Duration::from_millis(100);
+
+/// Keys up to this size (`MEMORY USAGE`) are fingerprinted whole with
+/// `DUMP`; larger ones by the page on screen.
+const DUMP_MAX_BYTES: u64 = 64 * 1024;
 
 /// How long opening the live connection (and each setup command) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,28 +152,20 @@ pub enum KeyChange {
 
 /// Run the live task until `cancel` fires or the command channel closes.
 /// The connection opens on the first `Track`.
+/// `value_state` is the App's: polling fingerprints the page it shows.
 pub async fn run(
     client: redis::Client,
     config: LiveConfig,
+    value_state: Arc<Mutex<ValueState>>,
     mut cmd_rx: UnboundedReceiver<LiveCmd>,
     action_tx: Sender<Action>,
     cancel: CancellationToken,
 ) {
-    let db = client.get_connection_info().redis_settings().db();
-    let mut task = LiveTask {
-        client,
-        config,
-        action_tx,
-        conn: None,
-        db,
-        key: None,
-        expires_at: None,
-        retry: None,
-        status: None,
-        no_tracking: false,
-    };
+    let mut task = LiveTask::new(client, config, value_state, action_tx);
     loop {
         let retry_at = task.retry.map(|(_, at)| at);
+        let poll_at = task.poll.as_ref().and_then(|poll| poll.next_at);
+        let notice_at = task.pending.as_ref().map(|(at, _)| *at);
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(cmd) => task.apply(cmd).await,
@@ -158,6 +173,8 @@ pub async fn run(
             },
             push = next_push(task.conn.as_mut()) => task.on_push(push).await,
             () = sleep_until(retry_at) => task.reconnect().await,
+            () = sleep_until(poll_at) => task.poll().await,
+            () = sleep_until(notice_at) => task.flush_notice(Instant::now()),
             () = cancel.cancelled() => break,
         }
     }
@@ -191,6 +208,8 @@ struct LiveTask {
     /// with the tracked key's DB.
     client: redis::Client,
     config: LiveConfig,
+    /// The App's value state: what polling fingerprints.
+    value_state: Arc<Mutex<ValueState>>,
     action_tx: Sender<Action>,
     conn: Option<Tracked>,
     /// DB the connection is (or will be) opened on.
@@ -203,11 +222,71 @@ struct LiveTask {
     retry: Option<(u32, Instant)>,
     /// The status last sent to the App.
     status: Option<Liveness>,
-    /// The server can't track; don't ask again on every key.
+    /// The server can't track and polling isn't wanted (`live.mode =
+    /// "tracking"`); don't ask again on every key.
     no_tracking: bool,
+    /// Polling instead of tracking (`Some` from the start in poll mode, or
+    /// once the server turned out unable to track).
+    poll: Option<Poll>,
+    /// The key list is off screen (dashboard, Pub/Sub): no polling.
+    paused: bool,
+    /// When the last `OpenKeyChanged` went out.
+    last_notice: Option<Instant>,
+    /// A notice held back by [`NOTICE_GAP`], and when it is due.
+    pending: Option<(Instant, Action)>,
+}
+
+/// Poll mode state.
+#[derive(Default)]
+struct Poll {
+    /// Its connection, on `db`. The manager reconnects by itself; a
+    /// fingerprint taken after a gap still shows what changed in it.
+    conn: Option<(i64, ConnectionManager)>,
+    /// When the next check runs (`None`: no key, or paused).
+    next_at: Option<Instant>,
+    /// The last fingerprint and what it was taken of.
+    last: Option<(View, u64)>,
+    /// `DUMP` was refused (ACL): fingerprint by the page instead.
+    no_dump: bool,
+}
+
+/// What a fingerprint covers: a page turn or an opened JSON field changes
+/// it without the key changing, so the baseline restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct View {
+    key: String,
+    page: usize,
+    json_path: Vec<String>,
+    whole: bool,
 }
 
 impl LiveTask {
+    fn new(
+        client: redis::Client,
+        config: LiveConfig,
+        value_state: Arc<Mutex<ValueState>>,
+        action_tx: Sender<Action>,
+    ) -> Self {
+        let db = client.get_connection_info().redis_settings().db();
+        Self {
+            client,
+            config,
+            value_state,
+            action_tx,
+            conn: None,
+            db,
+            key: None,
+            expires_at: None,
+            retry: None,
+            status: None,
+            no_tracking: false,
+            poll: (config.mode == LiveMode::Poll).then(Poll::default),
+            paused: false,
+            last_notice: None,
+            pending: None,
+        }
+    }
+
     async fn apply(&mut self, cmd: LiveCmd) {
         match cmd {
             LiveCmd::Track { key, db } => {
@@ -215,6 +294,10 @@ impl LiveTask {
                 self.db = db;
                 self.key = Some(key);
                 self.expires_at = None;
+                if self.poll.is_some() {
+                    self.start_polling().await;
+                    return;
+                }
                 if self.retry.is_some() || self.no_tracking {
                     // Down: armed on reconnect.
                     return;
@@ -234,8 +317,19 @@ impl LiveTask {
             LiveCmd::Untrack => {
                 self.key = None;
                 self.expires_at = None;
+                self.pending = None;
+                if let Some(poll) = &mut self.poll {
+                    poll.next_at = None;
+                    poll.last = None;
+                }
             }
-            LiveCmd::Pause(_) => {}
+            LiveCmd::Pause(paused) => {
+                self.paused = paused;
+                let due = (!paused && self.key.is_some()).then(Instant::now);
+                if let Some(poll) = &mut self.poll {
+                    poll.next_at = due;
+                }
+            }
         }
     }
 
@@ -257,18 +351,22 @@ impl LiveTask {
                     self.arm().await;
                 }
             }
-            Ok((capability, _)) => {
-                let reason = match choose(self.config.mode, Some(&capability)) {
-                    Plan::Poll { reason } => reason,
-                    Plan::NotLive(reason) => Some(reason),
-                    Plan::Track | Plan::Off => None,
-                };
-                log::info!("Live updates: no CLIENT TRACKING ({capability:?})");
-                self.no_tracking = true;
-                self.set_status(Liveness::NotLive(
-                    reason.unwrap_or_else(|| "no tracking".to_owned()),
-                ));
-            }
+            Ok((capability, _)) => match choose(self.config.mode, Some(&capability)) {
+                Plan::Poll { reason } => {
+                    log::info!(
+                        "Live updates: polling ({})",
+                        reason.as_deref().unwrap_or("configured")
+                    );
+                    self.poll = Some(Poll::default());
+                    self.start_polling().await;
+                }
+                Plan::NotLive(reason) => {
+                    log::info!("Live updates: off ({reason})");
+                    self.no_tracking = true;
+                    self.set_status(Liveness::NotLive(reason));
+                }
+                Plan::Track | Plan::Off => {}
+            },
             Err(err) => {
                 log::warn!("Opening the live connection failed: {err}");
                 self.schedule(1);
@@ -350,16 +448,138 @@ impl LiveTask {
         let Some(key) = self.key.clone() else {
             return;
         };
-        let change = if r_type == "none" {
-            if expired_by.is_some_and(|at| at <= Instant::now() + EXPIRY_SLACK) {
-                KeyChange::Expired
-            } else {
-                KeyChange::Deleted
+        let change = classify(r_type, expired_by);
+        self.notify(key, change);
+    }
+
+    /// Send `OpenKeyChanged`, or hold it until [`NOTICE_GAP`] has passed
+    /// since the last one (a newer change replaces a held one).
+    fn notify(&mut self, key: String, change: KeyChange) {
+        self.notify_at(key, change, Instant::now());
+    }
+
+    fn notify_at(&mut self, key: String, change: KeyChange, now: Instant) {
+        let action = Action::OpenKeyChanged { key, change };
+        match self.last_notice {
+            Some(last) if now < last + NOTICE_GAP => {
+                self.pending = Some((last + NOTICE_GAP, action));
             }
-        } else {
-            KeyChange::Changed { r_type }
+            _ => {
+                self.last_notice = Some(now);
+                self.pending = None;
+                try_send_action(&self.action_tx, action);
+            }
+        }
+    }
+
+    fn flush_notice(&mut self, now: Instant) {
+        if let Some((_, action)) = self.pending.take() {
+            self.last_notice = Some(now);
+            try_send_action(&self.action_tx, action);
+        }
+    }
+
+    /// Open the polling connection on `self.db` (again after a DB switch)
+    /// and check the open key at once, which sets the baseline.
+    async fn start_polling(&mut self) {
+        let Some(poll) = &mut self.poll else {
+            return;
         };
-        try_send_action(&self.action_tx, Action::OpenKeyChanged { key, change });
+        poll.last = None;
+        poll.next_at = None;
+        if poll.conn.as_ref().is_none_or(|(db, _)| *db != self.db) {
+            poll.conn = None;
+            let opened = match self.db_client() {
+                Ok(client) => tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(redis::RedisError::from((redis::ErrorKind::Io, "timed out")))
+                    }),
+                Err(err) => Err(err),
+            };
+            match opened {
+                Ok(conn) => {
+                    if let Some(poll) = &mut self.poll {
+                        poll.conn = Some((self.db, conn));
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Opening the polling connection failed: {err}");
+                    self.schedule(1);
+                    return;
+                }
+            }
+        }
+        self.set_status(self.polling_status());
+        let due = (!self.paused && self.key.is_some()).then(Instant::now);
+        if let Some(poll) = &mut self.poll {
+            poll.next_at = due;
+        }
+    }
+
+    fn polling_status(&self) -> Liveness {
+        let every_ms = u64::try_from(self.config.poll_interval().as_millis()).unwrap_or(u64::MAX);
+        Liveness::Polling { every_ms }
+    }
+
+    /// A poll is due: fingerprint the open key and report a change.
+    async fn poll(&mut self) {
+        let interval = self.config.poll_interval();
+        let Some(poll) = &mut self.poll else {
+            return;
+        };
+        poll.next_at = Some(Instant::now() + interval);
+        let (Some(key), Some((_, conn))) = (self.key.clone(), poll.conn.clone()) else {
+            return;
+        };
+        let snapshot = self.value_state.lock().clone();
+        if snapshot.key.as_deref() != Some(key.as_str()) {
+            // The App hasn't opened it yet.
+            return;
+        }
+        let whole = !poll.no_dump && snapshot.size.is_some_and(|size| size <= DUMP_MAX_BYTES);
+        let view = View {
+            key: key.clone(),
+            page: snapshot.page,
+            json_path: snapshot.json_path.clone(),
+            whole,
+        };
+        let taken = fingerprint(conn, snapshot, whole).await;
+        let Some(poll) = &mut self.poll else {
+            return;
+        };
+        let print = match taken {
+            Ok(print) => print,
+            Err(Failure::DumpRefused(err)) => {
+                log::info!("DUMP refused, polling by page: {err}");
+                poll.no_dump = true;
+                poll.next_at = Some(Instant::now());
+                return;
+            }
+            Err(Failure::Connection(err)) => {
+                log::warn!("Polling {key} failed: {err}");
+                self.set_status(Liveness::NotLive("reconnecting".to_owned()));
+                return;
+            }
+            Err(Failure::Other(err)) => {
+                log::warn!("Polling {key} failed: {err}");
+                self.set_status(Liveness::NotLive(err));
+                return;
+            }
+        };
+        let previous = poll.last.replace((view.clone(), print.hash));
+        let expired_by = std::mem::replace(
+            &mut self.expires_at,
+            u64::try_from(print.pttl)
+                .ok()
+                .map(|ms| Instant::now() + Duration::from_millis(ms)),
+        );
+        self.set_status(self.polling_status());
+        if let Some((last_view, last_hash)) = previous {
+            if last_view == view && last_hash != print.hash {
+                self.notify(key, classify(print.r_type, expired_by));
+            }
+        }
     }
 
     /// A reconnect attempt is due.
@@ -371,7 +591,11 @@ impl LiveTask {
             // Nothing open: connect again on the next `Track`.
             return;
         }
-        self.connect(true).await;
+        if self.poll.is_some() {
+            self.start_polling().await;
+        } else {
+            self.connect(true).await;
+        }
         if self.retry.is_some() {
             // `connect` scheduled attempt 1 again; keep counting.
             self.schedule(attempt.saturating_add(1));
@@ -401,6 +625,103 @@ impl LiveTask {
             try_send_action(&self.action_tx, Action::LiveStatus(status));
         }
     }
+}
+
+/// What a key that changed is now: its type, or gone. Gone within
+/// [`EXPIRY_SLACK`] of its known expiry counts as expired.
+fn classify(r_type: String, expired_by: Option<Instant>) -> KeyChange {
+    classify_at(r_type, expired_by, Instant::now())
+}
+
+fn classify_at(r_type: String, expired_by: Option<Instant>, now: Instant) -> KeyChange {
+    if r_type != "none" {
+        KeyChange::Changed { r_type }
+    } else if expired_by.is_some_and(|at| at <= now + EXPIRY_SLACK) {
+        KeyChange::Expired
+    } else {
+        KeyChange::Deleted
+    }
+}
+
+/// A polled key's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Print {
+    r_type: String,
+    pttl: i64,
+    hash: u64,
+}
+
+#[derive(Debug)]
+enum Failure {
+    DumpRefused(String),
+    Connection(String),
+    Other(String),
+}
+
+/// Fingerprint the key `snapshot` names: `TYPE` and `PTTL`, plus either
+/// `DUMP` (`whole`, small keys: catches a change anywhere in the key) or
+/// the page on screen, fetched as the value task does (bounded: one page,
+/// at most 64 KiB of a string). `OBJECT IDLETIME` isn't used: our own reads
+/// reset it, and it errors under an LFU policy.
+async fn fingerprint(
+    mut conn: ConnectionManager,
+    snapshot: ValueState,
+    whole: bool,
+) -> Result<Print, Failure> {
+    let Some(key) = snapshot.key.clone() else {
+        return Err(Failure::Other("no key".to_owned()));
+    };
+    let mut pipe = redis::pipe();
+    pipe.cmd("TYPE").arg(&key).cmd("PTTL").arg(&key);
+    let reply = if whole {
+        pipe.cmd("DUMP").arg(&key);
+        pipe.query_async::<(String, i64, Option<Vec<u8>>)>(&mut conn)
+            .await
+            .map(|(r_type, pttl, dump)| (r_type, pttl, Some(dump)))
+    } else {
+        pipe.query_async::<(String, i64)>(&mut conn)
+            .await
+            .map(|(r_type, pttl)| (r_type, pttl, None))
+    };
+    let (r_type, pttl, dump) = reply.map_err(|err| {
+        if is_connection_error(&err) {
+            Failure::Connection(err.to_string())
+        } else if whole {
+            Failure::DumpRefused(err.to_string())
+        } else {
+            Failure::Other(err.to_string())
+        }
+    })?;
+    let mut hasher = DefaultHasher::new();
+    r_type.hash(&mut hasher);
+    match dump {
+        Some(dump) => dump.hash(&mut hasher),
+        None if r_type == "none" => {}
+        None if super::types::RedisType::from(r_type.as_str()) != snapshot.r_type => {
+            // Another type: the page can't be read as the old one, and the
+            // type alone already differs.
+        }
+        None => {
+            // The App's state holds the HSCAN / SSCAN sweep it already did;
+            // read the page fresh.
+            let mut snapshot = snapshot;
+            snapshot.rescan();
+            let (_, loaded) = client::fetch_value_page(conn, snapshot)
+                .await
+                .map_err(|err| match err.downcast::<redis::RedisError>() {
+                    Ok(err) if is_connection_error(&err) => Failure::Connection(err.to_string()),
+                    Ok(err) => Failure::Other(err.to_string()),
+                    Err(err) => Failure::Other(err.to_string()),
+                })?;
+            format!("{:?}", loaded.value).hash(&mut hasher);
+            format!("{:?}", loaded.page).hash(&mut hasher);
+        }
+    }
+    Ok(Print {
+        r_type,
+        pttl,
+        hash: hasher.finish(),
+    })
 }
 
 /// Whether an `invalidate` push's data names `key`. A nil payload is a
@@ -543,6 +864,91 @@ mod tests {
         assert!(needs_capability(LiveMode::Tracking));
         assert!(!needs_capability(LiveMode::Poll));
         assert!(!needs_capability(LiveMode::Off));
+    }
+
+    fn task(config: LiveConfig) -> (LiveTask, mpsc::Receiver<Action>) {
+        let (tx, rx) = mpsc::channel(16);
+        let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
+        let task = LiveTask::new(client, config, Arc::default(), tx);
+        (task, rx)
+    }
+
+    fn changed(n: u32) -> KeyChange {
+        KeyChange::Changed {
+            r_type: format!("t{n}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notices_are_spaced_and_the_last_one_goes_out() {
+        let (mut task, mut rx) = task(LiveConfig::default());
+        let t0 = Instant::now();
+        task.notify_at("k".into(), changed(1), t0);
+        assert!(matches!(rx.try_recv(), Ok(Action::OpenKeyChanged { .. })));
+
+        // Two more within the gap: held, the newer replacing the older.
+        let soon = t0 + Duration::from_millis(10);
+        task.notify_at("k".into(), changed(2), soon);
+        task.notify_at("k".into(), changed(3), soon);
+        assert!(rx.try_recv().is_err());
+        let (due, _) = task.pending.as_ref().expect("held");
+        assert_eq!(*due, t0 + NOTICE_GAP);
+
+        task.flush_notice(t0 + NOTICE_GAP);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::OpenKeyChanged {
+                key: "k".into(),
+                change: changed(3)
+            }
+        );
+        assert!(task.pending.is_none());
+
+        task.notify_at("k".into(), changed(4), t0 + NOTICE_GAP * 2);
+        assert!(rx.try_recv().is_ok(), "after the gap: sent at once");
+    }
+
+    #[test]
+    fn gone_keys_are_deleted_unless_their_ttl_ran_out() {
+        let now = Instant::now();
+        assert_eq!(classify_at("hash".into(), None, now), changed_type("hash"));
+        assert_eq!(classify_at("none".into(), None, now), KeyChange::Deleted);
+        assert_eq!(
+            classify_at("none".into(), Some(now + Duration::from_millis(500)), now),
+            KeyChange::Expired
+        );
+        assert_eq!(
+            classify_at("none".into(), Some(now + Duration::from_mins(1)), now),
+            KeyChange::Deleted,
+            "deleted long before it would expire"
+        );
+    }
+
+    fn changed_type(r_type: &str) -> KeyChange {
+        KeyChange::Changed {
+            r_type: r_type.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_mode_waits_for_a_key_and_pauses() {
+        let config = LiveConfig {
+            mode: LiveMode::Poll,
+            ..LiveConfig::default()
+        };
+        let (mut task, _rx) = task(config);
+        assert!(task.poll.is_some(), "poll mode polls from the start");
+        task.apply(LiveCmd::Pause(false)).await;
+        assert_eq!(task.poll.as_ref().unwrap().next_at, None, "no key yet");
+
+        task.key = Some("k".into());
+        task.apply(LiveCmd::Pause(false)).await;
+        assert!(task.poll.as_ref().unwrap().next_at.is_some());
+        task.apply(LiveCmd::Pause(true)).await;
+        assert_eq!(task.poll.as_ref().unwrap().next_at, None, "paused");
+        task.apply(LiveCmd::Pause(false)).await;
+        task.apply(LiveCmd::Untrack).await;
+        assert_eq!(task.poll.as_ref().unwrap().next_at, None, "nothing open");
     }
 
     #[test]
