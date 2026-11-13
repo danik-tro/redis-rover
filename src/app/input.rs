@@ -1,7 +1,11 @@
 use super::App;
 use std::time::{Duration, Instant};
 
-use crate::{config, mode::PopupMode, widgets::keyspace::SORT_MENU};
+use crate::{
+    config,
+    mode::PopupMode,
+    widgets::keyspace::{TypeMenuOutcome, SORT_MENU},
+};
 use crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
 
@@ -62,18 +66,12 @@ impl App {
             return self.handle_keybindings(key);
         }
 
-        // The sort menu takes one letter (or Esc); Ctrl-c still quits.
-        if self.keyspace.is_sort_menu_open() {
+        // The sort menu and the type checklist own every key; Ctrl-c quits.
+        if self.keyspace.is_sort_menu_open() || self.keyspace.is_type_menu_open() {
             if Self::is_quit_key(key) {
                 return Some(Action::Quit);
             }
-            if is_cancel {
-                self.keyspace.close_sort_menu();
-            } else if let KeyCode::Char(c) = key.code {
-                if let Some(choice) = SORT_MENU.iter().find(|item| item.0 == c) {
-                    self.pick_sort(choice.1);
-                }
-            }
+            self.handle_menu_key(key, is_cancel);
             return None;
         }
 
@@ -145,6 +143,23 @@ impl App {
         self.handle_keybindings(key)
     }
 
+    /// A key in the open sort menu (one letter picks, Esc closes) or type
+    /// checklist (Esc cancels, Enter applies, the rest is the widget's).
+    fn handle_menu_key(&mut self, key: KeyEvent, is_cancel: bool) {
+        if self.keyspace.is_sort_menu_open() {
+            if is_cancel {
+                self.keyspace.close_sort_menu();
+            } else if let KeyCode::Char(c) = key.code {
+                if let Some(choice) = SORT_MENU.iter().find(|item| item.0 == c) {
+                    self.pick_sort(choice.1);
+                }
+            }
+        } else if is_cancel {
+            self.keyspace.close_type_menu();
+        } else if let TypeMenuOutcome::Apply(filter) = self.keyspace.handle_type_menu_key(key) {
+            self.apply_type_filter(filter);
+        }
+    }
     /// Keys in the Pub/Sub tab. Popups take raw keys (Esc cancels, Ctrl-c
     /// still quits): Enter subscribes in the add popup, Ctrl-s sends in the
     /// publish popup. Otherwise Esc closes the help overlay first, then keys

@@ -44,6 +44,7 @@ impl From<Command> for Action {
             Command::PubSubTogglePause => Self::PubSubTogglePause,
             Command::ToggleReadOnly => Self::ToggleReadOnly,
             Command::OpenSortMenu => Self::OpenSortMenu,
+            Command::TypeFilter => Self::OpenTypeFilter,
         }
     }
 }

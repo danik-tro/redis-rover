@@ -4,6 +4,7 @@ mod input;
 mod overlay;
 mod render;
 mod state;
+mod type_menu;
 
 pub use format::format_bytes;
 pub(crate) use format::truncate_to_width;
@@ -12,6 +13,7 @@ pub(crate) use forms::{build_input_text_area, input_text};
 pub use input::OverlayRequest;
 pub use render::KeySpaceWidget;
 pub use state::{PageInfo, ScrollOutcome};
+pub use type_menu::{TypeMenu, TypeMenuOutcome};
 
 use forms::{
     add_item_pair_titles, ActionOverlay, ActiveField, AddItemDraft, EditItemDraft, FilterPreview,
@@ -19,12 +21,14 @@ use forms::{
 };
 use state::{Focus, KeySpaceMode, KeySpacePopupMode, SelectedElement};
 
+use crossterm::event::KeyEvent;
 use ratatui::widgets::TableState;
 use ratatui_textarea::TextArea;
 
 use crate::{
     redis_client::types::{
         zset_entry_json, KeyMeta, KeyValue, KeyspaceState, LoadedValue, RedisType, SortKey,
+        TypeFilter,
     },
     widgets::text_view::{TextCache, TextView},
 };
@@ -68,6 +72,8 @@ pub struct KeySpace {
     json_path: Vec<String>,
     /// The `o` sort menu is open.
     sort_menu: bool,
+    /// The `Shift-t` type checklist, while open.
+    type_menu: Option<TypeMenu>,
 }
 
 /// The sort menu's letters (`None` = SCAN order), in the order shown.
@@ -108,6 +114,7 @@ impl KeySpace {
             visible_rows: 0,
             json_path: Vec::new(),
             sort_menu: false,
+            type_menu: None,
         }
     }
 
@@ -171,6 +178,28 @@ impl KeySpace {
 
     pub fn is_sort_menu_open(&self) -> bool {
         self.sort_menu
+    }
+
+    /// Open the type checklist, ticked as `filter`, offering the types on
+    /// the page next to the standard ones.
+    pub fn open_type_menu(&mut self, filter: &TypeFilter) {
+        let seen = self.keys.iter().map(|meta| meta.r_type.name());
+        self.type_menu = Some(TypeMenu::new(filter, seen));
+    }
+
+    pub fn close_type_menu(&mut self) {
+        self.type_menu = None;
+    }
+
+    pub fn is_type_menu_open(&self) -> bool {
+        self.type_menu.is_some()
+    }
+
+    /// A key in the open type checklist.
+    pub fn handle_type_menu_key(&mut self, key: KeyEvent) -> TypeMenuOutcome {
+        self.type_menu
+            .as_mut()
+            .map_or(TypeMenuOutcome::Open, |menu| menu.handle_key(key))
     }
 
     /// Key rows that fit in the table, as measured by the last render.

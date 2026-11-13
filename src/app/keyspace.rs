@@ -4,7 +4,7 @@ use std::time::Instant;
 use super::confirm::{AfterWrite, Reselect};
 use crate::redis_client::{
     event::RedisEvent,
-    types::{ItemDelete, RedisType, Sort, SortKey},
+    types::{ItemDelete, RedisType, Sort, SortKey, TypeFilter},
 };
 
 use crate::{
@@ -434,6 +434,21 @@ impl App {
         self.request_backfill();
     }
 
+    /// `Shift-t`: the type checklist, ticked as the active filter.
+    pub(super) fn open_type_filter(&mut self) {
+        let filter = self.state.keyspace_state.lock().type_filter().clone();
+        self.keyspace.open_type_menu(&filter);
+    }
+
+    /// Enter in the type checklist: show only those types (none ticked: all).
+    /// Restarts the sweep from page 1, like a new pattern.
+    pub(super) fn apply_type_filter(&mut self, filter: TypeFilter) {
+        self.keyspace.close_type_menu();
+        if self.state.keyspace_state.lock().set_type_filter(filter) {
+            self.fetch_keys();
+        }
+    }
+
     /// Start the metadata backfill if the sort still lacks some (the runner
     /// ignores it while one runs).
     pub(super) fn request_backfill(&mut self) {
@@ -621,6 +636,45 @@ mod tests {
         press(&mut app, KeyCode::Char('o'), none);
         press(&mut app, KeyCode::Char('x'), none);
         assert_eq!(app.state.keyspace_state.lock().sort(), None);
+    }
+
+    #[test]
+    fn shift_t_opens_the_type_checklist_and_enter_applies() {
+        use crate::app::tests::press;
+        use crate::redis_client::{event::RedisEvent, types::TypeFilter};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, _cmds, mut redis_rx) = crate::app::tests::app_with_channels();
+        app.mode = crate::mode::Mode::KeySpace;
+        let none = KeyModifiers::empty();
+
+        press(&mut app, KeyCode::Char('T'), KeyModifiers::SHIFT);
+        assert!(app.keyspace.is_type_menu_open());
+        press(&mut app, KeyCode::Esc, none);
+        assert!(!app.keyspace.is_type_menu_open());
+        assert!(redis_rx.try_recv().is_err(), "Esc changes nothing");
+
+        // string, list, set, zset, hash: tick hash.
+        press(&mut app, KeyCode::Char('T'), KeyModifiers::SHIFT);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j'), none);
+        }
+        press(&mut app, KeyCode::Char(' '), none);
+        assert!(app.keyspace.is_type_menu_open(), "Space only ticks");
+        press(&mut app, KeyCode::Enter, none);
+        assert!(!app.keyspace.is_type_menu_open());
+        assert_eq!(
+            app.state.keyspace_state.lock().type_filter(),
+            &TypeFilter::new(["hash"])
+        );
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchKeys)));
+
+        // Reopened ticked as applied; x + Enter shows every type again.
+        press(&mut app, KeyCode::Char('T'), KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('x'), none);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.state.keyspace_state.lock().type_filter().is_empty());
+        assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchKeys)));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use parking_lot::Mutex;
 use ratatui::{
     buffer::Buffer,
@@ -27,7 +28,7 @@ use redis_rover::internals::{
     Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
     JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
     MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Sort, SortKey, Target, Toast, ToastWidget, ValuePageInfo,
+    SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -148,6 +149,7 @@ fn page(keys: usize, known_total: usize, pattern: Option<&str>) -> PageInfo {
         pattern: pattern.map(Into::into),
         sort: None,
         meta_progress: None,
+        types: String::new(),
     }
 }
 
@@ -257,6 +259,39 @@ fn sort_menu_80() {
     let mut keyspace = keyspace(rows, info);
     keyspace.open_sort_menu();
     check("sort_menu_80", &draw_keyspace(&mut keyspace, 80, 20));
+}
+
+#[test]
+fn type_filter_popup_80() {
+    init();
+    let mut keyspace = keyspace(key_rows(), page(10, 10, None));
+    // The module type on the page is offered after the standard ones.
+    keyspace.open_type_menu(&TypeFilter::new(["zset"]));
+    for code in [KeyCode::Down; 4].into_iter().chain([KeyCode::Char(' ')]) {
+        keyspace.handle_type_menu_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    check(
+        "type_filter_popup_80",
+        &draw_keyspace(&mut keyspace, 80, 20),
+    );
+}
+
+#[test]
+fn keys_type_filtered_120() {
+    init();
+    let rows: Vec<KeyMeta> = key_rows()
+        .into_iter()
+        .filter(|k| k.key.starts_with("user:"))
+        .collect();
+    let info = PageInfo {
+        types: TypeFilter::new(["hash", "zset"]).label(),
+        ..page(rows.len(), rows.len(), Some("user:*"))
+    };
+    let mut keyspace = keyspace(rows, info);
+    check(
+        "keys_type_filtered_120",
+        &draw_keyspace(&mut keyspace, 120, 12),
+    );
 }
 
 #[test]

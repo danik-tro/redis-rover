@@ -1,8 +1,10 @@
 mod keyspace;
+mod type_filter;
 mod value;
 mod view;
 
 pub use keyspace::{KeyspaceState, SweepApply, SweepRequest, SweepResult};
+pub use type_filter::{TypeFilter, TypeScan, STANDARD_TYPES};
 pub use value::{
     json_path, zset_entry_json, JsonField, JsonPreview, JsonPreviewKind, LoadedValue, ScanSweep,
     ValuePageInfo, ValueState, DEFAULT_JSON_PREVIEW_BYTES, JSON_PREVIEW_ITEMS,

@@ -1,6 +1,6 @@
 use super::{
     add_item_pair_titles, format_bytes_u128, ActiveField, KeySpace, KeySpaceWidget, NewKeyDraft,
-    NewKeyStep, NewKind, OverlayKind, SORT_MENU,
+    NewKeyStep, NewKind, OverlayKind, TypeMenu, SORT_MENU,
 };
 
 use ratatui::{
@@ -146,8 +146,6 @@ impl KeySpaceWidget {
             .render(popup_area, buf);
     }
 
-    /// Center a popup of `height` rows in `area`, returning the inner Rect (after
-    /// clearing it). Mirrors the centering used by the other overlays.
     /// The `o` menu: one row per choice, the active one marked with `›` and
     /// its direction; the letters pick, the active letter again reverses.
     pub(super) fn render_sort_menu(state: &KeySpace, area: Rect, buf: &mut Buffer) {
@@ -202,6 +200,60 @@ impl KeySpaceWidget {
             .render(popup, buf);
     }
 
+    /// The `Shift-t` checklist: `[x]` per picked type, `›` on the cursor
+    /// row. Scrolls when the area is shorter than the list.
+    pub(super) fn render_type_menu(menu: &TypeMenu, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let width = 26.min(area.width);
+        let rows = u16::try_from(menu.items.len()).unwrap_or(u16::MAX);
+        let height = rows.saturating_add(2).min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        Clear.render(popup, buf);
+        let shown = usize::from(height.saturating_sub(2)).max(1);
+        let first = (menu.cursor + 1).saturating_sub(shown);
+        let lines: Vec<Line> = menu
+            .items
+            .iter()
+            .zip(&menu.checked)
+            .enumerate()
+            .skip(first)
+            .take(shown)
+            .map(|(row, (name, &checked))| {
+                let on_cursor = row == menu.cursor;
+                let text = format!(
+                    " {} [{}] {name}",
+                    if on_cursor { "›" } else { " " },
+                    if checked { "x" } else { " " }
+                );
+                let line = Line::from(text);
+                match (on_cursor, checked) {
+                    (true, _) => line.fg(cfg.colors.base0d).bold(),
+                    (false, true) => line.fg(cfg.colors.base0e),
+                    (false, false) => line,
+                }
+            })
+            .collect();
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Show types ")
+                    .title_bottom(Line::from(" Space · x none · Enter ").fg(cfg.colors.base04))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(cfg.colors.base04)
+                    .bg(cfg.colors.base00)
+                    .fg(cfg.colors.base05),
+            )
+            .render(popup, buf);
+    }
+
+    /// Center a popup of `height` rows in `area`, returning the inner Rect (after
+    /// clearing it). Mirrors the centering used by the other overlays.
     fn centered_popup(area: Rect, height: u16, buf: &mut Buffer) -> Rect {
         let [_, popup_area, _] = Layout::vertical([
             Constraint::Percentage(30),

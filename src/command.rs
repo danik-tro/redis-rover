@@ -44,4 +44,5 @@ pub enum Command {
     PubSubTogglePause,
     ToggleReadOnly,
     OpenSortMenu,
+    TypeFilter,
 }

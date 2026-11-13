@@ -13,6 +13,7 @@
                                      │ Set filter pattern                  f       │
                                      │ Delete filter pattern               l       │
                                      │ Sort by key / type / TTL / size     o       │
+                                     │ Show only some types                Shift-T │
                                      │ Enter value / JSON field / confirm  Enter   │
                                      │ Add new key                         a       │
                                      │ Add item (in collection)            i       │

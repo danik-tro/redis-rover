@@ -28,6 +28,7 @@
       "<Shift-y>": "YankKey",
       "<Shift-r>": "ToggleReadOnly",
       "o": "OpenSortMenu",
+      "<Shift-t>": "TypeFilter",
       "?": "ToggleHelp",
     },
     "Dashboard": {

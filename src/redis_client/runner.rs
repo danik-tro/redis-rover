@@ -21,7 +21,7 @@ use super::{
     client,
     event::RedisEvent,
     pubsub::{self, PubSubCmd},
-    storage::Storage,
+    storage::{Storage, TypeScanRejected},
     types::{RedisType, SweepApply, ValueState},
 };
 
@@ -729,7 +729,15 @@ impl EventHandler {
             let Some(request) = self.state.keyspace_state.lock().sweep_request() else {
                 break;
             };
-            let result = self.storage.scan_until(&request).await?;
+            let result = match self.storage.scan_until(&request).await {
+                Ok(result) => result,
+                // Before Redis 6: filter types on the client and ask again.
+                Err(err) if err.is::<TypeScanRejected>() => {
+                    self.state.keyspace_state.lock().disable_server_type_scan();
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let mut state = self.state.keyspace_state.lock();
             // Merge even after a page turn (the sweep is still valid), but
             // leave the newer page to the newer FetchKeys.
