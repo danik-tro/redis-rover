@@ -7,8 +7,13 @@ use crate::redis_client::{
     types::RedisType,
 };
 
+use std::time::{Duration, SystemTime};
+
 use super::App;
 use crate::mode::Mode;
+
+/// How long rows a live refetch changed stay highlighted.
+pub(super) const CHANGED_HIGHLIGHT: Duration = Duration::from_millis(1500);
 
 impl App {
     /// Tell the live task which key is open now, if that changed.
@@ -50,8 +55,10 @@ impl App {
     }
 
     /// The live task saw `key` change. Refetch it in place: same page,
-    /// same row, same scroll; a new type starts over.
-    pub(super) fn open_key_changed(&mut self, key: &str, change: &KeyChange) {
+    /// same row, same scroll; a new type starts over. A key that is gone
+    /// keeps its last value on screen, marked with the time (`wall`), and
+    /// the cursor stays where it is.
+    pub(super) fn open_key_changed(&mut self, key: &str, change: &KeyChange, wall: SystemTime) {
         // A page reload can leave the cursor elsewhere (or nowhere) while
         // the value state still names the key; nothing is shown for it then.
         if self
@@ -66,23 +73,29 @@ impl App {
             if value_state.key.as_deref() != Some(key) {
                 return;
             }
-            match change {
-                KeyChange::Changed { r_type } => {
-                    let r_type = RedisType::from(r_type.as_str());
-                    if r_type == value_state.r_type {
-                        value_state.rescan();
-                    } else {
-                        value_state.select(key, r_type);
-                    }
-                }
-                KeyChange::Deleted | KeyChange::Expired => value_state.rescan(),
+            let KeyChange::Changed { r_type } = change else {
+                drop(value_state);
+                self.live.refetching = false;
+                self.keyspace
+                    .mark_gone(key, *change == KeyChange::Expired, wall);
+                return;
+            };
+            let r_type = RedisType::from(r_type.as_str());
+            // Only the same type on the same page lines up row by row.
+            self.live.refetching = r_type == value_state.r_type;
+            if self.live.refetching {
+                value_state.rescan();
+            } else {
+                value_state.select(key, r_type);
             }
         }
+        self.keyspace.clear_gone();
         self.send_redis_event(RedisEvent::FetchValue);
     }
 
     pub(super) fn set_liveness(&mut self, status: &Liveness) {
         self.live.status = Some(status.clone());
+        self.keyspace.set_liveness(Some(status.clone()));
     }
 
     #[cfg(test)]
@@ -207,6 +220,81 @@ mod tests {
             sent(&mut rx),
             vec![LiveCmd::Pause(true), LiveCmd::Pause(false)]
         );
+    }
+
+    /// The open key `a` loaded as a hash, then changed by another client.
+    #[test]
+    fn a_change_highlights_the_changed_rows_for_a_while() {
+        use std::sync::Arc;
+
+        use crate::{
+            clock::FixedClock,
+            redis_client::types::{KeyValue, LoadedValue, ValuePageInfo},
+        };
+
+        let (mut app, _rx) = live_app();
+        let clock = Arc::new(FixedClock::new(std::time::UNIX_EPOCH));
+        app.clock = clock.clone();
+        let hash = |name: &str| {
+            Some(LoadedValue {
+                value: KeyValue::Hash(vec![
+                    ("name".into(), name.into()),
+                    ("plan".into(), "pro".into()),
+                ]),
+                page: ValuePageInfo::default(),
+            })
+        };
+        app.update(&Action::RequestSelectedValue);
+        *app.state.selected_value.lock() = hash("Ann");
+        app.update(&Action::LoadSelectedValueIntoView);
+        assert!(app.keyspace.changed_rows().is_empty(), "a first load");
+
+        app.update(&Action::OpenKeyChanged {
+            key: "a".into(),
+            change: KeyChange::Changed {
+                r_type: "string".into(),
+            },
+        });
+        *app.state.selected_value.lock() = hash("Bob");
+        app.update(&Action::LoadSelectedValueIntoView);
+        assert_eq!(app.keyspace.changed_rows(), [0]);
+
+        app.redraw.dirty = false;
+        clock.advance(Duration::from_millis(1499));
+        app.update(&Action::Tick);
+        assert!(!app.redraw.dirty);
+        clock.advance(Duration::from_millis(1));
+        app.update(&Action::Tick);
+        assert!(app.keyspace.changed_rows().is_empty());
+        assert!(app.redraw.dirty, "the highlight going away redraws");
+    }
+
+    #[test]
+    fn a_deleted_key_stays_on_screen_and_is_not_refetched() {
+        let (mut app, _rx) = live_app();
+        app.update(&Action::RequestSelectedValue);
+        let generation = app.state.value_state.lock().generation;
+        app.update(&Action::OpenKeyChanged {
+            key: "a".into(),
+            change: KeyChange::Deleted,
+        });
+        assert_eq!(app.state.value_state.lock().generation, generation);
+        assert!(app.keyspace.is_gone());
+        assert_eq!(
+            app.keyspace.selected_key().map(|(key, _)| key).as_deref(),
+            Some("a"),
+            "the cursor stays"
+        );
+
+        // Created again: refetched and no longer gone.
+        app.update(&Action::OpenKeyChanged {
+            key: "a".into(),
+            change: KeyChange::Changed {
+                r_type: "string".into(),
+            },
+        });
+        assert!(app.state.value_state.lock().generation > generation);
+        assert!(!app.keyspace.is_gone());
     }
 
     #[test]

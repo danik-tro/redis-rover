@@ -1,0 +1,14 @@
+╭ Keys ────────────────────╮╭ Values ─────────────── ✕ not live (reconnecting) ╮
+│ filter *                 ││ Key   user:1001                                  │
+│ ──────────────────────── ││ Type  hash                                       │
+│   Ty      TTL       Size ││ TTL   No expiry                                  │
+│ ──────────────────────── ││ Size  312 B                                      │
+│ ▌ ha        ∞      312 B ││ ──────────────────────────────────────────────── │
+│   ha        ∞      296 B ││   Field                   Value                  │
+│   st       1h       96 B ││ ──────────────────────────────────────────────── │
+│   li        ∞   2.00 KiB ││   name                    Ann Example            │
+│   se        ∞      540 B ││   email                   ann@example.com        │
+│   zs       1d   1.17 KiB ││   plan                    pro                    │
+│   st        ∞   8.00 KiB ││   visits                  42                     │
+│   js        ∞      420 B ││                                                  │
+╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯

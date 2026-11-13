@@ -26,10 +26,10 @@ use ratatui::{
 use redis_rover::internals::{
     render_help, render_typed_confirm, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget,
     Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
-    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadProgress,
-    LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent,
-    RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter,
-    ValuePageInfo,
+    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness,
+    LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget,
+    RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget,
+    TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -488,6 +488,94 @@ fn value_hash() {
         ),
     );
     check("value_hash", &draw_keyspace(&mut keyspace, 120, 20));
+}
+
+// ---- Live updates ---------------------------------------------------------
+
+fn user_hash(name: &str) -> KeyValue {
+    KeyValue::Hash(
+        [
+            ("name", name),
+            ("email", "ann@example.com"),
+            ("plan", "pro"),
+            ("visits", "42"),
+        ]
+        .iter()
+        .map(|(f, v)| ((*f).into(), (*v).into()))
+        .collect(),
+    )
+}
+
+/// `user:1001` open, with the live task's `status`.
+fn live_value(status: Liveness) -> KeySpace {
+    let mut keyspace = with_value("user:1001", user_hash("Ann Example"));
+    keyspace.set_liveness(Some(status));
+    keyspace
+}
+
+#[test]
+fn value_live_120() {
+    init();
+    let mut keyspace = live_value(Liveness::Live);
+    check("value_live_120", &draw_keyspace(&mut keyspace, 120, 14));
+}
+
+#[test]
+fn value_polling_80() {
+    init();
+    let mut keyspace = live_value(Liveness::Polling { every_ms: 2000 });
+    check("value_polling_80", &draw_keyspace(&mut keyspace, 80, 14));
+}
+
+#[test]
+fn value_not_live_80() {
+    init();
+    let mut keyspace = live_value(Liveness::NotLive("reconnecting".into()));
+    check("value_not_live_80", &draw_keyspace(&mut keyspace, 80, 14));
+}
+
+/// The text has no colours, so the highlight is checked on the cells.
+#[test]
+fn value_changed_row_120() {
+    init();
+    let mut keyspace = live_value(Liveness::Live);
+    keyspace.show_live_value(
+        Some(LoadedValue {
+            value: user_hash("Bob"),
+            page: ValuePageInfo::default(),
+        }),
+        Instant::now() + Duration::from_millis(1500),
+    );
+    let buf = draw_keyspace(&mut keyspace, 120, 14);
+    check("value_changed_row_120", &buf);
+    let row_of = |text: &str| {
+        (0..buf.area.height)
+            .find(|&y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap()
+    };
+    let bg = |text: &str| buf[(60, row_of(text))].bg;
+    assert_ne!(
+        bg("Bob"),
+        bg("ann@example.com"),
+        "the changed row stands out"
+    );
+    assert_eq!(bg("pro"), bg("ann@example.com"));
+}
+
+#[test]
+fn value_deleted_80() {
+    init();
+    let mut keyspace = live_value(Liveness::Live);
+    let wall = UNIX_EPOCH + Duration::from_secs(14 * 3600 + 22 * 60 + 7);
+    keyspace.mark_gone("user:1001", false, wall);
+    let buf = draw_keyspace(&mut keyspace, 80, 14);
+    check("value_deleted_80", &buf);
+    assert!(dump(&buf).contains("key deleted · 14:22:07"));
 }
 
 /// AC5: TTLs and a toast drawn at a fixed time render the same on every run.

@@ -55,16 +55,20 @@ impl App {
         }
     }
 
+    /// A `Tick` redraws only when something shown changed.
+    fn tick(&mut self, now: Instant, help_open: bool) {
+        let mut changed = help_open != self.help_is_open();
+        changed |= self.expire_pending_chord(now);
+        changed |= self.request_filter_count(now);
+        changed |= self.toast.expire(now);
+        changed |= self.keyspace.expire_changed(now);
+        changed |= self.pubsub_tick(now, self.clock.wall());
+        self.redraw.dirty |= changed;
+    }
+
     fn apply(&mut self, action: &Action, now: Instant, help_open: bool) {
         match *action {
-            Action::Tick => {
-                let mut changed = help_open != self.help_is_open();
-                changed |= self.expire_pending_chord(now);
-                changed |= self.request_filter_count(now);
-                changed |= self.toast.expire(now);
-                changed |= self.pubsub_tick(now, self.clock.wall());
-                self.redraw.dirty |= changed;
-            }
+            Action::Tick => self.tick(now, help_open),
             Action::Quit => self.should_quit = true,
             // `Resize` / `Render` are terminal work, done by `handle_action`.
             Action::Resize(..) | Action::Render | Action::Refresh => {}
@@ -92,7 +96,7 @@ impl App {
             Action::ToggleTree => self.toggle_tree(),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
-            Action::LoadSelectedValueIntoView => self.load_selected_value(),
+            Action::LoadSelectedValueIntoView => self.load_selected_value(now),
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(),
             Action::ScrollUp => self.scroll_up(),
@@ -132,7 +136,7 @@ impl App {
             Action::OpenKeyChanged {
                 ref key,
                 ref change,
-            } => self.open_key_changed(key, change),
+            } => self.open_key_changed(key, change, self.clock.wall()),
             Action::LiveStatus(ref status) => self.set_liveness(status),
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
@@ -430,7 +434,7 @@ mod tests {
             value: KeyValue::Json(serde_json::json!({ "x": 1 })),
             page: ValuePageInfo::default(),
         });
-        app.load_selected_value();
+        app.load_selected_value(std::time::Instant::now());
         assert!(app.keyspace.is_text_focused());
 
         // Esc: back to the preview, on row 1 ("b").
@@ -438,7 +442,7 @@ mod tests {
         assert!(app.state.value_state.lock().json_path.is_empty());
         assert!(matches!(redis_rx.try_recv(), Ok(RedisEvent::FetchValue)));
         *app.state.selected_value.lock() = Some(preview);
-        app.load_selected_value();
+        app.load_selected_value(std::time::Instant::now());
         assert_eq!(app.keyspace.selected_json_field().as_deref(), Some("b"));
 
         // Esc at the root leaves the value as before.

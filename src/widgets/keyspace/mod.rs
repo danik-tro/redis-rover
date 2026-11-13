@@ -1,6 +1,7 @@
 mod format;
 mod forms;
 mod input;
+mod live;
 mod overlay;
 mod render;
 mod state;
@@ -79,6 +80,8 @@ pub struct KeySpace {
     tree_rows: Option<Vec<PageRow>>,
     /// A background load is running (`Shift-a`, or `g o` searching).
     load_progress: Option<LoadProgress>,
+    /// Liveness label, changed rows and a gone key (live updates).
+    live: live::LiveView,
 }
 
 /// What the Keys pane's bottom border says while a load runs.
@@ -159,6 +162,7 @@ impl KeySpace {
             type_menu: None,
             tree_rows: None,
             load_progress: None,
+            live: live::LiveView::default(),
         }
     }
 

@@ -172,6 +172,7 @@ fn bench_text(c: &mut Criterion) {
         header: "Value",
         paging: false,
         close: None,
+        ..TextLabels::default()
     };
     let mut group = c.benchmark_group("render_text");
     group.sample_size(10);

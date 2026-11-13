@@ -1,6 +1,8 @@
 use super::App;
 use std::time::Instant;
 
+use super::live::CHANGED_HIGHLIGHT;
+
 use super::confirm::{AfterWrite, Reselect};
 use crate::redis_client::{
     event::RedisEvent,
@@ -154,6 +156,7 @@ impl App {
         self.json_focus_row = Some(row);
         self.page_turn_row = None;
         self.keyspace.set_value_loading();
+        self.live.refetching = false;
         self.send_redis_event(RedisEvent::FetchValue);
     }
 
@@ -307,6 +310,7 @@ impl App {
         if moved {
             self.page_turn_row = Some(row);
             self.keyspace.set_value_loading();
+            self.live.refetching = false;
             self.send_redis_event(RedisEvent::FetchValue);
         }
     }
@@ -372,15 +376,21 @@ impl App {
         self.page_turn_row = None;
         self.json_focus_row = None;
         self.keyspace.set_value_loading();
+        self.live.refetching = false;
         self.send_redis_event(RedisEvent::FetchValue);
         self.track_open_key();
     }
 
-    pub(super) fn load_selected_value(&mut self) {
+    pub(super) fn load_selected_value(&mut self, now: Instant) {
         let value = self.state.selected_value.lock().clone();
         let json_path = self.state.value_state.lock().json_path.clone();
         self.keyspace.set_json_path(json_path);
-        self.keyspace.set_selected_value(value);
+        if std::mem::take(&mut self.live.refetching) {
+            self.keyspace
+                .show_live_value(value, now + CHANGED_HIGHLIGHT);
+        } else {
+            self.keyspace.set_selected_value(value);
+        }
 
         if let Some(row) = self.json_focus_row.take() {
             self.keyspace.focus_value_at(row);
