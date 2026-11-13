@@ -451,7 +451,7 @@ impl Default for Base16Palette {
 }
 
 #[serde_as]
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeyspaceConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub string: Color,
@@ -481,6 +481,15 @@ pub struct KeyspaceConfig {
     /// instead of read whole; see [`KeyspaceConfig::json_preview_bytes`].
     #[serde(default = "default_json_preview_bytes")]
     pub json_preview_bytes: usize,
+
+    /// Splits key names into the tree view's groups (`user:1:name` →
+    /// `user:` → `user:1:`). Empty means the default, `:`.
+    #[serde(default = "default_separator")]
+    pub separator: String,
+}
+
+fn default_separator() -> String {
+    crate::redis_client::types::DEFAULT_SEPARATOR.to_owned()
 }
 
 fn default_json_preview_bytes() -> usize {
@@ -510,6 +519,7 @@ impl Default for KeyspaceConfig {
             stream: Color::from_str("#8be9fd").unwrap(),
             unknown: Color::from_str("#f71638").unwrap(),
             json_preview_bytes: default_json_preview_bytes(),
+            separator: default_separator(),
         }
     }
 }

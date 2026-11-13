@@ -41,6 +41,8 @@ pub enum Action {
     OpenSortMenu,
     /// `Shift-t`: open the type filter checklist.
     OpenTypeFilter,
+    /// `v`: flat list ↔ prefix tree.
+    ToggleTree,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
     /// A value fetch failed. Only clears the value's loading indicator.

@@ -84,6 +84,7 @@ impl App {
             Action::KeyMetaBackfilled => self.meta_backfilled(),
             Action::OpenSortMenu => self.keyspace.open_sort_menu(),
             Action::OpenTypeFilter => self.open_type_filter(),
+            Action::ToggleTree => self.toggle_tree(),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(),
@@ -94,7 +95,7 @@ impl App {
                 let right = *action == Action::ScrollRight;
                 if self.mode == Mode::PubSub {
                     self.pubsub.pan_detail(right);
-                } else {
+                } else if !self.fold_tree(right) {
                     self.keyspace.pan_text(right);
                 }
             }
@@ -115,7 +116,11 @@ impl App {
             Action::DiscardKeyspacePopup => self.close_popup(),
             Action::ConfirmKeyspacePopup => self.confirm_popup(),
             Action::DeleteKeyspaceFilter => self.delete_keyspace_filter(),
-            Action::EnterValue => self.enter_value(),
+            Action::EnterValue => {
+                if !self.toggle_group() {
+                    self.enter_value();
+                }
+            }
             Action::RequestDeleteKey => self.request_delete_key(),
             Action::RequestSetTtl => self.request_set_ttl(),
             Action::RequestEditValue => self.request_edit_value(),

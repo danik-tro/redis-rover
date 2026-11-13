@@ -12,7 +12,7 @@
 
 use std::cmp::Ordering;
 
-use super::{KeyMeta, KeyValue, RedisType};
+use super::{tree::Tree, KeyMeta, KeyValue, RedisType};
 
 /// What the key list is sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,18 +343,71 @@ pub fn merge_run(order: &mut Vec<u32>, mut run: Vec<u32>, cmp: impl Fn(u32, u32)
 /// Sort and display-order state of the key list.
 #[derive(Debug, Clone, Default)]
 pub struct KeyView {
+    /// The sort the user picked. In tree mode it orders the keys inside
+    /// each group; the order itself is by name.
     sort: Option<Sort>,
-    /// Sweep indices in display order. `None` with a sort set means it must
-    /// be rebuilt; `None` without one means SCAN order.
+    /// Sweep indices sorted by [`Self::order_sort`]. `None` with such a
+    /// sort means it must be rebuilt; `None` without one means SCAN order.
     order: Option<Vec<u32>>,
-    /// Bumped on every sort change, so a rebuild for an older sort is dropped.
+    /// Bumped on every change of the order's sort, so a rebuild for an
+    /// older one is dropped.
     sort_generation: u64,
+    /// Prefix tree mode, built over the name order.
+    tree: Option<Tree>,
 }
+
+const BY_NAME: Sort = Sort {
+    key: SortKey::Name,
+    descending: false,
+};
 
 impl KeyView {
     #[must_use]
     pub fn sort(&self) -> Option<Sort> {
         self.sort
+    }
+
+    /// What `order` is sorted by: by name in tree mode, else the user's
+    /// sort.
+    fn order_sort(&self) -> Option<Sort> {
+        if self.tree.is_some() {
+            Some(BY_NAME)
+        } else {
+            self.sort
+        }
+    }
+
+    #[must_use]
+    pub fn tree(&self) -> Option<&Tree> {
+        self.tree.as_ref()
+    }
+
+    pub fn tree_mut(&mut self) -> Option<&mut Tree> {
+        self.tree.as_mut()
+    }
+
+    /// Turn tree mode on (with this separator) or off. The order is
+    /// rebuilt by the next page fetch if its sort changes.
+    pub fn set_tree(&mut self, tree: Option<Tree>) {
+        let before = self.order_sort();
+        self.tree = tree;
+        if self.order_sort() != before {
+            self.order = None;
+            self.sort_generation += 1;
+        }
+    }
+
+    /// Rebuild the tree's visible rows (nothing outside tree mode; no rows
+    /// while the order waits for its rebuild).
+    pub fn refresh_tree<I: SortInput + ?Sized>(&mut self, input: &I) {
+        let sort = self.sort;
+        let (Some(tree), order) = (self.tree.as_mut(), self.order.as_deref()) else {
+            return;
+        };
+        match order {
+            Some(by_name) => tree.rebuild(input, by_name, sort),
+            None => tree.clear_rows(),
+        }
     }
 
     /// The display order, when a sort is set and the order is built.
@@ -366,17 +419,21 @@ impl KeyView {
     /// A sort is set but its order isn't built yet.
     #[must_use]
     pub fn needs_rebuild(&self) -> bool {
-        self.sort.is_some() && self.order.is_none()
+        self.order_sort().is_some() && self.order.is_none()
     }
 
-    /// Change the sort. The order is rebuilt by the next page fetch.
+    /// Change the sort. The order is rebuilt by the next page fetch (in
+    /// tree mode it stays by name; only the rows change).
     pub fn set_sort(&mut self, sort: Option<Sort>) {
         if self.sort == sort {
             return;
         }
+        let before = self.order_sort();
         self.sort = sort;
-        self.order = None;
-        self.sort_generation += 1;
+        if self.order_sort() != before {
+            self.order = None;
+            self.sort_generation += 1;
+        }
     }
 
     /// The sweep restarted: keep the sort, drop the order.
@@ -387,7 +444,7 @@ impl KeyView {
 
     /// Merge the new sweep indices `from..to` into the built order.
     pub fn merge_new<I: SortInput + ?Sized>(&mut self, names: &I, from: u32, to: u32) {
-        let (Some(sort), Some(order)) = (self.sort, self.order.as_mut()) else {
+        let (Some(sort), Some(order)) = (self.order_sort(), self.order.as_mut()) else {
             return;
         };
         merge_run(order, (from..to).collect(), |a, b| {
@@ -398,7 +455,7 @@ impl KeyView {
     /// Keys `indices` got their metadata: move them to their place in a
     /// type / TTL / size order (they sat at the end as unknown).
     pub fn reposition<I: SortInput + ?Sized>(&mut self, input: &I, indices: &[u32]) {
-        let (Some(sort), Some(order)) = (self.sort, self.order.as_mut()) else {
+        let (Some(sort), Some(order)) = (self.order_sort(), self.order.as_mut()) else {
             return;
         };
         if !sort.key.needs_meta() || indices.is_empty() {
@@ -416,7 +473,7 @@ impl KeyView {
 
     /// Build the order inline over `len` names.
     pub fn rebuild<I: SortInput + ?Sized>(&mut self, names: &I, len: u32) {
-        if let Some(sort) = self.sort {
+        if let Some(sort) = self.order_sort() {
             self.order = Some(sort_indices(names, len, sort));
         }
     }
@@ -425,7 +482,7 @@ impl KeyView {
     /// lock. `None` without a sort.
     #[must_use]
     pub fn job(&self, names: &[String], meta: Option<&MetaColumns>, epoch: u64) -> Option<SortJob> {
-        let sort = self.sort?;
+        let sort = self.order_sort()?;
         Some(SortJob {
             names: NameArena::copy(names),
             meta: meta.filter(|_| sort.key.needs_meta()).cloned(),

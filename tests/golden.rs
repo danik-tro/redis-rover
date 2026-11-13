@@ -27,8 +27,8 @@ use redis_rover::internals::{
     render_help, render_typed_confirm, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget,
     Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
     JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, LoadedValue,
-    MetricsHistory, Mode, PageInfo, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo,
+    RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -150,6 +150,7 @@ fn page(keys: usize, known_total: usize, pattern: Option<&str>) -> PageInfo {
         sort: None,
         meta_progress: None,
         types: String::new(),
+        tree_keys: None,
     }
 }
 
@@ -292,6 +293,72 @@ fn keys_type_filtered_120() {
         "keys_type_filtered_120",
         &draw_keyspace(&mut keyspace, 120, 12),
     );
+}
+
+fn group(prefix: &str, count: usize, depth: u16, expanded: bool) -> PageRow {
+    PageRow::Group {
+        prefix: prefix.into(),
+        count,
+        depth,
+        expanded,
+    }
+}
+
+/// `user:1:name`, `user:1:email`, `user:2:name`, `order:9` plus two keys
+/// outside any group, the tree folded.
+#[test]
+fn tree_folded_80() {
+    init();
+    let leaves = vec![
+        key("config", RedisType::Hash, 312, -1),
+        key("counter", RedisType::String, 56, -1),
+    ];
+    let rows = vec![
+        group("order:", 1, 0, false),
+        group("user:", 3, 0, false),
+        PageRow::Leaf { depth: 0 },
+        PageRow::Leaf { depth: 0 },
+    ];
+    let info = PageInfo {
+        tree_keys: Some(6),
+        ..page(4, 4, None)
+    };
+    let mut keyspace = KeySpace::new(Vec::new());
+    keyspace.set_page(leaves, Some(rows));
+    keyspace.set_page_info(info);
+    keyspace.select_key_by_name("user:");
+    check("tree_folded_80", &draw_keyspace(&mut keyspace, 80, 14));
+}
+
+#[test]
+fn tree_unfolded_120() {
+    init();
+    let leaves = vec![
+        key("user:1:email", RedisType::String, 72, -1),
+        key("user:1:name", RedisType::String, 64, 3_600),
+        key("user:2:name", RedisType::String, 64, -1),
+        key("config", RedisType::Hash, 312, -1),
+        key("counter", RedisType::String, 56, -1),
+    ];
+    let rows = vec![
+        group("order:", 1, 0, false),
+        group("user:", 3, 0, true),
+        group("user:1:", 2, 1, true),
+        PageRow::Leaf { depth: 2 },
+        PageRow::Leaf { depth: 2 },
+        PageRow::Leaf { depth: 1 },
+        PageRow::Leaf { depth: 0 },
+        PageRow::Leaf { depth: 0 },
+    ];
+    let info = PageInfo {
+        tree_keys: Some(6),
+        ..page(8, 8, None)
+    };
+    let mut keyspace = KeySpace::new(Vec::new());
+    keyspace.set_page(leaves, Some(rows));
+    keyspace.set_page_info(info);
+    keyspace.select_key_by_name("user:1:name");
+    check("tree_unfolded_120", &draw_keyspace(&mut keyspace, 120, 14));
 }
 
 #[test]

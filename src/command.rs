@@ -45,4 +45,5 @@ pub enum Command {
     ToggleReadOnly,
     OpenSortMenu,
     TypeFilter,
+    ToggleTree,
 }

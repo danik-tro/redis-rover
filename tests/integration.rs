@@ -24,7 +24,8 @@ use redis::AsyncCommands;
 use redis_rover::{
     internals::{
         Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyItem,
-        KeyValue, NewKeySpec, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
+        KeyValue, NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target,
+        TypeFilter,
     },
     Cli,
 };
@@ -448,6 +449,60 @@ async fn type_filter_survives_rescan_and_db_switch() {
     assert_eq!(shown, db3.zsets.iter().cloned().collect(), "db 3 zsets");
     h.state.keyspace_state.lock().rescan();
     assert_eq!(h.fetch_all_pages().await.len(), 7, "after a rescan");
+    h.shutdown().await;
+}
+
+/// The page as the key table shows it: `▸ user: (3)` for a group, the
+/// name for a key.
+fn tree_labels(h: &Harness) -> Vec<String> {
+    let ks = h.state.keyspace_state.lock();
+    let mut keys = ks.page_keys().into_iter();
+    ks.page_rows()
+        .expect("tree mode")
+        .into_iter()
+        .map(|row| match row {
+            PageRow::Group { prefix, count, .. } => format!("▸ {prefix} ({count})"),
+            PageRow::Leaf { .. } => keys.next().expect("a key per leaf"),
+        })
+        .collect()
+}
+
+/// The tree groups seeded prefixes, unfolds, and stays a tree (with its
+/// open groups) after a rescan and a DB switch.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn tree_groups_seeded_prefixes() {
+    let server = support::start_redis().await;
+    let names = ["user:1:name", "user:1:email", "user:2:name", "order:9"];
+    for db in [0, 3] {
+        let mut admin = server.admin(db).await;
+        for name in names {
+            let () = admin.set(name, "v").await.expect("SET");
+        }
+    }
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state.keyspace_state.lock().toggle_tree(":");
+    h.fetch_page().await;
+    assert_eq!(tree_labels(&h), ["▸ order: (1)", "▸ user: (3)"]);
+    let opened = h.state.keyspace_state.lock().set_group(1, Some(true));
+    assert_eq!(opened.as_deref(), Some("user:"));
+    h.fetch_page().await;
+    let unfolded = [
+        "▸ order: (1)",
+        "▸ user: (3)",
+        "▸ user:1: (2)",
+        "user:2:name",
+    ];
+    assert_eq!(tree_labels(&h), unfolded);
+
+    h.state.keyspace_state.lock().rescan();
+    h.fetch_page().await;
+    assert_eq!(tree_labels(&h), unfolded, "after a rescan");
+
+    h.send(RedisEvent::SelectDb(3));
+    h.expect("DbSwitched", |a| *a == Action::DbSwitched).await;
+    h.fetch_page().await;
+    assert_eq!(tree_labels(&h), unfolded, "after SelectDb(3)");
     h.shutdown().await;
 }
 

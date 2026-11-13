@@ -32,6 +32,8 @@ pub struct PageInfo {
     pub meta_progress: Option<(usize, usize)>,
     /// Picked types as `hash,zset` (empty: every type).
     pub types: String,
+    /// Tree mode: keys loaded (the rows count groups and keys shown).
+    pub tree_keys: Option<usize>,
 }
 
 impl From<&KeyspaceState> for PageInfo {
@@ -51,12 +53,22 @@ impl From<&KeyspaceState> for PageInfo {
                 .meta_progress()
                 .filter(|&(known, loaded)| known < loaded),
             types: state.type_filter().label(),
+            tree_keys: state.is_tree().then_some(state.scanned.len()),
         }
     }
 }
 
 impl PageInfo {
     /// `size 41k/120k` while the active sort still lacks metadata.
+    /// The filter row's right end: the sort's `size 41k/120k` while it
+    /// lacks metadata, else `tree · 1.2k keys` in tree mode.
+    pub(super) fn note(&self) -> Option<String> {
+        self.sort_note().or_else(|| {
+            self.tree_keys
+                .map(|keys| format!("tree · {} keys", super::format::format_count(keys)))
+        })
+    }
+
     pub(super) fn sort_note(&self) -> Option<String> {
         let (known, loaded) = self.meta_progress?;
         let key = self.sort?.key.label();
@@ -208,7 +220,9 @@ impl KeySpace {
         self.loading = loading;
     }
 
+    /// Show `keys` as the flat list.
     pub fn set_keys(&mut self, keys: Vec<KeyMeta>) {
+        self.tree_rows = None;
         _ = std::mem::replace(&mut self.keys, keys);
         self.loaded = true;
     }

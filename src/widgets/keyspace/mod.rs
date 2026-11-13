@@ -27,8 +27,8 @@ use ratatui_textarea::TextArea;
 
 use crate::{
     redis_client::types::{
-        zset_entry_json, KeyMeta, KeyValue, KeyspaceState, LoadedValue, RedisType, SortKey,
-        TypeFilter,
+        zset_entry_json, KeyMeta, KeyValue, KeyspaceState, LoadedValue, PageRow, RedisType,
+        SortKey, TypeFilter,
     },
     widgets::text_view::{TextCache, TextView},
 };
@@ -74,6 +74,9 @@ pub struct KeySpace {
     sort_menu: bool,
     /// The `Shift-t` type checklist, while open.
     type_menu: Option<TypeMenu>,
+    /// Tree mode: one row per entry of `keys`. A group's entry in `keys` is
+    /// a stand-in named after its prefix, never treated as a key.
+    tree_rows: Option<Vec<PageRow>>,
 }
 
 /// The sort menu's letters (`None` = SCAN order), in the order shown.
@@ -115,13 +118,67 @@ impl KeySpace {
             json_path: Vec::new(),
             sort_menu: false,
             type_menu: None,
+            tree_rows: None,
         }
     }
 
     /// Size (`MEMORY USAGE`) of the selected key, if any.
     pub fn selected_size(&self) -> Option<u128> {
-        let meta = self.keys.get(self.table.selected()?)?;
+        let meta = self.key_at(self.table.selected()?)?;
         Some(meta.size)
+    }
+
+    /// The key on table row `row`; `None` for a group row.
+    pub(super) fn key_at(&self, row: usize) -> Option<&KeyMeta> {
+        if matches!(self.tree_row(row), Some(PageRow::Group { .. })) {
+            return None;
+        }
+        self.keys.get(row)
+    }
+
+    fn tree_row(&self, row: usize) -> Option<&PageRow> {
+        self.tree_rows.as_ref()?.get(row)
+    }
+
+    /// The selected row's group in tree mode: `(prefix, expanded)`.
+    pub fn selected_group(&self) -> Option<(&str, bool)> {
+        match self.tree_row(self.table.selected()?)? {
+            PageRow::Group {
+                prefix, expanded, ..
+            } => Some((prefix, *expanded)),
+            PageRow::Leaf { .. } => None,
+        }
+    }
+
+    /// Show a tree page: `rows` with one `Leaf` per entry of `keys`, in
+    /// order. `None` shows `keys` as the flat list.
+    pub fn set_page(&mut self, keys: Vec<KeyMeta>, rows: Option<Vec<PageRow>>) {
+        let Some(rows) = rows else {
+            self.set_keys(keys);
+            return;
+        };
+        let mut leaves = keys.into_iter();
+        let mut table = Vec::with_capacity(rows.len());
+        let mut shown = Vec::with_capacity(rows.len());
+        for row in rows {
+            let entry = match &row {
+                PageRow::Group { prefix, .. } => KeyMeta {
+                    key: prefix.clone(),
+                    r_type: RedisType::Unknown(String::new()),
+                    size: 0,
+                    ttl: -1,
+                    value: KeyValue::Unknown,
+                },
+                PageRow::Leaf { .. } => match leaves.next() {
+                    Some(meta) => meta,
+                    None => break,
+                },
+            };
+            table.push(entry);
+            shown.push(row);
+        }
+        self.set_keys(table);
+        self.tree_rows = Some(shown);
     }
 
     /// Text to copy for the selected collection element (#27), when focus is
@@ -183,7 +240,9 @@ impl KeySpace {
     /// Open the type checklist, ticked as `filter`, offering the types on
     /// the page next to the standard ones.
     pub fn open_type_menu(&mut self, filter: &TypeFilter) {
-        let seen = self.keys.iter().map(|meta| meta.r_type.name());
+        let seen = (0..self.keys.len())
+            .filter_map(|row| self.key_at(row))
+            .map(|meta| meta.r_type.name());
         self.type_menu = Some(TypeMenu::new(filter, seen));
     }
 
@@ -213,24 +272,24 @@ impl KeySpace {
     }
 
     pub fn selected_key(&self) -> Option<(String, RedisType)> {
-        let idx = self.table.selected()?;
-        let meta = self.keys.get(idx)?;
+        let meta = self.key_at(self.table.selected()?)?;
         Some((meta.key.clone(), meta.r_type.clone()))
     }
 
-    /// The table lists exactly `names`, in this order.
+    /// The table lists exactly the keys `names`, in this order (group rows
+    /// aside).
     pub fn shows_keys(&self, names: &[String]) -> bool {
-        self.keys.len() == names.len()
-            && self
-                .keys
-                .iter()
-                .zip(names)
-                .all(|(row, name)| row.key == *name)
+        let keys: Vec<&str> = (0..self.keys.len())
+            .filter_map(|row| self.key_at(row))
+            .map(|meta| meta.key.as_str())
+            .collect();
+        keys.len() == names.len() && keys.iter().zip(names).all(|(key, name)| key == name)
     }
 
     /// Re-select the row whose key matches `name`, if it's still present in the
     /// current page. Used to keep the cursor on a key across a refresh after a
-    /// non-destructive edit. Returns `true` if the key was found and selected.
+    /// non-destructive edit. A group's prefix selects its row in tree mode.
+    /// Returns `true` if the key was found and selected.
     pub fn select_key_by_name(&mut self, name: &str) -> bool {
         if let Some(idx) = self.keys.iter().position(|meta| meta.key == name) {
             self.table.select(Some(idx));

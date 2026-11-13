@@ -1,6 +1,6 @@
 use super::{
-    format_bytes_u128, format_ttl, format_ttl_detail, truncate_to_width, value_footer, Focus,
-    KeySpace, CLUSTER_BANNER,
+    format::format_count, format_bytes_u128, format_ttl, format_ttl_detail, truncate_to_width,
+    value_footer, Focus, KeySpace, CLUSTER_BANNER,
 };
 
 use byte_unit::{Byte, UnitType};
@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     config,
     redis_client::types::{
-        JsonField, JsonPreview, JsonPreviewKind, KeyValue, SortKey, TYPE_BADGE_WIDTH,
+        JsonField, JsonPreview, JsonPreviewKind, KeyValue, PageRow, SortKey, TYPE_BADGE_WIDTH,
     },
     widgets::text_view::{self, TextLabels},
 };
@@ -65,10 +65,16 @@ impl KeySpaceWidget {
         let cfg = config::get();
         // Inside the Values pane's border.
         let inner = Block::new().borders(Borders::ALL).inner(area);
-        let selected = state
-            .table
-            .selected()
-            .and_then(|index| state.keys.get(index));
+        if let Some((prefix, expanded)) = state.selected_group() {
+            let hint = if expanded {
+                "Enter or ← to close"
+            } else {
+                "Enter or → to open"
+            };
+            Self::render_placeholder(vec![Line::from(format!("{prefix} · {hint}"))], inner, buf);
+            return;
+        }
+        let selected = state.table.selected().and_then(|row| state.key_at(row));
         let Some(key) = selected else {
             Self::render_placeholder(vec![Line::from("Select a key · Enter to open")], inner, buf);
             return;
@@ -298,6 +304,26 @@ impl KeySpaceWidget {
 #[allow(clippy::cast_possible_truncation)]
 const TYPE_COLUMN_WIDTH: u16 = TYPE_BADGE_WIDTH as u16;
 
+/// A column of the key table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Type,
+    Key,
+    Ttl,
+    Size,
+}
+
+impl Column {
+    fn width(self) -> Constraint {
+        match self {
+            Self::Type => Constraint::Length(TYPE_COLUMN_WIDTH),
+            Self::Key => Constraint::Fill(1),
+            Self::Ttl => Constraint::Length(7),
+            Self::Size => Constraint::Length(10),
+        }
+    }
+}
+
 /// Selection marker shared by the key and value tables.
 fn highlight_symbol() -> Span<'static> {
     Span::from("▌ ").fg(config::get().colors.base0d)
@@ -423,8 +449,9 @@ impl StatefulWidget for KeySpaceWidget {
         .areas(table_area);
 
         // While a type / TTL / size sort still lacks metadata, the right end
-        // says how much is known (`size 41k/120k`).
-        let note = state.page.sort_note();
+        // says how much is known (`size 41k/120k`); in tree mode, how many
+        // keys the tree groups.
+        let note = state.page.note();
         let note_width = note
             .as_deref()
             .map_or(0, |n| u16::try_from(n.width()).unwrap_or(u16::MAX));
@@ -462,12 +489,14 @@ impl StatefulWidget for KeySpaceWidget {
         // Header + the rule row under it take two lines.
         state.visible_rows = usize::from(table_area.height.saturating_sub(2)).max(1);
 
-        let widths = [
-            Constraint::Length(TYPE_COLUMN_WIDTH),
-            Constraint::Fill(1),
-            Constraint::Length(7),
-            Constraint::Length(10),
-        ];
+        // The flat list shows every column. The tree needs room for its
+        // names, so a narrow pane drops the type, then TTL and size.
+        let columns: &[Column] = match (&state.tree_rows, table_area.width) {
+            (None, _) | (Some(_), 60..) => &[Column::Type, Column::Key, Column::Ttl, Column::Size],
+            (Some(_), 36..) => &[Column::Key, Column::Size],
+            (Some(_), _) => &[Column::Key],
+        };
+        let widths: Vec<Constraint> = columns.iter().map(|c| c.width()).collect();
         // The sorted column carries its direction: `Key ▲`, `Size ▼`.
         let title = |name: &'static str, key: SortKey| -> String {
             match state.page.sort {
@@ -477,12 +506,12 @@ impl StatefulWidget for KeySpaceWidget {
                 _ => name.to_owned(),
             }
         };
-        let header: Row<'_> = Row::new([
-            Cell::from(title("Type", SortKey::Type)),
-            Cell::from(title("Key", SortKey::Name)),
-            Cell::from(Line::from(title("TTL", SortKey::Ttl)).right_aligned()),
-            Cell::from(Line::from(title("Size", SortKey::Size)).right_aligned()),
-        ])
+        let header: Row<'_> = Row::new(columns.iter().map(|column| match column {
+            Column::Type => Cell::from(title("Type", SortKey::Type)),
+            Column::Key => Cell::from(title("Key", SortKey::Name)),
+            Column::Ttl => Cell::from(Line::from(title("TTL", SortKey::Ttl)).right_aligned()),
+            Column::Size => Cell::from(Line::from(title("Size", SortKey::Size)).right_aligned()),
+        }))
         .bottom_margin(1)
         .fg(cfg.colors.base03)
         .bold();
@@ -490,11 +519,14 @@ impl StatefulWidget for KeySpaceWidget {
         // The Key column is `Fill`: measure it the way the table will, so long
         // names can end in `…` instead of being clipped silently.
         let highlight_width = u16::try_from(highlight_symbol().width()).unwrap_or(u16::MAX);
+        let key_column = columns.iter().position(|c| *c == Column::Key).unwrap_or(0);
         let key_width = usize::from(
-            Layout::horizontal(widths).spacing(1).split(Rect {
-                width: table_area.width.saturating_sub(highlight_width),
-                ..table_area
-            })[1]
+            Layout::horizontal(widths.iter().copied())
+                .spacing(1)
+                .split(Rect {
+                    width: table_area.width.saturating_sub(highlight_width),
+                    ..table_area
+                })[key_column]
                 .width,
         );
 
@@ -502,7 +534,36 @@ impl StatefulWidget for KeySpaceWidget {
         // brighter "dim" or `∞` / `—` / size vanish into its background.
         let selected = state.table.selected();
         let rows = state.keys.iter().enumerate().map(|(i, meta)| {
-            let badge: ratatui::text::Text = (&meta.r_type).into();
+            let tree_row = state.tree_rows.as_ref().and_then(|rows| rows.get(i));
+            if let Some(PageRow::Group {
+                count,
+                depth,
+                expanded,
+                ..
+            }) = tree_row
+            {
+                let label = format!(
+                    "{}{} {} ({})",
+                    "  ".repeat(usize::from(*depth)),
+                    if *expanded { '▾' } else { '▸' },
+                    meta.key,
+                    format_count(*count),
+                );
+                return Row::new(columns.iter().map(|column| {
+                    match column {
+                        Column::Key => {
+                            Cell::from(truncate_to_width(&label, key_width).into_owned())
+                                .fg(cfg.colors.base0d)
+                                .bold()
+                        }
+                        _ => Cell::default(),
+                    }
+                }));
+            }
+            let indent = match tree_row {
+                Some(PageRow::Leaf { depth }) => "  ".repeat(usize::from(*depth) + 1),
+                _ => String::new(),
+            };
             let dim = if selected == Some(i) {
                 cfg.colors.base05
             } else {
@@ -514,21 +575,31 @@ impl StatefulWidget for KeySpaceWidget {
             } else {
                 dim
             };
-            Row::new([
-                Cell::from(badge),
-                Cell::from(truncate_to_width(&meta.key, key_width)).fg(cfg.colors.base05),
-                Cell::from(Line::from(format_ttl(meta.ttl)).right_aligned()).fg(ttl_color),
-                Cell::from(
-                    Line::from(format!(
-                        "{:.2}",
-                        Byte::from_u128(meta.size)
-                            .unwrap_or_default()
-                            .get_appropriate_unit(UnitType::Binary)
-                    ))
-                    .right_aligned(),
-                )
-                .fg(dim),
-            ])
+            Row::new(columns.iter().map(|column| {
+                match column {
+                    Column::Type => {
+                        let badge: ratatui::text::Text = (&meta.r_type).into();
+                        Cell::from(badge)
+                    }
+                    Column::Key => Cell::from(
+                        truncate_to_width(&format!("{indent}{}", meta.key), key_width).into_owned(),
+                    )
+                    .fg(cfg.colors.base05),
+                    Column::Ttl => {
+                        Cell::from(Line::from(format_ttl(meta.ttl)).right_aligned()).fg(ttl_color)
+                    }
+                    Column::Size => Cell::from(
+                        Line::from(format!(
+                            "{:.2}",
+                            Byte::from_u128(meta.size)
+                                .unwrap_or_default()
+                                .get_appropriate_unit(UnitType::Binary)
+                        ))
+                        .right_aligned(),
+                    )
+                    .fg(dim),
+                }
+            }))
         });
         let table: Table<'_> = Table::new(rows, widths)
             .header(header)
