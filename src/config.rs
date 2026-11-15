@@ -57,6 +57,9 @@ pub struct Config {
     pub keyspace: KeyspaceConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Redis connection timeouts.
+    #[serde(default)]
+    pub connection: ConnectionConfig,
     #[serde(default)]
     pub pubsub: PubSubConfig,
     /// Write safety: when the command preview shows.
@@ -250,6 +253,58 @@ pub enum LiveMode {
     Poll,
     /// No live updates.
     Off,
+}
+
+/// Redis connection timeouts. The redis crate's own defaults (500 ms per
+/// reply, 1 s to connect) are too short for a VPN / WAN link or a large
+/// reply, so every connection is opened with these.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default)]
+pub struct ConnectionConfig {
+    /// How long one command may wait for its reply, in milliseconds; see
+    /// [`ConnectionConfig::response_timeout`].
+    pub response_timeout_ms: u64,
+    /// How long one connection attempt may take, in milliseconds; see
+    /// [`ConnectionConfig::connect_timeout`].
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            response_timeout_ms: 5000,
+            connect_timeout_ms: 5000,
+        }
+    }
+}
+
+impl ConnectionConfig {
+    /// Reply timeout of the connections the UI waits on (keys, values,
+    /// writes, `INFO`), clamped to 500 ms..=10 min. 0 means the default.
+    pub fn response_timeout(&self) -> Duration {
+        let ms = match self.response_timeout_ms {
+            0 => Self::default().response_timeout_ms,
+            ms => ms,
+        };
+        Duration::from_millis(ms.clamp(500, 600_000))
+    }
+
+    /// Reply timeout of the background connections (copying a whole value,
+    /// load all, metadata backfill), whose replies can be large: six times
+    /// [`ConnectionConfig::response_timeout`], at least 30 s.
+    pub fn bulk_response_timeout(&self) -> Duration {
+        (self.response_timeout() * 6).max(Duration::from_secs(30))
+    }
+
+    /// Timeout of one connection attempt, clamped to 500 ms..=1 min. 0 means
+    /// the default.
+    pub fn connect_timeout(&self) -> Duration {
+        let ms = match self.connect_timeout_ms {
+            0 => Self::default().connect_timeout_ms,
+            ms => ms,
+        };
+        Duration::from_millis(ms.clamp(500, 60_000))
+    }
 }
 
 /// Settings for the live-metrics dashboard.
@@ -813,6 +868,24 @@ mod tests {
         let cfg: Config = json5::from_str("{ keybindings: {} }").unwrap();
         assert_eq!(cfg.dashboard.interval_ms, 1000);
         assert_eq!(cfg.dashboard.history, 300);
+    }
+
+    #[test]
+    fn connection_timeouts_default_and_clamp() {
+        let mut c = ConnectionConfig::default();
+        assert_eq!(c.response_timeout(), Duration::from_secs(5));
+        assert_eq!(c.bulk_response_timeout(), Duration::from_secs(30));
+        assert_eq!(c.connect_timeout(), Duration::from_secs(5));
+
+        c.response_timeout_ms = 0;
+        c.connect_timeout_ms = 0;
+        assert_eq!(c.response_timeout(), Duration::from_secs(5), "0 = default");
+        assert_eq!(c.connect_timeout(), Duration::from_secs(5), "0 = default");
+
+        c.response_timeout_ms = 10;
+        assert_eq!(c.response_timeout(), Duration::from_millis(500));
+        c.response_timeout_ms = 20_000;
+        assert_eq!(c.bulk_response_timeout(), Duration::from_mins(2));
     }
 
     #[test]

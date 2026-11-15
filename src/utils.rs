@@ -112,6 +112,27 @@ pub fn get_config_dir() -> PathBuf {
     directory
 }
 
+/// Create (or truncate) `path` readable and writable by its owner only. The
+/// log holds key names and error text from the server, which other local
+/// users have no business reading. A file left from an older version with
+/// wider permissions is narrowed too.
+fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 /// Initialise the file-based tracing subscriber under the data directory.
 ///
 /// # Errors
@@ -122,7 +143,7 @@ pub fn initialize_logging() -> Result<()> {
     let directory = get_data_dir();
     std::fs::create_dir_all(&directory)?;
     let log_path = directory.join(LOG_FILE.as_str());
-    let log_file = std::fs::File::create(log_path)?;
+    let log_file = create_private_file(&log_path)?;
     std::env::set_var(
         "RUST_LOG",
         std::env::var("RUST_LOG")
@@ -283,5 +304,31 @@ mod format_tests {
     fn pct() {
         assert_eq!(fmt_pct(0.982), "98.2 %");
         assert_eq!(fmt_pct(0.0), "0.0 %");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod log_file_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::create_private_file;
+
+    /// #70: the log file is the owner's only, also when an older, wider
+    /// file is already there.
+    #[test]
+    fn log_file_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("rrover-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("redis-rover.log");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        drop(create_private_file(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(create_private_file(&path).unwrap());
+        assert_eq!(mode(&path), 0o600, "an old 0644 file is narrowed");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

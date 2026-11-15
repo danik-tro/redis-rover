@@ -27,7 +27,7 @@ use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
 };
 use testcontainers_modules::redis::Redis;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Image every test runs against.
@@ -298,7 +298,7 @@ pub async fn fingerprint(con: &mut ConnectionManager, keys: &[String]) -> Vec<St
 /// The background runner, wired up like `redis_rover::run` wires it for `App`.
 pub struct Harness {
     pub state: SharedState,
-    events: broadcast::Sender<RedisEvent>,
+    events: mpsc::UnboundedSender<RedisEvent>,
     pubsub: mpsc::UnboundedSender<PubSubCmd>,
     live: mpsc::UnboundedSender<LiveCmd>,
     actions: mpsc::Receiver<Action>,
@@ -340,7 +340,7 @@ impl Harness {
         })
     }
 
-    /// Send a `RedisEvent`, as `App` does through its broadcast sender.
+    /// Send a `RedisEvent`, as `App` does through its sender.
     /// The runner's read-only flag, as `App` shares it (the `R` toggle).
     pub fn read_only_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.runner.read_only_flag()

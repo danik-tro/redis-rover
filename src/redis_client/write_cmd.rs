@@ -21,10 +21,25 @@ fn list_index(index: usize) -> isize {
     isize::try_from(index).unwrap_or(isize::MAX)
 }
 
-/// `SET key value`.
+/// `SET key value KEEPTTL`: an edit changes the value, not the expiry. A
+/// plain `SET` would drop the TTL and make a session or cache key permanent.
 #[must_use]
 pub fn set_string(key: &str, value: &str) -> Vec<Cmd> {
-    vec![Cmd::set(key, value)]
+    let mut cmd = Cmd::set(key, value);
+    cmd.arg("KEEPTTL");
+    vec![cmd]
+}
+
+/// The same edit for a server without `KEEPTTL` (before Redis 6.0):
+/// `SET key value PX ttl_ms` with the TTL read just before, or a plain `SET`
+/// when the key has none (`PTTL` answers -1, or -2 for a missing key).
+#[must_use]
+pub fn set_string_px(key: &str, value: &str, ttl_ms: i64) -> Vec<Cmd> {
+    let mut cmd = Cmd::set(key, value);
+    if ttl_ms > 0 {
+        cmd.arg("PX").arg(ttl_ms);
+    }
+    vec![cmd]
 }
 
 /// `DEL key`.

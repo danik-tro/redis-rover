@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -6,9 +7,8 @@ use std::{
     time::Duration,
 };
 
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::{
-    sync::broadcast::{self, Sender as BroadcastSender},
     sync::mpsc::{self, Sender as ActionSender, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
     time::MissedTickBehavior,
@@ -28,8 +28,6 @@ use super::{
 
 type FetchError = Box<dyn std::error::Error + Sync + Send>;
 
-const BROADCAST_CAPACITY: usize = 50;
-
 /// Most `SCAN` steps one filter match count may take (~200k keys at COUNT 1000).
 const COUNT_MAX_STEPS: usize = 200;
 /// Time budget for one filter match count.
@@ -43,8 +41,16 @@ const BACKFILL_NOTIFY: Duration = Duration::from_millis(250);
 /// Least time between two `LoadAllProgress` actions.
 const LOAD_NOTIFY: Duration = Duration::from_millis(250);
 
-/// How long a DB switch may take to open its new connection.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a connection is used for, which decides its reply timeout
+/// (`connection.response_timeout_ms` in the config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// Keys, values, writes, `INFO`: the UI waits on each reply.
+    Interactive,
+    /// Copying a whole value, load all, metadata backfill: large replies
+    /// that run in their own task.
+    Bulk,
+}
 
 /// Test hook: milliseconds each value fetch waits before it starts (0 = off).
 /// The integration suite uses it to make one value fetch slow without
@@ -79,7 +85,13 @@ pub struct Runner {
     live_rx: Option<UnboundedReceiver<LiveCmd>>,
 
     action_tx: ActionSender<Action>,
-    tx: BroadcastSender<RedisEvent>,
+    /// `RedisEvent`s from `App` to the state task. Unbounded, so an event is
+    /// never dropped: a lost write or `FetchKeys` would leave the UI waiting
+    /// for an answer. Events come from key presses, and repeated fetches are
+    /// coalesced (see [`superseded`]), so the queue stays short.
+    tx: UnboundedSender<RedisEvent>,
+    /// Taken by `start` when the state task is spawned.
+    rx: Option<UnboundedReceiver<RedisEvent>>,
 }
 
 impl Runner {
@@ -98,7 +110,7 @@ impl Runner {
         let (live_tx, live_rx) = mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
 
-        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (tx, rx) = mpsc::unbounded_channel();
 
         Self {
             cancellation_token,
@@ -116,6 +128,7 @@ impl Runner {
             live_rx: Some(live_rx),
             action_tx,
             tx,
+            rx: Some(rx),
         }
     }
 
@@ -140,7 +153,7 @@ impl Runner {
     }
 
     #[must_use]
-    pub fn tx(&self) -> BroadcastSender<RedisEvent> {
+    pub fn tx(&self) -> UnboundedSender<RedisEvent> {
         self.tx.clone()
     }
 
@@ -231,11 +244,13 @@ impl Runner {
     }
 
     fn launch_refresh_state_task(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
         let manager = self.manager.clone();
         let cancellation_token = self.cancellation_token.clone();
 
         let action_tx = self.action_tx.clone();
-        let mut rx = self.tx.subscribe();
         let state = self.state.clone();
         let storage = Storage::new(manager);
         let client = self.client.clone();
@@ -244,7 +259,7 @@ impl Runner {
         self.state_task = tokio::spawn(async move {
             // Values load over their own connection, so a large value reply
             // never holds back a keys page queued behind it on the socket.
-            let value_storage = match open_connection(client.clone()).await {
+            let value_storage = match connect(client.clone(), Link::Interactive).await {
                 Ok(manager) => Storage::new(manager),
                 Err(err) => {
                     log::warn!("Opening the value connection failed, sharing the main one: {err}");
@@ -255,14 +270,35 @@ impl Runner {
                 EventHandler::new(state, action_tx, storage, value_storage, client, read_only);
             event_handler.load_db_count().await;
 
+            // Events already waiting when one arrives; see `superseded`.
+            let mut queued: VecDeque<RedisEvent> = VecDeque::new();
             loop {
-                tokio::select! {
-                    Ok(event) = rx.recv() => {
-                        event_handler.handle(event).await;
-                    },
-                    () = cancellation_token.cancelled() => {
-                        break;
-                    },
+                if queued.is_empty() {
+                    tokio::select! {
+                        event = rx.recv() => match event {
+                            Some(event) => queued.push_back(event),
+                            // Every sender is gone: nothing more can arrive.
+                            None => break,
+                        },
+                        () = cancellation_token.cancelled() => break,
+                    }
+                }
+                while let Ok(event) = rx.try_recv() {
+                    queued.push_back(event);
+                }
+                let Some(event) = queued.pop_front() else {
+                    continue;
+                };
+                if superseded(&event, queued.front()) {
+                    // `App` counts one answer per `FetchKeys`.
+                    if matches!(event, RedisEvent::FetchKeys) {
+                        event_handler.action_hook(Action::KeysLoadAborted);
+                    }
+                    continue;
+                }
+                event_handler.handle(event).await;
+                if cancellation_token.is_cancelled() {
+                    break;
                 }
             }
         });
@@ -338,6 +374,18 @@ impl Runner {
     }
 }
 
+/// `event` can be skipped because `next`, queued right behind it, does the
+/// same work. `FetchKeys` and `FetchValue` carry no payload: each reads the
+/// latest shared state, so of a run of them only the last one is needed.
+/// Holding `j` or `n` while a fetch is slow queues such runs.
+fn superseded(event: &RedisEvent, next: Option<&RedisEvent>) -> bool {
+    matches!(
+        (event, next),
+        (RedisEvent::FetchKeys, Some(RedisEvent::FetchKeys))
+            | (RedisEvent::FetchValue, Some(RedisEvent::FetchValue))
+    )
+}
+
 pub struct EventHandler {
     state: SharedState,
     tx: ActionSender<Action>,
@@ -355,6 +403,9 @@ pub struct EventHandler {
     yank_task: Option<JoinHandle<()>>,
     /// The running value page fetch, if any. A new one aborts it.
     value_task: Option<JoinHandle<()>>,
+    /// The yank's own connection, opened like `backfill_storage`: a whole
+    /// multi-MB value gets the longer [`Link::Bulk`] reply timeout.
+    yank_storage: Option<Storage>,
     /// The running metadata backfill, if any.
     backfill_task: Option<JoinHandle<()>>,
     /// The backfill's own connection, opened on its first run (and again
@@ -404,6 +455,7 @@ impl EventHandler {
             count_task: None,
             yank_task: None,
             value_task: None,
+            yank_storage: None,
             backfill_task: None,
             backfill_storage: None,
             load_task: None,
@@ -434,7 +486,9 @@ impl EventHandler {
         match event {
             RedisEvent::SelectDb(db) => self.select_db(db).await,
             RedisEvent::CountMatches { pattern } => self.count_matches(pattern),
-            RedisEvent::FetchFullValue { key, r_type } => self.fetch_full_value(key, r_type),
+            RedisEvent::FetchFullValue { key, r_type } => {
+                self.fetch_full_value(key, r_type).await;
+            }
             RedisEvent::SetString { key, value } => {
                 match self.storage.set_string(&key, &value).await {
                     Ok(()) => {
@@ -552,7 +606,10 @@ impl EventHandler {
     /// reconnects with the DB from its connection info, so after a dropped
     /// connection it would silently go back to the old DB.
     async fn select_db(&mut self, db: i64) {
-        match tokio::try_join!(self.connect_db(db), self.connect_db(db)) {
+        match tokio::try_join!(
+            self.connect_db(db, Link::Interactive),
+            self.connect_db(db, Link::Interactive)
+        ) {
             Ok((manager, value_manager)) => {
                 self.abort_count();
                 for task in [
@@ -568,6 +625,7 @@ impl EventHandler {
                 }
                 self.storage = Storage::new(manager);
                 self.value_storage = Storage::new(value_manager);
+                self.yank_storage = None;
                 self.backfill_storage = None;
                 self.load_storage = None;
                 *self.state.db.lock() = db;
@@ -617,11 +675,19 @@ impl EventHandler {
 
     /// Fetch `key`'s whole value in a separate task and leave its clipboard
     /// text in `SharedState::yank`, then send `YankReady` (or `YankFailed`).
-    fn fetch_full_value(&mut self, key: String, r_type: RedisType) {
+    async fn fetch_full_value(&mut self, key: String, r_type: RedisType) {
         if let Some(task) = self.yank_task.take() {
             task.abort();
         }
-        let storage = self.storage.clone();
+        let storage = if let Some(storage) = self.yank_storage.clone() {
+            storage
+        } else if let Some(storage) = self.open_side_storage("yank").await {
+            self.yank_storage = Some(storage.clone());
+            storage
+        } else {
+            // Better a short timeout than no copy at all.
+            self.storage.clone()
+        };
         let tx = self.tx.clone();
         let slot = self.state.yank.clone();
         self.yank_task = Some(tokio::spawn(async move {
@@ -715,7 +781,7 @@ impl EventHandler {
     /// whose commands should never queue in front of a page.
     async fn open_side_storage(&self, what: &str) -> Option<Storage> {
         let db = *self.state.db.lock();
-        match self.connect_db(db).await {
+        match self.connect_db(db, Link::Bulk).await {
             Ok(manager) => Some(Storage::new(manager)),
             Err(err) => {
                 log::warn!("Opening the {what} connection failed: {err}");
@@ -762,11 +828,11 @@ impl EventHandler {
         }
     }
 
-    async fn connect_db(&self, db: i64) -> Result<ConnectionManager, FetchError> {
+    async fn connect_db(&self, db: i64, link: Link) -> Result<ConnectionManager, FetchError> {
         let info = self.client.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(db);
         let client = redis::Client::open(info.set_redis_settings(settings))?;
-        open_connection(client).await
+        connect(client, link).await
     }
 
     /// Fetch the selected value's current page in a separate task on the value
@@ -937,11 +1003,58 @@ async fn sweep_to_end(
     }
 }
 
-/// Open a connection manager for `client`, giving up after [`CONNECT_TIMEOUT`].
-async fn open_connection(client: redis::Client) -> Result<ConnectionManager, FetchError> {
-    let manager = tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
-        .await
-        .map_err(|_| format!("timed out after {CONNECT_TIMEOUT:?}"))??;
+/// Open a connection manager for `client` with the configured timeouts
+/// (`connection` in the config) in place of the redis crate's 500 ms reply
+/// and 1 s connect defaults. All attempts together (the manager retries a
+/// failed one) get the connect timeout, so a DB switch that can't work
+/// fails as fast as before.
+///
+/// # Errors
+///
+/// The server can't be reached, refuses the connection settings, or the
+/// attempts time out.
+pub async fn connect(client: redis::Client, link: Link) -> Result<ConnectionManager, FetchError> {
+    let overall = config::get().connection.connect_timeout();
+    connect_within(client, link, overall).await
+}
+
+/// How long the manager's retries may go on at startup, on top of the
+/// connect timeout. After a refused connection they take up to about 13 s
+/// (6 retries with backoff); cutting them short would replace
+/// `Connection refused` with a timeout.
+const STARTUP_RETRY_ALLOWANCE: Duration = Duration::from_secs(15);
+
+/// [`connect`] for the session's first connection: the manager's retries
+/// run to their end, so the error names the cause, while a host that never
+/// answers still fails in bounded time.
+///
+/// # Errors
+///
+/// As [`connect`].
+pub async fn connect_at_startup(client: redis::Client) -> Result<ConnectionManager, FetchError> {
+    let overall = config::get().connection.connect_timeout() + STARTUP_RETRY_ALLOWANCE;
+    connect_within(client, Link::Interactive, overall).await
+}
+
+async fn connect_within(
+    client: redis::Client,
+    link: Link,
+    overall: Duration,
+) -> Result<ConnectionManager, FetchError> {
+    let timeouts = config::get().connection;
+    let response = match link {
+        Link::Interactive => timeouts.response_timeout(),
+        Link::Bulk => timeouts.bulk_response_timeout(),
+    };
+    let manager_config = ConnectionManagerConfig::new()
+        .set_response_timeout(Some(response))
+        .set_connection_timeout(Some(timeouts.connect_timeout()));
+    let manager = tokio::time::timeout(
+        overall,
+        ConnectionManager::new_with_config(client, manager_config),
+    )
+    .await
+    .map_err(|_| format!("connecting timed out after {overall:?}"))??;
     Ok(manager)
 }
 
@@ -981,5 +1094,30 @@ async fn load_value(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{superseded, RedisEvent};
+
+    /// #63: of a run of `FetchKeys` (or `FetchValue`) only the last is
+    /// handled; anything else, a write above all, is never skipped.
+    #[test]
+    fn only_repeated_fetches_are_superseded() {
+        let keys = RedisEvent::FetchKeys;
+        let value = RedisEvent::FetchValue;
+        let write = RedisEvent::DeleteKey { key: "k".into() };
+
+        assert!(superseded(&keys, Some(&keys)));
+        assert!(superseded(&value, Some(&value)));
+        assert!(!superseded(&keys, Some(&value)));
+        assert!(!superseded(&keys, Some(&write)));
+        assert!(!superseded(&keys, None), "the last one runs");
+        assert!(!superseded(&write, Some(&write)), "writes always run");
+        assert!(!superseded(
+            &RedisEvent::SelectDb(1),
+            Some(&RedisEvent::SelectDb(1))
+        ));
     }
 }

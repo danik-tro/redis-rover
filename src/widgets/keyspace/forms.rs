@@ -301,6 +301,14 @@ impl KeySpace {
         self.new_key.is_some()
     }
 
+    /// The wizard is on a step with a text input (name or element), not on
+    /// the type list or a notice.
+    pub fn wizard_takes_text(&self) -> bool {
+        self.new_key
+            .as_ref()
+            .is_some_and(|d| matches!(d.step, NewKeyStep::Name | NewKeyStep::Element))
+    }
+
     /// Open the add-key wizard at the type-selection step.
     pub fn open_new_key(&mut self) {
         self.new_key = Some(NewKeyDraft::new());

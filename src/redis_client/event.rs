@@ -4,7 +4,9 @@ use super::{
     write_cmd,
 };
 
-#[derive(Clone, Debug)]
+/// `Debug` is written by hand (below): events are logged, and a value, a
+/// collection element or a Pub/Sub payload must never reach the log file.
+#[derive(Clone)]
 pub enum RedisEvent {
     FetchKeys,
     /// Fetch `TYPE` / `TTL` / `MEMORY USAGE` of loaded keys that lack them,
@@ -76,6 +78,83 @@ pub enum RedisEvent {
         channel: String,
         payload: String,
     },
+}
+
+/// Prints the variant and the key (or channel, pattern, DB); values,
+/// elements and payloads only as their size.
+impl std::fmt::Debug for RedisEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn bytes(text: &str) -> String {
+            format!("<{} bytes>", text.len())
+        }
+        match self {
+            Self::FetchKeys => f.write_str("FetchKeys"),
+            Self::BackfillMeta => f.write_str("BackfillMeta"),
+            Self::LoadAll { until } => write!(f, "LoadAll {{ until: {until:?} }}"),
+            Self::StopLoadAll => f.write_str("StopLoadAll"),
+            Self::SelectDb(db) => write!(f, "SelectDb({db})"),
+            Self::FetchValue => f.write_str("FetchValue"),
+            Self::CountMatches { pattern } => {
+                write!(f, "CountMatches {{ pattern: {pattern:?} }}")
+            }
+            Self::FetchFullValue { key, r_type } => {
+                write!(f, "FetchFullValue {{ key: {key:?}, r_type: {r_type:?} }}")
+            }
+            Self::SetString { key, value } => {
+                write!(f, "SetString {{ key: {key:?}, value: {} }}", bytes(value))
+            }
+            Self::DeleteKey { key } => write!(f, "DeleteKey {{ key: {key:?} }}"),
+            Self::SetTtl { key, secs } => {
+                write!(f, "SetTtl {{ key: {key:?}, secs: {secs} }}")
+            }
+            Self::CreateKey { key, spec } => {
+                let (kind, len) = match spec {
+                    NewKeySpec::String(_) => ("String", 1),
+                    NewKeySpec::List(items) => ("List", items.len()),
+                    NewKeySpec::Set(items) => ("Set", items.len()),
+                    NewKeySpec::Hash(pairs) => ("Hash", pairs.len()),
+                    NewKeySpec::Zset(pairs) => ("Zset", pairs.len()),
+                };
+                write!(
+                    f,
+                    "CreateKey {{ key: {key:?}, spec: {kind} <{len} elements> }}"
+                )
+            }
+            Self::AddItem { key, item } => {
+                let kind = match item {
+                    KeyItem::ListValue(_) => "ListValue",
+                    KeyItem::SetMember(_) => "SetMember",
+                    KeyItem::HashField { .. } => "HashField",
+                    KeyItem::ZsetMember { .. } => "ZsetMember",
+                };
+                write!(f, "AddItem {{ key: {key:?}, item: {kind} }}")
+            }
+            Self::EditItem { key, edit } => {
+                let kind = match edit {
+                    ItemEdit::ListSet { .. } => "ListSet",
+                    ItemEdit::SetReplace { .. } => "SetReplace",
+                    ItemEdit::HashSet { .. } => "HashSet",
+                    ItemEdit::ZsetScore { .. } => "ZsetScore",
+                };
+                write!(f, "EditItem {{ key: {key:?}, edit: {kind} }}")
+            }
+            Self::DeleteItem { key, delete } => {
+                let kind = match delete {
+                    ItemDelete::ListIndex(_) => "ListIndex",
+                    ItemDelete::SetMember(_) => "SetMember",
+                    ItemDelete::HashField(_) => "HashField",
+                    ItemDelete::ZsetMember(_) => "ZsetMember",
+                };
+                write!(f, "DeleteItem {{ key: {key:?}, delete: {kind} }}")
+            }
+            Self::FetchPubSubChannels => f.write_str("FetchPubSubChannels"),
+            Self::Publish { channel, payload } => write!(
+                f,
+                "Publish {{ channel: {channel:?}, payload: {} }}",
+                bytes(payload)
+            ),
+        }
+    }
 }
 
 impl RedisEvent {
@@ -169,6 +248,69 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    /// #70: events are logged with `{:?}`; no value, element or payload
+    /// may show up there.
+    #[test]
+    fn debug_output_holds_no_values() {
+        const SECRET: &str = "s3cr3t-value";
+        let k = || "user:1".to_owned();
+        let secret = || SECRET.to_owned();
+        let events = [
+            RedisEvent::SetString {
+                key: k(),
+                value: secret(),
+            },
+            RedisEvent::CreateKey {
+                key: k(),
+                spec: NewKeySpec::Hash(vec![(secret(), secret())]),
+            },
+            RedisEvent::CreateKey {
+                key: k(),
+                spec: NewKeySpec::String(secret()),
+            },
+            RedisEvent::AddItem {
+                key: k(),
+                item: KeyItem::HashField {
+                    field: secret(),
+                    value: secret(),
+                },
+            },
+            RedisEvent::EditItem {
+                key: k(),
+                edit: ItemEdit::SetReplace {
+                    old: secret(),
+                    new: secret(),
+                },
+            },
+            RedisEvent::DeleteItem {
+                key: k(),
+                delete: ItemDelete::SetMember(secret()),
+            },
+            RedisEvent::Publish {
+                channel: "news".into(),
+                payload: secret(),
+            },
+        ];
+        for event in events {
+            let shown = format!("{event:?}");
+            assert!(!shown.contains(SECRET), "{shown}");
+            assert!(
+                shown.contains("user:1") || shown.contains("news"),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            format!(
+                "{:?}",
+                RedisEvent::SetString {
+                    key: k(),
+                    value: secret()
+                }
+            ),
+            r#"SetString { key: "user:1", value: <12 bytes> }"#
+        );
+    }
+
     /// Every write variant (and every payload shape) with the exact lines it
     /// previews.
     #[test]
@@ -181,7 +323,7 @@ mod tests {
                     key: k(),
                     value: "hello world".into(),
                 },
-                vec![r#"SET "user:1" "hello world""#],
+                vec![r#"SET "user:1" "hello world" "KEEPTTL""#],
             ),
             (RedisEvent::DeleteKey { key: k() }, vec![r#"DEL "user:1""#]),
             (

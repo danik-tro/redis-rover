@@ -6,7 +6,14 @@ impl KeyValue {
     /// True for a STRING whose preview is shorter than the stored value.
     #[must_use]
     pub fn is_truncated(&self) -> bool {
-        matches!(self, Self::String { value, total_len } if value.len() < *total_len)
+        matches!(self, Self::String { value, total_len, .. } if value.len() < *total_len)
+    }
+
+    /// True for a STRING that isn't valid UTF-8: what is shown differs from
+    /// what is stored.
+    #[must_use]
+    pub fn is_lossy(&self) -> bool {
+        matches!(self, Self::String { lossy: true, .. })
     }
 
     /// Text to copy for the whole value (#27): a STRING as stored, anything
@@ -544,6 +551,7 @@ mod tests {
         let string = KeyValue::String {
             value: "{\"a\":1}".into(),
             total_len: 7,
+            lossy: false,
         };
         assert_eq!(string.to_clipboard_text().unwrap(), "{\"a\":1}");
 
@@ -584,10 +592,12 @@ mod tests {
         let full = KeyValue::String {
             value: "abc".into(),
             total_len: 3,
+            lossy: false,
         };
         let cut = KeyValue::String {
             value: "ab".into(),
             total_len: 3,
+            lossy: false,
         };
         assert!(!full.is_truncated());
         assert!(cut.is_truncated());

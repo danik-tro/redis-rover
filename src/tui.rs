@@ -95,7 +95,9 @@ impl Tui {
         let event_task = tokio::spawn(async {});
 
         let mouse = false;
-        let paste = false;
+        // Bracketed paste: a paste arrives as one `Event::Paste`, not as
+        // key presses that would run as commands (`d`, then `y`).
+        let paste = true;
         Ok(Self {
             terminal,
             event_task,

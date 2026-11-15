@@ -668,12 +668,12 @@ async fn db_switch_survives_a_reconnect() {
     let mut reloaded = false;
     for _ in 0..20 {
         h.send(RedisEvent::FetchKeys);
+        // Wait for this FetchKeys' own answer: a failure is `Error`, then
+        // `KeysLoadAborted`. Stopping at the `Error` would leave the other
+        // in the channel, and every later answer would be read one late.
         let action = h
             .expect("keys or a failure", |a| {
-                matches!(
-                    a,
-                    Action::LoadKeysIntoKeySpace | Action::KeysLoadAborted | Action::Error(_)
-                )
+                matches!(a, Action::LoadKeysIntoKeySpace | Action::KeysLoadAborted)
             })
             .await;
         if action == Action::LoadKeysIntoKeySpace {
@@ -858,6 +858,158 @@ async fn read_only_toggle_reaches_the_runner() {
     assert!(matches!(action, Action::RefreshSpace), "{action:?}");
     let value: String = admin.get(&key).await.expect("get");
     assert_eq!(value, "after");
+    h.shutdown().await;
+}
+
+/// #63: more events than the old 50-slot broadcast channel held, sent
+/// before the runner can take one. None may be lost and the runner must go
+/// on answering (it used to stop for the rest of the session).
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_burst_of_events_never_stalls_the_runner() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("burst");
+    let keys = support::seed_strings(&mut admin, &p, 5).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_pattern(Some(format!("{p}*")));
+    h.state
+        .value_state
+        .lock()
+        .select(&keys[0], RedisType::String);
+
+    for _ in 0..200 {
+        h.send(RedisEvent::FetchValue);
+        h.send(RedisEvent::FetchKeys);
+    }
+    // A write queued behind the burst still runs.
+    h.send(RedisEvent::SetTtl {
+        key: keys[0].clone(),
+        secs: 100,
+    });
+    h.expect("the write queued behind the burst", |a| {
+        *a == Action::RefreshSpace
+    })
+    .await;
+    let ttl: i64 = admin.ttl(&keys[0]).await.expect("TTL");
+    assert!(ttl > 0, "the queued EXPIRE ran");
+
+    // And the runner still answers afterwards.
+    let page = h.fetch_page().await;
+    assert_eq!(page.len(), 5);
+    h.shutdown().await;
+}
+
+/// #69: a user whose ACL refuses `MEMORY USAGE` still gets the key list,
+/// with unknown sizes, instead of "Failed to fetch keys".
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn keys_list_without_memory_usage() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("nomem");
+    let keys = support::seed_strings(&mut admin, &p, 5).await;
+    let () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("limited")
+        .arg("on")
+        .arg(">pw")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-memory")
+        .query_async(&mut admin)
+        .await
+        .expect("ACL SETUSER");
+    let url = server.url(0).replacen("redis://", "redis://limited:pw@", 1);
+    let client = redis::Client::open(url).expect("client");
+    let mut h = Harness::new(client, false).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_pattern(Some(format!("{p}*")));
+
+    // Twice: the second page fetch no longer sends `MEMORY USAGE`.
+    for _ in 0..2 {
+        let page: HashSet<String> = h.fetch_page().await.into_iter().collect();
+        assert_eq!(page, keys.iter().cloned().collect::<HashSet<_>>());
+        let metas = h.state.keys.lock().clone().expect("the page");
+        assert!(metas.iter().all(|m| m.size == 0), "sizes unknown");
+        assert!(metas.iter().all(|m| m.r_type == RedisType::String));
+    }
+    h.shutdown().await;
+}
+
+/// #66: editing a STRING keeps its TTL (`SET … KEEPTTL`), also on a server
+/// without `KEEPTTL` (`PTTL`, then `SET … PX`), and a key without a TTL
+/// gets none.
+async fn string_edit_keeps_ttl(server: &support::Server) {
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("keepttl");
+    let with_ttl = format!("{p}session");
+    let without = format!("{p}plain");
+    let () = admin.set_ex(&with_ttl, "old", 1000).await.expect("SETEX");
+    let () = admin.set(&without, "old").await.expect("SET");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    for key in [&with_ttl, &without] {
+        h.send(RedisEvent::SetString {
+            key: key.clone(),
+            value: "new".into(),
+        });
+        // `RefreshSpace` is the last action of a successful SetString.
+        let ok = h
+            .expect("the edit's result", |a| {
+                matches!(a, Action::RefreshSpace | Action::Error(_))
+            })
+            .await;
+        assert_eq!(ok, Action::RefreshSpace, "SetString {key}");
+        let value: String = admin.get(key).await.expect("GET");
+        assert_eq!(value, "new");
+    }
+    let ttl: i64 = admin.ttl(&with_ttl).await.expect("TTL");
+    assert!((900..=1000).contains(&ttl), "TTL kept, got {ttl}");
+    let ttl: i64 = admin.ttl(&without).await.expect("TTL");
+    assert_eq!(ttl, -1, "no TTL invented");
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn string_edit_keeps_ttl_on_redis_7() {
+    string_edit_keeps_ttl(&support::start_redis().await).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn string_edit_keeps_ttl_on_redis_5() {
+    string_edit_keeps_ttl(&support::start_redis_tag("5-alpine").await).await;
+}
+
+/// #66: a STRING that isn't UTF-8 is flagged, so the editor refuses it
+/// instead of saving `�` over the stored bytes.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn binary_string_is_flagged_lossy() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("binary");
+    let binary = format!("{p}blob");
+    let text = format!("{p}text");
+    let () = admin
+        .set(&binary, &[0x00u8, 0xff, 0xfe, 0x61][..])
+        .await
+        .expect("SET");
+    let () = admin.set(&text, "héllo").await.expect("SET");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    let value = load_value(&mut h, &binary, RedisType::String).await;
+    assert!(value.is_lossy(), "{value:?}");
+    let value = load_value(&mut h, &text, RedisType::String).await;
+    assert!(!value.is_lossy(), "{value:?}");
     h.shutdown().await;
 }
 

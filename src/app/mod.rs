@@ -34,10 +34,7 @@ use color_eyre::eyre::Result;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::prelude::Rect;
 
-use tokio::sync::{
-    broadcast,
-    mpsc::{self, Receiver, Sender, UnboundedSender},
-};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -97,7 +94,7 @@ pub struct App {
     tx: mpsc::Sender<Action>,
     rx: mpsc::Receiver<Action>,
 
-    redis_tx: broadcast::Sender<RedisEvent>,
+    redis_tx: mpsc::UnboundedSender<RedisEvent>,
     summary: Info,
     keyspace: KeySpace,
     dashboard: Dashboard,
@@ -181,7 +178,7 @@ impl App {
         state: SharedState,
         tx: Sender<Action>,
         rx: Receiver<Action>,
-        redis_tx: broadcast::Sender<RedisEvent>,
+        redis_tx: mpsc::UnboundedSender<RedisEvent>,
         pubsub_tx: UnboundedSender<PubSubCmd>,
         target: &str,
         tick_rate: f64,
@@ -353,6 +350,10 @@ impl App {
             tui::Event::Render => Some(Action::Render),
             tui::Event::Resize(x, y) => Some(Action::Resize(*x, *y)),
             tui::Event::Key(key) => self.handle_key_event(*key),
+            tui::Event::Paste(text) => {
+                self.handle_paste(text);
+                None
+            }
             _ => None,
         }
     }
@@ -400,10 +401,7 @@ mod tests {
     use ratatui::prelude::Rect;
     use ratatui::{buffer::Buffer, crossterm::event::KeyEvent, widgets::StatefulWidget};
 
-    use tokio::sync::{
-        broadcast,
-        mpsc::{self},
-    };
+    use tokio::sync::mpsc;
 
     use crate::action::Action;
     use crate::app::render::AppWidget;
@@ -414,7 +412,7 @@ mod tests {
 
     pub(super) fn app_with_pubsub() -> (App, mpsc::UnboundedReceiver<PubSubCmd>) {
         let (tx, rx) = mpsc::channel(8);
-        let (redis_tx, _) = broadcast::channel(8);
+        let (redis_tx, _) = mpsc::unbounded_channel();
         let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
         let app = App::new(
             SharedState::default(),
@@ -446,10 +444,10 @@ mod tests {
     pub(super) fn app_with_channels() -> (
         App,
         mpsc::UnboundedReceiver<PubSubCmd>,
-        broadcast::Receiver<RedisEvent>,
+        mpsc::UnboundedReceiver<RedisEvent>,
     ) {
         let (mut app, cmds) = app_with_pubsub();
-        let (redis_tx, redis_rx) = broadcast::channel(8);
+        let (redis_tx, redis_rx) = mpsc::unbounded_channel();
         app.redis_tx = redis_tx;
         (app, cmds, redis_rx)
     }

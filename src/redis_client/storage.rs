@@ -1,5 +1,9 @@
 use std::{
     collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -55,11 +59,18 @@ const PUBSUB_CHANNELS_MAX: usize = 1000;
 #[derive(Clone)]
 pub struct Storage {
     manager: ConnectionManager,
+    /// The server refused `MEMORY USAGE` (an ACL without it, a managed
+    /// service or a fork that lacks it): stop asking on this connection and
+    /// show sizes as unknown. Shared by the clones of this `Storage`.
+    memory_usage_refused: Arc<AtomicBool>,
 }
 
 impl Storage {
     pub fn new(manager: ConnectionManager) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            memory_usage_refused: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Run a single `SCAN cursor MATCH pattern COUNT count [TYPE t]` step and
@@ -223,6 +234,10 @@ impl Storage {
 
     /// Fetch TYPE / MEMORY USAGE / TTL for every key in a single pipeline.
     ///
+    /// A server that refuses `MEMORY USAGE` still lists its keys: the size
+    /// is left unknown (0) and, after the first refusal, no longer asked
+    /// for on this connection. `TYPE` and `TTL` errors stay errors.
+    ///
     /// # Errors
     ///
     /// Returns an error if the pipeline fails or any reply has an unexpected
@@ -235,15 +250,17 @@ impl Storage {
             return Ok(Vec::new());
         }
 
+        let with_size = !self.memory_usage_refused.load(Ordering::Relaxed);
         let mut pipe = redis::pipe();
+        // Each reply comes back on its own, a refused command as
+        // `Value::ServerError`, instead of one error for the whole page.
+        pipe.ignore_errors();
         for key in keys {
-            pipe.cmd("TYPE")
-                .arg(key)
-                .cmd("MEMORY")
-                .arg("USAGE")
-                .arg(key)
-                .cmd("TTL")
-                .arg(key);
+            pipe.cmd("TYPE").arg(key);
+            if with_size {
+                pipe.cmd("MEMORY").arg("USAGE").arg(key);
+            }
+            pipe.cmd("TTL").arg(key);
         }
         let mut manager = self.manager.clone();
         let raw: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
@@ -252,11 +269,26 @@ impl Storage {
         let mut iter = raw.into_iter();
         for key in keys {
             let r_type_val = iter.next().ok_or("pipeline response truncated")?;
-            let size_val = iter.next().ok_or("pipeline response truncated")?;
+            let size_val = if with_size {
+                iter.next().ok_or("pipeline response truncated")?
+            } else {
+                redis::Value::Nil
+            };
             let ttl_val = iter.next().ok_or("pipeline response truncated")?;
 
             let r_type = String::from_redis_value(r_type_val)?;
-            let size = Option::<u128>::from_redis_value(size_val)?;
+            let size = match size_val {
+                redis::Value::ServerError(err) => {
+                    if !self.memory_usage_refused.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "MEMORY USAGE refused ({}); sizes are not shown",
+                            redis::RedisError::from(err)
+                        );
+                    }
+                    None
+                }
+                value => Option::<u128>::from_redis_value(value)?,
+            };
             let ttl = isize::from_redis_value(ttl_val)?;
 
             metas.push(KeyMeta {

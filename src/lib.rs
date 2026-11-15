@@ -27,7 +27,7 @@ pub use target::TargetError;
 
 use color_eyre::eyre::Result;
 use redis::aio::ConnectionManager;
-use redis_client::runner::Runner;
+use redis_client::runner::{connect_at_startup, Runner};
 use state::SharedState;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -81,7 +81,7 @@ pub async fn run(args: Cli) -> Result<()> {
     let client = target.client()?;
     let label = cli::connection_label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
-    let manager: ConnectionManager = ConnectionManager::new(client.clone())
+    let manager: ConnectionManager = connect_at_startup(client.clone())
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
@@ -132,7 +132,7 @@ pub mod internals {
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
-    pub use crate::redis_client::runner::{Runner, VALUE_FETCH_DELAY_MS};
+    pub use crate::redis_client::runner::{connect, Link, Runner, VALUE_FETCH_DELAY_MS};
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyMeta, KeyValue,
         KeyspaceState, LoadedValue, NewKeySpec, PageRow, RedisInfo, RedisType, Sort, SortKey,

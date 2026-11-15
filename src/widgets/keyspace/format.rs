@@ -43,7 +43,9 @@ pub(super) fn value_footer(
     json_path: &[String],
 ) -> Option<String> {
     let noun = match &loaded.value {
-        KeyValue::String { value, total_len } => {
+        KeyValue::String {
+            value, total_len, ..
+        } => {
             if !loaded.value.is_truncated() {
                 return None;
             }
@@ -312,6 +314,7 @@ mod tests {
             value: KeyValue::String {
                 value: "abc".into(),
                 total_len: 3,
+                lossy: false,
             },
             page: ValuePageInfo::default(),
         };
@@ -321,6 +324,7 @@ mod tests {
             value: KeyValue::String {
                 value: "x".repeat(1024),
                 total_len: 2048,
+                lossy: false,
             },
             page: ValuePageInfo::default(),
         };
