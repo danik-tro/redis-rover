@@ -9,8 +9,9 @@ on:
   # without creating a release or publishing to crates.io.
   workflow_dispatch:
 
+# Read-only by default; only the job that creates the release may write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   # Keep in sync with rust-toolchain.toml.
@@ -21,6 +22,8 @@ jobs:
   publish:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # the Release step uploads the archives
 
     strategy:
       fail-fast: false
