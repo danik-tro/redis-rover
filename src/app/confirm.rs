@@ -175,10 +175,15 @@ impl App {
             .show("Read-only off: writes are enabled", false, now);
     }
 
+    /// The open question is the typed confirm (it has a text input).
+    pub(super) fn typed_confirm_open(&self) -> bool {
+        matches!(&self.pending, Some(PendingConfirm::Write(w)) if w.typed.is_some())
+    }
+
     /// Keys while a question is open. Popup-local like Enter / Esc in the
     /// other popups: `y` accepts, `n` / Esc cancels, the quit binding quits.
     pub(super) fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if matches!(&self.pending, Some(PendingConfirm::Write(w)) if w.typed.is_some()) {
+        if self.typed_confirm_open() {
             return self.handle_typed_key(key);
         }
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
@@ -272,7 +277,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
-    use tokio::sync::broadcast;
+    use tokio::sync::mpsc;
 
     use super::PendingConfirm;
     use crate::{
@@ -305,7 +310,10 @@ mod tests {
     }
 
     /// An app on the hash `user:1` = {name: Bob}, drilled into its value.
-    fn on_hash(env: Environment, policy: PreviewPolicy) -> (App, broadcast::Receiver<RedisEvent>) {
+    fn on_hash(
+        env: Environment,
+        policy: PreviewPolicy,
+    ) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
         let (app, _, events) = app_with_channels();
         let mut app = app.environment(env);
         app.preview = policy;
@@ -332,11 +340,11 @@ mod tests {
         (app, events)
     }
 
-    fn drain(events: &mut broadcast::Receiver<RedisEvent>) -> Vec<RedisEvent> {
+    fn drain(events: &mut mpsc::UnboundedReceiver<RedisEvent>) -> Vec<RedisEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
 
-    fn writes(events: &mut broadcast::Receiver<RedisEvent>) -> Vec<RedisEvent> {
+    fn writes(events: &mut mpsc::UnboundedReceiver<RedisEvent>) -> Vec<RedisEvent> {
         drain(events)
             .into_iter()
             .filter(RedisEvent::is_write)
@@ -455,7 +463,7 @@ mod tests {
     }
 
     /// An app on the key list with `name` selected.
-    fn on_key(env: Environment, name: &str) -> (App, broadcast::Receiver<RedisEvent>) {
+    fn on_key(env: Environment, name: &str) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
         let (app, _, mut events) = app_with_channels();
         let mut app = app.environment(env);
         *app.state.keys.lock() = Some(vec![crate::app::tests::meta(name)]);

@@ -14,6 +14,27 @@ use crate::{action::Action, command::Command, keybindings::KeyResolution, mode::
 /// How long a partially typed key chord waits for its next key.
 const CHORD_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The text input a paste goes into. Checked in the order
+/// `handle_key_event` routes keys, so a paste reaches the input that typing
+/// would reach, and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteTarget {
+    /// The typed confirm on Prod.
+    TypedConfirm,
+    /// The Pub/Sub add / publish popup; `multiline` in the payload field.
+    PubSubPopup {
+        multiline: bool,
+    },
+    /// The filter popup.
+    Filter,
+    /// The edit-value / TTL overlay.
+    Overlay,
+    /// The add-key wizard on its name or element step.
+    Wizard,
+    AddItem,
+    EditItem,
+}
+
 impl App {
     pub(super) fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         let is_confirm = key.code == KeyCode::Enter;
@@ -143,6 +164,94 @@ impl App {
         self.handle_keybindings(key)
     }
 
+    /// The focused text input, if a paste may go anywhere at all.
+    fn paste_target(&self) -> Option<PasteTarget> {
+        if self.mode == Mode::Popup(PopupMode::Error) {
+            return None;
+        }
+        if self.pending.is_some() {
+            return self
+                .typed_confirm_open()
+                .then_some(PasteTarget::TypedConfirm);
+        }
+        if self.db_picker.is_open() {
+            return None;
+        }
+        if self.mode == Mode::PubSub {
+            return self.pubsub.is_popup().then(|| PasteTarget::PubSubPopup {
+                multiline: self.pubsub.is_payload_focused(),
+            });
+        }
+        if self.mode == Mode::Dashboard
+            || self.keyspace.is_sort_menu_open()
+            || self.keyspace.is_type_menu_open()
+        {
+            return None;
+        }
+        if self.keyspace.is_popup() {
+            return Some(PasteTarget::Filter);
+        }
+        if self.keyspace.is_input_active() {
+            return Some(PasteTarget::Overlay);
+        }
+        if self.keyspace.is_wizard_active() {
+            return self
+                .keyspace
+                .wizard_takes_text()
+                .then_some(PasteTarget::Wizard);
+        }
+        if self.keyspace.is_add_item_active() {
+            return self
+                .keyspace
+                .item_input_ready()
+                .then_some(PasteTarget::AddItem);
+        }
+        if self.keyspace.is_edit_item_active() {
+            return self
+                .keyspace
+                .item_input_ready()
+                .then_some(PasteTarget::EditItem);
+        }
+        None
+    }
+
+    /// Pasted text (bracketed paste). It is typed into the focused text
+    /// input and goes nowhere else: on the key list or in a yes / no question
+    /// its letters would run as commands (`d`, then `y`, deletes a key).
+    /// Line breaks and tabs become spaces, so a pasted line break never
+    /// confirms an input; only the publish payload keeps its lines. Other
+    /// control characters are dropped.
+    pub(super) fn handle_paste(&mut self, text: &str) {
+        let now = self.clock.now();
+        let Some(target) = self.paste_target() else {
+            self.toast
+                .show("Paste ignored: no text field is open", false, now);
+            return;
+        };
+        let multiline = target == PasteTarget::PubSubPopup { multiline: true };
+        let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", "\n");
+        for c in text.chars() {
+            let code = match c {
+                '\n' | '\r' if multiline => KeyCode::Enter,
+                '\n' | '\r' | '\t' => KeyCode::Char(' '),
+                c if c.is_control() => continue,
+                c => KeyCode::Char(c),
+            };
+            let key = KeyEvent::new(code, crossterm::event::KeyModifiers::empty());
+            match target {
+                PasteTarget::TypedConfirm => {
+                    self.handle_confirm_key(key);
+                }
+                PasteTarget::PubSubPopup { .. } => self.pubsub.handle_popup_key(key),
+                PasteTarget::Filter => self.keyspace.handle_key(key, now),
+                PasteTarget::Overlay => self.keyspace.handle_overlay_key(key),
+                PasteTarget::Wizard => self.keyspace.handle_wizard_key(key),
+                PasteTarget::AddItem => self.keyspace.handle_add_item_key(key),
+                PasteTarget::EditItem => self.keyspace.handle_edit_item_key(key),
+            }
+        }
+    }
+
     /// A key in the open sort menu (one letter picks, Esc closes) or type
     /// checklist (Esc cancels, Enter applies, the rest is the widget's).
     fn handle_menu_key(&mut self, key: KeyEvent, is_cancel: bool) {
@@ -241,5 +350,93 @@ impl App {
             self.last_key_at = None;
         }
         expired
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use tokio::sync::mpsc;
+
+    use crate::{
+        app::{
+            tests::{app_with_channels, key, meta},
+            App,
+        },
+        redis_client::event::RedisEvent,
+        target::Environment,
+    };
+
+    /// An app on the key list with `name` selected.
+    fn on_key(env: Environment, name: &str) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
+        let (app, _, mut events) = app_with_channels();
+        let mut app = app.environment(env);
+        *app.state.keys.lock() = Some(vec![meta(name)]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(name));
+        while events.try_recv().is_ok() {}
+        (app, events)
+    }
+
+    fn press(app: &mut App, k: KeyEvent) {
+        if let Some(action) = app.handle_key_event(k) {
+            app.update(&action);
+        }
+    }
+
+    fn writes(events: &mut mpsc::UnboundedReceiver<RedisEvent>) -> Vec<RedisEvent> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter(RedisEvent::is_write)
+            .collect()
+    }
+
+    /// #67: the same letters delete the key when typed, and do nothing when
+    /// pasted, on the key list and in the yes / no preview.
+    #[test]
+    fn paste_never_runs_as_commands() {
+        let (mut app, mut events) = on_key(Environment::Local, "orders:2024");
+        app.handle_paste("d\ny\n");
+        assert!(app.pending.is_none(), "paste opened the delete preview");
+        assert!(!app.keyspace.is_overlay_open());
+        assert!(writes(&mut events).is_empty());
+
+        // The preview is open: a pasted `y` is not an answer.
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(app.pending.is_some());
+        app.handle_paste("y");
+        assert!(app.pending.is_some());
+        assert!(writes(&mut events).is_empty(), "paste confirmed a delete");
+
+        // Typed, `y` does delete: the paste above is what was at stake.
+        press(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    #[test]
+    fn paste_goes_into_the_focused_input_and_never_confirms_it() {
+        let (mut app, mut events) = on_key(Environment::Local, "orders:2024");
+        let now = app.clock.now();
+        app.keyspace.enter_filter_pattern(now);
+        app.handle_paste("user:*\r\nsession:\t*\u{1b}[31m\n");
+        assert!(app.keyspace.is_popup(), "a line break confirmed the filter");
+        assert_eq!(
+            app.keyspace.confirm_filter_pattern().as_deref(),
+            Some("user:* session: *[31m"),
+            "line breaks and tabs are spaces, ESC is dropped"
+        );
+        assert!(writes(&mut events).is_empty());
+    }
+
+    /// The typed confirm on Prod takes the pasted name, and still needs
+    /// Enter.
+    #[test]
+    fn paste_into_the_typed_confirm_does_not_delete() {
+        let (mut app, mut events) = on_key(Environment::Prod, "orders:2024");
+        press(&mut app, key(KeyCode::Char('d')));
+        app.handle_paste("orders:2024\n");
+        assert!(app.pending.is_some());
+        assert!(writes(&mut events).is_empty());
+        press(&mut app, key(KeyCode::Enter));
+        assert_eq!(writes(&mut events).len(), 1);
     }
 }

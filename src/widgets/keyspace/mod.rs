@@ -398,6 +398,7 @@ mod tests {
             value: KeyValue::String {
                 value: text.into(),
                 total_len: text.len(),
+                lossy: false,
             },
             page: ValuePageInfo::default(),
         }
@@ -459,6 +460,7 @@ mod tests {
             value: KeyValue::String {
                 value: "abc".into(),
                 total_len: 10,
+                lossy: false,
             },
             page: ValuePageInfo::default(),
         };
@@ -466,5 +468,31 @@ mod tests {
         assert_eq!(keyspace.loaded_value_text(), None);
         let keyspace = with_value(RedisType::String, string_value("abc"));
         assert_eq!(keyspace.loaded_value_text().as_deref(), Some("abc"));
+    }
+
+    /// #66: a STRING shown with `�` in place of invalid bytes opens a
+    /// notice, not the editor; saving that text would overwrite the bytes.
+    #[test]
+    fn binary_string_is_not_editable() {
+        let mut keyspace = with_value(RedisType::String, string_value("abc"));
+        keyspace.open_edit_value();
+        assert!(keyspace.is_input_active(), "plain text opens the editor");
+
+        let binary = LoadedValue {
+            value: KeyValue::String {
+                value: "a\u{FFFD}b".into(),
+                total_len: 3,
+                lossy: true,
+            },
+            page: ValuePageInfo::default(),
+        };
+        let mut keyspace = with_value(RedisType::String, binary);
+        keyspace.open_edit_value();
+        assert!(keyspace.is_overlay_open(), "a notice");
+        assert!(!keyspace.is_input_active(), "no editor");
+        assert!(
+            keyspace.take_overlay_request().is_none(),
+            "nothing to write"
+        );
     }
 }

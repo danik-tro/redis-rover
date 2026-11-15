@@ -412,6 +412,7 @@ fn value_string() {
         KeyValue::String {
             value: text.into(),
             total_len: text.len(),
+            lossy: false,
         },
     );
     check("value_string", &draw_keyspace(&mut keyspace, 120, 20));
@@ -588,6 +589,7 @@ fn keys_ttl_toast() {
         KeyValue::String {
             value: "<html>…</html>".into(),
             total_len: 15_000,
+            lossy: false,
         },
     );
     let mut toast = Toast::default();

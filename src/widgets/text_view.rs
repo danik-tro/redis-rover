@@ -449,6 +449,7 @@ mod tests {
         let value = |text: &str, total_len: usize| KeyValue::String {
             value: text.into(),
             total_len,
+            lossy: false,
         };
         let json = TextCache::build(&value("{\"a\":1}", 7)).unwrap();
         assert!(json.json);

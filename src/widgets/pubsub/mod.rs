@@ -320,6 +320,13 @@ impl PubSub {
         matches!(self.popup, Some(Popup::Publish(_)))
     }
 
+    /// The publish popup's payload field has focus: pasted line breaks
+    /// stay line breaks there.
+    #[must_use]
+    pub fn is_payload_focused(&self) -> bool {
+        matches!(&self.popup, Some(Popup::Publish(popup)) if popup.payload_focused())
+    }
+
     pub fn close_popup(&mut self) {
         self.popup = None;
     }

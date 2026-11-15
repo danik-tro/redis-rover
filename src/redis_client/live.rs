@@ -39,7 +39,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{client, pubsub::backoff, types::ValueState};
+use super::{client, pubsub::backoff, runner::Link, types::ValueState};
 use crate::{
     action::{try_send_action, Action},
     config::{LiveConfig, LiveMode},
@@ -489,13 +489,11 @@ impl LiveTask {
         poll.next_at = None;
         if poll.conn.as_ref().is_none_or(|(db, _)| *db != self.db) {
             poll.conn = None;
+            // The configured timeouts, not the redis crate's 500 ms reply
+            // default: a fingerprint (`DUMP`, a value page) can be slow.
             let opened = match self.db_client() {
-                Ok(client) => tokio::time::timeout(CONNECT_TIMEOUT, ConnectionManager::new(client))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(redis::RedisError::from((redis::ErrorKind::Io, "timed out")))
-                    }),
-                Err(err) => Err(err),
+                Ok(client) => super::runner::connect(client, Link::Interactive).await,
+                Err(err) => Err(err.into()),
             };
             match opened {
                 Ok(conn) => {

@@ -208,7 +208,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
-    use tokio::sync::broadcast;
+    use tokio::sync::mpsc;
 
     use super::Loading;
     use crate::{
@@ -223,7 +223,7 @@ mod tests {
         widgets::keyspace::LoadProgress,
     };
 
-    fn drain(events: &mut broadcast::Receiver<RedisEvent>) -> Vec<RedisEvent> {
+    fn drain(events: &mut mpsc::UnboundedReceiver<RedisEvent>) -> Vec<RedisEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
 
@@ -238,7 +238,7 @@ mod tests {
     }
 
     /// An app whose sweep holds `keys` (one page, more to come).
-    fn app_on(keys: &[&str]) -> (App, broadcast::Receiver<RedisEvent>) {
+    fn app_on(keys: &[&str]) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
         let (mut app, _, events) = app_with_channels();
         app.state
             .keyspace_state

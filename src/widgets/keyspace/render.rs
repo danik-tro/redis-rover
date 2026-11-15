@@ -646,6 +646,11 @@ impl StatefulWidget for KeySpaceWidget {
                     Column::Ttl => {
                         Cell::from(Line::from(format_ttl(meta.ttl)).right_aligned()).fg(ttl_color)
                     }
+                    // 0 is "unknown" (`MEMORY USAGE` refused, or the key
+                    // went away): no stored key takes 0 bytes.
+                    Column::Size if meta.size == 0 => {
+                        Cell::from(Line::from("—").right_aligned()).fg(dim)
+                    }
                     Column::Size => Cell::from(
                         Line::from(format!(
                             "{:.2}",

@@ -87,13 +87,17 @@ pub async fn fetch_value_page(
 
     let value = match state.r_type {
         RedisType::String => {
-            let (value, total_len) =
+            let (value, total_len, lossy) =
                 fetch_string_preview(manager, &key, STRING_PREVIEW_BYTES).await?;
             state.total = None;
             return Ok((
                 state,
                 LoadedValue {
-                    value: KeyValue::String { value, total_len },
+                    value: KeyValue::String {
+                        value,
+                        total_len,
+                        lossy,
+                    },
                     page: ValuePageInfo::default(),
                 },
             ));
@@ -384,8 +388,10 @@ pub async fn fetch_full_value(
         RedisType::String => {
             let bytes: Vec<u8> = redis::cmd("GET").arg(key).query_async(manager).await?;
             let total_len = bytes.len();
+            let text = String::from_utf8_lossy(&bytes);
             KeyValue::String {
-                value: String::from_utf8_lossy(&bytes).into_owned(),
+                lossy: matches!(text, std::borrow::Cow::Owned(_)),
+                value: text.into_owned(),
                 total_len,
             }
         }
@@ -556,13 +562,13 @@ fn pair_up(flat: Vec<String>) -> Vec<(String, String)> {
     pairs
 }
 
-/// `STRLEN` + `GETRANGE 0 max-1` in one pipeline. Returns the decoded preview
-/// and the full length in bytes.
+/// `STRLEN` + `GETRANGE 0 max-1` in one pipeline. Returns the decoded preview,
+/// the full length in bytes, and whether decoding replaced invalid bytes.
 async fn fetch_string_preview(
     manager: &mut ConnectionManager,
     key: &str,
     max: usize,
-) -> Result<(String, usize), BoxError> {
+) -> Result<(String, usize, bool), BoxError> {
     let (total, bytes): (usize, Vec<u8>) = redis::pipe()
         .cmd("STRLEN")
         .arg(key)
@@ -573,13 +579,15 @@ async fn fetch_string_preview(
         .query_async(manager)
         .await?;
     let truncated = bytes.len() < total;
-    Ok((decode_preview(&bytes, truncated), total))
+    let (text, lossy) = decode_preview(&bytes, truncated);
+    Ok((text, total, lossy))
 }
 
 /// Decode a value preview as UTF-8. When the preview was cut short, a
 /// multi-byte character split at the end is dropped instead of shown as `�`.
-/// Other invalid bytes are replaced with `�`.
-fn decode_preview(bytes: &[u8], truncated: bool) -> String {
+/// Other invalid bytes are replaced with `�`, and the flag says so: such a
+/// value is binary, and saving the text shown would overwrite it.
+fn decode_preview(bytes: &[u8], truncated: bool) -> (String, bool) {
     let mut end = bytes.len();
     if truncated {
         if let Err(err) = std::str::from_utf8(bytes) {
@@ -589,7 +597,9 @@ fn decode_preview(bytes: &[u8], truncated: bool) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    let text = String::from_utf8_lossy(&bytes[..end]);
+    let lossy = matches!(text, std::borrow::Cow::Owned(_));
+    (text.into_owned(), lossy)
 }
 
 type WriteResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -602,13 +612,31 @@ async fn run_writes(mut manager: ConnectionManager, cmds: Vec<redis::Cmd>) -> Wr
     Ok(())
 }
 
-/// Overwrite a key with a plain string value (`SET`).
+/// Overwrite a key with a plain string value, keeping its TTL
+/// (`SET … KEEPTTL`). A server before Redis 6.0 rejects `KEEPTTL` as a syntax
+/// error; there the TTL is read first and sent back with the value
+/// (`PTTL`, then `SET … PX`).
 ///
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn set_string(manager: ConnectionManager, key: &str, value: &str) -> WriteResult {
-    run_writes(manager, write_cmd::set_string(key, value)).await
+pub async fn set_string(mut manager: ConnectionManager, key: &str, value: &str) -> WriteResult {
+    match run_writes(manager.clone(), write_cmd::set_string(key, value)).await {
+        Err(err) if is_syntax_error(err.as_ref()) => {
+            let ttl_ms: i64 = redis::cmd("PTTL")
+                .arg(key)
+                .query_async(&mut manager)
+                .await?;
+            run_writes(manager, write_cmd::set_string_px(key, value, ttl_ms)).await
+        }
+        result => result,
+    }
+}
+
+/// The server answered `ERR syntax error`: it doesn't know an option.
+fn is_syntax_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    err.downcast_ref::<redis::RedisError>()
+        .is_some_and(|e| e.to_string().to_lowercase().contains("syntax error"))
 }
 
 /// Delete a key (`DEL`). Type-agnostic — works on any value type.
@@ -724,15 +752,21 @@ mod tests {
     fn decode_preview_drops_split_trailing_char() {
         // "aé" is [0x61, 0xC3, 0xA9]; cutting after 2 bytes splits the "é".
         let bytes = "aé".as_bytes();
-        assert_eq!(decode_preview(&bytes[..2], true), "a");
-        assert_eq!(decode_preview(bytes, false), "aé");
+        assert_eq!(decode_preview(&bytes[..2], true), ("a".to_string(), false));
+        assert_eq!(decode_preview(bytes, false), ("aé".to_string(), false));
     }
 
     #[test]
     fn decode_preview_replaces_invalid_bytes() {
-        assert_eq!(decode_preview(&[0x61, 0xFF, 0x62], false), "a\u{FFFD}b");
+        assert_eq!(
+            decode_preview(&[0x61, 0xFF, 0x62], false),
+            ("a\u{FFFD}b".to_string(), true)
+        );
         // Invalid byte in the middle of a truncated preview is still replaced.
-        assert_eq!(decode_preview(&[0xFF, 0x61], true), "\u{FFFD}a");
+        assert_eq!(
+            decode_preview(&[0xFF, 0x61], true),
+            ("\u{FFFD}a".to_string(), true)
+        );
     }
 
     /// Live checks against a seeded Redis. Run with
@@ -890,7 +924,10 @@ mod tests {
         let (_, loaded) = fetch_value_page(manager().await, state("big:str", RedisType::String))
             .await
             .unwrap();
-        let KeyValue::String { value, total_len } = &loaded.value else {
+        let KeyValue::String {
+            value, total_len, ..
+        } = &loaded.value
+        else {
             panic!()
         };
         assert_eq!((value.len(), *total_len), (64 * 1024, 5_000_000));
@@ -899,7 +936,10 @@ mod tests {
         let (_, loaded) = fetch_value_page(manager().await, state("str:utf8", RedisType::String))
             .await
             .unwrap();
-        let KeyValue::String { value, total_len } = &loaded.value else {
+        let KeyValue::String {
+            value, total_len, ..
+        } = &loaded.value
+        else {
             panic!()
         };
         assert_eq!(*total_len, 90_000);

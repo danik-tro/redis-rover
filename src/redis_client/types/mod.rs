@@ -123,9 +123,12 @@ impl RedisInfo {
 pub enum KeyValue {
     /// The first [`STRING_PREVIEW_BYTES`] of the value. Truncated when
     /// `value.len() < total_len` (`total_len` is `STRLEN`, in bytes).
+    /// `lossy`: the stored bytes aren't valid UTF-8, so `value` shows `�`
+    /// in their place and must never be written back.
     String {
         value: String,
         total_len: usize,
+        lossy: bool,
     },
     List(Vec<String>),
     Set(Vec<String>),

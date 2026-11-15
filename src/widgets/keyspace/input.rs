@@ -276,10 +276,18 @@ impl KeySpace {
     }
 
     /// Open the value editor. STRING values pre-fill the editor; a truncated
-    /// STRING or any other type opens a read-only notice instead, so a cut-off
-    /// preview is never written back.
+    /// or binary STRING or any other type opens a read-only notice instead,
+    /// so a cut-off preview or `�` placeholders are never written back.
     pub fn open_edit_value(&mut self) {
         match self.selected_value.as_ref().map(|loaded| &loaded.value) {
+            Some(value) if value.is_lossy() => {
+                self.action_overlay = Some(ActionOverlay {
+                    kind: OverlayKind::Notice(
+                        "Binary value (not valid UTF-8): can't be edited here.".to_string(),
+                    ),
+                    text_area: None,
+                });
+            }
             Some(value) if value.is_truncated() => {
                 self.action_overlay = Some(ActionOverlay {
                     kind: OverlayKind::Notice("Value too large to edit here.".to_string()),
@@ -361,6 +369,16 @@ impl KeySpace {
 
     pub fn is_add_item_active(&self) -> bool {
         self.add_item.is_some()
+    }
+
+    /// The add-item or edit-item overlay shows its input, not a notice
+    /// (which any key dismisses).
+    pub fn item_input_ready(&self) -> bool {
+        match (&self.add_item, &self.edit_item) {
+            (Some(draft), _) => draft.notice.is_none(),
+            (None, Some(draft)) => draft.notice.is_none(),
+            (None, None) => false,
+        }
     }
 
     /// Open the add-item overlay for the focused collection `key` of type `kind`.

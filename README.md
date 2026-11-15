@@ -350,6 +350,14 @@ For example, to preview RedisJSON documents only above 4 MiB:
 }
 ```
 
+On a slow link (VPN, another region) raise the timeouts. A command waits `response_timeout_ms` for its reply (5 s by default; copying a whole value, load all and the metadata backfill get six times that, at least 30 s), and one connection attempt may take `connect_timeout_ms` (5 s):
+
+```json5
+{
+  "connection": { "response_timeout_ms": 15000, "connect_timeout_ms": 10000 },
+}
+```
+
 ---
 
 ## Development

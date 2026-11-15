@@ -126,6 +126,11 @@ impl PublishPopup {
         self.channel.lines().first().cloned().unwrap_or_default()
     }
 
+    /// The payload field has focus (the one input that takes several lines).
+    pub(super) fn payload_focused(&self) -> bool {
+        self.focus == PublishField::Payload
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
         match (key.code, self.focus) {
             (KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter, PublishField::Channel) => {
