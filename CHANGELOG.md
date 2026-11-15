@@ -100,6 +100,10 @@ First public release. Requires Rust 1.97 or newer.
   only with `safety.preview = "off"`.
 - The footer's ` RO ` badge is now the environment badge (` LOCAL `, ` PROD · RO `, …).
 - A partial `colors` table in the user config no longer fails to load.
+- New `connection` config section: `response_timeout_ms` (5 s; copying a whole value, load
+  all and the metadata backfill get six times that, at least 30 s) and
+  `connect_timeout_ms` (5 s).
+- The write preview of a STRING edit shows `SET … "KEEPTTL"`.
 
 - Paging deep into a big keyspace is as fast as the first page: a page turn no longer
   copies every key swept so far (52.95 ms → 3.3 µs at 1M keys, the same at 10M).
@@ -118,6 +122,20 @@ First public release. Requires Rust 1.97 or newer.
 
 ### Fixed
 
+- The key list, values and writes could stop responding for the rest of the session after
+  a burst of key presses while a request was slow (holding `j` during a long SCAN). No
+  request is dropped any more.
+- Editing a STRING keeps its TTL (`SET … KEEPTTL`; `PTTL` + `SET … PX` before Redis 6.0).
+  It used to make the key permanent.
+- A STRING that isn't valid UTF-8 can no longer be opened in the editor, where saving
+  would have overwritten its bytes.
+- Pasted text is typed into the focused text field only. On the key list or in a `y` / `n`
+  question it used to run as key presses (`d`, then `y`, deleted the selected key).
+- Commands no longer time out after 500 ms. See `connection` under Changed.
+- A server that refuses `MEMORY USAGE` (an ACL, a managed service) still lists its keys;
+  the size column shows `—`.
+- The log file is created readable by its owner only (0600), and it no longer contains
+  written values or Pub/Sub payloads.
 - `cargo install` and release builds failed to compile (the panic handler used an old
   `human-panic` API).
 - The config environment variables are `REDIS_ROVER_CONFIG`, `REDIS_ROVER_DATA` and
