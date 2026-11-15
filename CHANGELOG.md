@@ -104,6 +104,18 @@ First public release. Requires Rust 1.97 or newer.
   all and the metadata backfill get six times that, at least 30 s) and
   `connect_timeout_ms` (5 s).
 - The write preview of a STRING edit shows `SET … "KEEPTTL"`.
+- A write of several commands runs in one `MULTI` / `EXEC`, and the preview shows it. A
+  LIST element is edited or deleted by a short script (`EVAL`) that first checks the
+  element is still the one shown; without scripting (an ACL) the check is a separate
+  `LINDEX`. A new STRING key is created with `SET … NX`.
+- `rrover <profile> --url <other>`: when `--url` replaces a profile's `url`, the
+  profile's `environment` and `read_only: false` apply only if the new host doesn't call
+  for more protection. `rrover local --url redis://prod-db:6379` now starts as `UNKNOWN`
+  and read-only (it was `LOCAL` and writable). `--print-target` names the source.
+- The config and data directories are named after this project
+  (`io.github.danik-tro.redis-rover` on macOS, `danik-tro\redis-rover` on Windows; no
+  change on Linux). An existing directory under the old name keeps being used until
+  the new one exists. `rrover --version` prints both paths.
 
 - Paging deep into a big keyspace is as fast as the first page: a page turn no longer
   copies every key swept so far (52.95 ms → 3.3 µs at 1M keys, the same at 10M).
@@ -136,6 +148,21 @@ First public release. Requires Rust 1.97 or newer.
   the size column shows `—`.
 - The log file is created readable by its owner only (0600), and it no longer contains
   written values or Pub/Sub payloads.
+- Key names, collection members and channel names that aren't valid UTF-8 no longer
+  fail the key list ("Failed to fetch keys") or the value. They are shown with
+  `redis-cli` escapes (`\xff\xfe`), and such a key can be opened, given a TTL and
+  deleted. A binary element can be deleted but not edited.
+- A LIST edit or delete no longer changes the wrong element after another client pushed
+  or popped ("the list changed at this index, reload it"), and a lost connection can no
+  longer leave a delete marker in a list or drop a SET member that was being replaced.
+- Control and invisible characters in a key name (line breaks, escape sequences, bidi
+  overrides, zero-width spaces) are shown as escapes (`\n`, `\x1b`, `\u{202e}`) in the
+  key list, the value tables, the write preview and the typed confirm on Prod, so two
+  different names never look the same.
+- `--probe` and startup errors escape text from the server, which could otherwise send
+  escape sequences to the terminal.
+- A mistyped key in `keybindings` is reported as a configuration error (exit code 3)
+  instead of a crash, and a missing user config is no longer logged as an error.
 - `cargo install` and release builds failed to compile (the panic handler used an old
   `human-panic` API).
 - The config environment variables are `REDIS_ROVER_CONFIG`, `REDIS_ROVER_DATA` and
