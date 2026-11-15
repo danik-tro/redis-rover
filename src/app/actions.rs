@@ -48,6 +48,7 @@ impl App {
         let help_open = self.help_is_open();
         let mode = self.mode;
         self.maybe_dismiss_help(action, now);
+        self.flush_pending_value(action);
         self.apply(action, now, help_open);
         if self.mode != mode {
             self.sync_backfill_pause();
@@ -60,6 +61,7 @@ impl App {
         let mut changed = help_open != self.help_is_open();
         changed |= self.expire_pending_chord(now);
         changed |= self.request_filter_count(now);
+        changed |= self.fetch_rested_value(now);
         changed |= self.toast.expire(now);
         changed |= self.keyspace.expire_changed(now);
         changed |= self.pubsub_tick(now, self.clock.wall());
@@ -81,6 +83,7 @@ impl App {
             Action::ResetMetrics => self.reset_metrics(),
             Action::LoadKeySpace => self.load_keyspace(),
             Action::RefreshSpace => self.refresh_space(),
+            Action::KeysChanged => self.fetch_keys(),
             Action::LoadKeysIntoKeySpace => {
                 self.finish_keys_fetch();
                 self.load_new_keys();
@@ -95,11 +98,12 @@ impl App {
             Action::OpenTypeFilter => self.open_type_filter(),
             Action::ToggleTree => self.toggle_tree(),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
+            Action::KeysScanning(checked) => self.keyspace.set_scanning(Some(checked)),
             Action::RequestSelectedValue => self.request_selected_value(),
             Action::LoadSelectedValueIntoView => self.load_selected_value(now),
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
-            Action::ScrollDown => self.scroll_down(),
-            Action::ScrollUp => self.scroll_up(),
+            Action::ScrollDown => self.scroll_down(now),
+            Action::ScrollUp => self.scroll_up(now),
             Action::ScrollLeft | Action::ScrollRight => {
                 let right = *action == Action::ScrollRight;
                 if self.mode == Mode::PubSub {
@@ -246,6 +250,7 @@ impl App {
             | Action::Render
             | Action::DiscardKeyspacePopup
             | Action::KeysLoadAborted
+            | Action::KeysScanning(_)
             | Action::DbSwitched
             | Action::OpenKeyChanged { .. }
             | Action::LiveStatus(_)

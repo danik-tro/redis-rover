@@ -297,6 +297,15 @@ impl Runner {
                     continue;
                 }
                 event_handler.handle(event).await;
+                if std::mem::take(&mut event_handler.keys_unfinished) {
+                    // The page needs more SCAN slices (#80). The rest goes
+                    // behind whatever arrived meanwhile, so a write or a new
+                    // filter never waits for the whole keyspace.
+                    while let Ok(event) = rx.try_recv() {
+                        queued.push_back(event);
+                    }
+                    queued.push_back(RedisEvent::FetchKeys);
+                }
                 if cancellation_token.is_cancelled() {
                     break;
                 }
@@ -374,6 +383,17 @@ impl Runner {
     }
 }
 
+/// How a `FetchKeys` ended.
+enum Fetched {
+    /// The page is in `SharedState::keys`.
+    Page,
+    /// The user left this page / sweep meanwhile.
+    Stale,
+    /// One SCAN slice ran and the page is still short; about `checked` keys
+    /// of the keyspace were looked at so far.
+    Unfinished { checked: u64 },
+}
+
 /// `event` can be skipped because `next`, queued right behind it, does the
 /// same work. `FetchKeys` and `FetchValue` carry no payload: each reads the
 /// latest shared state, so of a run of them only the last one is needed.
@@ -397,6 +417,10 @@ pub struct EventHandler {
     read_only: Arc<AtomicBool>,
     /// `ValueState::generation` of the last value fetch started.
     last_value_generation: Option<u64>,
+    /// The last `FetchKeys` spent its SCAN slice with the page still short:
+    /// the state task queues another one for the rest and the request is
+    /// answered by that one.
+    keys_unfinished: bool,
     /// The running filter match count, if any. A new request aborts it.
     count_task: Option<JoinHandle<()>>,
     /// The running full-value fetch for copying, if any. A new one aborts it.
@@ -452,6 +476,7 @@ impl EventHandler {
             client,
             read_only,
             last_value_generation: None,
+            keys_unfinished: false,
             count_task: None,
             yank_task: None,
             value_task: None,
@@ -493,9 +518,9 @@ impl EventHandler {
                 match self.storage.set_string(&key, &value).await {
                     Ok(()) => {
                         // Re-fetch the value so the detail view reflects the edit,
-                        // and refresh the keyspace so the size column updates.
+                        // and the key's row so the size column updates.
                         self.action_hook(Action::RequestSelectedValue);
-                        self.action_hook(Action::RefreshSpace);
+                        self.key_written(&key).await;
                     }
                     Err(err) => {
                         log::error!("SetString failed for {key}: {err:?}");
@@ -504,14 +529,14 @@ impl EventHandler {
                 }
             }
             RedisEvent::DeleteKey { key } => match self.storage.delete_key(&key).await {
-                Ok(()) => self.action_hook(Action::RefreshSpace),
+                Ok(()) => self.key_written(&key).await,
                 Err(err) => {
                     log::error!("DeleteKey failed for {key}: {err:?}");
                     self.action_hook(Action::Error(format!("Failed to delete {key}: {err}")));
                 }
             },
             RedisEvent::SetTtl { key, secs } => match self.storage.set_ttl(&key, secs).await {
-                Ok(()) => self.action_hook(Action::RefreshSpace),
+                Ok(()) => self.key_written(&key).await,
                 Err(err) => {
                     log::error!("SetTtl failed for {key}: {err:?}");
                     self.action_hook(Action::Error(format!("Failed to set TTL on {key}: {err}")));
@@ -519,8 +544,12 @@ impl EventHandler {
             },
             RedisEvent::CreateKey { key, spec } => {
                 match self.storage.create_key(&key, &spec).await {
-                    // Cursor lands on the new key via `App::reselect_key`.
-                    Ok(()) => self.action_hook(Action::RefreshSpace),
+                    // The new key sits at the end of what is loaded: go to
+                    // its page, where `App::reselect_key` puts the cursor.
+                    Ok(()) => {
+                        self.state.keyspace_state.lock().reveal(key.clone());
+                        self.key_written(&key).await;
+                    }
                     Err(err) => {
                         log::error!("CreateKey failed for {key}: {err:?}");
                         self.action_hook(Action::Error(format!("Failed to create {key}: {err}")));
@@ -530,9 +559,9 @@ impl EventHandler {
             RedisEvent::AddItem { key, item } => match self.storage.add_item(&key, &item).await {
                 Ok(()) => {
                     // Re-fetch the value so the detail table reflects the new
-                    // element, and refresh the keyspace so the size column updates.
+                    // element, and the key's row so the size column updates.
                     self.action_hook(Action::RequestSelectedValue);
-                    self.action_hook(Action::RefreshSpace);
+                    self.key_written(&key).await;
                 }
                 Err(err) => {
                     log::error!("AddItem failed for {key}: {err:?}");
@@ -543,9 +572,9 @@ impl EventHandler {
                 match self.storage.edit_item(&key, &edit).await {
                     Ok(()) => {
                         // Re-fetch the value so the detail table reflects the
-                        // edit; refresh the keyspace so the size column updates.
+                        // edit, and the key's row so the size column updates.
                         self.action_hook(Action::RequestSelectedValue);
-                        self.action_hook(Action::RefreshSpace);
+                        self.key_written(&key).await;
                     }
                     Err(err) => {
                         log::error!("EditItem failed for {key}: {err:?}");
@@ -559,7 +588,7 @@ impl EventHandler {
                 match self.storage.delete_item(&key, &delete).await {
                     Ok(()) => {
                         self.action_hook(Action::RequestSelectedValue);
-                        self.action_hook(Action::RefreshSpace);
+                        self.key_written(&key).await;
                     }
                     Err(err) => {
                         log::error!("DeleteItem failed for {key}: {err:?}");
@@ -866,13 +895,43 @@ impl EventHandler {
         }));
     }
 
+    /// A write to `key` succeeded (#76). The sweep isn't scanned again: the
+    /// key's `TYPE` / `TTL` / size are read once and the sweep gets what a
+    /// rescan would find for it — the key gone, new, or with other
+    /// metadata. Then `KeysChanged`, so the App fetches its page again.
+    /// Only if that read fails is the sweep restarted, as every write used
+    /// to do.
+    async fn key_written(&self, key: &str) {
+        match self.storage.fetch_meta(&[key.to_owned()]).await {
+            Ok(rows) => {
+                let mut state = self.state.keyspace_state.lock();
+                match rows.first() {
+                    Some(row) if row.r_type.name() != "none" => state.upsert_key(row),
+                    // Deleted, or the write emptied it (the last element).
+                    _ => {
+                        state.remove_key(key);
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("Reading a written key's metadata failed, rescanning: {err}");
+                self.state.keyspace_state.lock().rescan();
+            }
+        }
+        self.action_hook(Action::KeysChanged);
+    }
+
     /// Load the current keyspace page into `state.keys` and send
     /// `LoadKeysIntoKeySpace`, or `KeysLoadAborted` when the user left the page
     /// meanwhile (a newer `FetchKeys` is then queued) or the fetch failed.
     async fn fetch_keys(&mut self) {
         match self.fetch_page().await {
-            Ok(true) => self.action_hook(Action::LoadKeysIntoKeySpace),
-            Ok(false) => self.action_hook(Action::KeysLoadAborted),
+            Ok(Fetched::Page) => self.action_hook(Action::LoadKeysIntoKeySpace),
+            Ok(Fetched::Stale) => self.action_hook(Action::KeysLoadAborted),
+            Ok(Fetched::Unfinished { checked }) => {
+                self.keys_unfinished = true;
+                self.action_hook(Action::KeysScanning(checked));
+            }
             Err(err) => {
                 log::error!("FetchKeys failed: {err:?}");
                 self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
@@ -882,18 +941,24 @@ impl EventHandler {
     }
 
     /// Advance the SCAN sweep until it covers the current page (or ends), then
-    /// fetch metadata for just that page's keys. Returns `false` if the result
-    /// is stale.
+    /// fetch metadata for just that page's keys. One call runs one SCAN slice
+    /// (`Storage::scan_until`'s budget); a page still short after it is
+    /// [`Fetched::Unfinished`].
     ///
     /// The sweep is never copied and the lock is never held across `.await`:
     /// the runner takes a [`SweepRequest`](super::types::SweepRequest) under
     /// the lock, scans without it, and merges the raw keys back under it. If
     /// SCAN repeated keys and the page is still short, it asks again.
-    async fn fetch_page(&self) -> Result<bool, FetchError> {
+    async fn fetch_page(&self) -> Result<Fetched, FetchError> {
+        let mut scanned = false;
         loop {
             let Some(request) = self.state.keyspace_state.lock().sweep_request() else {
                 break;
             };
+            if scanned {
+                let checked = self.state.keyspace_state.lock().sweep_checked;
+                return Ok(Fetched::Unfinished { checked });
+            }
             let result = match self.storage.scan_until(&request).await {
                 Ok(result) => result,
                 // Before Redis 6: filter types on the client and ask again.
@@ -908,11 +973,12 @@ impl EventHandler {
             // leave the newer page to the newer FetchKeys.
             // `Raced`: another SCAN moved the sweep first; ask again from there.
             match state.apply_result(&request, result) {
-                SweepApply::Stale => return Ok(false),
+                SweepApply::Stale => return Ok(Fetched::Stale),
                 SweepApply::Applied if state.generation != request.generation => {
-                    return Ok(false);
+                    return Ok(Fetched::Stale);
                 }
-                SweepApply::Applied | SweepApply::Raced => {}
+                SweepApply::Applied => scanned = true,
+                SweepApply::Raced => {}
             }
         }
         self.build_view().await?;
@@ -927,11 +993,11 @@ impl EventHandler {
 
         let state = self.state.keyspace_state.lock();
         if state.generation != generation {
-            return Ok(false);
+            return Ok(Fetched::Stale);
         }
         *self.state.page_rows.lock() = rows;
         *self.state.keys.lock() = Some(keys);
-        Ok(true)
+        Ok(Fetched::Page)
     }
 
     /// Build a pending sort order. A large one is sorted in

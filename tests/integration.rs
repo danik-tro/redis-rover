@@ -121,26 +121,221 @@ async fn load_value(h: &mut Harness, key: &str, r_type: RedisType) -> KeyValue {
 }
 
 /// Send a write and wait for the runner's answer: `RequestSelectedValue` /
-/// `RefreshSpace` on success, `Error` on failure.
+/// `KeysChanged` on success, `Error` on failure.
 async fn write(h: &mut Harness, event: RedisEvent) -> Action {
     h.send(event);
     h.expect("the write's result", |a| {
         matches!(
             a,
-            Action::RequestSelectedValue | Action::RefreshSpace | Action::Error(_)
+            Action::RequestSelectedValue | Action::KeysChanged | Action::Error(_)
         )
     })
     .await
 }
 
 /// Like [`write`], but waits for the last action of a write
-/// (`RefreshSpace`), so the next write's answer isn't mistaken for this one.
+/// (`KeysChanged`), so the next write's answer isn't mistaken for this one.
 async fn write_done(h: &mut Harness, event: RedisEvent) -> Action {
     h.send(event);
     h.expect("the write's result", |a| {
-        matches!(a, Action::RefreshSpace | Action::Error(_))
+        matches!(a, Action::KeysChanged | Action::Error(_))
     })
     .await
+}
+
+/// #80: a page that needs a long sweep is scanned in slices. A write sent
+/// while it runs is done between two slices, and the fetch still gets its
+/// one answer with every match.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_long_scan_lets_a_write_through() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("slices");
+    // One key in ten matches, so no SCAN step comes back empty (the COUNT
+    // hint stays at 100) and a 10,000-row page takes the whole sweep:
+    // about 600 steps, twelve slices.
+    let keys = support::seed_strings(&mut admin, &format!("{p}k:"), 60_000).await;
+    let matching = keys.iter().filter(|k| k.ends_with('7')).count();
+
+    let mut h = Harness::new(server.client(0), false).await;
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        ks.set_page_size(10_000, 0);
+        ks.set_pattern(Some(format!("{p}k:*7")));
+    }
+    h.send(RedisEvent::FetchKeys);
+    h.send(RedisEvent::CreateKey {
+        key: format!("{p}new"),
+        spec: NewKeySpec::String("v".into()),
+    });
+
+    let mut seen = Vec::new();
+    loop {
+        let action = h
+            .expect("the page", |a| {
+                matches!(
+                    a,
+                    Action::KeysScanning(_)
+                        | Action::KeysChanged
+                        | Action::LoadKeysIntoKeySpace
+                        | Action::KeysLoadAborted
+                        | Action::Error(_)
+                )
+            })
+            .await;
+        let done = action == Action::LoadKeysIntoKeySpace;
+        seen.push(action);
+        if done {
+            break;
+        }
+    }
+    let position = |wanted: &dyn Fn(&Action) -> bool| seen.iter().position(wanted);
+    let scanning = position(&|a| matches!(a, Action::KeysScanning(_)));
+    let written = position(&|a| *a == Action::KeysChanged);
+    assert!(scanning.is_some(), "no progress shown: {seen:?}");
+    assert!(
+        written.is_some_and(|at| at + 1 < seen.len()),
+        "the write waited for the page: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Action::Error(_) | Action::KeysLoadAborted)),
+        "{seen:?}"
+    );
+    let checked: Vec<u64> = seen
+        .iter()
+        .filter_map(|a| match a {
+            Action::KeysScanning(checked) => Some(*checked),
+            _ => None,
+        })
+        .collect();
+    assert!(checked.windows(2).all(|w| w[0] < w[1]), "{checked:?}");
+
+    {
+        let ks = h.state.keyspace_state.lock();
+        assert!(ks.sweep_done);
+        assert_eq!(ks.scanned.len(), matching);
+    }
+    assert!(h.drain(Duration::from_millis(200)).await.is_empty());
+    h.shutdown().await;
+}
+
+/// #76: the app's own writes change one key of the sweep. Nothing is
+/// scanned again, so the place in a long list (and what is loaded) stays.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_write_updates_the_sweep_without_a_rescan() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("inplace");
+    support::seed_strings(&mut admin, &format!("{p}k:"), 2_000).await;
+    let set = format!("{p}set");
+    let _: () = admin.sadd(&set, "only").await.expect("SADD");
+
+    let mut h = Harness::new(server.client(0), false).await;
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        ks.set_page_size(100, 0);
+        ks.next_page();
+    }
+    let page = h.fetch_page().await;
+    let (cursor, loaded) = {
+        let ks = h.state.keyspace_state.lock();
+        (ks.sweep_cursor, ks.scanned.len())
+    };
+    assert!(cursor != 0 && loaded >= 200, "the sweep is part way");
+    // The sweep as it would be after a rescan: restarted, cursor 0.
+    let sweep = |h: &Harness| {
+        let ks = h.state.keyspace_state.lock();
+        (ks.sweep_cursor, ks.scanned.len(), ks.page)
+    };
+
+    // Delete a key of the page: one key less, the rest as it was.
+    let victim = page[3].clone();
+    let done = write_done(
+        &mut h,
+        RedisEvent::DeleteKey {
+            key: victim.clone(),
+        },
+    )
+    .await;
+    assert_eq!(done, Action::KeysChanged);
+    assert_eq!(sweep(&h), (cursor, loaded - 1, 1));
+    let after = h.fetch_page().await;
+    assert!(!after.contains(&victim));
+    assert_eq!(after[..3], page[..3], "the rows before it didn't move");
+    assert_eq!(after[3..99], page[4..], "the rows after it moved up");
+    // Filling the page's last row scanned on from where the sweep was.
+    let (cursor, loaded) = {
+        let ks = h.state.keyspace_state.lock();
+        (ks.sweep_cursor, ks.scanned.len())
+    };
+    assert!(cursor != 0 && loaded > 200);
+
+    // Create: the new key joins the loaded ones.
+    let fresh = format!("{p}fresh");
+    let done = write_done(
+        &mut h,
+        RedisEvent::CreateKey {
+            key: fresh.clone(),
+            spec: NewKeySpec::String("v".into()),
+        },
+    )
+    .await;
+    assert_eq!(done, Action::KeysChanged);
+    assert_eq!(sweep(&h), (cursor, loaded + 1, 1));
+    // The next fetch shows the page the new key is on.
+    assert!(h.fetch_page().await.contains(&fresh));
+    assert!(h.state.keyspace_state.lock().previous_page());
+    let loaded = loaded + 1;
+    let page_now = h.state.keyspace_state.lock().page;
+
+    // A TTL on a loaded key changes nothing in the sweep; the page shows it.
+    let timed = after[0].clone();
+    let done = write_done(
+        &mut h,
+        RedisEvent::SetTtl {
+            key: timed.clone(),
+            secs: 500,
+        },
+    )
+    .await;
+    assert_eq!(done, Action::KeysChanged);
+    assert_eq!(sweep(&h), (cursor, loaded, page_now));
+    h.state.keyspace_state.lock().page = 1;
+    h.fetch_page().await;
+    let ttl = h
+        .state
+        .keys
+        .lock()
+        .as_ref()
+        .and_then(|keys| keys.iter().find(|k| k.key == timed).map(|k| k.ttl));
+    assert!(matches!(ttl, Some(1..=500)), "{ttl:?}");
+
+    // Removing a set's last member deletes the key: it leaves the sweep
+    // (if the sweep had reached it).
+    let held = h.state.keyspace_state.lock().index_of(&set).is_some();
+    let done = write_done(
+        &mut h,
+        RedisEvent::DeleteItem {
+            key: set.clone(),
+            delete: ItemDelete::SetMember("only".into()),
+        },
+    )
+    .await;
+    assert_eq!(done, Action::KeysChanged);
+    assert_eq!(h.state.keyspace_state.lock().index_of(&set), None);
+    assert_eq!(sweep(&h), (cursor, loaded - usize::from(held), 1));
+
+    // The rest of the sweep still finds every key exactly once.
+    h.state.keyspace_state.lock().set_page_size(5_000, 0);
+    let all = h.fetch_page().await;
+    let unique: HashSet<&String> = all.iter().collect();
+    assert_eq!(unique.len(), all.len());
+    assert_eq!(all.len(), 2_000, "2,000 - 1 deleted + 1 created");
+    h.shutdown().await;
 }
 
 /// `CLIENT KILL TYPE <kind>` from `con` (which is skipped). Returns how many
@@ -808,7 +1003,7 @@ async fn read_only_rejects_every_write() {
                 matches!(
                     a,
                     Action::Error(_)
-                        | Action::RefreshSpace
+                        | Action::KeysChanged
                         | Action::RequestSelectedValue
                         | Action::Published { .. }
                 )
@@ -824,7 +1019,7 @@ async fn read_only_rejects_every_write() {
     assert!(
         !late.iter().any(|a| matches!(
             a,
-            Action::RefreshSpace | Action::RequestSelectedValue | Action::Published { .. }
+            Action::KeysChanged | Action::RequestSelectedValue | Action::Published { .. }
         )),
         "a write went through: {late:?}"
     );
@@ -851,7 +1046,7 @@ async fn read_only_toggle_reaches_the_runner() {
         key: key.clone(),
         value: "after".into(),
     };
-    let answer = |a: &Action| matches!(a, Action::Error(_) | Action::RefreshSpace);
+    let answer = |a: &Action| matches!(a, Action::Error(_) | Action::KeysChanged);
 
     flag.store(true, std::sync::atomic::Ordering::Release);
     h.send(write());
@@ -865,7 +1060,7 @@ async fn read_only_toggle_reaches_the_runner() {
     flag.store(false, std::sync::atomic::Ordering::Release);
     h.send(write());
     let action = h.expect("the write", answer).await;
-    assert!(matches!(action, Action::RefreshSpace), "{action:?}");
+    assert!(matches!(action, Action::KeysChanged), "{action:?}");
     let value: String = admin.get(&key).await.expect("get");
     assert_eq!(value, "after");
     h.shutdown().await;
@@ -901,7 +1096,7 @@ async fn a_burst_of_events_never_stalls_the_runner() {
         secs: 100,
     });
     h.expect("the write queued behind the burst", |a| {
-        *a == Action::RefreshSpace
+        *a == Action::KeysChanged
     })
     .await;
     let ttl: i64 = admin.ttl(&keys[0]).await.expect("TTL");
@@ -1228,13 +1423,13 @@ async fn string_edit_keeps_ttl(server: &support::Server) {
             key: key.clone(),
             value: "new".into(),
         });
-        // `RefreshSpace` is the last action of a successful SetString.
+        // `KeysChanged` is the last action of a successful SetString.
         let ok = h
             .expect("the edit's result", |a| {
-                matches!(a, Action::RefreshSpace | Action::Error(_))
+                matches!(a, Action::KeysChanged | Action::Error(_))
             })
             .await;
-        assert_eq!(ok, Action::RefreshSpace, "SetString {key}");
+        assert_eq!(ok, Action::KeysChanged, "SetString {key}");
         let value: String = admin.get(key).await.expect("GET");
         assert_eq!(value, "new");
     }

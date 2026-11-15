@@ -24,7 +24,7 @@ pub struct PageInfo {
     pub complete: bool,
     pub page_size: usize,
     /// Raw cursor of the next SCAN step (debug detail).
-    pub scan_cursor: usize,
+    pub scan_cursor: u64,
     pub pattern: Option<String>,
     /// Active sort (`None`: SCAN order).
     pub sort: Option<Sort>,
@@ -237,6 +237,11 @@ impl KeySpace {
 
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
+    }
+
+    /// A page fetch is still scanning: about how many keys it has checked.
+    pub fn set_scanning(&mut self, checked: Option<u64>) {
+        self.scanning = checked;
     }
 
     /// Show `keys` as the flat list.

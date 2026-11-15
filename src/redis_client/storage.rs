@@ -34,7 +34,7 @@ impl std::error::Error for TypeScanRejected {}
 
 /// `SCAN cursor MATCH pattern COUNT count [TYPE t]`.
 fn scan_cmd(
-    cursor: usize,
+    cursor: u64,
     pattern: Option<&str>,
     count: usize,
     scan_type: Option<&str>,
@@ -49,6 +49,13 @@ fn scan_cmd(
     cmd.arg(cursor).arg(options);
     cmd
 }
+
+/// Most `SCAN` steps one [`Storage::scan_until`] call runs.
+const SCAN_SLICE_STEPS: usize = 50;
+/// How long one [`Storage::scan_until`] call keeps starting new steps.
+const SCAN_SLICE_TIME: Duration = Duration::from_millis(200);
+/// Upper end of the `COUNT` hint while steps find nothing.
+const SCAN_COUNT_MAX: usize = 10_000;
 
 /// `SCAN ... COUNT` hint for the match counter: bigger steps than browsing,
 /// since it walks the whole keyspace.
@@ -87,21 +94,25 @@ impl Storage {
     /// Returns an error if SCAN fails or replies with an unexpected shape.
     pub async fn scan_batch(
         &self,
-        cursor: usize,
+        cursor: u64,
         pattern: Option<&str>,
         count: usize,
         scan_type: Option<&str>,
-    ) -> redis::RedisResult<(usize, Vec<String>)> {
+    ) -> redis::RedisResult<(u64, Vec<String>)> {
         let mut manager = self.manager.clone();
         // Key names are bytes: one that isn't UTF-8 must not fail the page.
-        let (cursor, keys): (usize, Vec<Text>) = scan_cmd(cursor, pattern, count, scan_type)
+        let (cursor, keys): (u64, Vec<Text>) = scan_cmd(cursor, pattern, count, scan_type)
             .query_async(&mut manager)
             .await?;
         Ok((cursor, strings(keys)))
     }
 
     /// Answer a [`SweepRequest`]: run `SCAN` steps from its cursor until they
-    /// returned at least `need` keys or the sweep ended. Keys are returned raw
+    /// returned at least `need` keys, the sweep ended, or the slice's budget
+    /// ([`SCAN_SLICE_STEPS`] steps or [`SCAN_SLICE_TIME`]) is spent; the
+    /// caller asks again for the rest, so a pattern that matches little never
+    /// keeps one call busy for the whole keyspace (#80). While steps come
+    /// back empty the `COUNT` hint grows tenfold, up to [`SCAN_COUNT_MAX`]. Keys are returned raw
     /// (possibly repeating earlier ones); the caller merges them. A type
     /// filter is applied by the server (`TYPE t`) or, for several types, by
     /// asking `TYPE` for each batch and keeping the matching keys.
@@ -117,19 +128,18 @@ impl Storage {
         let mut result = SweepResult {
             cursor: request.cursor,
             batch: Vec::new(),
+            checked: 0,
         };
+        let started = Instant::now();
+        let mut count = request.scan_count;
+        let mut steps = 0;
         let scan_type = match &request.types {
             TypeScan::Server(scan_type) => Some(scan_type.as_str()),
             TypeScan::All | TypeScan::Client(_) => None,
         };
         loop {
             let step = self
-                .scan_batch(
-                    result.cursor,
-                    request.pattern.as_deref(),
-                    request.scan_count,
-                    scan_type,
-                )
+                .scan_batch(result.cursor, request.pattern.as_deref(), count, scan_type)
                 .await;
             let (cursor, keys) = match step {
                 Ok(step) => step,
@@ -141,6 +151,9 @@ impl Storage {
                 Err(err) => return Err(err.into()),
             };
             result.cursor = cursor;
+            result.checked += count as u64;
+            steps += 1;
+            let found_before = result.batch.len();
             match &request.types {
                 TypeScan::Client(filter) => {
                     let types = self.fetch_types(&keys).await?;
@@ -153,8 +166,15 @@ impl Storage {
                 }
                 TypeScan::All | TypeScan::Server(_) => result.batch.extend(keys),
             }
-            if result.done() || result.batch.len() >= request.need {
+            if result.done()
+                || result.batch.len() >= request.need
+                || steps >= SCAN_SLICE_STEPS
+                || started.elapsed() >= SCAN_SLICE_TIME
+            {
                 return Ok(result);
+            }
+            if result.batch.len() == found_before {
+                count = count.saturating_mul(10).min(SCAN_COUNT_MAX.max(count));
             }
         }
     }

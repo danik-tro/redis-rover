@@ -2,6 +2,8 @@
 //! the Pub/Sub message detail: JSON is pretty-printed and colored, `w` wraps,
 //! arrows pan when wrap is off.
 
+use std::cell::RefCell;
+
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -52,7 +54,7 @@ impl TextView {
     /// Scroll `step` rows down (or up).
     pub(crate) fn scroll(&mut self, down: bool, step: usize) {
         self.top = if down {
-            (self.top + step).min(self.max_top)
+            self.top.saturating_add(step).min(self.max_top)
         } else {
             self.top.saturating_sub(step)
         };
@@ -89,24 +91,82 @@ pub struct TextCache {
     pub(crate) lines: Vec<Line<'static>>,
     /// The text is JSON (a `RedisJSON` document, or text that parses).
     pub(crate) json: bool,
+    /// What a frame needs to know about every line, measured once (#79).
+    measure: RefCell<Measure>,
+}
+
+/// Sizes of a [`TextCache`]'s lines, so a frame handles only the lines it
+/// shows. Filled by the first render; the wrap part again when the width
+/// changes.
+#[derive(Default)]
+struct Measure {
+    /// Display width of each line.
+    widths: Vec<usize>,
+    widest: usize,
+    /// The body width the text was last wrapped at, with the first wrapped
+    /// row of each line and, last, the row count of the whole text.
+    wrap: Option<(u16, Vec<usize>)>,
+}
+
+/// Rows `line` takes when wrapped at `width` columns, as `Paragraph` wraps
+/// it. Only a line wider than that is wrapped to find out.
+fn wrapped_rows(line: &Line<'_>, line_width: usize, width: u16) -> usize {
+    if line_width <= usize::from(width) {
+        return 1;
+    }
+    let spans: Vec<Span<'_>> = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.as_ref(), span.style))
+        .collect();
+    Paragraph::new(Line::from(spans))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 impl TextCache {
+    fn new(lines: Vec<Line<'static>>, json: bool) -> Self {
+        Self {
+            lines,
+            json,
+            measure: RefCell::default(),
+        }
+    }
+
+    /// The line sizes, measured if they aren't yet; with `wrap_width` also
+    /// the wrapped rows at that width.
+    fn measure(&self, wrap_width: Option<u16>) -> std::cell::RefMut<'_, Measure> {
+        let mut measure = self.measure.borrow_mut();
+        if measure.widths.len() != self.lines.len() {
+            measure.widths = self.lines.iter().map(Line::width).collect();
+            measure.widest = measure.widths.iter().copied().max().unwrap_or(0);
+            measure.wrap = None;
+        }
+        if let Some(width) = wrap_width {
+            if measure.wrap.as_ref().is_none_or(|(at, _)| *at != width) {
+                let mut starts = Vec::with_capacity(self.lines.len() + 1);
+                let mut row = 0;
+                for (line, &line_width) in self.lines.iter().zip(&measure.widths) {
+                    starts.push(row);
+                    row += wrapped_rows(line, line_width, width);
+                }
+                starts.push(row);
+                measure.wrap = Some((width, starts));
+            }
+        }
+        measure
+    }
+
     /// Lines for a keyspace value; `None` for collections / unsupported types.
     pub(crate) fn build(value: &KeyValue) -> Option<Self> {
         match value {
             KeyValue::String { value: text, .. } => {
                 Some(Self::from_text(text, !value.is_truncated()))
             }
-            KeyValue::Json(json) => Some(Self {
-                lines: json_lines(json),
-                json: true,
-            }),
+            KeyValue::Json(json) => Some(Self::new(json_lines(json), true)),
             KeyValue::JsonPreview(preview) => match &preview.kind {
-                JsonPreviewKind::Array { items, .. } => Some(Self {
-                    lines: json_lines(items),
-                    json: true,
-                }),
+                JsonPreviewKind::Array { items, .. } => Some(Self::new(json_lines(items), true)),
                 JsonPreviewKind::TooLarge { json_type } => Some(Self::from_lines(too_large_lines(
                     preview.bytes,
                     json_type.as_deref(),
@@ -127,14 +187,8 @@ impl TextCache {
     #[must_use]
     pub fn from_text(text: &str, try_json: bool) -> Self {
         match try_json.then(|| parse_json_text(text)).flatten() {
-            Some(json) => Self {
-                lines: json_lines(&json),
-                json: true,
-            },
-            None => Self {
-                lines: plain_lines(text),
-                json: false,
-            },
+            Some(json) => Self::new(json_lines(&json), true),
+            None => Self::new(plain_lines(text), false),
         }
     }
 
@@ -146,7 +200,7 @@ impl TextCache {
         if lines.is_empty() {
             lines.push(Line::default());
         }
-        Self { lines, json: false }
+        Self::new(lines, false)
     }
 }
 
@@ -316,45 +370,52 @@ pub fn render(
         }
         line.patch_style(labels.highlight)
     };
-    let paragraph = if view.wrap {
-        let lines: Vec<Line<'static>> = cache
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| mark(i, line))
-            .collect();
-        Paragraph::new(lines).wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new(cache.lines.clone())
-    };
-    let total = if view.wrap {
-        paragraph.line_count(body_area.width)
-    } else {
-        cache.lines.len()
+    // Nothing here walks the whole text: the sizes are measured once
+    // (`TextCache::measure`) and only the lines in view are drawn. That
+    // also keeps `scroll`'s `u16` offset small however long the text is.
+    let wrap = view.wrap && width > 0;
+    let measure = cache.measure(wrap.then_some(body_area.width));
+    // The rows of an earlier wrap stay cached while wrap is off.
+    let starts = measure
+        .wrap
+        .as_ref()
+        .filter(|_| wrap)
+        .map(|(_, starts)| starts.as_slice());
+    let total = match starts {
+        Some(starts) => starts.last().copied().unwrap_or(0),
+        None => cache.lines.len(),
     };
     view.height = height;
     view.max_top = total.saturating_sub(height);
     view.max_left = if view.wrap {
         0
     } else {
-        cache
-            .lines
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(width)
+        measure.widest.saturating_sub(width)
     };
     view.top = view.top.min(view.max_top);
     view.left = view.left.min(view.max_left);
 
     let to_u16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    if view.wrap {
-        paragraph
-            .scroll((to_u16(view.top), 0))
+    if let Some(starts) = starts {
+        // The line that holds row `top`, and how far into it the row is.
+        let first = starts
+            .partition_point(|&start| start <= view.top)
+            .saturating_sub(1)
+            .min(cache.lines.len().saturating_sub(1));
+        let offset = view.top - starts[first];
+        let rows: Vec<Line<'static>> = cache
+            .lines
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take_while(|&(i, _)| starts[i] < view.top + height)
+            .map(|(i, line)| mark(i, line))
+            .collect();
+        Paragraph::new(rows)
+            .wrap(Wrap { trim: false })
+            .scroll((to_u16(offset), 0))
             .render(body_area, buf);
     } else {
-        // Slice the rows first: `scroll` takes a `u16` offset.
         let rows: Vec<Line<'static>> = cache
             .lines
             .iter()
@@ -367,6 +428,7 @@ pub fn render(
             .scroll((0, to_u16(view.left)))
             .render(body_area, buf);
     }
+    drop(measure);
 
     let footer = text_footer(note, labels, view, total, focused);
     Paragraph::new(Line::from(footer).fg(cfg.colors.base03))
@@ -465,6 +527,85 @@ mod tests {
         assert!(TextCache::from_text("{\"a\":1}", true).json);
         assert!(!TextCache::from_text("{\"a\":1}", false).json);
         assert_eq!(TextCache::from_lines(Vec::new()).lines.len(), 1);
+    }
+
+    /// The text rows `render` draws for `cache` at `top`.
+    fn drawn(cache: &TextCache, view: &mut TextView, area: Rect) -> Vec<String> {
+        let mut buf = Buffer::empty(area);
+        render(
+            cache,
+            &TextLabels::default(),
+            None,
+            true,
+            area,
+            &mut buf,
+            view,
+        );
+        (1..area.height - 1)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// #79: only the lines in view are wrapped, and the result is what
+    /// wrapping the whole text and scrolling it shows.
+    #[test]
+    fn wrapped_text_is_drawn_like_the_whole_paragraph() {
+        let text: String = (0..60)
+            .map(|i| match i % 4 {
+                0 => format!("{i} short\n"),
+                1 => format!("{i} {}\n", "word ".repeat(30)),
+                2 => format!("{i} {}\n", "x".repeat(95)),
+                _ => format!("{i} 日本語のテキスト {}\n\n", "é ".repeat(40)),
+            })
+            .collect();
+        let cache = TextCache::from_text(&text, false);
+        for width in [7, 20, 33] {
+            let area = Rect::new(0, 0, width, 12);
+            let body = Rect::new(0, 0, width, 10);
+            let whole = Paragraph::new(cache.lines.clone()).wrap(Wrap { trim: false });
+            let total = whole.line_count(width);
+            let mut view = TextView::default();
+            for top in (0..total).step_by(3) {
+                view.top = top;
+                let rows = drawn(&cache, &mut view, area);
+                let mut buf = Buffer::empty(body);
+                whole
+                    .clone()
+                    .scroll((u16::try_from(view.top).unwrap(), 0))
+                    .render(body, &mut buf);
+                let expected: Vec<String> = (0..body.height)
+                    .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+                    .collect();
+                assert_eq!(rows, expected, "width {width}, top {top}");
+            }
+            assert_eq!(view.max_top, total - 10, "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_long_wrapped_text_scrolls_past_65535_rows() {
+        let lines: Vec<String> = (0..40_000).map(|i| format!("line {i} aaaa bbbb")).collect();
+        let text = lines.join("\n");
+        let cache = TextCache::from_text(&text, false);
+        let area = Rect::new(0, 0, 10, 6);
+        let mut view = TextView::default();
+        drawn(&cache, &mut view, area);
+        // Every line takes two rows at this width.
+        assert_eq!(view.max_top, 80_000 - 4);
+        view.top = 70_000;
+        let rows = drawn(&cache, &mut view, area);
+        assert_eq!(rows[0].trim_end(), "line 35000");
+        assert_eq!(rows[1].trim_end(), "aaaa bbbb");
+        view.scroll(true, usize::MAX);
+        let rows = drawn(&cache, &mut view, area);
+        assert_eq!(rows[3].trim_end(), "aaaa bbbb");
+        assert_eq!(rows[2].trim_end(), "line 39999");
+
+        // No wrap: the widest line sets how far the text pans.
+        view.toggle_wrap();
+        drawn(&cache, &mut view, area);
+        assert_eq!(view.max_left, "line 39999 aaaa bbbb".len() - 10);
+        assert_eq!(view.max_top, 40_000 - 4);
     }
 
     #[test]

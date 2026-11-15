@@ -81,6 +81,10 @@ pub struct App {
     /// A JSON field was opened or closed: once its value loads, focus it
     /// (its text, or this row of its field table).
     json_focus_row: Option<usize>,
+    /// When the key cursor last moved (#77).
+    last_cursor_move: Option<Instant>,
+    /// A held `j` / `k` moved the cursor and its value isn't requested yet.
+    value_pending: bool,
 
     should_quit: bool,
     /// Keys of a partially typed chord (a strict prefix of some binding).
@@ -211,6 +215,8 @@ impl App {
             page_turn_row: None,
             json_rows: Vec::new(),
             json_focus_row: None,
+            last_cursor_move: None,
+            value_pending: false,
             pending_keys: Vec::new(),
             last_key_at: None,
             keys_in_flight: 0,
@@ -512,8 +518,8 @@ mod tests {
             Action::PubSubFocus => app.pubsub.toggle_focus(),
             Action::PubSubTogglePause => app.pubsub.toggle_pause(),
             Action::PubSubEnter => app.pubsub_enter(),
-            Action::ScrollDown => app.scroll_down(),
-            Action::ScrollUp => app.scroll_up(),
+            Action::ScrollDown => app.scroll_down(app.clock.now()),
+            Action::ScrollUp => app.scroll_up(app.clock.now()),
             Action::TogglePubSub => app.toggle_pubsub(),
             Action::OpenSortMenu => app.keyspace.open_sort_menu(),
             Action::OpenTypeFilter => app.open_type_filter(),

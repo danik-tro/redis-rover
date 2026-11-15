@@ -404,7 +404,7 @@ impl StatefulWidget for KeySpaceWidget {
         } else {
             (focused, unfocused)
         };
-        let pane_title = |text: &'static str, has_focus: bool| {
+        let pane_title = |text: String, has_focus: bool| {
             if has_focus {
                 Line::from(text).fg(cfg.colors.base05).bold()
             } else {
@@ -450,10 +450,14 @@ impl StatefulWidget for KeySpaceWidget {
             .border_style(keys_border)
             .borders(Borders::all())
             .title(pane_title(
-                if state.loading {
-                    " Keys · loading… "
-                } else {
-                    " Keys "
+                match state.scanning {
+                    // The sum of the SCAN `COUNT` hints, so an estimate.
+                    Some(checked) if state.loading => format!(
+                        " Keys · scanning… ~{} checked ",
+                        format_count(usize::try_from(checked).unwrap_or(usize::MAX))
+                    ),
+                    _ if state.loading => " Keys · loading… ".to_owned(),
+                    _ => " Keys ".to_owned(),
                 },
                 !value_focused,
             ))
@@ -477,7 +481,7 @@ impl StatefulWidget for KeySpaceWidget {
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(values_border)
             .borders(Borders::all())
-            .title(pane_title(values_title, value_focused));
+            .title(pane_title(values_title.to_owned(), value_focused));
         // Liveness belongs to the open key: shown only while one is.
         let key_shown = state.table.selected().and_then(|row| state.key_at(row));
         if let (Some(status), Some(_)) = (state.live.status.as_ref(), key_shown) {
