@@ -131,6 +131,18 @@ First public release. Requires Rust 1.97 or newer.
   idle key list draws about 6 frames a minute (the footer's CPU % at most every 10 s); the
   dashboard redraws once per sample and the Pub/Sub tab on each new message and every
   second. `frames_drawn` is logged at debug level once a minute.
+- A write (edit, delete, TTL, new key, add / remove an element) no longer rescans the
+  keyspace: the list takes that one key's change and stays where it is, on any page, and
+  a running `Shift-a` load goes on. A new key is shown on its page, at the end of what is
+  loaded. `r` still rescans, to pick up what other clients wrote.
+- Holding `j` / `k` on the key list fetches the value once the cursor rests (about
+  100 ms), not for every row passed. A single press fetches at once, as before.
+- A filter that matches few keys of a large keyspace is scanned in slices of at most 50
+  `SCAN` steps or 200 ms. Writes, a DB switch and a new filter run between slices, the
+  Keys title shows `scanning… ~2.1M checked`, and the `COUNT` hint grows (up to 10,000)
+  while steps find nothing.
+- The text viewer draws only the lines on screen. A frame of a wrapped 5 MB value took
+  78 ms and takes about 0.1 ms; the wrapped rows are counted once per value and width.
 
 ### Fixed
 
@@ -167,6 +179,8 @@ First public release. Requires Rust 1.97 or newer.
   `human-panic` API).
 - The config environment variables are `REDIS_ROVER_CONFIG`, `REDIS_ROVER_DATA` and
   `REDIS_ROVER_LOGLEVEL`, as the README says (they were `RROVER_*` before).
+- A wrapped text longer than 65,535 rows can be scrolled to its end.
+- SCAN cursors are 64-bit on every platform (a 32-bit build could not hold one).
 
 ### Development
 
