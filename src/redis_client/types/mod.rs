@@ -158,8 +158,14 @@ pub enum KeyItem {
 /// replace).
 #[derive(Debug, Clone)]
 pub enum ItemEdit {
-    /// `LSET key index value` — replace the LIST element at `index`.
-    ListSet { index: usize, value: String },
+    /// Replace the LIST element at `index`, but only while it still holds
+    /// `expected` (the value shown when the edit was opened): another
+    /// client's `LPUSH` / `LPOP` moves every index.
+    ListSet {
+        index: usize,
+        expected: String,
+        value: String,
+    },
     /// `SREM old` + `SADD new` — replace a SET member. Rejected if `new` already
     /// exists (no silent clobber).
     SetReplace { old: String, new: String },
@@ -173,9 +179,10 @@ pub enum ItemEdit {
 /// (`d` inside a value). Removes exactly the selected element, not the key.
 #[derive(Debug, Clone)]
 pub enum ItemDelete {
-    /// Delete the LIST element at `index` (Redis has no delete-by-index, so this
-    /// uses the `LSET` tombstone + `LREM` trick).
-    ListIndex(usize),
+    /// Delete the LIST element at `index` while it still holds `expected`
+    /// (Redis has no delete-by-index, so this uses the `LSET` tombstone +
+    /// `LREM` trick, inside one script).
+    ListIndex { index: usize, expected: String },
     /// `SREM key member`.
     SetMember(String),
     /// `HDEL key field`.

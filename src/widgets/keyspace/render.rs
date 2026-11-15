@@ -18,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config,
+    redis_client::escape::printable,
     redis_client::types::{
         JsonField, JsonPreview, JsonPreviewKind, KeyValue, PageRow, SortKey, TYPE_BADGE_WIDTH,
     },
@@ -261,7 +262,7 @@ impl KeySpaceWidget {
         let table_rows = rows_data
             .iter()
             .enumerate()
-            .map(|(i, item)| rows.row(i, [Cell::from(item.as_str()).fg(cfg.colors.base05)]));
+            .map(|(i, item)| rows.row(i, [Cell::from(printable(item)).fg(cfg.colors.base05)]));
         let table = Table::new(table_rows, widths)
             .header(header)
             .highlight_symbol(highlight_symbol())
@@ -291,8 +292,8 @@ impl KeySpaceWidget {
             rows.row(
                 i,
                 [
-                    Cell::from(left.as_str()).fg(cfg.colors.base05),
-                    Cell::from(right.as_str()).fg(cfg.colors.base04),
+                    Cell::from(printable(left)).fg(cfg.colors.base05),
+                    Cell::from(printable(right)).fg(cfg.colors.base04),
                 ],
             )
         });
@@ -604,7 +605,7 @@ impl StatefulWidget for KeySpaceWidget {
                     "{}{} {} ({})",
                     "  ".repeat(usize::from(*depth)),
                     if *expanded { '▾' } else { '▸' },
-                    meta.key,
+                    printable(&meta.key),
                     format_count(*count),
                 );
                 return Row::new(columns.iter().map(|column| {
@@ -640,7 +641,8 @@ impl StatefulWidget for KeySpaceWidget {
                         Cell::from(badge)
                     }
                     Column::Key => Cell::from(
-                        truncate_to_width(&format!("{indent}{}", meta.key), key_width).into_owned(),
+                        truncate_to_width(&format!("{indent}{}", printable(&meta.key)), key_width)
+                            .into_owned(),
                     )
                     .fg(cfg.colors.base05),
                     Column::Ttl => {

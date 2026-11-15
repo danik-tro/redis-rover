@@ -210,7 +210,7 @@ impl App {
     }
 
     pub(super) fn show_error_popup(&mut self, msg: &str) {
-        self.error_message = Some(msg.to_owned());
+        self.error_message = Some(crate::redis_client::bytes::shown(msg).into_owned());
         if !matches!(self.mode, Mode::Popup(_)) {
             self.previous_mode = Some(self.mode);
             self.mode = Mode::Popup(PopupMode::Error);

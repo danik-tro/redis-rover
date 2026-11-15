@@ -84,16 +84,17 @@ impl<'de> Deserialize<'de> for KeyBindings {
     {
         let parsed_map = HashMap::<Mode, HashMap<String, Command>>::deserialize(deserializer)?;
 
-        let keybindings = parsed_map
-            .into_iter()
-            .map(|(mode, inner_map)| {
-                let converted_inner_map = inner_map
-                    .into_iter()
-                    .map(|(key_str, cmd)| (parse_key_sequence(&key_str).unwrap(), cmd))
-                    .collect();
-                (mode, converted_inner_map)
-            })
-            .collect();
+        let mut keybindings = HashMap::new();
+        for (mode, inner_map) in parsed_map {
+            let mut converted = HashMap::new();
+            for (key_str, cmd) in inner_map {
+                // A mistyped key is a configuration error, not a crash.
+                let keys = parse_key_sequence(&key_str)
+                    .map_err(|e| serde::de::Error::custom(format!("keybindings.{mode:?}: {e}")))?;
+                converted.insert(keys, cmd);
+            }
+            keybindings.insert(mode, converted);
+        }
 
         Ok(KeyBindings(keybindings))
     }

@@ -76,6 +76,17 @@ impl Environment {
         }
     }
 
+    /// How much protection the environment gives: `Local` < `Staging` <
+    /// `Unknown` (starts read-only) < `Prod` (also typed confirms).
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Local => 0,
+            Self::Staging => 1,
+            Self::Unknown => 2,
+            Self::Prod => 3,
+        }
+    }
+
     /// Whether a session starts read-only without a flag or profile setting.
     #[must_use]
     pub fn default_read_only(self) -> bool {
@@ -131,6 +142,10 @@ pub enum Source {
     Default,
     /// Inferred from the host (environment).
     Inferred,
+    /// Inferred from the `--url` host, because `--url` replaced the URL of
+    /// the named profile and the host calls for more protection than the
+    /// profile's settings.
+    UrlOverridesProfile(String),
     /// The environment's default (read-only).
     Environment,
 }
@@ -144,6 +159,9 @@ impl fmt::Display for Source {
             Self::Url => write!(f, "url"),
             Self::Default => write!(f, "default"),
             Self::Inferred => write!(f, "inferred from host"),
+            Self::UrlOverridesProfile(name) => {
+                write!(f, "inferred from the --url host, not profile {name}")
+            }
             Self::Environment => write!(f, "environment default"),
         }
     }
@@ -297,15 +315,28 @@ pub fn resolve(
         PasswordSource::None
     };
 
+    // `--url` replaced the profile's own URL: the profile describes another
+    // server, so its `environment` and `read_only: false` can only add
+    // protection here, never take it away (`rrover local --url prod-db`
+    // must not come up as LOCAL and writable).
+    let url_replaced = cli.url.is_some() && profile.is_some_and(|p| p.url.is_some());
+    let override_source = || Source::UrlOverridesProfile(name.unwrap_or_default().to_owned());
+    let inferred = Environment::infer(info.addr());
     let (environment, env_source) = match profile.and_then(|p| p.environment) {
+        Some(env) if url_replaced && inferred.strictness() > env.strictness() => {
+            (inferred, override_source())
+        }
         Some(env) => (env, profile_source()),
-        None => (Environment::infer(info.addr()), Source::Inferred),
+        None => (inferred, Source::Inferred),
     };
+    let profile_read_only = profile
+        .and_then(|p| p.read_only)
+        .filter(|read_only| *read_only || !url_replaced || !environment.default_read_only());
     let (read_only, read_only_source) = if cli.read_only {
         (true, Source::Flag("--read-only"))
     } else if cli.writable {
         (false, Source::Flag("--writable"))
-    } else if let Some(read_only) = profile.and_then(|p| p.read_only) {
+    } else if let Some(read_only) = profile_read_only {
         (read_only, profile_source())
     } else {
         (environment.default_read_only(), Source::Environment)
@@ -778,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one row per case
     fn read_only_resolution_order() {
         use super::Environment;
         let map = HashMap::from([
@@ -801,6 +833,15 @@ mod tests {
                 "pinned".to_owned(),
                 Profile {
                     url: Some("redis://10.0.0.5".into()),
+                    read_only: Some(false),
+                    ..Profile::default()
+                },
+            ),
+            (
+                "local".to_owned(),
+                Profile {
+                    url: Some("redis://localhost".into()),
+                    environment: Some(Environment::Local),
                     read_only: Some(false),
                     ..Profile::default()
                 },
@@ -852,12 +893,39 @@ mod tests {
                 false,
                 Source::Profile("pinned".into()),
             ),
-            // The profile's environment wins over the host, even with --url.
+            // A stricter profile environment stays, even with --url.
             (
                 &["prod", "--url", "redis://127.0.0.1"],
                 Environment::Prod,
                 true,
                 Source::Environment,
+            ),
+            // #73: --url replaced the profile's URL with another host, so
+            // the profile can't make it less protected.
+            (
+                &["local", "--url", "redis://prod-db:6379"],
+                Environment::Unknown,
+                true,
+                Source::Environment,
+            ),
+            (
+                &["pinned", "--url", "redis://10.0.0.9"],
+                Environment::Unknown,
+                true,
+                Source::Environment,
+            ),
+            (
+                &["local", "--url", "redis://prod-db:6379", "--writable"],
+                Environment::Unknown,
+                false,
+                Source::Flag("--writable"),
+            ),
+            // Another loopback port is still local.
+            (
+                &["local", "--url", "redis://127.0.0.1:6390"],
+                Environment::Local,
+                false,
+                Source::Profile("local".into()),
             ),
         ];
         for (args, env, read_only, source) in cases {
@@ -866,6 +934,21 @@ mod tests {
             assert_eq!(t.read_only, *read_only, "{args:?}");
             assert_eq!(&t.read_only_source, source, "{args:?}");
         }
+
+        let t = resolve(
+            &cli(&["local", "--url", "redis://prod-db:6379"]),
+            &map,
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.env_source, Source::UrlOverridesProfile("local".into()));
+        assert!(
+            t.report()
+                .unwrap()
+                .contains("(inferred from the --url host, not profile local)"),
+            "{}",
+            t.report().unwrap()
+        );
     }
 
     #[test]

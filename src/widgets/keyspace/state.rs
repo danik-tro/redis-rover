@@ -1,6 +1,7 @@
 use super::{KeySpace, LoadProgress};
 
 use crate::{
+    redis_client::escape::printable,
     redis_client::types::{
         ItemDelete, JsonPreview, JsonPreviewKind, KeyMeta, KeyValue, KeyspaceState, LoadedValue,
         Sort,
@@ -140,18 +141,23 @@ impl SelectedElement {
     /// One-line human label for the element, used in the delete-item confirm.
     pub(super) fn label(&self) -> String {
         match self {
-            SelectedElement::ListIndex { index, value } => format!("[{index}] {value}"),
-            SelectedElement::SetMember(member) | SelectedElement::ZsetMember { member, .. } => {
-                member.clone()
+            SelectedElement::ListIndex { index, value } => {
+                format!("[{index}] {}", printable(value))
             }
-            SelectedElement::HashField { field, .. } => field.clone(),
+            SelectedElement::SetMember(member) | SelectedElement::ZsetMember { member, .. } => {
+                printable(member).into_owned()
+            }
+            SelectedElement::HashField { field, .. } => printable(field).into_owned(),
         }
     }
 
     /// Translate the element into its deletion request.
     pub(super) fn into_delete(self) -> ItemDelete {
         match self {
-            SelectedElement::ListIndex { index, .. } => ItemDelete::ListIndex(index),
+            SelectedElement::ListIndex { index, value } => ItemDelete::ListIndex {
+                index,
+                expected: value,
+            },
             SelectedElement::SetMember(member) => ItemDelete::SetMember(member),
             SelectedElement::HashField { field, .. } => ItemDelete::HashField(field),
             SelectedElement::ZsetMember { member, .. } => ItemDelete::ZsetMember(member),

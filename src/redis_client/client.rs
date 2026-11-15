@@ -4,6 +4,7 @@ use color_eyre::eyre::Result;
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 
+use super::bytes::{strings, Raw, Text};
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{
     json_path, ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyValue,
@@ -131,7 +132,10 @@ pub async fn fetch_value_page(
         RedisType::Hash | RedisType::Set => {
             let is_hash = state.r_type == RedisType::Hash;
             let len_cmd = if is_hash { "HLEN" } else { "SCARD" };
-            let total: usize = redis::cmd(len_cmd).arg(&key).query_async(manager).await?;
+            let total: usize = redis::cmd(len_cmd)
+                .arg(Raw(&key))
+                .query_async(manager)
+                .await?;
             state.total = Some(total);
 
             while state.needs_scan() {
@@ -195,7 +199,7 @@ async fn fetch_json(
         bytes
     } else {
         let mut cmd = redis::cmd("JSON.DEBUG");
-        cmd.arg("MEMORY").arg(key);
+        cmd.arg("MEMORY").arg(Raw(key));
         if !at_root {
             cmd.arg(&path);
         }
@@ -204,7 +208,7 @@ async fn fetch_json(
 
     if bytes <= cap {
         let mut cmd = redis::cmd("JSON.GET");
-        cmd.arg(key);
+        cmd.arg(Raw(key));
         if !at_root {
             cmd.arg(&path);
         }
@@ -218,7 +222,7 @@ async fn fetch_json(
     }
 
     let json_type: redis::Value = match redis::cmd("JSON.TYPE")
-        .arg(key)
+        .arg(Raw(key))
         .arg(&path)
         .query_async(manager)
         .await
@@ -240,7 +244,7 @@ async fn fetch_json(
         "object" => {
             if !state.sweep.done {
                 let names: redis::Value = redis::cmd("JSON.OBJKEYS")
-                    .arg(key)
+                    .arg(Raw(key))
                     .arg(&path)
                     .query_async(manager)
                     .await?;
@@ -260,10 +264,10 @@ async fn fetch_json(
         "array" => {
             let (len, items): (redis::Value, String) = redis::pipe()
                 .cmd("JSON.ARRLEN")
-                .arg(key)
+                .arg(Raw(key))
                 .arg(&path)
                 .cmd("JSON.GET")
-                .arg(key)
+                .arg(Raw(key))
                 .arg(format!("{path}[0:{JSON_PREVIEW_ITEMS}]"))
                 .query_async(manager)
                 .await?;
@@ -301,11 +305,11 @@ async fn fetch_json_fields(
         let field = json_path(&path);
         path.pop();
         pipe.cmd("JSON.TYPE")
-            .arg(key)
+            .arg(Raw(key))
             .arg(&field)
             .cmd("JSON.DEBUG")
             .arg("MEMORY")
-            .arg(key)
+            .arg(Raw(key))
             .arg(&field);
     }
     let replies: Vec<redis::Value> = pipe.query_async(manager).await?;
@@ -386,7 +390,7 @@ pub async fn fetch_full_value(
     let manager = &mut manager;
     let value = match r_type {
         RedisType::String => {
-            let bytes: Vec<u8> = redis::cmd("GET").arg(key).query_async(manager).await?;
+            let bytes: Vec<u8> = redis::cmd("GET").arg(Raw(key)).query_async(manager).await?;
             let total_len = bytes.len();
             let text = String::from_utf8_lossy(&bytes);
             KeyValue::String {
@@ -396,21 +400,24 @@ pub async fn fetch_full_value(
             }
         }
         RedisType::Json => {
-            let raw: String = redis::cmd("JSON.GET").arg(key).query_async(manager).await?;
+            let raw: String = redis::cmd("JSON.GET")
+                .arg(Raw(key))
+                .query_async(manager)
+                .await?;
             KeyValue::Json(serde_json::from_str(&raw)?)
         }
         RedisType::List => {
             let mut items = Vec::new();
             loop {
                 let (start, stop) = chunk_bounds(items.len())?;
-                let chunk: Vec<String> = redis::cmd("LRANGE")
-                    .arg(key)
+                let chunk: Vec<Text> = redis::cmd("LRANGE")
+                    .arg(Raw(key))
                     .arg(start)
                     .arg(stop)
                     .query_async(manager)
                     .await?;
                 let done = chunk.len() < FULL_FETCH_CHUNK;
-                items.extend(chunk);
+                items.extend(strings(chunk));
                 if done {
                     break KeyValue::List(items);
                 }
@@ -420,15 +427,15 @@ pub async fn fetch_full_value(
             let mut items = Vec::new();
             loop {
                 let (start, stop) = chunk_bounds(items.len())?;
-                let chunk: Vec<(String, f64)> = redis::cmd("ZRANGE")
-                    .arg(key)
+                let chunk: Vec<(Text, f64)> = redis::cmd("ZRANGE")
+                    .arg(Raw(key))
                     .arg(start)
                     .arg(stop)
                     .arg("WITHSCORES")
                     .query_async(manager)
                     .await?;
                 let done = chunk.len() < FULL_FETCH_CHUNK;
-                items.extend(chunk);
+                items.extend(chunk.into_iter().map(|(member, score)| (member.0, score)));
                 if done {
                     break KeyValue::Zset(items);
                 }
@@ -438,14 +445,15 @@ pub async fn fetch_full_value(
             let is_hash = *r_type == RedisType::Hash;
             let mut sweep = ScanSweep::default();
             loop {
-                let (cursor, batch): (u64, Vec<String>) =
+                let (cursor, batch): (u64, Vec<Text>) =
                     redis::cmd(if is_hash { "HSCAN" } else { "SSCAN" })
-                        .arg(key)
+                        .arg(Raw(key))
                         .arg(sweep.cursor)
                         .arg("COUNT")
                         .arg(FULL_FETCH_CHUNK)
                         .query_async(manager)
                         .await?;
+                let batch = strings(batch);
                 if is_hash {
                     sweep.merge_fields(cursor, pair_up(batch));
                 } else {
@@ -498,17 +506,17 @@ async fn fetch_list_window(
     state: &mut ValueState,
 ) -> Result<Vec<String>, BoxError> {
     let (start, stop) = window_bounds(state)?;
-    let (total, items): (usize, Vec<String>) = redis::pipe()
+    let (total, items): (usize, Vec<Text>) = redis::pipe()
         .cmd("LLEN")
-        .arg(key)
+        .arg(Raw(key))
         .cmd("LRANGE")
-        .arg(key)
+        .arg(Raw(key))
         .arg(start)
         .arg(stop)
         .query_async(manager)
         .await?;
     state.total = Some(total);
-    Ok(items)
+    Ok(strings(items))
 }
 
 /// `ZCARD` + `ZRANGE … WITHSCORES` for the current page, in one pipeline.
@@ -519,18 +527,21 @@ async fn fetch_zset_window(
     state: &mut ValueState,
 ) -> Result<Vec<(String, f64)>, BoxError> {
     let (start, stop) = window_bounds(state)?;
-    let (total, items): (usize, Vec<(String, f64)>) = redis::pipe()
+    let (total, items): (usize, Vec<(Text, f64)>) = redis::pipe()
         .cmd("ZCARD")
-        .arg(key)
+        .arg(Raw(key))
         .cmd("ZRANGE")
-        .arg(key)
+        .arg(Raw(key))
         .arg(start)
         .arg(stop)
         .arg("WITHSCORES")
         .query_async(manager)
         .await?;
     state.total = Some(total);
-    Ok(items)
+    Ok(items
+        .into_iter()
+        .map(|(member, score)| (member.0, score))
+        .collect())
 }
 
 /// One `HSCAN` / `SSCAN key cursor COUNT n` step. HSCAN replies with a flat
@@ -541,14 +552,14 @@ async fn scan_step(
     is_hash: bool,
     state: &ValueState,
 ) -> Result<(u64, Vec<String>), BoxError> {
-    let reply = redis::cmd(if is_hash { "HSCAN" } else { "SSCAN" })
-        .arg(key)
+    let (cursor, batch): (u64, Vec<Text>) = redis::cmd(if is_hash { "HSCAN" } else { "SSCAN" })
+        .arg(Raw(key))
         .arg(state.sweep.cursor)
         .arg("COUNT")
         .arg(state.scan_count)
         .query_async(manager)
         .await?;
-    Ok(reply)
+    Ok((cursor, strings(batch)))
 }
 
 /// Turn a flat `field, value, field, value` list into pairs. A trailing odd
@@ -571,9 +582,9 @@ async fn fetch_string_preview(
 ) -> Result<(String, usize, bool), BoxError> {
     let (total, bytes): (usize, Vec<u8>) = redis::pipe()
         .cmd("STRLEN")
-        .arg(key)
+        .arg(Raw(key))
         .cmd("GETRANGE")
-        .arg(key)
+        .arg(Raw(key))
         .arg(0)
         .arg(max.saturating_sub(1))
         .query_async(manager)
@@ -604,12 +615,52 @@ fn decode_preview(bytes: &[u8], truncated: bool) -> (String, bool) {
 
 type WriteResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// Run the commands of one write ([`write_cmd`]) in order.
+/// Run the commands of one write ([`write_cmd`]). Several commands go in
+/// one `MULTI` / `EXEC`, so a lost connection or a timeout between them
+/// can't leave half a write behind (a tombstone in a list, a SET member
+/// removed and never added back).
 async fn run_writes(mut manager: ConnectionManager, cmds: Vec<redis::Cmd>) -> WriteResult {
-    for cmd in cmds {
-        let () = cmd.query_async(&mut manager).await?;
+    match cmds.as_slice() {
+        [] => {}
+        [cmd] => {
+            let () = cmd.query_async(&mut manager).await?;
+        }
+        cmds => {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for cmd in cmds {
+                pipe.add_command(cmd.clone());
+            }
+            let () = pipe.query_async(&mut manager).await?;
+        }
     }
     Ok(())
+}
+
+/// The server refuses `EVAL` itself (an ACL without scripting, a proxy
+/// that doesn't know it), as opposed to an error from inside the script.
+fn scripting_refused(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    err.downcast_ref::<redis::RedisError>().is_some_and(|e| {
+        let text = e.to_string().to_lowercase();
+        text.contains("noperm") || text.contains("unknown command")
+    })
+}
+
+/// The LIST write without a script: check the element, then run `cmds` in
+/// one `MULTI`. Only for servers where [`scripting_refused`].
+async fn list_write_unscripted(
+    mut manager: ConnectionManager,
+    key: &str,
+    index: usize,
+    expected: &str,
+    cmds: Vec<redis::Cmd>,
+) -> WriteResult {
+    let position = isize::try_from(index).unwrap_or(isize::MAX);
+    let current: Option<Text> = manager.lindex(Raw(key), position).await?;
+    if current.map(|text| text.0).as_deref() != Some(expected) {
+        return Err(write_cmd::LIST_CHANGED.into());
+    }
+    run_writes(manager, cmds).await
 }
 
 /// Overwrite a key with a plain string value, keeping its TTL
@@ -624,7 +675,7 @@ pub async fn set_string(mut manager: ConnectionManager, key: &str, value: &str) 
     match run_writes(manager.clone(), write_cmd::set_string(key, value)).await {
         Err(err) if is_syntax_error(err.as_ref()) => {
             let ttl_ms: i64 = redis::cmd("PTTL")
-                .arg(key)
+                .arg(Raw(key))
                 .query_async(&mut manager)
                 .await?;
             run_writes(manager, write_cmd::set_string_px(key, value, ttl_ms)).await
@@ -669,7 +720,7 @@ pub async fn key_exists(
     mut manager: ConnectionManager,
     key: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let exists: bool = manager.exists(key).await?;
+    let exists: bool = manager.exists(Raw(key)).await?;
     Ok(exists)
 }
 
@@ -680,7 +731,22 @@ pub async fn key_exists(
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn create_key(manager: ConnectionManager, key: &str, spec: &NewKeySpec) -> WriteResult {
+pub async fn create_key(
+    mut manager: ConnectionManager,
+    key: &str,
+    spec: &NewKeySpec,
+) -> WriteResult {
+    if let NewKeySpec::String(_) = spec {
+        // `SET … NX` answers nil when the key appeared after the `EXISTS`
+        // guard: nothing was overwritten.
+        for cmd in write_cmd::create_key(key, spec) {
+            let set: Option<String> = cmd.query_async(&mut manager).await?;
+            if set.is_none() {
+                return Err(format!("Key '{key}' already exists").into());
+            }
+        }
+        return Ok(());
+    }
     run_writes(manager, write_cmd::create_key(key, spec)).await
 }
 
@@ -705,13 +771,26 @@ pub async fn add_item(manager: ConnectionManager, key: &str, item: &KeyItem) -> 
 pub async fn edit_item(mut manager: ConnectionManager, key: &str, edit: &ItemEdit) -> WriteResult {
     if let ItemEdit::SetReplace { old, new } = edit {
         if old != new {
-            let exists: bool = manager.sismember(key, new).await?;
+            let exists: bool = manager.sismember(Raw(key), Raw(new)).await?;
             if exists {
                 return Err(format!("Member '{new}' already exists").into());
             }
         }
     }
-    run_writes(manager, write_cmd::edit_item(key, edit)).await
+    match run_writes(manager.clone(), write_cmd::edit_item(key, edit)).await {
+        Err(err) if scripting_refused(err.as_ref()) => match edit {
+            ItemEdit::ListSet {
+                index,
+                expected,
+                value,
+            } => {
+                let cmds = write_cmd::list_set_unscripted(key, *index, value);
+                list_write_unscripted(manager, key, *index, expected, cmds).await
+            }
+            _ => Err(err),
+        },
+        result => result,
+    }
 }
 
 /// Delete a single collection element. LIST elements are removed by index via
@@ -725,7 +804,16 @@ pub async fn delete_item(
     key: &str,
     delete: &ItemDelete,
 ) -> WriteResult {
-    run_writes(manager, write_cmd::delete_item(key, delete)).await
+    match run_writes(manager.clone(), write_cmd::delete_item(key, delete)).await {
+        Err(err) if scripting_refused(err.as_ref()) => match delete {
+            ItemDelete::ListIndex { index, expected } => {
+                let cmds = write_cmd::list_delete_unscripted(key, *index);
+                list_write_unscripted(manager, key, *index, expected, cmds).await
+            }
+            _ => Err(err),
+        },
+        result => result,
+    }
 }
 
 #[cfg(test)]

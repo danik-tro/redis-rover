@@ -68,6 +68,9 @@ pub async fn report(client: &redis::Client, label: &str) -> Result<String> {
     ];
     let mut out = String::new();
     for (name, value) in rows {
+        // Version, role and error text come from the server: no escape
+        // sequence of its choosing reaches the terminal.
+        let value = crate::redis_client::escape::printable(&value);
         let _ = writeln!(out, "{name:<9} {value}");
     }
     Ok(out)
@@ -216,6 +219,17 @@ mod tests {
         let role = Ok(Value::Array(vec![Value::BulkString(b"master".to_vec())]));
         assert_eq!(role_line(&role), "master");
         assert!(role_line(&Err(server_err("unknown command `ROLE`"))).starts_with("n/a"));
+    }
+
+    /// #71: a hostile server can't put escape sequences into the report.
+    #[test]
+    fn server_text_is_escaped() {
+        let raw = "redis_version:7.0\u{1b}]0;owned\u{7}\r\nredis_mode:standalone\r\n";
+        let line = server_line(Ok(raw));
+        assert_eq!(
+            crate::redis_client::escape::printable(&line),
+            "Redis 7.0\\x1b]0;owned\\x07 (standalone)"
+        );
     }
 
     #[test]

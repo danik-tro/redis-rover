@@ -350,8 +350,8 @@ impl Config {
         let data_dir = crate::utils::get_data_dir();
         let config_dir = crate::utils::get_config_dir();
         let mut builder = config::Config::builder()
-            .set_default("_data_dir", data_dir.to_str().unwrap())?
-            .set_default("_config_dir", config_dir.to_str().unwrap())?;
+            .set_default("_data_dir", data_dir.to_string_lossy().as_ref())?
+            .set_default("_config_dir", config_dir.to_string_lossy().as_ref())?;
 
         let config_files = [
             ("config.json5", config::FileFormat::Json5),
@@ -372,7 +372,8 @@ impl Config {
             }
         }
         if !found_config {
-            log::error!("No configuration file found. Application may not behave as expected");
+            // The bundled defaults apply; most users have no file.
+            log::debug!("No user configuration file in {}", config_dir.display());
         }
 
         let built = builder.build()?;

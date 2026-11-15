@@ -35,7 +35,9 @@ impl Toast {
     /// for [`TOAST_TIMEOUT`] from `now`, or until replaced if `sticky`.
     pub fn show(&mut self, msg: impl Into<String>, sticky: bool, now: Instant) {
         let expires = (!sticky).then(|| now + TOAST_TIMEOUT);
-        self.current = Some((msg.into(), expires));
+        // A name with bytes that aren't UTF-8 reads as `\xHH`.
+        let msg = crate::redis_client::bytes::shown(&msg.into()).into_owned();
+        self.current = Some((msg, expires));
     }
 
     /// A background message (Pub/Sub notification). It never replaces the

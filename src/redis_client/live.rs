@@ -39,7 +39,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{client, pubsub::backoff, runner::Link, types::ValueState};
+use super::{bytes::Raw, client, pubsub::backoff, runner::Link, types::ValueState};
 use crate::{
     action::{try_send_action, Action},
     config::{LiveConfig, LiveMode},
@@ -392,9 +392,9 @@ impl LiveTask {
             .arg("YES")
             .ignore()
             .cmd("TYPE")
-            .arg(&key)
+            .arg(Raw(&key))
             .cmd("PTTL")
-            .arg(&key)
+            .arg(Raw(&key))
             .query_async(&mut tracked.conn)
             .await;
         match reply {
@@ -670,9 +670,9 @@ async fn fingerprint(
         return Err(Failure::Other("no key".to_owned()));
     };
     let mut pipe = redis::pipe();
-    pipe.cmd("TYPE").arg(&key).cmd("PTTL").arg(&key);
+    pipe.cmd("TYPE").arg(Raw(&key)).cmd("PTTL").arg(Raw(&key));
     let reply = if whole {
-        pipe.cmd("DUMP").arg(&key);
+        pipe.cmd("DUMP").arg(Raw(&key));
         pipe.query_async::<(String, i64, Option<Vec<u8>>)>(&mut conn)
             .await
             .map(|(r_type, pttl, dump)| (r_type, pttl, Some(dump)))
@@ -727,11 +727,15 @@ async fn fingerprint(
 fn invalidates(data: &[Value], key: &str) -> bool {
     match data.first() {
         Some(Value::Nil) | None => true,
-        Some(Value::Array(keys) | Value::Set(keys)) => keys.iter().any(|k| match k {
-            Value::BulkString(bytes) => bytes == key.as_bytes(),
-            Value::SimpleString(s) => s == key,
-            _ => false,
-        }),
+        Some(Value::Array(keys) | Value::Set(keys)) => {
+            // The key as the server names it (`bytes.rs`).
+            let raw = super::bytes::bytes_from_text(key);
+            keys.iter().any(|k| match k {
+                Value::BulkString(bytes) => bytes.as_slice() == raw.as_ref(),
+                Value::SimpleString(s) => s.as_bytes() == raw.as_ref(),
+                _ => false,
+            })
+        }
         Some(_) => false,
     }
 }

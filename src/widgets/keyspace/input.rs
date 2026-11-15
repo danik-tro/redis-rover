@@ -8,7 +8,11 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::redis_client::types::{ItemDelete, ItemEdit, KeyItem, KeyValue, RedisType};
+use crate::redis_client::{
+    bytes::is_binary,
+    escape::printable,
+    types::{ItemDelete, ItemEdit, KeyItem, KeyValue, RedisType},
+};
 
 impl KeySpace {
     pub fn is_popup(&self) -> bool {
@@ -507,13 +511,26 @@ impl KeySpace {
                 (format!("Value [#{index}]"), value.clone())
             }
             SelectedElement::SetMember(member) => ("Member".to_string(), member.clone()),
-            SelectedElement::HashField { field, value } => {
-                (format!("Value (field: {field})"), value.clone())
-            }
-            SelectedElement::ZsetMember { member, score } => {
-                (format!("Score (member: {member})"), score.to_string())
-            }
+            SelectedElement::HashField { field, value } => (
+                format!("Value (field: {})", printable(field)),
+                value.clone(),
+            ),
+            SelectedElement::ZsetMember { member, score } => (
+                format!("Score (member: {})", printable(member)),
+                score.to_string(),
+            ),
         };
+        // Bytes that aren't UTF-8 can't be typed, so the text in the input
+        // would not be the element: it can be deleted, not edited.
+        if is_binary(&seed) {
+            self.action_overlay = Some(ActionOverlay {
+                kind: OverlayKind::Notice(
+                    "Binary element (not valid UTF-8): can't be edited here.".to_string(),
+                ),
+                text_area: None,
+            });
+            return;
+        }
         let input = build_input_text_area(&title, "Enter value", Some(&seed));
         self.edit_item = Some(EditItemDraft {
             key,
@@ -546,8 +563,9 @@ impl KeySpace {
         let draft = self.edit_item.as_mut()?;
         let text = input_text(&draft.input);
         let edit = match &draft.target {
-            SelectedElement::ListIndex { index, .. } => ItemEdit::ListSet {
+            SelectedElement::ListIndex { index, value } => ItemEdit::ListSet {
                 index: *index,
+                expected: value.clone(),
                 value: text,
             },
             SelectedElement::SetMember(old) => ItemEdit::SetReplace {
