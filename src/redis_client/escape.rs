@@ -1,6 +1,6 @@
 //! Commands as `redis-cli` would show them, for the write preview.
 
-use std::fmt::Write as _;
+use std::{borrow::Cow, fmt::Write as _};
 
 use redis::{Arg, Cmd};
 
@@ -28,9 +28,97 @@ pub fn format_cmd(cmd: &Cmd) -> String {
     out
 }
 
+/// A character that changes how the text around it is drawn without being
+/// visible itself: a control character, a Unicode format character (`Cf`:
+/// bidi overrides and isolates, zero-width space / joiner, soft hyphen,
+/// BOM, tag characters) or a line / paragraph separator. A terminal acts on
+/// the first kind (escape sequences); the others let two different names
+/// look the same, or one name read as another.
+#[must_use]
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || super::bytes::byte_of(c).is_some()
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{600}'..='\u{605}'
+                | '\u{61c}'
+                | '\u{6dd}'
+                | '\u{70f}'
+                | '\u{890}'..='\u{891}'
+                | '\u{8e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+}
+
+/// `c` as an escape: `\n`, `\r`, `\t`, `\x1b` for a control character
+/// below U+0080, `\u{202e}` for the rest.
+fn push_hidden(out: &mut String, c: char) {
+    // A byte that isn't UTF-8 (`bytes.rs`), as `redis-cli` shows it.
+    if let Some(byte) = super::bytes::byte_of(c) {
+        let _ = write!(out, "\\x{byte:02x}");
+        return;
+    }
+    match c {
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        c if c.is_ascii() => {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        }
+        c => {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
+    }
+}
+
+/// Text from the server (a key name, a version string, an error) made safe
+/// to show: every [`is_hidden_char`] is written as an escape, so it can't
+/// move the cursor, write the clipboard (OSC 52) or hide part of a name.
+/// Everything else, a backslash included, is left as it is.
+#[must_use]
+pub fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(is_hidden_char) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if is_hidden_char(c) {
+            push_hidden(&mut out, c);
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// [`printable`] for text that may span lines (an error with the stderr
+/// of `password_command`): line breaks stay, everything else is escaped.
+#[must_use]
+pub fn printable_lines(text: &str) -> String {
+    text.split('\n')
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One argument in double quotes, escaped like `redis-cli` does: `\\`,
 /// `\"`, `\n`, `\r`, `\t`, `\a`, `\b`; other control characters and bytes
-/// that aren't UTF-8 as `\xHH`. Printable Unicode stays readable. Past
+/// that aren't UTF-8 as `\xHH`, invisible format characters (bidi overrides,
+/// zero-width space) as `\u{202e}`. Printable Unicode stays readable. Past
 /// [`PREVIEW_ARG_BYTES`] it is cut (on a character boundary) and ends in
 /// `…(2.1 KiB more)`.
 #[must_use]
@@ -54,6 +142,7 @@ pub fn quote_arg(bytes: &[u8]) -> String {
                         let _ = write!(out, "\\x{b:02x}");
                     }
                 }
+                c if is_hidden_char(c) => push_hidden(&mut out, c),
                 c => out.push(c),
             }
         }
@@ -105,7 +194,41 @@ fn human_bytes(n: usize) -> String {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use super::{format_cmd, human_bytes, quote_arg};
+    use super::{format_cmd, human_bytes, printable, quote_arg};
+
+    /// #71 / #72: nothing the terminal acts on, and nothing invisible,
+    /// survives.
+    #[test]
+    fn printable_escapes_hidden_characters() {
+        let cases = [
+            ("user:1", "user:1"),
+            ("café ☕ キー", "café ☕ キー"),
+            (r"C:\tmp", r"C:\tmp"),
+            ("a\nb\r\tc", r"a\nb\r\tc"),
+            ("\u{1b}]52;c;aGk=\u{7}", r"\x1b]52;c;aGk=\x07"),
+            ("\u{9b}31m", r"\u{9b}31m"),
+            ("pay\u{202e}txt.exe", r"pay\u{202e}txt.exe"),
+            ("ad\u{200b}min", r"ad\u{200b}min"),
+            ("\u{feff}x\u{7f}", r"\u{feff}x\x7f"),
+        ];
+        for (raw, shown) in cases {
+            assert_eq!(printable(raw), shown, "{raw:?}");
+            assert!(
+                !printable(raw).chars().any(super::is_hidden_char),
+                "{raw:?}"
+            );
+        }
+        assert!(matches!(printable("plain"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            super::printable_lines("one\ntwo\u{1b}[2J\r\n"),
+            "one\ntwo\\x1b[2J\\r\n"
+        );
+        // The write preview shows them too.
+        assert_eq!(
+            quote_arg("ad\u{200b}min\u{202e}".as_bytes()),
+            r#""ad\u{200b}min\u{202e}""#
+        );
+    }
 
     #[test]
     fn quotes_and_escapes_like_redis_cli() {

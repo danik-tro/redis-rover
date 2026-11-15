@@ -34,7 +34,23 @@ pub static LOG_ENV: LazyLock<String> =
 pub static LOG_FILE: LazyLock<String> = LazyLock::new(|| format!("{}.log", env!("CARGO_PKG_NAME")));
 
 fn project_directory() -> Option<ProjectDirs> {
+    ProjectDirs::from("io.github", "danik-tro", env!("CARGO_PKG_NAME"))
+}
+
+/// Where versions up to 0.x kept their files: under the qualifier of the
+/// project template (`com.kdheepak.redis-rover` on macOS, `kdheepak\…` on
+/// Windows; the same path as today on Linux).
+fn legacy_project_directory() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "kdheepak", env!("CARGO_PKG_NAME"))
+}
+
+/// `current`, unless it doesn't exist yet and `legacy` does: an existing
+/// config keeps working after the directory was renamed.
+fn current_or_legacy(current: PathBuf, legacy: Option<PathBuf>) -> PathBuf {
+    match legacy {
+        Some(legacy) if !current.exists() && legacy.exists() => legacy,
+        _ => current,
+    }
 }
 
 /// Install panic + eyre hooks that tear down the TUI and emit a
@@ -94,7 +110,10 @@ pub fn get_data_dir() -> PathBuf {
     let directory = if let Some(s) = DATA_FOLDER.clone() {
         s
     } else if let Some(proj_dirs) = project_directory() {
-        proj_dirs.data_local_dir().to_path_buf()
+        current_or_legacy(
+            proj_dirs.data_local_dir().to_path_buf(),
+            legacy_project_directory().map(|dirs| dirs.data_local_dir().to_path_buf()),
+        )
     } else {
         PathBuf::from(".").join(".data")
     };
@@ -105,7 +124,10 @@ pub fn get_config_dir() -> PathBuf {
     let directory = if let Some(s) = CONFIG_FOLDER.clone() {
         s
     } else if let Some(proj_dirs) = project_directory() {
-        proj_dirs.config_local_dir().to_path_buf()
+        current_or_legacy(
+            proj_dirs.config_local_dir().to_path_buf(),
+            legacy_project_directory().map(|dirs| dirs.config_local_dir().to_path_buf()),
+        )
     } else {
         PathBuf::from(".").join(".config")
     };
@@ -144,19 +166,18 @@ pub fn initialize_logging() -> Result<()> {
     std::fs::create_dir_all(&directory)?;
     let log_path = directory.join(LOG_FILE.as_str());
     let log_file = create_private_file(&log_path)?;
-    std::env::set_var(
-        "RUST_LOG",
-        std::env::var("RUST_LOG")
-            .or_else(|_| std::env::var(LOG_ENV.as_str()))
-            .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME"))),
-    );
+    // Read here, never written back with `set_var`: other threads already
+    // run by now, and changing the environment under them is unsound.
+    let directives = std::env::var("RUST_LOG")
+        .or_else(|_| std::env::var(LOG_ENV.as_str()))
+        .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")));
     let file_subscriber = tracing_subscriber::fmt::layer()
         .with_file(true)
         .with_line_number(true)
         .with_writer(log_file)
         .with_target(false)
         .with_ansi(false)
-        .with_filter(tracing_subscriber::filter::EnvFilter::from_default_env());
+        .with_filter(tracing_subscriber::filter::EnvFilter::new(directives));
     tracing_subscriber::registry()
         .with(file_subscriber)
         .with(ErrorLayer::default())

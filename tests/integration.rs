@@ -23,9 +23,9 @@ use clap::Parser;
 use redis::AsyncCommands;
 use redis_rover::{
     internals::{
-        Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind,
-        KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, NewKeySpec, PageRow, PubSubCmd,
-        RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
+        text_from_bytes, Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview,
+        JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, NewKeySpec, PageRow,
+        PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
     },
     Cli,
 };
@@ -129,6 +129,16 @@ async fn write(h: &mut Harness, event: RedisEvent) -> Action {
             a,
             Action::RequestSelectedValue | Action::RefreshSpace | Action::Error(_)
         )
+    })
+    .await
+}
+
+/// Like [`write`], but waits for the last action of a write
+/// (`RefreshSpace`), so the next write's answer isn't mistaken for this one.
+async fn write_done(h: &mut Harness, event: RedisEvent) -> Action {
+    h.send(event);
+    h.expect("the write's result", |a| {
+        matches!(a, Action::RefreshSpace | Action::Error(_))
     })
     .await
 }
@@ -903,6 +913,170 @@ async fn a_burst_of_events_never_stalls_the_runner() {
     h.shutdown().await;
 }
 
+/// #68: a LIST edit or delete by index is refused once another client has
+/// moved the elements, a SET member replace runs as one transaction, and a
+/// new STRING never overwrites a key created meanwhile.
+#[tokio::test]
+#[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)] // one scenario per write shape
+async fn list_writes_check_the_element_shown() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("stale");
+    let list = format!("{p}list");
+    let () = admin.rpush(&list, &["a", "b", "c"]).await.expect("RPUSH");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    // Another client pushes in front: index 1 now holds "a", not "b".
+    let () = admin.lpush(&list, "new").await.expect("LPUSH");
+    for event in [
+        RedisEvent::EditItem {
+            key: list.clone(),
+            edit: ItemEdit::ListSet {
+                index: 1,
+                expected: "b".into(),
+                value: "B".into(),
+            },
+        },
+        RedisEvent::DeleteItem {
+            key: list.clone(),
+            delete: ItemDelete::ListIndex {
+                index: 1,
+                expected: "b".into(),
+            },
+        },
+    ] {
+        match write_done(&mut h, event).await {
+            Action::Error(text) => assert!(text.contains("the list changed"), "{text}"),
+            other => panic!("a stale index must be refused, got {other:?}"),
+        }
+    }
+    let items: Vec<String> = admin.lrange(&list, 0, -1).await.expect("LRANGE");
+    assert_eq!(items, ["new", "a", "b", "c"]);
+
+    // With the value shown now, both go through.
+    let ok = write_done(
+        &mut h,
+        RedisEvent::EditItem {
+            key: list.clone(),
+            edit: ItemEdit::ListSet {
+                index: 2,
+                expected: "b".into(),
+                value: "B".into(),
+            },
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "edit: {ok:?}");
+    let ok = write_done(
+        &mut h,
+        RedisEvent::DeleteItem {
+            key: list.clone(),
+            delete: ItemDelete::ListIndex {
+                index: 0,
+                expected: "new".into(),
+            },
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "delete: {ok:?}");
+    let items: Vec<String> = admin.lrange(&list, 0, -1).await.expect("LRANGE");
+    assert_eq!(items, ["a", "B", "c"]);
+
+    // A user without scripting: the same check, without `EVAL`.
+    let () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("noscript")
+        .arg("on")
+        .arg(">pw")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-@scripting")
+        .query_async(&mut admin)
+        .await
+        .expect("ACL SETUSER");
+    let url = server
+        .url(0)
+        .replacen("redis://", "redis://noscript:pw@", 1);
+    let mut limited = Harness::new(redis::Client::open(url).expect("client"), false).await;
+    let stale = write_done(
+        &mut limited,
+        RedisEvent::DeleteItem {
+            key: list.clone(),
+            delete: ItemDelete::ListIndex {
+                index: 0,
+                expected: "zzz".into(),
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(&stale, Action::Error(text) if text.contains("the list changed")),
+        "{stale:?}"
+    );
+    let ok = write_done(
+        &mut limited,
+        RedisEvent::DeleteItem {
+            key: list.clone(),
+            delete: ItemDelete::ListIndex {
+                index: 0,
+                expected: "a".into(),
+            },
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "unscripted delete: {ok:?}");
+    let items: Vec<String> = admin.lrange(&list, 0, -1).await.expect("LRANGE");
+    assert_eq!(items, ["B", "c"]);
+
+    // SET member replace: SREM + SADD in one MULTI.
+    let set = format!("{p}set");
+    let () = admin.sadd(&set, &["a", "b"]).await.expect("SADD");
+    let ok = write_done(
+        &mut h,
+        RedisEvent::EditItem {
+            key: set.clone(),
+            edit: ItemEdit::SetReplace {
+                old: "a".into(),
+                new: "z".into(),
+            },
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "set: {ok:?}");
+    let mut members: Vec<String> = admin.smembers(&set).await.expect("SMEMBERS");
+    members.sort();
+    assert_eq!(members, ["b", "z"]);
+
+    // A new STRING over an existing key is refused and changes nothing.
+    let taken = format!("{p}taken");
+    let () = admin.set(&taken, "theirs").await.expect("SET");
+    let refused = write_done(
+        &mut h,
+        RedisEvent::CreateKey {
+            key: taken.clone(),
+            spec: NewKeySpec::String("ours".into()),
+        },
+    )
+    .await;
+    assert!(matches!(refused, Action::Error(_)), "{refused:?}");
+    let value: String = admin.get(&taken).await.expect("GET");
+    assert_eq!(value, "theirs");
+    let fresh = format!("{p}fresh");
+    let ok = write_done(
+        &mut h,
+        RedisEvent::CreateKey {
+            key: fresh.clone(),
+            spec: NewKeySpec::String("ours".into()),
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "create: {ok:?}");
+    let value: String = admin.get(&fresh).await.expect("GET");
+    assert_eq!(value, "ours");
+}
+
 /// #69: a user whose ACL refuses `MEMORY USAGE` still gets the key list,
 /// with unknown sizes, instead of "Failed to fetch keys".
 #[tokio::test]
@@ -940,6 +1114,100 @@ async fn keys_list_without_memory_usage() {
         assert!(metas.iter().all(|m| m.size == 0), "sizes unknown");
         assert!(metas.iter().all(|m| m.r_type == RedisType::String));
     }
+    h.shutdown().await;
+}
+
+/// #65: a key name and collection members that aren't UTF-8 neither fail
+/// the page nor the value, and the key can be opened, edited and deleted
+/// under its exact bytes.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn binary_key_names_and_members() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("bin");
+    let plain = support::seed_strings(&mut admin, &p, 3).await;
+    let raw_string: Vec<u8> = [p.as_bytes(), b"\xff\xfe"].concat();
+    let raw_hash: Vec<u8> = [p.as_bytes(), b"hash\x80"].concat();
+    let raw_list: Vec<u8> = [p.as_bytes(), b"list"].concat();
+    let () = admin.set(&raw_string, "x").await.expect("SET");
+    let () = admin
+        .hset(&raw_hash, b"f\xc0".as_slice(), b"\x93\x01\x02".as_slice())
+        .await
+        .expect("HSET");
+    let () = admin
+        .rpush(&raw_list, &[b"a".as_slice(), b"\xfe\xed".as_slice()])
+        .await
+        .expect("RPUSH");
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.state
+        .keyspace_state
+        .lock()
+        .set_pattern(Some(format!("{p}*")));
+    let page = h.fetch_page().await;
+    assert_eq!(page.len(), plain.len() + 3, "{page:?}");
+    // The names as the app keeps them: exact bytes, as text.
+    let string_key = text_from_bytes(&raw_string);
+    let hash_key = text_from_bytes(&raw_hash);
+    assert!(page.contains(&string_key), "{page:?}");
+    assert!(page.contains(&hash_key), "{page:?}");
+    let metas = h.state.keys.lock().clone().expect("the page");
+    let type_of = |key: &str| {
+        metas
+            .iter()
+            .find(|m| m.key == key)
+            .map(|m| m.r_type.clone())
+            .expect("meta")
+    };
+    assert_eq!(type_of(&string_key), RedisType::String);
+    assert_eq!(type_of(&hash_key), RedisType::Hash);
+
+    // Values with binary members load.
+    match load_value(&mut h, &hash_key, RedisType::Hash).await {
+        KeyValue::Hash(entries) => assert_eq!(entries.len(), 1),
+        other => panic!("hash: {other:?}"),
+    }
+    let list_key = format!("{p}list");
+    let items = match load_value(&mut h, &list_key, RedisType::List).await {
+        KeyValue::List(items) => items,
+        other => panic!("list: {other:?}"),
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], "a");
+
+    // Deleting the binary element targets its exact bytes.
+    let ok = write_done(
+        &mut h,
+        RedisEvent::DeleteItem {
+            key: list_key.clone(),
+            delete: ItemDelete::ListIndex {
+                index: 1,
+                expected: items[1].clone(),
+            },
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "delete item: {ok:?}");
+    let left: Vec<Vec<u8>> = admin.lrange(&raw_list, 0, -1).await.expect("LRANGE");
+    assert_eq!(left, [b"a".to_vec()]);
+
+    // TTL and delete on the binary key name.
+    let ok = write_done(
+        &mut h,
+        RedisEvent::SetTtl {
+            key: string_key.clone(),
+            secs: 500,
+        },
+    )
+    .await;
+    assert!(!matches!(ok, Action::Error(_)), "ttl: {ok:?}");
+    let ttl: i64 = admin.ttl(&raw_string).await.expect("TTL");
+    assert!(ttl > 0, "{ttl}");
+    let ok = write_done(&mut h, RedisEvent::DeleteKey { key: string_key }).await;
+    assert!(!matches!(ok, Action::Error(_)), "delete: {ok:?}");
+    let exists: bool = admin.exists(&raw_string).await.expect("EXISTS");
+    assert!(!exists, "the binary key is deleted");
     h.shutdown().await;
 }
 
@@ -1042,6 +1310,7 @@ async fn value_edits_round_trip() {
     let key = &seeded.lists[0];
     let edit = ItemEdit::ListSet {
         index: 1,
+        expected: "b".into(),
         value: "B".into(),
     };
     let ok = write(

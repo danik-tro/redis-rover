@@ -140,7 +140,7 @@ impl std::fmt::Debug for RedisEvent {
             }
             Self::DeleteItem { key, delete } => {
                 let kind = match delete {
-                    ItemDelete::ListIndex(_) => "ListIndex",
+                    ItemDelete::ListIndex { .. } => "ListIndex",
                     ItemDelete::SetMember(_) => "SetMember",
                     ItemDelete::HashField(_) => "HashField",
                     ItemDelete::ZsetMember(_) => "ZsetMember",
@@ -239,7 +239,13 @@ impl RedisEvent {
             Self::DeleteItem { key, delete } => write_cmd::delete_item(key, delete),
             Self::Publish { channel, payload } => write_cmd::publish(channel, payload),
         };
-        cmds.iter().map(format_cmd).collect()
+        let mut lines: Vec<String> = cmds.iter().map(format_cmd).collect();
+        // Several commands run as one transaction (`client::run_writes`).
+        if lines.len() > 1 {
+            lines.insert(0, "MULTI".to_owned());
+            lines.push("EXEC".to_owned());
+        }
+        lines
     }
 }
 
@@ -339,7 +345,7 @@ mod tests {
                     key: k(),
                     spec: NewKeySpec::String("v".into()),
                 },
-                vec![r#"SET "user:1" "v""#],
+                vec![r#"SET "user:1" "v" "NX""#],
             ),
             (
                 RedisEvent::CreateKey {
@@ -408,10 +414,13 @@ mod tests {
                     key: k(),
                     edit: ItemEdit::ListSet {
                         index: 2,
+                        expected: "old".into(),
                         value: "v".into(),
                     },
                 },
-                vec![r#"LSET "user:1" "2" "v""#],
+                vec![
+                    r#"EVAL "-- LSET if the element is unchanged\nif redis.call('LINDEX', KEYS"…(162 B more) "1" "user:1" "2" "old" "v""#,
+                ],
             ),
             (
                 RedisEvent::EditItem {
@@ -421,7 +430,12 @@ mod tests {
                         new: "b".into(),
                     },
                 },
-                vec![r#"SREM "user:1" "a""#, r#"SADD "user:1" "b""#],
+                vec![
+                    "MULTI",
+                    r#"SREM "user:1" "a""#,
+                    r#"SADD "user:1" "b""#,
+                    "EXEC",
+                ],
             ),
             (
                 RedisEvent::EditItem {
@@ -456,11 +470,13 @@ mod tests {
             (
                 RedisEvent::DeleteItem {
                     key: k(),
-                    delete: ItemDelete::ListIndex(3),
+                    delete: ItemDelete::ListIndex {
+                        index: 3,
+                        expected: "old".into(),
+                    },
                 },
                 vec![
-                    r#"LSET "user:1" "3" "__rrover_deleted__\x00""#,
-                    r#"LREM "user:1" "1" "__rrover_deleted__\x00""#,
+                    r#"EVAL "-- LSET tombstone + LREM if the element is unchanged\nif redis.ca"…(219 B more) "1" "user:1" "3" "old" "__rrover_deleted__\x00""#,
                 ],
             ),
             (

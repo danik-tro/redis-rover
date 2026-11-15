@@ -71,7 +71,7 @@ Each setting is taken from the first place that sets it:
 | DB | `--db` > profile `db` > the URL path > 0 |
 | TLS files | each `--tls-*` flag > profile `tls` |
 | Password | `--token` > profile `password_command` > the URL |
-| Environment | profile `environment` > inferred from the host |
+| Environment | profile `environment` > inferred from the host. When `--url` replaces a profile's `url`, the stricter of the two |
 | Read-only | `--read-only` > `--writable` > profile `read_only` > the environment's default |
 
 ```console
@@ -122,7 +122,7 @@ Keep the servers you use in the `profiles` section of your [config](#configurati
 
 | Field | Meaning |
 |---|---|
-| `url` | Redis URL. `--url` still wins. |
+| `url` | Redis URL. `--url` still wins; the profile's `environment` and `read_only: false` then apply only if the new host doesn't call for more protection (`rrover local --url redis://prod-db:6379` starts as `UNKNOWN`, read-only). |
 | `environment` | `local`, `staging`, `prod` or `unknown`. Inferred from the host when unset. |
 | `db` | Starting DB. `--db` still wins. |
 | `read_only` | `true` / `false` overrides the environment's default. |

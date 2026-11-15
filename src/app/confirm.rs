@@ -64,10 +64,13 @@ impl TypedConfirm {
         if env != Environment::Prod {
             return None;
         }
-        let expected = if key.chars().count() > TYPED_NAME_MAX {
+        // What the user types is what they see: hidden characters in the
+        // name are shown, and typed, as their escapes.
+        let shown = crate::redis_client::escape::printable(key);
+        let expected = if shown.chars().count() > TYPED_NAME_MAX {
             "delete".to_owned()
         } else {
-            key.clone()
+            shown.into_owned()
         };
         Some(Self {
             input: typed_input(&expected),

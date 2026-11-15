@@ -133,6 +133,8 @@ impl App {
     /// [`Self::copy_text`] with a `note` next to the size, e.g.
     /// `Copied payload of c (64.00 KiB, truncated)`.
     fn copy_text_noted(&mut self, text: &str, what: &str, note: Option<&str>) {
+        // Bytes that aren't UTF-8 are copied the way they are shown.
+        let text = &*crate::redis_client::bytes::shown(text);
         let msg = match self.clipboard.copy(text) {
             Ok(via) => copied_toast(what, text.len(), note, via),
             Err(err) => format!("Copy failed: {err}"),

@@ -11,6 +11,7 @@ use redis::aio::ConnectionManager;
 use redis::{FromRedisValue, ScanOptions};
 
 use super::{
+    bytes::{strings, Raw, Text},
     client,
     pubsub_store::ServerChannels,
     types::{
@@ -92,9 +93,11 @@ impl Storage {
         scan_type: Option<&str>,
     ) -> redis::RedisResult<(usize, Vec<String>)> {
         let mut manager = self.manager.clone();
-        scan_cmd(cursor, pattern, count, scan_type)
+        // Key names are bytes: one that isn't UTF-8 must not fail the page.
+        let (cursor, keys): (usize, Vec<Text>) = scan_cmd(cursor, pattern, count, scan_type)
             .query_async(&mut manager)
-            .await
+            .await?;
+        Ok((cursor, strings(keys)))
     }
 
     /// Answer a [`SweepRequest`]: run `SCAN` steps from its cursor until they
@@ -167,7 +170,7 @@ impl Storage {
         }
         let mut pipe = redis::pipe();
         for key in keys {
-            pipe.cmd("TYPE").arg(key);
+            pipe.cmd("TYPE").arg(Raw(key));
         }
         let mut manager = self.manager.clone();
         pipe.query_async(&mut manager).await
@@ -256,11 +259,11 @@ impl Storage {
         // `Value::ServerError`, instead of one error for the whole page.
         pipe.ignore_errors();
         for key in keys {
-            pipe.cmd("TYPE").arg(key);
+            pipe.cmd("TYPE").arg(Raw(key));
             if with_size {
-                pipe.cmd("MEMORY").arg("USAGE").arg(key);
+                pipe.cmd("MEMORY").arg("USAGE").arg(Raw(key));
             }
-            pipe.cmd("TTL").arg(key);
+            pipe.cmd("TTL").arg(Raw(key));
         }
         let mut manager = self.manager.clone();
         let raw: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
@@ -439,10 +442,11 @@ impl Storage {
         &self,
     ) -> Result<ServerChannels, Box<dyn std::error::Error + Sync + Send>> {
         let mut manager = self.manager.clone();
-        let mut names: Vec<String> = redis::cmd("PUBSUB")
+        let names: Vec<Text> = redis::cmd("PUBSUB")
             .arg("CHANNELS")
             .query_async(&mut manager)
             .await?;
+        let mut names = strings(names);
         let total = names.len();
         names.sort_unstable();
         names.truncate(PUBSUB_CHANNELS_MAX);
@@ -450,11 +454,16 @@ impl Storage {
         let channels = if names.is_empty() {
             Vec::new()
         } else {
-            redis::cmd("PUBSUB")
+            let args: Vec<Raw> = names.iter().map(|name| Raw(name)).collect();
+            let counts: Vec<(Text, u64)> = redis::cmd("PUBSUB")
                 .arg("NUMSUB")
-                .arg(&names)
+                .arg(args)
                 .query_async(&mut manager)
-                .await?
+                .await?;
+            counts
+                .into_iter()
+                .map(|(name, count)| (name.0, count))
+                .collect()
         };
         let patterns: u64 = redis::cmd("PUBSUB")
             .arg("NUMPAT")

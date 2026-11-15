@@ -13,7 +13,9 @@ async fn main() -> ExitCode {
     match redis_rover::run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}: {e:#}", env!("CARGO_PKG_NAME"));
+            // The error can quote the server (or a proxy in front of it).
+            let message = redis_rover::printable_lines(&format!("{e:#}"));
+            eprintln!("{}: {message}", env!("CARGO_PKG_NAME"));
             if e.downcast_ref::<TargetError>().is_some() {
                 ExitCode::from(EXIT_CONFIG)
             } else {
