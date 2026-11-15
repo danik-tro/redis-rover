@@ -1,7 +1,11 @@
 use super::App;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::live::CHANGED_HIGHLIGHT;
+
+/// How long the cursor rests on a key before its value is fetched while
+/// `j` / `k` is held (#77).
+const VALUE_FETCH_REST: Duration = Duration::from_millis(100);
 
 use super::confirm::{AfterWrite, Reselect};
 use crate::redis_client::{
@@ -593,8 +597,9 @@ impl App {
         self.fetch_keys();
     }
 
-    /// Re-run the SCAN sweep (picking up writes) while staying on the current
-    /// page.
+    /// `r`: re-run the SCAN sweep (picking up what other clients wrote) while
+    /// staying on the current page. The app's own writes don't need it
+    /// (`Action::KeysChanged`).
     pub(super) fn refresh_space(&mut self) {
         self.state.keyspace_state.lock().rescan();
         self.fetch_keys();
@@ -612,10 +617,57 @@ impl App {
 
     pub(super) fn finish_keys_fetch(&mut self) {
         self.keys_in_flight = self.keys_in_flight.saturating_sub(1);
+        self.keyspace.set_scanning(None);
         self.keyspace.set_loading(self.keys_in_flight > 0);
     }
 
-    pub(super) fn scroll_down(&mut self) {
+    /// The cursor moved to another key. The value is fetched at once when the
+    /// cursor was at rest, else (a held `j` / `k`) once it has rested for
+    /// [`VALUE_FETCH_REST`]: `Tick` or the next other action sends it.
+    fn cursor_moved(&mut self, now: Instant) {
+        self.keyspace.clear_selected_value();
+        let resting = self
+            .last_cursor_move
+            .is_none_or(|at| now.duration_since(at) >= VALUE_FETCH_REST);
+        self.last_cursor_move = Some(now);
+        self.value_pending = !resting;
+        if resting {
+            action::try_send_action(&self.tx, Action::RequestSelectedValue);
+        }
+    }
+
+    /// Send the value fetch a held `j` / `k` left pending, once the cursor
+    /// has rested. Returns whether it was sent.
+    pub(super) fn fetch_rested_value(&mut self, now: Instant) -> bool {
+        let rested = self
+            .last_cursor_move
+            .is_none_or(|at| now.duration_since(at) >= VALUE_FETCH_REST);
+        if !self.value_pending || !rested {
+            return false;
+        }
+        self.value_pending = false;
+        self.request_selected_value();
+        true
+    }
+
+    /// Before any action but a cursor move: what it does must see the
+    /// selected key's value requested, as if it had not been held back.
+    pub(super) fn flush_pending_value(&mut self, action: &Action) {
+        if !self.value_pending
+            || matches!(
+                action,
+                Action::Tick | Action::Render | Action::ScrollDown | Action::ScrollUp
+            )
+        {
+            return;
+        }
+        self.value_pending = false;
+        if *action != Action::RequestSelectedValue {
+            self.request_selected_value();
+        }
+    }
+
+    pub(super) fn scroll_down(&mut self, now: Instant) {
         if self.mode == Mode::PubSub {
             self.pubsub_move(true);
             return;
@@ -637,11 +689,10 @@ impl App {
             return;
         }
         self.keyspace.scroll_next();
-        self.keyspace.clear_selected_value();
-        action::try_send_action(&self.tx, Action::RequestSelectedValue);
+        self.cursor_moved(now);
     }
 
-    pub(super) fn scroll_up(&mut self) {
+    pub(super) fn scroll_up(&mut self, now: Instant) {
         if self.mode == Mode::PubSub {
             self.pubsub_move(false);
             return;
@@ -662,8 +713,7 @@ impl App {
             return;
         }
         self.keyspace.scroll_previous();
-        self.keyspace.clear_selected_value();
-        action::try_send_action(&self.tx, Action::RequestSelectedValue);
+        self.cursor_moved(now);
     }
 }
 
@@ -736,6 +786,65 @@ mod tests {
         serve_page(&mut app);
         assert_eq!(app.keyspace.selected_group(), None);
         assert!(app.keyspace.select_key_by_name("order:9"));
+    }
+
+    #[test]
+    fn a_held_j_fetches_the_value_once_the_cursor_rests() {
+        use crate::action::Action;
+        use crate::clock::FixedClock;
+        use crate::redis_client::event::RedisEvent;
+        use std::{sync::Arc, time::Duration, time::UNIX_EPOCH};
+
+        /// Run what the app queued for itself; count the value fetches sent.
+        fn settle(
+            app: &mut super::App,
+            redis_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RedisEvent>,
+        ) -> usize {
+            while let Ok(action) = app.rx.try_recv() {
+                app.update(&action);
+            }
+            std::iter::from_fn(|| redis_rx.try_recv().ok())
+                .filter(|event| matches!(event, RedisEvent::FetchValue))
+                .count()
+        }
+
+        let (mut app, _cmds, mut redis_rx) = crate::app::tests::app_with_channels();
+        let clock = Arc::new(FixedClock::new(UNIX_EPOCH));
+        app.clock = clock.clone();
+        app.mode = crate::mode::Mode::KeySpace;
+        *app.state.keys.lock() = Some(["a", "b", "c", "d", "e"].map(meta).to_vec());
+        app.load_new_keys();
+
+        // A single press fetches at once.
+        app.update(&Action::ScrollDown);
+        assert_eq!(settle(&mut app, &mut redis_rx), 1);
+
+        // Held: the next moves come 30 ms apart and fetch nothing.
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(30));
+            app.update(&Action::ScrollDown);
+        }
+        app.update(&Action::Tick);
+        assert_eq!(settle(&mut app, &mut redis_rx), 0, "still moving");
+
+        // At rest: the next Tick fetches the row the cursor stopped on.
+        clock.advance(Duration::from_millis(120));
+        app.update(&Action::Tick);
+        assert_eq!(settle(&mut app, &mut redis_rx), 1);
+        assert_eq!(app.state.value_state.lock().key.as_deref(), Some("d"));
+        app.update(&Action::Tick);
+        assert_eq!(settle(&mut app, &mut redis_rx), 0, "sent once");
+
+        // Another action right after a held move doesn't wait for the Tick.
+        clock.advance(Duration::from_millis(200));
+        app.update(&Action::ScrollUp);
+        assert_eq!(settle(&mut app, &mut redis_rx), 1);
+        clock.advance(Duration::from_millis(30));
+        app.update(&Action::ScrollUp);
+        assert_eq!(settle(&mut app, &mut redis_rx), 0);
+        app.update(&Action::EnterValue);
+        assert_eq!(settle(&mut app, &mut redis_rx), 1);
+        assert_eq!(app.state.value_state.lock().key.as_deref(), Some("b"));
     }
 
     #[test]

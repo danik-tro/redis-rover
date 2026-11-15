@@ -421,7 +421,7 @@ mod tests {
         assert!(text.contains("(2)"), "{text}");
         assert!(!text.contains("PubSub 2"), "{text}");
 
-        app.scroll_down();
+        app.scroll_down(app.clock.now());
         assert_eq!(unread(&app), vec![0, 0]);
     }
 

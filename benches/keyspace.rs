@@ -44,7 +44,11 @@ fn merge_all(batches: Vec<Vec<String>>, finish: bool) -> KeyspaceState {
     let mut state = KeyspaceState::default();
     let last = batches.len();
     for (i, batch) in batches.into_iter().enumerate() {
-        let cursor = if finish && i + 1 == last { 0 } else { i + 1 };
+        let cursor = if finish && i + 1 == last {
+            0
+        } else {
+            i as u64 + 1
+        };
         state.merge_batch(cursor, batch);
     }
     state
@@ -81,7 +85,14 @@ fn page_turn(state: &mut KeyspaceState, batch: Vec<String>) -> Vec<String> {
     assert!(state.next_page());
     if let Some(request) = state.sweep_request() {
         let cursor = request.cursor + 1;
-        let applied = state.apply_result(&request, SweepResult { cursor, batch });
+        let applied = state.apply_result(
+            &request,
+            SweepResult {
+                cursor,
+                batch,
+                checked: 0,
+            },
+        );
         assert_eq!(applied, SweepApply::Applied);
     }
     state.page_keys()

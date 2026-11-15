@@ -119,6 +119,20 @@ impl MetaColumns {
         self.known
     }
 
+    /// Drop key `index`; the keys after it move down by one, as they do in
+    /// the sweep.
+    pub fn remove(&mut self, index: u32) {
+        let i = index as usize;
+        if i >= self.types.len() {
+            return;
+        }
+        if self.types.remove(i) != TYPE_UNKNOWN {
+            self.known -= 1;
+        }
+        self.ttl.remove(i);
+        self.size.remove(i);
+    }
+
     #[must_use]
     pub fn is_known(&self, index: u32) -> bool {
         self.types
@@ -442,6 +456,17 @@ impl KeyView {
         self.sort_generation += 1;
     }
 
+    /// Sweep index `index` is gone and the ones after it moved down by one:
+    /// the same in the built order.
+    pub fn remove(&mut self, index: u32) {
+        if let Some(order) = self.order.as_mut() {
+            order.retain(|&i| i != index);
+            for i in order.iter_mut().filter(|i| **i > index) {
+                *i -= 1;
+            }
+        }
+    }
+
     /// Merge the new sweep indices `from..to` into the built order.
     pub fn merge_new<I: SortInput + ?Sized>(&mut self, names: &I, from: u32, to: u32) {
         let (Some(sort), Some(order)) = (self.order_sort(), self.order.as_mut()) else {
@@ -555,7 +580,7 @@ pub struct SortJob {
     /// A copy of the columns, for a type / TTL / size sort.
     meta: Option<MetaColumns>,
     sort: Sort,
-    /// `KeyspaceState::sweep_epoch` when the job was made.
+    /// `KeyspaceState::index_epoch` when the job was made.
     pub(super) epoch: u64,
     sort_generation: u64,
 }

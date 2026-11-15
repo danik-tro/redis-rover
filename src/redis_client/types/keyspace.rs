@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use hashbrown::HashTable;
 
 use super::{
+    glob::glob_match,
     tree::{PageRow, Tree, TreeRow},
     type_filter::{TypeFilter, TypeScan},
     view::{KeyView, MetaColumns, Sort, SortJob, SortedOrder, Swept, SYNC_SORT_MAX},
@@ -48,7 +49,10 @@ pub struct KeyspaceState {
     /// Hashes a key name for `seen`. A field so tests can force collisions.
     hash: fn(&str) -> u32,
     /// Cursor for the next `SCAN` step of the sweep.
-    pub sweep_cursor: usize,
+    pub sweep_cursor: u64,
+    /// Keys the sweep's SCAN steps were asked to check so far (the sum of
+    /// their `COUNT` hints, so an estimate).
+    pub sweep_checked: u64,
     /// The sweep reached the end (SCAN returned cursor 0).
     pub sweep_done: bool,
     /// Bumped on every page / pattern / rescan change, so the background
@@ -58,6 +62,10 @@ pub struct KeyspaceState {
     /// A SCAN result from the same epoch still extends the sweep even if the
     /// user turned the page meanwhile.
     sweep_epoch: u64,
+    /// Bumped whenever sweep indices change meaning: a restart, or a key
+    /// taken out ([`Self::remove_key`]). Work that holds indices (a
+    /// backfill batch, a sort job) is dropped when it differs.
+    index_epoch: u64,
     /// Display order of the loaded keys (SCAN order unless sorted).
     view: KeyView,
     /// Type / TTL / size per key, parallel to `scanned`. Allocated the first
@@ -115,7 +123,7 @@ fn table_hash(hash: u32) -> u64 {
 pub struct SweepRequest {
     pub pattern: Option<String>,
     /// Cursor to continue the sweep from.
-    pub cursor: usize,
+    pub cursor: u64,
     /// `COUNT` hint for every `SCAN` step.
     pub scan_count: usize,
     /// New keys the current page still needs. The runner can't dedup against
@@ -132,8 +140,11 @@ pub struct SweepRequest {
 /// last step. Duplicates are settled by [`KeyspaceState::apply_result`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepResult {
-    pub cursor: usize,
+    pub cursor: u64,
     pub batch: Vec<String>,
+    /// Sum of the `COUNT` hints of the steps run: about how many keys the
+    /// server looked at.
+    pub checked: u64,
 }
 
 /// What [`KeyspaceState::apply_result`] did with a SCAN answer.
@@ -259,9 +270,11 @@ impl KeyspaceState {
         self.scanned.clear();
         self.seen.clear();
         self.sweep_cursor = 0;
+        self.sweep_checked = 0;
         self.sweep_done = false;
         self.generation += 1;
         self.sweep_epoch += 1;
+        self.index_epoch += 1;
         self.view.reset();
         self.refresh_tree();
         if let Some(meta) = self.meta.as_mut() {
@@ -326,7 +339,16 @@ impl KeyspaceState {
 
     /// Merge one `SCAN` step into the sweep, skipping keys already seen (SCAN
     /// may return a key more than once). A returned cursor of 0 ends the sweep.
-    pub fn merge_batch(&mut self, cursor: usize, keys: Vec<String>) {
+    pub fn merge_batch(&mut self, cursor: u64, keys: Vec<String>) {
+        let full = self.merge_names(keys);
+        self.sweep_cursor = cursor;
+        self.sweep_done = cursor == 0 || full;
+        self.refresh_tree();
+    }
+
+    /// Add the names the sweep doesn't hold yet, at its end and at their
+    /// place in a built order. Returns `true` when the index is full.
+    fn merge_names(&mut self, keys: Vec<String>) -> bool {
         let mut full = false;
         let first_new = self.scanned.len();
         for key in keys {
@@ -363,9 +385,68 @@ impl KeyspaceState {
         #[allow(clippy::cast_possible_truncation)]
         self.view
             .merge_new(&input, first_new as u32, self.scanned.len() as u32);
-        self.sweep_cursor = cursor;
-        self.sweep_done = cursor == 0 || full;
+        full
+    }
+
+    /// A write left `row.key` existing with this metadata (#76): what a
+    /// rescan would find, for that one key. A key the sweep doesn't hold is
+    /// added at its end if the pattern and the type filter show it; a held
+    /// one gets its new type / TTL / size and its place in such a sort. The
+    /// SCAN that later returns the key again is a duplicate like any other.
+    pub fn upsert_key(&mut self, row: &KeyMeta) {
+        let index = if let Some(index) = self.index_of(&row.key) {
+            index
+        } else {
+            let shown = self
+                .pattern
+                .as_deref()
+                .is_none_or(|pattern| glob_match(pattern, &row.key))
+                && self.type_filter.matches(row.r_type.name());
+            let index = self.scanned_len_u32();
+            if !shown || self.merge_names(vec![row.key.clone()]) {
+                return;
+            }
+            index
+        };
+        if let Some(meta) = self.meta.as_mut() {
+            meta.set(index, row);
+            let input = Swept {
+                names: &self.scanned,
+                meta: self.meta.as_ref(),
+            };
+            self.view.reposition(&input, &[index]);
+        }
         self.refresh_tree();
+    }
+
+    /// A write deleted `name` (#76): take it out of the sweep. The keys
+    /// after it move down by one index, so whatever holds indices (a
+    /// backfill batch, a sort job) is dropped; the SCAN cursor and a running
+    /// load go on. Returns `false` if the sweep didn't hold it.
+    pub fn remove_key(&mut self, name: &str) -> bool {
+        let Some(index) = self.index_of(name) else {
+            return false;
+        };
+        let hash = (self.hash)(name);
+        if let Ok(slot) = self
+            .seen
+            .find_entry(table_hash(hash), |slot| slot.index == index)
+        {
+            slot.remove();
+        }
+        // The table is keyed by the name's hash, which a new index keeps.
+        for slot in self.seen.iter_mut().filter(|slot| slot.index > index) {
+            slot.index -= 1;
+        }
+        self.scanned.remove(index as usize);
+        if let Some(meta) = self.meta.as_mut() {
+            meta.remove(index);
+        }
+        self.view.remove(index);
+        self.index_epoch += 1;
+        self.generation += 1;
+        self.refresh_tree();
+        true
     }
 
     /// The next `SCAN` work the current page needs, or `None` when the sweep
@@ -398,6 +479,7 @@ impl KeyspaceState {
         if self.sweep_done || request.cursor != self.sweep_cursor {
             return SweepApply::Raced;
         }
+        self.sweep_checked += result.checked;
         self.merge_batch(result.cursor, result.batch);
         SweepApply::Applied
     }
@@ -679,7 +761,7 @@ impl KeyspaceState {
         Some(BackfillRequest {
             indices,
             names,
-            epoch: self.sweep_epoch,
+            epoch: self.index_epoch,
         })
     }
 
@@ -687,7 +769,7 @@ impl KeyspaceState {
     /// move those keys to their place. Returns `false`, and changes nothing,
     /// when the sweep restarted meanwhile.
     pub fn record_meta(&mut self, request: &BackfillRequest, metas: &[KeyMeta]) -> bool {
-        if request.epoch != self.sweep_epoch {
+        if request.epoch != self.index_epoch {
             return false;
         }
         let Some(meta) = self.meta.as_mut() else {
@@ -765,14 +847,14 @@ impl KeyspaceState {
             return None;
         }
         self.view
-            .job(&self.scanned, self.meta.as_ref(), self.sweep_epoch)
+            .job(&self.scanned, self.meta.as_ref(), self.index_epoch)
     }
 
     /// Install a finished [`SortJob`]. Returns `false`, and changes nothing,
     /// when the sweep restarted or the sort changed meanwhile. Keys merged
     /// since the job was made are merged into the order.
     pub fn install_sorted(&mut self, sorted: SortedOrder) -> bool {
-        if sorted.epoch != self.sweep_epoch {
+        if sorted.epoch != self.index_epoch {
             return false;
         }
         let len = self.scanned_len_u32();
@@ -815,9 +897,11 @@ impl Default for KeyspaceState {
             seen: HashTable::new(),
             hash: hash_name,
             sweep_cursor: 0,
+            sweep_checked: 0,
             sweep_done: false,
             generation: 0,
             sweep_epoch: 0,
+            index_epoch: 0,
             view: KeyView::default(),
             meta: None,
             backfill_paused: false,
@@ -1053,6 +1137,133 @@ mod tests {
         );
     }
 
+    fn written(key: &str, r_type: &str, size: u128) -> KeyMeta {
+        KeyMeta {
+            key: key.into(),
+            r_type: crate::redis_client::types::RedisType::from(r_type),
+            size,
+            ttl: -1,
+            value: crate::redis_client::types::KeyValue::Unknown,
+        }
+    }
+
+    /// #76: a write changes one key of the sweep; nothing is scanned again.
+    #[test]
+    fn a_written_key_is_removed_added_or_updated_in_place() {
+        let mut state = state_with(10);
+        state.merge_batch(42, names(&["a", "b", "c", "d"]));
+        let request = state.sweep_request();
+
+        // Deleted: gone from the list and the index, the rest keep working.
+        assert!(state.remove_key("b"));
+        assert!(!state.remove_key("b"));
+        assert_eq!(state.page_keys(), names(&["a", "c", "d"]));
+        assert_eq!(state.index_of("b"), None);
+        assert_eq!(
+            ["a", "c", "d"].map(|k| state.index_of(k)),
+            [Some(0), Some(1), Some(2)]
+        );
+        assert_eq!((state.sweep_cursor, state.sweep_done), (42, false));
+
+        // Created: at the end; SCAN returning it later is a duplicate.
+        state.upsert_key(&written("new", "string", 9));
+        state.upsert_key(&written("new", "string", 9));
+        assert_eq!(state.page_keys(), names(&["a", "c", "d", "new"]));
+        assert_eq!((state.sweep_cursor, state.sweep_done), (42, false));
+        // A SCAN answer asked for before the writes still extends the sweep.
+        let request = request.unwrap();
+        assert_eq!(
+            state.apply_result(&request, result(7, names(&["new", "b", "e"]))),
+            SweepApply::Applied
+        );
+        assert_eq!(state.page_keys(), names(&["a", "c", "d", "new", "b", "e"]));
+
+        // The pattern and the type filter decide whether a new key shows.
+        state.set_pattern(Some("user:*".into()));
+        state.upsert_key(&written("order:1", "string", 1));
+        state.upsert_key(&written("user:1", "string", 1));
+        assert_eq!(state.page_keys(), names(&["user:1"]));
+        state.set_type_filter(TypeFilter::new(["hash"]));
+        state.upsert_key(&written("user:2", "string", 1));
+        state.upsert_key(&written("user:3", "hash", 1));
+        assert_eq!(state.page_keys(), names(&["user:3"]));
+    }
+
+    #[test]
+    fn a_written_key_moves_to_its_place_in_a_sort() {
+        use crate::redis_client::types::SortKey;
+
+        let mut state = state_with(10);
+        state.set_sort(Some(Sort {
+            key: SortKey::Size,
+            descending: true,
+        }));
+        state.merge_batch(5, names(&["a", "b", "c"]));
+        state.rebuild_view();
+        let request = state.backfill_request(10).unwrap();
+        let rows: Vec<KeyMeta> = request
+            .names
+            .iter()
+            .zip([30, 20, 10])
+            .map(|(name, size)| written(name, "string", size))
+            .collect();
+        assert!(state.record_meta(&request, &rows));
+        assert_eq!(state.page_keys(), names(&["a", "b", "c"]));
+
+        // Edited: `c` grew past the others.
+        state.upsert_key(&written("c", "string", 99));
+        assert_eq!(state.page_keys(), names(&["c", "a", "b"]));
+        // Created between them.
+        state.upsert_key(&written("n", "string", 25));
+        assert_eq!(state.page_keys(), names(&["c", "a", "n", "b"]));
+        assert_eq!(state.meta_progress(), Some((4, 4)));
+
+        // Deleted: indices moved, so a backfill batch from before is dropped
+        // and the columns still line up with the names.
+        let old_batch = BackfillRequest {
+            indices: vec![3],
+            names: names(&["n"]),
+            epoch: state.index_epoch,
+        };
+        assert!(state.remove_key("a"));
+        assert_eq!(state.page_keys(), names(&["c", "n", "b"]));
+        assert_eq!(state.meta_progress(), Some((3, 3)));
+        assert!(!state.record_meta(&old_batch, &[written("n", "string", 1)]));
+        let sizes: Vec<u128> = state
+            .page_from_meta()
+            .unwrap()
+            .iter()
+            .map(|row| row.size)
+            .collect();
+        assert_eq!(sizes, [99, 25, 20]);
+    }
+
+    #[test]
+    fn a_removed_key_leaves_its_tree_group() {
+        let mut state = state_with(10);
+        state.merge_batch(5, names(&["user:1", "user:2", "solo"]));
+        state.toggle_tree(":");
+        state.rebuild_view();
+        let group = state
+            .page_rows()
+            .unwrap()
+            .iter()
+            .position(|row| matches!(row, PageRow::Group { .. }))
+            .unwrap();
+        state.set_group(group, Some(true));
+        let shown = |state: &KeyspaceState| {
+            let mut keys = state.page_keys();
+            keys.sort();
+            keys
+        };
+        assert_eq!(shown(&state), names(&["solo", "user:1", "user:2"]));
+
+        assert!(state.remove_key("user:1"));
+        assert_eq!(shown(&state), names(&["solo", "user:2"]));
+        state.upsert_key(&written("user:0", "string", 1));
+        assert_eq!(shown(&state), names(&["solo", "user:0", "user:2"]));
+    }
+
     #[test]
     fn reset_for_db_keeps_pattern_and_goes_to_first_page() {
         let mut state = state_with(10);
@@ -1140,8 +1351,12 @@ mod tests {
         assert_eq!(state.pattern.as_deref(), Some("k1*"));
     }
 
-    fn result(cursor: usize, batch: Vec<String>) -> SweepResult {
-        SweepResult { cursor, batch }
+    fn result(cursor: u64, batch: Vec<String>) -> SweepResult {
+        SweepResult {
+            cursor,
+            batch,
+            checked: 0,
+        }
     }
 
     #[test]
@@ -1308,7 +1523,7 @@ mod tests {
     fn index_survives_growth() {
         let mut state = state_with(10);
         for b in 0..100 {
-            state.merge_batch(b + 1, keys(b * 100..(b + 1) * 100));
+            state.merge_batch(b as u64 + 1, keys(b * 100..(b + 1) * 100));
         }
         // Every name again, after many table resizes: all repeats.
         state.merge_batch(0, keys(0..10_000));

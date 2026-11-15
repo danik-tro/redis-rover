@@ -45,6 +45,8 @@ pub struct KeySpace {
     loaded: bool,
     /// A keyspace fetch is in flight.
     loading: bool,
+    /// A page fetch is still scanning: about how many keys it has checked.
+    scanning: Option<u64>,
     page: PageInfo,
     mode: KeySpaceMode,
     text_area: Option<TextArea<'static>>,
@@ -140,6 +142,7 @@ impl KeySpace {
             keys,
             loaded: false,
             loading: false,
+            scanning: None,
             page: PageInfo::from(&KeyspaceState::default()),
             table: TableState::default(),
             value_table: TableState::default(),

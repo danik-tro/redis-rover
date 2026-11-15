@@ -32,10 +32,16 @@ pub enum Action {
     YankFailed(String),
     LoadKeySpace,
     RefreshSpace,
+    /// A write changed a key and the sweep already has the change (#76):
+    /// fetch the page again, without a rescan.
+    KeysChanged,
     LoadKeysIntoKeySpace,
     /// A keyspace fetch ended without new keys (failed, or superseded by a
     /// newer fetch). Only clears the loading indicator.
     KeysLoadAborted,
+    /// A keyspace fetch is still scanning for its page: about this many keys
+    /// checked so far (#80). The answer to the fetch comes later.
+    KeysScanning(u64),
     /// The metadata backfill stored another batch: the sort order (and the
     /// page) may have changed.
     KeyMetaBackfilled,
