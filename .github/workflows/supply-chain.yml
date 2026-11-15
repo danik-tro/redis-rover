@@ -3,12 +3,16 @@ name: Supply chain
 # Informational only: never fails. Findings go to the job summary and a sticky
 # PR comment (see scripts/supply-chain-report.sh). Runs once per PR commit;
 # never on push, so master and branch pushes don't spend minutes on it.
+# Also every 5 days on master (job summary only), so an advisory published
+# after the last PR is still seen.
 on:
   pull_request:
+  schedule:
+    - cron: "0 4 */5 * *"
 
 # A new commit on the PR cancels the run for the previous one.
 concurrency:
-  group: supply-chain-${{ github.event.pull_request.number }}
+  group: supply-chain-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -52,7 +56,7 @@ jobs:
       # Fork PRs get a read-only token, so they only get the job summary.
       # When clean, only update an existing comment (to ✅), never post a new one.
       - name: Comment on PR
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@v3
         with:
