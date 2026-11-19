@@ -106,7 +106,11 @@ impl App {
         // While a text-input action overlay (edit / TTL) is open, raw keys feed
         // it; Enter confirms, Esc cancels.
         if self.keyspace.is_input_active() && !is_confirm && !is_cancel {
-            self.keyspace.handle_overlay_key(key);
+            if key.code == KeyCode::Tab && self.keyspace.is_copy_open() {
+                self.pick_copy_db();
+            } else {
+                self.keyspace.handle_overlay_key(key);
+            }
             return None;
         }
 

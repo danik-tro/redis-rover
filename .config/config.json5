@@ -32,6 +32,8 @@
       "v": "ToggleTree",
       "<Shift-a>": "LoadAll",
       "<g><o>": "GoToOpenKey",
+      "<F2>": "Rename",
+      "c": "CopyKey",
       "?": "ToggleHelp",
     },
     "Dashboard": {

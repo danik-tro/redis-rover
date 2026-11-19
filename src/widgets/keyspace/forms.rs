@@ -3,7 +3,10 @@ use super::{KeySpace, SelectedElement};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::widgets::{Block, BorderType, Borders};
+use ratatui::{
+    text::Line,
+    widgets::{Block, BorderType, Borders},
+};
 use ratatui_textarea::{CursorMove, TextArea};
 
 use crate::{
@@ -80,6 +83,11 @@ pub(super) enum OverlayKind {
     EditValue,
     /// Enter a key-level TTL in seconds (text input).
     SetTtl,
+    /// The new name of key `from` (text input, seeded with `from`).
+    RenameKey { from: String },
+    /// Copy key `from` to the typed name in `db` (`None`: this DB; `Tab`
+    /// picks another).
+    CopyKey { from: String, db: Option<i64> },
     /// Confirm copying a large value (#27): fetching it whole may be slow.
     ConfirmYank {
         key: String,
@@ -588,6 +596,24 @@ pub(crate) fn build_input_text_area(
             .title(title.to_string()),
     );
     text_area
+}
+
+/// Give an input box a new title and a key hint (or an error) on its
+/// bottom border.
+pub(crate) fn set_input_titles(
+    text_area: &mut TextArea<'static>,
+    title: &str,
+    bottom: Line<'static>,
+) {
+    let cfg = config::get();
+    text_area.set_block(
+        Block::default()
+            .border_style(cfg.colors.base04)
+            .border_type(BorderType::Rounded)
+            .borders(Borders::ALL)
+            .title(title.to_string())
+            .title_bottom(bottom.right_aligned()),
+    );
 }
 
 /// Titles for the two paired add-item inputs of a collection type. Single-input

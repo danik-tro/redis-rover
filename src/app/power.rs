@@ -1,0 +1,300 @@
+//! Power edits (sol 08): rename and copy a key. Every one goes through
+//! [`App::submit_write`]; a taken name comes back as `Action::TargetExists`
+//! and is asked about again ([`App::target_exists`]).
+
+use super::{confirm::AfterWrite, App};
+use crate::{redis_client::event::RedisEvent, widgets::keyspace::OverlayRequest};
+
+impl App {
+    /// `F2`: rename the selected key.
+    pub(super) fn request_rename(&mut self) {
+        let Some((key, _)) = self.keyspace.selected_key() else {
+            return;
+        };
+        if self.deny_write() {
+            return;
+        }
+        self.keyspace.open_rename_key(key);
+    }
+
+    /// `c`: copy the selected key (`Tab` in the input picks the DB).
+    pub(super) fn request_copy_key(&mut self) {
+        let Some((key, _)) = self.keyspace.selected_key() else {
+            return;
+        };
+        if self.deny_write() {
+            return;
+        }
+        self.keyspace.open_copy_key(key);
+    }
+
+    /// `Tab` in the copy input: the DB picker, choosing a target this time.
+    pub(super) fn pick_copy_db(&mut self) {
+        if self.cluster_enabled() {
+            self.toast
+                .show("Cluster mode only has db 0", false, self.clock.now());
+            return;
+        }
+        self.open_db_picker();
+        self.db_picker.set_title(" Copy to database ", "choose");
+    }
+
+    /// Enter in the DB picker opened by [`Self::pick_copy_db`].
+    pub(super) fn confirm_copy_db(&mut self, selected: Option<i64>) {
+        let current = *self.state.db.lock();
+        self.keyspace
+            .set_copy_db(selected.filter(|&db| db != current));
+    }
+
+    /// The rename / copy input was confirmed: preview the write. An empty
+    /// or unchanged name does nothing.
+    pub(super) fn submit_move(&mut self, request: OverlayRequest) {
+        let now = self.clock.now();
+        let (event, after) = match request {
+            OverlayRequest::Rename { from, to } => {
+                if to.is_empty() || to == from {
+                    self.toast.show("Same name: nothing to rename", false, now);
+                    return;
+                }
+                let after = AfterWrite::reselect(&to);
+                let event = RedisEvent::RenameKey {
+                    from,
+                    to,
+                    overwrite: false,
+                };
+                (event, after)
+            }
+            OverlayRequest::Copy { from, to, db } => {
+                if to.is_empty() || (to == from && db.is_none()) {
+                    self.toast.show(
+                        "Pick another name or another DB (Tab) to copy to",
+                        false,
+                        now,
+                    );
+                    return;
+                }
+                let after = if db.is_none() {
+                    AfterWrite::reselect(&to)
+                } else {
+                    AfterWrite::default()
+                };
+                let event = RedisEvent::CopyKey {
+                    from,
+                    to,
+                    db,
+                    overwrite: false,
+                };
+                (event, after)
+            }
+            _ => return,
+        };
+        self.submit_write(event, after);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use tokio::sync::mpsc;
+
+    use crate::{
+        action::Action,
+        app::{
+            confirm::PendingConfirm,
+            tests::{app_with_channels, key, meta},
+            App,
+        },
+        redis_client::event::RedisEvent,
+        target::Environment,
+    };
+
+    fn on_key(env: Environment, name: &str) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
+        let (app, _, mut events) = app_with_channels();
+        let mut app = app.environment(env);
+        *app.state.keys.lock() = Some(vec![meta(name)]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(name));
+        while events.try_recv().is_ok() {}
+        (app, events)
+    }
+
+    fn press(app: &mut App, k: KeyEvent) {
+        if let Some(action) = app.handle_key_event(k) {
+            app.update(&action);
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    fn writes(events: &mut mpsc::UnboundedReceiver<RedisEvent>) -> Vec<RedisEvent> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter(RedisEvent::is_write)
+            .collect()
+    }
+
+    fn preview(app: &App) -> (Vec<String>, Option<String>) {
+        match &app.pending {
+            Some(PendingConfirm::Write(write)) => write.shown(),
+            other => panic!("no write preview open: {other:?}"),
+        }
+    }
+
+    /// AC1 in the UI: F2 opens the name for editing, Enter previews
+    /// `RENAMENX`, `y` sends it and the cursor follows the new name.
+    #[test]
+    fn f2_renames_the_selected_key_after_a_preview() {
+        let (mut app, mut events) = on_key(Environment::Staging, "user:1");
+        press(&mut app, key(KeyCode::F(2)));
+        assert!(app.keyspace.is_input_active());
+        // Seeded with the name, cursor at the end.
+        press(&mut app, key(KeyCode::Backspace));
+        type_text(&mut app, "9");
+        press(&mut app, key(KeyCode::Enter));
+
+        let (lines, warning) = preview(&app);
+        assert_eq!(lines, [r#"RENAMENX "user:1" "user:9""#]);
+        assert_eq!(warning, None);
+        assert!(writes(&mut events).is_empty(), "nothing before y");
+        press(&mut app, key(KeyCode::Char('y')));
+        let sent = writes(&mut events);
+        assert!(
+            matches!(&sent[..], [RedisEvent::RenameKey { to, overwrite: false, .. }] if to == "user:9"),
+            "{sent:?}"
+        );
+        assert_eq!(app.reselect_key.as_deref(), Some("user:9"));
+    }
+
+    /// AC2 in the UI: a taken name is asked about again, naming it; `n`
+    /// replaces nothing, `y` sends the overwrite.
+    #[test]
+    fn a_taken_name_asks_again_naming_the_key() {
+        let (mut app, mut events) = on_key(Environment::Staging, "user:1");
+        let exists = Action::TargetExists {
+            from: "user:1".into(),
+            to: "user:9".into(),
+            db: None,
+            copy: false,
+        };
+        app.update(&exists);
+        let (lines, warning) = preview(&app);
+        assert_eq!(lines, [r#"RENAME "user:1" "user:9""#]);
+        assert_eq!(
+            warning.as_deref(),
+            Some("user:9 already exists: this replaces it")
+        );
+        press(&mut app, key(KeyCode::Char('n')));
+        assert!(writes(&mut events).is_empty());
+
+        app.update(&exists);
+        press(&mut app, key(KeyCode::Char('y')));
+        assert!(matches!(
+            &writes(&mut events)[..],
+            [RedisEvent::RenameKey {
+                overwrite: true,
+                ..
+            }]
+        ));
+    }
+
+    /// The overwrite is asked even with previews off, and on Prod it needs
+    /// the replaced key's name typed.
+    #[test]
+    fn the_overwrite_is_always_asked_and_typed_on_prod() {
+        let (mut app, mut events) = on_key(Environment::Local, "a");
+        app.preview = crate::config::PreviewPolicy::Off;
+        app.update(&Action::TargetExists {
+            from: "a".into(),
+            to: "b".into(),
+            db: Some(2),
+            copy: true,
+        });
+        let (lines, warning) = preview(&app);
+        assert_eq!(lines, [r#"COPY "a" "b" "DB" "2" "REPLACE""#]);
+        assert_eq!(
+            warning.as_deref(),
+            Some("b already exists in DB 2: this replaces it")
+        );
+        press(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(writes(&mut events).len(), 1);
+
+        let (mut app, mut events) = on_key(Environment::Prod, "a");
+        app.update(&Action::TargetExists {
+            from: "a".into(),
+            to: "b".into(),
+            db: None,
+            copy: false,
+        });
+        assert!(app.typed_confirm_open());
+        press(&mut app, key(KeyCode::Enter));
+        assert!(writes(&mut events).is_empty(), "Enter before typing");
+        type_text(&mut app, "b");
+        press(&mut app, key(KeyCode::Enter));
+        assert_eq!(writes(&mut events).len(), 1);
+    }
+
+    /// `c`, `Tab` picks DB 2 in the picker (which doesn't switch DBs), Enter
+    /// previews `COPY … DB 2`.
+    #[test]
+    fn c_copies_to_the_db_picked_with_tab() {
+        let (mut app, mut events) = on_key(Environment::Staging, "cart:1");
+        press(&mut app, key(KeyCode::Char('c')));
+        assert!(app.keyspace.is_copy_open());
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.db_picker.is_open());
+        press(&mut app, key(KeyCode::Char('2')));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(!app.db_picker.is_open());
+        assert!(app.keyspace.is_copy_open(), "back in the copy input");
+        assert!(writes(&mut events).is_empty());
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| matches!(e, RedisEvent::SelectDb(_))),
+            "the picker didn't switch DBs"
+        );
+
+        press(&mut app, key(KeyCode::Enter));
+        let (lines, _) = preview(&app);
+        assert_eq!(lines, [r#"COPY "cart:1" "cart:1" "DB" "2""#]);
+        press(&mut app, key(KeyCode::Char('y')));
+        assert!(matches!(
+            &writes(&mut events)[..],
+            [RedisEvent::CopyKey { db: Some(2), .. }]
+        ));
+    }
+
+    /// The same name in the same DB has nothing to copy or rename; a
+    /// pasted name goes into the input.
+    #[test]
+    fn same_name_does_nothing_and_paste_fills_the_input() {
+        let (mut app, mut events) = on_key(Environment::Local, "k");
+        press(&mut app, key(KeyCode::Char('c')));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(app.pending.is_none());
+        press(&mut app, key(KeyCode::F(2)));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(app.pending.is_none());
+        assert!(writes(&mut events).is_empty());
+
+        press(&mut app, key(KeyCode::F(2)));
+        app.handle_paste(":copy\n");
+        assert!(app.keyspace.is_input_active(), "the newline didn't confirm");
+        press(&mut app, key(KeyCode::Enter));
+        let (lines, _) = preview(&app);
+        assert_eq!(lines, [r#"RENAMENX "k" "k:copy""#]);
+    }
+
+    #[test]
+    fn read_only_opens_no_input() {
+        let (mut app, mut events) = on_key(Environment::Local, "k");
+        app.set_read_only(true);
+        press(&mut app, key(KeyCode::F(2)));
+        assert!(!app.keyspace.is_input_active());
+        press(&mut app, key(KeyCode::Char('c')));
+        assert!(!app.keyspace.is_input_active());
+        assert!(writes(&mut events).is_empty());
+    }
+}

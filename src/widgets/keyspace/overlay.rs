@@ -122,7 +122,10 @@ impl KeySpaceWidget {
             }
             OverlayKind::Notice(msg) => (" Notice ", msg.as_str(), "Esc: dismiss"),
             // The input kinds are handled above; unreachable here.
-            OverlayKind::EditValue | OverlayKind::SetTtl => return,
+            OverlayKind::EditValue
+            | OverlayKind::SetTtl
+            | OverlayKind::RenameKey { .. }
+            | OverlayKind::CopyKey { .. } => return,
         };
 
         let block = Block::default()

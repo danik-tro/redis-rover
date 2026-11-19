@@ -48,6 +48,14 @@ pub(super) struct PendingWrite {
     typed: Option<TypedConfirm>,
 }
 
+#[cfg(test)]
+impl PendingWrite {
+    /// The preview's command lines and warning.
+    pub(super) fn shown(&self) -> (Vec<String>, Option<String>) {
+        (self.lines.clone(), self.warning.clone())
+    }
+}
+
 /// Key names longer than this are confirmed by typing `delete` instead.
 const TYPED_NAME_MAX: usize = 40;
 

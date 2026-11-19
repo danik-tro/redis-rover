@@ -230,7 +230,7 @@ pub fn key_event_to_string(key_event: &KeyEvent) -> String {
         KeyCode::Delete => "Delete",
         KeyCode::Insert => "Insert",
         KeyCode::F(c) => {
-            char = format!("F({c})");
+            char = format!("F{c}");
             &char
         }
         KeyCode::Char(' ') => "Space",
