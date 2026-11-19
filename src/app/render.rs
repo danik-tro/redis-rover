@@ -184,6 +184,9 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::Quit, "Quit"),
 ];
 
+/// Keys every text input takes (ratatui-textarea's own, not rebindable).
+const TEXT_INPUT_HELP: &[(&str, &str)] = &[("Undo / redo in a text input", "Ctrl-U / Ctrl-R")];
+
 /// The main area and, below it, the five-row footer.
 fn layout(area: Rect) -> [Rect; 2] {
     Layout::vertical([Constraint::Percentage(100), Constraint::Length(5)])
@@ -453,7 +456,7 @@ impl App {
             _ => (Mode::KeySpace, KEYSPACE_HELP_ENTRIES),
         };
 
-        let rows: Vec<(String, String)> = entries
+        let mut rows: Vec<(String, String)> = entries
             .iter()
             .map(|(command, label)| {
                 let mut binds = keybindings.get_config_for_command(lookup_mode, *command);
@@ -466,6 +469,15 @@ impl App {
                 ((*label).to_string(), keys)
             })
             .collect();
+        // Fixed by ratatui-textarea, so not in the keybindings: listed for
+        // the screens that have text inputs.
+        if mode != Mode::Dashboard {
+            rows.extend(
+                TEXT_INPUT_HELP
+                    .iter()
+                    .map(|(label, keys)| ((*label).to_owned(), (*keys).to_owned())),
+            );
+        }
 
         // "Extend" the box to its content, clamped to the available area:
         // borders (2) and one column of padding on each side (2).

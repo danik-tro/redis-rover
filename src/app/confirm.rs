@@ -284,6 +284,15 @@ impl App {
             .show("Read-only off: writes are enabled", false, now);
     }
 
+    /// The typed confirm's text (tests).
+    #[cfg(test)]
+    pub(super) fn typed_text(&self) -> Option<String> {
+        match &self.pending {
+            Some(PendingConfirm::Write(w)) => w.typed.as_ref().map(|t| input_text(&t.input)),
+            _ => None,
+        }
+    }
+
     /// The open question is the typed confirm (it has a text input).
     pub(super) fn typed_confirm_open(&self) -> bool {
         matches!(&self.pending, Some(PendingConfirm::Write(w)) if w.typed.is_some())

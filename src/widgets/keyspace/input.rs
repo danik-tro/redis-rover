@@ -41,6 +41,24 @@ impl KeySpace {
     }
 
     /// Current text of the filter input (empty when the popup is closed).
+    /// The open input overlay's text (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn overlay_text(&self) -> Option<String> {
+        self.action_overlay
+            .as_ref()?
+            .text_area
+            .as_ref()
+            .map(input_text)
+    }
+
+    /// The filter popup's text (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn filter_text_for_test(&self) -> String {
+        self.filter_text()
+    }
+
     pub(super) fn filter_text(&self) -> String {
         self.text_area.as_ref().map(input_text).unwrap_or_default()
     }
