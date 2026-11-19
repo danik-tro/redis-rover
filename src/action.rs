@@ -83,6 +83,7 @@ pub enum Action {
     ToggleMark,
     MarkAllVisible,
     ClearMarks,
+    RequestEditExternal,
     ToggleDashboard,
     ToggleMetricsPause,
     ResetMetrics,

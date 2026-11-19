@@ -69,6 +69,8 @@ impl App {
 
     /// Ask the runner for `key`'s whole value; `YankReady` copies it.
     pub(super) fn start_full_yank(&mut self, key: String, r_type: RedisType) {
+        // A copy replaces a pending `Shift-e` fetch (the runner aborts it).
+        self.external_edit = None;
         self.toast
             .show(format!("Copying {key}…"), true, self.clock.now());
         self.send_redis_event(RedisEvent::FetchFullValue { key, r_type });
@@ -76,6 +78,9 @@ impl App {
 
     /// The runner left a whole value in `SharedState::yank`: copy it.
     pub(super) fn finish_yank(&mut self) {
+        if self.yank_for_editor() {
+            return;
+        }
         let Some((key, text)) = self.state.yank.lock().take() else {
             return;
         };

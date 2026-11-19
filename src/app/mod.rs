@@ -3,6 +3,7 @@ mod clipboard;
 mod confirm;
 mod dashboard;
 mod db;
+mod editor;
 mod input;
 mod keyspace;
 mod live;
@@ -104,6 +105,10 @@ pub struct App {
     keyspace: KeySpace,
     dashboard: Dashboard,
     db_picker: DbPicker,
+    /// `Shift-e` fetched this key's value for the editor (`YankReady`).
+    external_edit: Option<String>,
+    /// An edit waiting for the event loop, which owns the terminal.
+    editor_job: Option<editor::EditorJob>,
     pubsub: PubSub,
     /// Control channel of the Pub/Sub task.
     pubsub_tx: UnboundedSender<PubSubCmd>,
@@ -225,6 +230,8 @@ impl App {
             rx,
             redis_tx,
             db_picker: DbPicker::default(),
+            external_edit: None,
+            editor_job: None,
             pubsub,
             pubsub_tx,
             pubsub_return: Mode::KeySpace,
@@ -331,6 +338,7 @@ impl App {
                     action::try_send_action(&self.tx, next);
                 }
             }
+            self.run_editor_job(tui).await?;
             if self.should_quit {
                 return Ok(());
             }

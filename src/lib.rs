@@ -10,6 +10,7 @@ mod clipboard;
 mod clock;
 mod command;
 mod config;
+mod external_editor;
 mod keybindings;
 mod mappings;
 mod mode;

@@ -108,9 +108,11 @@ impl App {
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
-            Action::YankFailed(ref msg) | Action::Notice(ref msg) => {
+            Action::YankFailed(ref msg) => {
+                self.external_edit = None;
                 self.toast.show(msg.clone(), false, now);
             }
+            Action::Notice(ref msg) => self.toast.show(msg.clone(), false, now),
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
@@ -135,6 +137,7 @@ impl App {
             Action::Error(ref msg) => self.show_error_popup(msg),
             Action::RequestRename
             | Action::RequestCopyKey
+            | Action::RequestEditExternal
             | Action::ToggleMark
             | Action::MarkAllVisible
             | Action::ClearMarks

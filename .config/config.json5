@@ -37,6 +37,7 @@
       "<Space>": "ToggleMark",
       "<Shift-m>": "MarkAllVisible",
       "<Shift-u>": "ClearMarks",
+      "<Shift-e>": "EditExternal",
       "?": "ToggleHelp",
     },
     "Dashboard": {

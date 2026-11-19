@@ -73,6 +73,9 @@ pub struct Tui {
     pub cancellation_token: CancellationToken,
     pub event_rx: UnboundedReceiver<Event>,
     pub event_tx: UnboundedSender<Event>,
+    /// Stops only the terminal event task ([`Tui::suspend`]); a child of
+    /// `cancellation_token`, which the Redis runner shares.
+    event_token: CancellationToken,
     pub frame_rate: f64,
     pub tick_rate: f64,
     pub mouse: bool,
@@ -104,6 +107,7 @@ impl Tui {
             cancellation_token,
             event_rx,
             event_tx,
+            event_token: CancellationToken::new(),
             frame_rate,
             tick_rate,
             mouse,
@@ -147,7 +151,8 @@ impl Tui {
         let tick_delay = std::time::Duration::from_secs_f64(1.0 / self.tick_rate);
         let render_delay = std::time::Duration::from_secs_f64(1.0 / self.frame_rate);
 
-        let tui_cancellation_token = self.cancellation_token.clone();
+        self.event_token = self.cancellation_token.child_token();
+        let tui_cancellation_token = self.event_token.clone();
 
         let event_tx = self.event_tx.clone();
 
@@ -247,6 +252,40 @@ impl Tui {
             crossterm::execute!(io(), EnableBracketedPaste)?;
         }
         self.start();
+        Ok(())
+    }
+
+    /// Hand the terminal to another program (`$EDITOR`): stop reading
+    /// terminal events, then leave the alternate screen and raw mode. The
+    /// app (and the Redis runner) keep running. Undo with [`Tui::resume`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a crossterm terminal command fails.
+    pub async fn suspend(&mut self) -> Result<()> {
+        self.event_token.cancel();
+        if tokio::time::timeout(Duration::from_millis(50), &mut self.event_task)
+            .await
+            .is_err()
+        {
+            self.event_task.abort();
+            // Wait for the abort, so the event reader is gone before the
+            // other program reads the terminal.
+            let _ = (&mut self.event_task).await;
+        }
+        self.flush()?;
+        restore()
+    }
+
+    /// Take the terminal back after [`Tui::suspend`]: raw mode, alternate
+    /// screen, a new event task, and a full redraw on the next frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a crossterm terminal command fails.
+    pub fn resume(&mut self) -> Result<()> {
+        self.enter()?;
+        self.terminal.clear()?;
         Ok(())
     }
 
