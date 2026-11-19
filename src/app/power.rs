@@ -3,7 +3,11 @@
 //! and is asked about again ([`App::target_exists`]).
 
 use super::{confirm::AfterWrite, App};
-use crate::{redis_client::event::RedisEvent, widgets::keyspace::OverlayRequest};
+use crate::{
+    redis_client::{event::RedisEvent, types::Ttl},
+    utils::TtlInput,
+    widgets::keyspace::OverlayRequest,
+};
 
 impl App {
     /// `F2`: rename the selected key.
@@ -44,6 +48,37 @@ impl App {
         let current = *self.state.db.lock();
         self.keyspace
             .set_copy_db(selected.filter(|&db| db != current));
+    }
+
+    /// The TTL input was confirmed: a duration, a shift of the current TTL
+    /// or `persist`. `0` deletes the key, so it says so above the preview.
+    pub(super) fn submit_ttl(&mut self, key: String, ttl: TtlInput) {
+        let after = AfterWrite::reselect(&key);
+        let (event, warning) = match ttl {
+            TtlInput::Set(0) => (
+                RedisEvent::SetTtl {
+                    key,
+                    ttl: Ttl::Expire(0),
+                },
+                Some("a TTL of 0 deletes the key".to_owned()),
+            ),
+            TtlInput::Set(secs) => (
+                RedisEvent::SetTtl {
+                    key,
+                    ttl: Ttl::Expire(secs),
+                },
+                None,
+            ),
+            TtlInput::Persist => (
+                RedisEvent::SetTtl {
+                    key,
+                    ttl: Ttl::Persist,
+                },
+                None,
+            ),
+            TtlInput::Shift(delta_secs) => (RedisEvent::ShiftTtl { key, delta_secs }, None),
+        };
+        self.submit_write_warned(event, after, warning);
     }
 
     /// The rename / copy input was confirmed: preview the write. An empty
@@ -285,6 +320,80 @@ mod tests {
         press(&mut app, key(KeyCode::Enter));
         let (lines, _) = preview(&app);
         assert_eq!(lines, [r#"RENAMENX "k" "k:copy""#]);
+    }
+
+    /// AC4 in the UI: what the TTL popup sends for each kind of input.
+    #[test]
+    fn the_ttl_popup_takes_durations_shifts_and_persist() {
+        use crate::redis_client::types::Ttl;
+
+        let cases = [
+            (
+                "2h30m",
+                RedisEvent::SetTtl {
+                    key: "k".into(),
+                    ttl: Ttl::Expire(9000),
+                },
+            ),
+            (
+                "+30m",
+                RedisEvent::ShiftTtl {
+                    key: "k".into(),
+                    delta_secs: 1800,
+                },
+            ),
+            (
+                "-5m",
+                RedisEvent::ShiftTtl {
+                    key: "k".into(),
+                    delta_secs: -300,
+                },
+            ),
+            (
+                "persist",
+                RedisEvent::SetTtl {
+                    key: "k".into(),
+                    ttl: Ttl::Persist,
+                },
+            ),
+        ];
+        for (typed, want) in cases {
+            let (mut app, mut events) = on_key(Environment::Local, "k");
+            app.preview = crate::config::PreviewPolicy::Off;
+            press(&mut app, key(KeyCode::Char('t')));
+            type_text(&mut app, typed);
+            press(&mut app, key(KeyCode::Enter));
+            let sent = writes(&mut events);
+            assert_eq!(format!("{sent:?}"), format!("[{want:?}]"), "{typed}");
+        }
+    }
+
+    /// `0` says it deletes the key, even with previews off; bad input keeps
+    /// the popup open and sends nothing.
+    #[test]
+    fn ttl_zero_warns_and_bad_input_stays_open() {
+        let (mut app, mut events) = on_key(Environment::Local, "k");
+        app.preview = crate::config::PreviewPolicy::Off;
+        press(&mut app, key(KeyCode::Char('t')));
+        type_text(&mut app, "0");
+        press(&mut app, key(KeyCode::Enter));
+        let (lines, warning) = preview(&app);
+        assert_eq!(lines, [r#"EXPIRE "k" "0""#]);
+        assert_eq!(warning.as_deref(), Some("a TTL of 0 deletes the key"));
+        press(&mut app, key(KeyCode::Char('n')));
+
+        press(&mut app, key(KeyCode::Char('t')));
+        type_text(&mut app, "5x");
+        press(&mut app, key(KeyCode::Enter));
+        assert!(app.keyspace.is_input_active(), "still open to fix it");
+        assert!(app.pending.is_none());
+        press(&mut app, key(KeyCode::Backspace));
+        press(&mut app, key(KeyCode::Enter));
+        assert!(!app.keyspace.is_input_active());
+        assert!(matches!(
+            &writes(&mut events)[..],
+            [RedisEvent::SetTtl { .. }]
+        ));
     }
 
     #[test]

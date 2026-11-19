@@ -297,8 +297,6 @@ pub fn group_thousands(n: usize) -> String {
 }
 
 /// A TTL as typed in the TTL popup ([`parse_ttl`]).
-// Used by the TTL popup from step 4 of sol 08 on.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlInput {
     /// Expire in this many seconds; `0` deletes the key.
@@ -310,7 +308,6 @@ pub enum TtlInput {
 }
 
 /// What the TTL popup accepts, for its error message and hint.
-#[allow(dead_code)]
 pub const TTL_HELP: &str = "use 90, 90s, 15m, 2h30m, 1d, +10m, -5m or persist";
 
 /// Parse a TTL: `90` / `90s` (seconds), `15m`, `2h30m`, `1d`, each unit at
@@ -320,7 +317,6 @@ pub const TTL_HELP: &str = "use 90, 90s, 15m, 2h30m, 1d, +10m, -5m or persist";
 /// # Errors
 ///
 /// A message naming the accepted forms when `text` is none of them.
-#[allow(dead_code)]
 pub fn parse_ttl(text: &str) -> Result<TtlInput, String> {
     let text = text.trim();
     if text.eq_ignore_ascii_case("persist") {
@@ -345,7 +341,6 @@ pub fn parse_ttl(text: &str) -> Result<TtlInput, String> {
 /// Duration units, largest first, with their length in seconds.
 const UNITS: [(u8, u64); 4] = [(b'd', 86_400), (b'h', 3_600), (b'm', 60), (b's', 1)];
 
-#[allow(dead_code)]
 /// `90`, `90s`, `2h30m`, `1d`: units `d h m s` in that order, each once.
 fn parse_duration_secs(text: &str) -> Option<u64> {
     if text.is_empty() {

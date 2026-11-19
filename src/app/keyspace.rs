@@ -10,7 +10,7 @@ const VALUE_FETCH_REST: Duration = Duration::from_millis(100);
 use super::confirm::{AfterWrite, Reselect};
 use crate::redis_client::{
     event::RedisEvent,
-    types::{ItemDelete, RedisType, Sort, SortKey, Ttl, TypeFilter},
+    types::{ItemDelete, RedisType, Sort, SortKey, TypeFilter},
 };
 
 use crate::{
@@ -112,13 +112,9 @@ impl App {
                 let after = AfterWrite::reselect(&key);
                 (RedisEvent::SetString { key, value }, after)
             }
-            OverlayRequest::SetTtl(secs) => {
-                let after = AfterWrite::reselect(&key);
-                let ttl = match u64::try_from(secs) {
-                    Ok(secs) if secs > 0 => Ttl::Expire(secs),
-                    _ => Ttl::Persist,
-                };
-                (RedisEvent::SetTtl { key, ttl }, after)
+            OverlayRequest::SetTtl(ttl) => {
+                self.submit_ttl(key, ttl);
+                return;
             }
             OverlayRequest::Yank { .. }
             | OverlayRequest::Rename { .. }
