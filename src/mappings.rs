@@ -53,6 +53,7 @@ impl From<Command> for Action {
             Command::ToggleMark => Self::ToggleMark,
             Command::MarkAllVisible => Self::MarkAllVisible,
             Command::ClearMarks => Self::ClearMarks,
+            Command::EditExternal => Self::RequestEditExternal,
         }
     }
 }

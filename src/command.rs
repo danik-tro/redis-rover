@@ -57,4 +57,6 @@ pub enum Command {
     /// Mark every key on the page (again: unmark them).
     MarkAllVisible,
     ClearMarks,
+    /// Edit the selected STRING in `$VISUAL` / `$EDITOR` / `vi`.
+    EditExternal,
 }

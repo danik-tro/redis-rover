@@ -207,6 +207,18 @@ impl App {
         after: AfterWrite,
         warning: Option<String>,
     ) {
+        self.submit_write_noted(event, after, warning, Vec::new());
+    }
+
+    /// [`Self::submit_write_warned`] with notes of the caller's under the
+    /// commands (an edit's size change).
+    pub(super) fn submit_write_noted(
+        &mut self,
+        event: RedisEvent,
+        after: AfterWrite,
+        warning: Option<String>,
+        notes: Vec<String>,
+    ) {
         let lines = event.preview();
         if lines.is_empty() || (warning.is_none() && !self.previews(&event)) {
             // Nothing to show (a no-op edit) or no preview wanted.
@@ -214,8 +226,10 @@ impl App {
             return;
         }
         let typed = TypedConfirm::for_event(&event, self.environment);
+        let mut all_notes = event.preview_notes();
+        all_notes.extend(notes);
         self.pending = Some(PendingConfirm::Write(Box::new(PendingWrite {
-            notes: event.preview_notes(),
+            notes: all_notes,
             event,
             lines,
             warning,

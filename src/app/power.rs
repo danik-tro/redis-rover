@@ -99,6 +99,7 @@ impl App {
         match *action {
             Action::RequestRename => self.request_rename(),
             Action::RequestCopyKey => self.request_copy_key(),
+            Action::RequestEditExternal => self.request_edit_external(),
             Action::ToggleMark | Action::MarkAllVisible | Action::ClearMarks => {
                 self.mark(action, now);
             }
