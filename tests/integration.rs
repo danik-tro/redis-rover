@@ -24,8 +24,8 @@ use redis::AsyncCommands;
 use redis_rover::{
     internals::{
         text_from_bytes, Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview,
-        JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, NewKeySpec, PageRow,
-        PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, TypeFilter,
+        JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, MemberKind, NewKeySpec,
+        PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, Ttl, TypeFilter,
     },
     Cli,
 };
@@ -298,7 +298,7 @@ async fn a_write_updates_the_sweep_without_a_rescan() {
         &mut h,
         RedisEvent::SetTtl {
             key: timed.clone(),
-            secs: 500,
+            ttl: Ttl::Expire(500),
         },
     )
     .await;
@@ -940,6 +940,7 @@ async fn failed_db_switch_reloads_the_old_page() {
 
 #[tokio::test]
 #[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)] // one event per write variant
 async fn read_only_rejects_every_write() {
     let server = support::start_redis().await;
     let mut admin = server.admin(0).await;
@@ -967,7 +968,7 @@ async fn read_only_rejects_every_write() {
         },
         RedisEvent::SetTtl {
             key: hash.clone(),
-            secs: 5,
+            ttl: Ttl::Expire(5),
         },
         RedisEvent::CreateKey {
             key: format!("{p}new"),
@@ -992,6 +993,37 @@ async fn read_only_rejects_every_write() {
             channel: format!("{p}chan"),
             payload: "hello".into(),
         },
+        RedisEvent::SetTtl {
+            key: hash.clone(),
+            ttl: Ttl::Expire(0),
+        },
+        RedisEvent::ShiftTtl {
+            key: zset.clone(),
+            delta_secs: 60,
+        },
+        RedisEvent::RenameKey {
+            from: string.clone(),
+            to: format!("{p}renamed"),
+            overwrite: true,
+        },
+        RedisEvent::CopyKey {
+            from: hash.clone(),
+            to: format!("{p}copy"),
+            db: Some(1),
+            overwrite: true,
+        },
+        RedisEvent::RenameField {
+            key: hash.clone(),
+            from: "f1".into(),
+            to: "g1".into(),
+        },
+        RedisEvent::RenameMember {
+            key: zset.clone(),
+            kind: MemberKind::Zset,
+            from: "a".into(),
+            to: "z".into(),
+        },
+        RedisEvent::DeleteKeys { keys: keys.clone() },
     ];
     for event in writes {
         assert!(event.is_write(), "{event:?} must count as a write");
@@ -1006,6 +1038,9 @@ async fn read_only_rejects_every_write() {
                         | Action::KeysChanged
                         | Action::RequestSelectedValue
                         | Action::Published { .. }
+                        | Action::TargetExists { .. }
+                        | Action::KeysDeleted(_)
+                        | Action::Notice(_)
                 )
             })
             .await;
@@ -1093,7 +1128,7 @@ async fn a_burst_of_events_never_stalls_the_runner() {
     // A write queued behind the burst still runs.
     h.send(RedisEvent::SetTtl {
         key: keys[0].clone(),
-        secs: 100,
+        ttl: Ttl::Expire(100),
     });
     h.expect("the write queued behind the burst", |a| {
         *a == Action::KeysChanged
@@ -1392,7 +1427,7 @@ async fn binary_key_names_and_members() {
         &mut h,
         RedisEvent::SetTtl {
             key: string_key.clone(),
-            secs: 500,
+            ttl: Ttl::Expire(500),
         },
     )
     .await;
@@ -2589,5 +2624,391 @@ async fn live_polls_a_large_key_by_its_page() {
     let () = admin.hset(&key, "name", "Bob").await.unwrap();
     let (_, value) = follow_change(&mut h, &key).await;
     assert_eq!(hash_value(&value, "name").as_deref(), Some("Bob"));
+    h.shutdown().await;
+}
+
+// ---- Sol 08: power edits ------------------------------------------------
+
+/// A page large enough to hold every key of a test, filtered to its prefix.
+async fn page_of(h: &mut Harness, prefix: &str) -> Vec<String> {
+    {
+        let mut ks = h.state.keyspace_state.lock();
+        ks.set_page_size(1_000, 0);
+        ks.set_pattern(Some(format!("{prefix}*")));
+    }
+    h.fetch_page().await
+}
+
+/// What a rename / copy answers: done (`KeysChanged`, or a `Notice` for a
+/// copy to another DB), `TargetExists`, or an error.
+async fn moved(h: &mut Harness, event: RedisEvent) -> Action {
+    h.send(event);
+    h.expect("the rename / copy result", |a| {
+        matches!(
+            a,
+            Action::KeysChanged
+                | Action::Error(_)
+                | Action::TargetExists { .. }
+                | Action::Notice(_)
+        )
+    })
+    .await
+}
+
+/// AC1 / AC2: `RENAMENX` keeps the TTL and puts the new name in the sweep;
+/// a taken name changes nothing until the overwrite is sent.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn rename_keeps_the_ttl_and_never_overwrites_unasked() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("rename");
+    let (user1, user9) = (format!("{p}user:1"), format!("{p}user:9"));
+    let _: () = admin.set_ex(&user1, "ada", 600).await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+    assert_eq!(page_of(&mut h, &p).await, std::slice::from_ref(&user1));
+
+    let rename = |overwrite| RedisEvent::RenameKey {
+        from: user1.clone(),
+        to: user9.clone(),
+        overwrite,
+    };
+    assert_eq!(moved(&mut h, rename(false)).await, Action::KeysChanged);
+    let ttl: i64 = admin.ttl(&user9).await.expect("TTL");
+    assert!((590..=600).contains(&ttl), "TTL kept: {ttl}");
+    assert!(!admin.exists::<_, bool>(&user1).await.expect("EXISTS"));
+    assert_eq!(
+        h.fetch_page().await,
+        std::slice::from_ref(&user9),
+        "patched, no rescan"
+    );
+
+    // AC2: user:9 is taken now.
+    let _: () = admin.set(&user1, "bob").await.expect("seed");
+    match moved(&mut h, rename(false)).await {
+        Action::TargetExists { from, to, db, copy } => {
+            assert_eq!(
+                (from, to, db, copy),
+                (user1.clone(), user9.clone(), None, false)
+            );
+        }
+        other => panic!("expected TargetExists, got {other:?}"),
+    }
+    let kept: String = admin.get(&user9).await.expect("GET");
+    assert_eq!(kept, "ada", "nothing replaced without the second confirm");
+
+    assert_eq!(moved(&mut h, rename(true)).await, Action::KeysChanged);
+    let replaced: String = admin.get(&user9).await.expect("GET");
+    assert_eq!(replaced, "bob");
+    assert_eq!(h.fetch_page().await, [user9]);
+    h.shutdown().await;
+}
+
+/// AC3: a copy to another DB keeps the TTL; `tag` picks the server (7.x
+/// has `COPY`, 6.0 goes through `DUMP` + `RESTORE`).
+async fn copy_to_db_2(tag: &str) {
+    let server = support::start_redis_tag(tag).await;
+    let mut admin = server.admin(0).await;
+    let mut db2 = server.admin(2).await;
+    let p = support::prefix("copy");
+    let cart = format!("{p}cart:1");
+    let _: () = admin
+        .hset_multiple(&cart, &[("apple", "2"), ("pear", "1")])
+        .await
+        .expect("seed");
+    let _: () = admin.expire(&cart, 900).await.expect("EXPIRE");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    let copy = |overwrite| RedisEvent::CopyKey {
+        from: cart.clone(),
+        to: cart.clone(),
+        db: Some(2),
+        overwrite,
+    };
+    match moved(&mut h, copy(false)).await {
+        Action::Notice(msg) => assert!(msg.contains("DB 2"), "{msg}"),
+        other => panic!("{tag}: expected the copy notice, got {other:?}"),
+    }
+    let copied: Vec<(String, String)> = db2.hgetall(&cart).await.expect("HGETALL");
+    assert_eq!(copied.len(), 2, "{tag}");
+    let ttl: i64 = db2.ttl(&cart).await.expect("TTL");
+    assert!((890..=900).contains(&ttl), "{tag}: TTL kept: {ttl}");
+
+    // Taken in DB 2: asked first, then replaced.
+    let _: () = db2.del(&cart).await.expect("DEL");
+    let _: () = db2.set(&cart, "other").await.expect("SET");
+    match moved(&mut h, copy(false)).await {
+        Action::TargetExists { db, copy, .. } => assert_eq!((db, copy), (Some(2), true)),
+        other => panic!("{tag}: expected TargetExists, got {other:?}"),
+    }
+    assert!(matches!(moved(&mut h, copy(true)).await, Action::Notice(_)));
+    let kind: String = redis::cmd("TYPE")
+        .arg(&cart)
+        .query_async(&mut db2)
+        .await
+        .expect("TYPE");
+    assert_eq!(kind, "hash", "{tag}");
+
+    // In the same DB the copy shows up in the sweep.
+    let twin = format!("{p}cart:2");
+    let in_place = RedisEvent::CopyKey {
+        from: cart.clone(),
+        to: twin.clone(),
+        db: None,
+        overwrite: false,
+    };
+    assert_eq!(moved(&mut h, in_place).await, Action::KeysChanged);
+    let mut page = page_of(&mut h, &p).await;
+    page.sort();
+    assert_eq!(page, [cart, twin]);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn copy_to_another_db_on_redis_7() {
+    copy_to_db_2(support::REDIS_TAG).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn copy_to_another_db_on_redis_6_0_uses_dump_restore() {
+    copy_to_db_2("6.0-alpine").await;
+}
+
+/// AC4: relative shifts, absolute durations, persist, and `EXPIRE 0`.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn ttl_durations_shift_set_and_persist() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("ttl");
+    let key = format!("{p}session");
+    let _: () = admin.set_ex(&key, "x", 3600).await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+    let ttl = |admin: &mut redis::aio::ConnectionManager| {
+        let mut admin = admin.clone();
+        let key = key.clone();
+        async move { admin.ttl::<_, i64>(&key).await.expect("TTL") }
+    };
+
+    let shift = |delta_secs| RedisEvent::ShiftTtl {
+        key: key.clone(),
+        delta_secs,
+    };
+    assert_eq!(write_done(&mut h, shift(1800)).await, Action::KeysChanged);
+    let now = ttl(&mut admin).await;
+    assert!((5390..=5400).contains(&now), "+30m: {now}");
+
+    let set = |ttl| RedisEvent::SetTtl {
+        key: key.clone(),
+        ttl,
+    };
+    assert_eq!(
+        write_done(&mut h, set(Ttl::Expire(9000))).await,
+        Action::KeysChanged
+    );
+    assert_eq!(ttl(&mut admin).await, 9000, "2h30m");
+
+    // Shifting past zero is refused, not a silent delete.
+    match write_done(&mut h, shift(-10_000)).await {
+        Action::Error(msg) => assert!(msg.contains("enter 0"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(
+        write_done(&mut h, set(Ttl::Persist)).await,
+        Action::KeysChanged
+    );
+    assert_eq!(ttl(&mut admin).await, -1, "persist");
+    match write_done(&mut h, shift(600)).await {
+        Action::Error(msg) => assert!(msg.contains("no TTL"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(
+        write_done(&mut h, set(Ttl::Expire(0))).await,
+        Action::KeysChanged
+    );
+    assert!(
+        !admin.exists::<_, bool>(&key).await.expect("EXISTS"),
+        "0 deletes"
+    );
+    h.shutdown().await;
+}
+
+/// AC5 / AC6: a field rename never overwrites and keeps the value; a zset
+/// member keeps its score; a set member moves.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn rename_field_and_member() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("renitem");
+    let (hash, zset, set) = (format!("{p}user"), format!("{p}board"), format!("{p}tags"));
+    let _: () = admin
+        .hset_multiple(&hash, &[("name", "Ada"), ("email", "ada@example.com")])
+        .await
+        .expect("seed");
+    let _: () = admin.zadd(&zset, "ada", 42).await.expect("seed");
+    let _: () = admin.sadd(&set, &["a", "b"]).await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    let field = |to: &str| RedisEvent::RenameField {
+        key: hash.clone(),
+        from: "name".into(),
+        to: to.into(),
+    };
+    match write_done(&mut h, field("email")).await {
+        Action::Error(msg) => assert!(msg.contains("already exists"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let email: String = admin.hget(&hash, "email").await.expect("HGET");
+    assert_eq!(email, "ada@example.com");
+    assert_eq!(
+        write_done(&mut h, field("full_name")).await,
+        Action::KeysChanged
+    );
+    let all: std::collections::HashMap<String, String> =
+        admin.hgetall(&hash).await.expect("HGETALL");
+    assert_eq!(all.get("full_name").map(String::as_str), Some("Ada"));
+    assert!(!all.contains_key("name"));
+
+    let member = RedisEvent::RenameMember {
+        key: zset.clone(),
+        kind: MemberKind::Zset,
+        from: "ada".into(),
+        to: "ada_l".into(),
+    };
+    assert_eq!(write_done(&mut h, member).await, Action::KeysChanged);
+    let score: Option<f64> = admin.zscore(&zset, "ada_l").await.expect("ZSCORE");
+    assert_eq!(score, Some(42.0));
+    let old: Option<f64> = admin.zscore(&zset, "ada").await.expect("ZSCORE");
+    assert_eq!(old, None);
+
+    let taken = RedisEvent::RenameMember {
+        key: set.clone(),
+        kind: MemberKind::Set,
+        from: "a".into(),
+        to: "b".into(),
+    };
+    assert!(matches!(write_done(&mut h, taken).await, Action::Error(_)));
+    let moved_member = RedisEvent::RenameMember {
+        key: set.clone(),
+        kind: MemberKind::Set,
+        from: "a".into(),
+        to: "c".into(),
+    };
+    assert_eq!(write_done(&mut h, moved_member).await, Action::KeysChanged);
+    let mut members: Vec<String> = admin.smembers(&set).await.expect("SMEMBERS");
+    members.sort();
+    assert_eq!(members, ["b", "c"]);
+    h.shutdown().await;
+}
+
+/// AC7: 50 marked keys go in one `UNLINK` and leave the sweep.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn bulk_delete_unlinks_and_patches_the_list() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("bulk");
+    let keys = support::seed_strings(&mut admin, &format!("{p}k:"), 60).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    assert_eq!(page_of(&mut h, &p).await.len(), 60);
+
+    let marked: Vec<String> = keys[..50].to_vec();
+    h.send(RedisEvent::DeleteKeys {
+        keys: marked.clone(),
+    });
+    let deleted = h
+        .expect("the delete", |a| {
+            matches!(a, Action::KeysDeleted(_) | Action::Error(_))
+        })
+        .await;
+    assert_eq!(deleted, Action::KeysDeleted(50));
+    h.expect("the refresh", |a| *a == Action::KeysChanged).await;
+    let left: u64 = redis::cmd("EXISTS")
+        .arg(&marked)
+        .query_async(&mut admin)
+        .await
+        .expect("EXISTS");
+    assert_eq!(left, 0);
+    let mut page = h.fetch_page().await;
+    page.sort();
+    let mut rest = keys[50..].to_vec();
+    rest.sort();
+    assert_eq!(page, rest);
+    h.shutdown().await;
+}
+
+/// A server that refuses `EVAL` (an ACL without `@scripting`): renames fall
+/// back to plain commands, say so, and still never overwrite.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn renames_fall_back_when_scripting_is_refused() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("noscript");
+    let (hash, zset) = (format!("{p}user"), format!("{p}board"));
+    let _: () = admin
+        .hset_multiple(&hash, &[("name", "Ada"), ("email", "a@x")])
+        .await
+        .expect("seed");
+    let _: () = admin.zadd(&zset, "ada", 42).await.expect("seed");
+    let () = redis::cmd("ACL")
+        .arg(&[
+            "SETUSER",
+            "noscript",
+            "on",
+            ">pw",
+            "~*",
+            "&*",
+            "+@all",
+            "-@scripting",
+        ])
+        .query_async(&mut admin)
+        .await
+        .expect("ACL SETUSER");
+    let url = format!("redis://noscript:pw@{}:{}/0", server.host, server.port);
+    let mut h = Harness::new(redis::Client::open(url).expect("url"), false).await;
+
+    h.send(RedisEvent::RenameField {
+        key: hash.clone(),
+        from: "name".into(),
+        to: "full_name".into(),
+    });
+    match h
+        .expect("the warning", |a| {
+            matches!(a, Action::Notice(_) | Action::Error(_))
+        })
+        .await
+    {
+        Action::Notice(msg) => assert!(msg.contains("not atomic"), "{msg}"),
+        other => panic!("expected the fallback notice, got {other:?}"),
+    }
+    h.expect("the refresh", |a| *a == Action::KeysChanged).await;
+    let value: Option<String> = admin.hget(&hash, "full_name").await.expect("HGET");
+    assert_eq!(value.as_deref(), Some("Ada"));
+
+    let taken = RedisEvent::RenameField {
+        key: hash.clone(),
+        from: "full_name".into(),
+        to: "email".into(),
+    };
+    match write_done(&mut h, taken).await {
+        Action::Error(msg) => assert!(msg.contains("already exists"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let email: String = admin.hget(&hash, "email").await.expect("HGET");
+    assert_eq!(email, "a@x");
+
+    let member = RedisEvent::RenameMember {
+        key: zset.clone(),
+        kind: MemberKind::Zset,
+        from: "ada".into(),
+        to: "ada_l".into(),
+    };
+    assert_eq!(write_done(&mut h, member).await, Action::KeysChanged);
+    let score: Option<f64> = admin.zscore(&zset, "ada_l").await.expect("ZSCORE");
+    assert_eq!(score, Some(42.0));
     h.shutdown().await;
 }

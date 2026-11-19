@@ -15,7 +15,7 @@ use crate::{
     redis_client::event::RedisEvent,
     target::Environment,
     widgets::{
-        confirm::{typed_input, ConfirmPopup},
+        confirm::{typed_input, typed_input_titled, ConfirmPopup, TypedText},
         keyspace::input_text,
     },
 };
@@ -39,6 +39,10 @@ pub(super) struct PendingWrite {
     event: RedisEvent,
     /// `event.preview()`, built once.
     lines: Vec<String>,
+    /// `event.preview_notes()`, under the commands.
+    notes: Vec<String>,
+    /// Above the commands: a key this replaces, `EXPIRE … 0`.
+    warning: Option<String>,
     after: AfterWrite,
     /// On Prod, deleting a key needs its name typed first.
     typed: Option<TypedConfirm>,
@@ -52,34 +56,86 @@ const TYPED_NAME_MAX: usize = 40;
 #[derive(Debug)]
 pub(super) struct TypedConfirm {
     expected: String,
+    /// `delete` / `replace`.
+    action: &'static str,
+    /// `it` / `them`.
+    object: &'static str,
+    /// `the name` / `the count`.
+    what: &'static str,
     input: TextArea<'static>,
 }
 
 impl TypedConfirm {
-    /// The typed confirm `event` needs on `env`: deleting a key on Prod.
+    /// The typed confirm `event` needs on `env`, on Prod only: deleting a
+    /// key (its name), deleting marked keys (their count), and a rename /
+    /// copy over an existing key (that key's name).
     fn for_event(event: &RedisEvent, env: Environment) -> Option<Self> {
-        let RedisEvent::DeleteKey { key } = event else {
-            return None;
-        };
         if env != Environment::Prod {
             return None;
         }
+        match event {
+            RedisEvent::DeleteKey { key } => Some(Self::name(key, "delete")),
+            RedisEvent::RenameKey {
+                to,
+                overwrite: true,
+                ..
+            }
+            | RedisEvent::CopyKey {
+                to,
+                overwrite: true,
+                ..
+            } => Some(Self::name(to, "replace")),
+            RedisEvent::DeleteKeys { keys } => {
+                let expected = keys.len().to_string();
+                Some(Self {
+                    input: typed_input_titled("Type the count", &expected),
+                    expected,
+                    action: "delete",
+                    object: "them",
+                    what: "the count",
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Type the key's name (or the action word, for a long name).
+    fn name(key: &str, action: &'static str) -> Self {
         // What the user types is what they see: hidden characters in the
         // name are shown, and typed, as their escapes.
         let shown = crate::redis_client::escape::printable(key);
         let expected = if shown.chars().count() > TYPED_NAME_MAX {
-            "delete".to_owned()
+            action.to_owned()
         } else {
             shown.into_owned()
         };
-        Some(Self {
-            input: typed_input(&expected),
+        let input = if action == "delete" {
+            typed_input(&expected)
+        } else if expected == action {
+            typed_input_titled(&format!("Type {action}"), &expected)
+        } else {
+            typed_input_titled("Type the key name", &expected)
+        };
+        Self {
+            input,
             expected,
-        })
+            action,
+            object: "it",
+            what: "the name",
+        }
     }
 
     fn matches(&self) -> bool {
         input_text(&self.input) == self.expected
+    }
+
+    fn text(&self) -> TypedText<'_> {
+        TypedText {
+            expected: &self.expected,
+            action: self.action,
+            object: self.object,
+            what: self.what,
+        }
     }
 }
 
@@ -132,19 +188,61 @@ impl App {
     /// Every write goes through here: shown in the preview popup when the
     /// policy says so, sent at once otherwise.
     pub(super) fn submit_write(&mut self, event: RedisEvent, after: AfterWrite) {
+        self.submit_write_warned(event, after, None);
+    }
+
+    /// [`Self::submit_write`] with a warning above the commands. A warned
+    /// write is always previewed, whatever `safety.preview` says.
+    pub(super) fn submit_write_warned(
+        &mut self,
+        event: RedisEvent,
+        after: AfterWrite,
+        warning: Option<String>,
+    ) {
         let lines = event.preview();
-        if lines.is_empty() || !self.previews(&event) {
+        if lines.is_empty() || (warning.is_none() && !self.previews(&event)) {
             // Nothing to show (a no-op edit) or no preview wanted.
             self.send_write(event, after);
             return;
         }
         let typed = TypedConfirm::for_event(&event, self.environment);
         self.pending = Some(PendingConfirm::Write(Box::new(PendingWrite {
+            notes: event.preview_notes(),
             event,
             lines,
+            warning,
             after,
             typed,
         })));
+    }
+
+    /// A rename / copy found `to` taken (`RENAMENX` / `COPY` answered 0):
+    /// ask again, naming the key it would replace.
+    pub(super) fn target_exists(&mut self, from: &str, to: &str, db: Option<i64>, copy: bool) {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        let shown = crate::redis_client::escape::printable(&to).into_owned();
+        let place = db.map(|db| format!(" in DB {db}")).unwrap_or_default();
+        let warning = format!("{shown} already exists{place}: this replaces it");
+        let after = if db.is_some() {
+            AfterWrite::default()
+        } else {
+            AfterWrite::reselect(&to)
+        };
+        let event = if copy {
+            RedisEvent::CopyKey {
+                from,
+                to,
+                db,
+                overwrite: true,
+            }
+        } else {
+            RedisEvent::RenameKey {
+                from,
+                to,
+                overwrite: true,
+            }
+        };
+        self.submit_write_warned(event, after, Some(warning));
     }
 
     fn send_write(&mut self, event: RedisEvent, after: AfterWrite) {
@@ -255,17 +353,17 @@ impl App {
             Some(PendingConfirm::LiftReadOnly) => {
                 ConfirmPopup::lift_read_only(env).render(area, buf);
             }
-            Some(PendingConfirm::Write(write)) => match &write.typed {
-                Some(typed) => ConfirmPopup::typed_delete(
-                    &write.lines,
-                    env,
-                    &typed.expected,
-                    &typed.input,
-                    typed.matches(),
-                )
-                .render(area, buf),
-                None => ConfirmPopup::write_preview(&write.lines, env).render(area, buf),
-            },
+            Some(PendingConfirm::Write(write)) => {
+                let popup = ConfirmPopup::write_preview(&write.lines, env)
+                    .warning(write.warning.as_deref())
+                    .notes(&write.notes);
+                match &write.typed {
+                    Some(typed) => popup
+                        .typed_confirm(&typed.text(), &typed.input, typed.matches())
+                        .render(area, buf),
+                    None => popup.render(area, buf),
+                }
+            }
             Some(PendingConfirm::LoadAll { db, keys, bytes }) => {
                 ConfirmPopup::load_all(*db, *keys, *bytes, env).render(area, buf);
             }

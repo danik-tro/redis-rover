@@ -191,6 +191,23 @@ pub enum ItemDelete {
     ZsetMember(String),
 }
 
+/// A key-level TTL to set (`SetTtl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ttl {
+    /// `EXPIRE key secs`; `0` deletes the key.
+    Expire(u64),
+    /// `PERSIST key`: no TTL.
+    Persist,
+}
+
+/// The collection a member is renamed in (`RenameMember`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    Set,
+    /// The score is kept.
+    Zset,
+}
+
 /// A fully-specified new key to create, produced by the add-key wizard. Carries
 /// the type and at least one seed element (Redis cannot store an empty
 /// collection). JSON is intentionally excluded — the wizard cannot create it.

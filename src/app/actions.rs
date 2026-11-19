@@ -122,7 +122,9 @@ impl App {
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
-            Action::YankFailed(ref msg) => self.toast.show(msg.clone(), false, now),
+            Action::YankFailed(ref msg) | Action::Notice(ref msg) => {
+                self.toast.show(msg.clone(), false, now);
+            }
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),
@@ -145,6 +147,7 @@ impl App {
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
+            Action::KeysDeleted(_) | Action::TargetExists { .. } => self.write_outcome(action, now),
             Action::FilterMatchCount {
                 ref pattern,
                 count,
@@ -164,6 +167,24 @@ impl App {
             | Action::PubSubChannelsLoaded
             | Action::PubSubToggleNotify
             | Action::Published { .. } => self.handle_pubsub_action(action),
+        }
+    }
+
+    /// What the runner says about a power edit (sol 08).
+    fn write_outcome(&mut self, action: &Action, now: Instant) {
+        match *action {
+            Action::KeysDeleted(count) => self.toast.show(
+                format!("{count} key{} deleted", if count == 1 { "" } else { "s" }),
+                false,
+                now,
+            ),
+            Action::TargetExists {
+                ref from,
+                ref to,
+                db,
+                copy,
+            } => self.target_exists(from, to, db, copy),
+            _ => {}
         }
     }
 

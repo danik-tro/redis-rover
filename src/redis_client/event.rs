@@ -1,6 +1,6 @@
 use super::{
     escape::format_cmd,
-    types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec, RedisType},
+    types::{ItemDelete, ItemEdit, KeyItem, MemberKind, NewKeySpec, RedisType, Ttl},
     write_cmd,
 };
 
@@ -44,10 +44,52 @@ pub enum RedisEvent {
     DeleteKey {
         key: String,
     },
-    /// Set a key-level TTL. `secs <= 0` clears the TTL (`PERSIST`).
+    /// Set a key-level TTL (`EXPIRE`, `0` deletes the key) or clear it
+    /// (`PERSIST`).
     SetTtl {
         key: String,
-        secs: i64,
+        ttl: Ttl,
+    },
+    /// Move a key's TTL by `delta_secs`: `TTL` read under `WATCH`, then
+    /// `EXPIRE key (ttl + delta)` in a `MULTI`, so a concurrent change is
+    /// caught. Refused when the key has no TTL or the result is not
+    /// positive.
+    ShiftTtl {
+        key: String,
+        delta_secs: i64,
+    },
+    /// `RENAMENX from to`; `RENAME` once replacing `to` was confirmed.
+    /// `RENAMENX` finding `to` answers `Action::TargetExists`.
+    RenameKey {
+        from: String,
+        to: String,
+        overwrite: bool,
+    },
+    /// `COPY from to [DB n] [REPLACE]`, or before Redis 6.2 `DUMP` +
+    /// `RESTORE` with the source's TTL. `db: None` copies within the DB.
+    CopyKey {
+        from: String,
+        to: String,
+        db: Option<i64>,
+        overwrite: bool,
+    },
+    /// Rename a HASH field (one script, refused if `to` exists).
+    RenameField {
+        key: String,
+        from: String,
+        to: String,
+    },
+    /// Rename a SET / ZSET member, keeping a ZSET score (one script,
+    /// refused if `to` exists).
+    RenameMember {
+        key: String,
+        kind: MemberKind,
+        from: String,
+        to: String,
+    },
+    /// `UNLINK` marked keys, [`write_cmd::DELETE_CHUNK`] per command.
+    DeleteKeys {
+        keys: Vec<String>,
     },
     /// Create a new key from the add-key wizard. Rejected if the key exists.
     CreateKey {
@@ -83,6 +125,7 @@ pub enum RedisEvent {
 /// Prints the variant and the key (or channel, pattern, DB); values,
 /// elements and payloads only as their size.
 impl std::fmt::Debug for RedisEvent {
+    #[allow(clippy::too_many_lines)] // one arm per variant
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn bytes(text: &str) -> String {
             format!("<{} bytes>", text.len())
@@ -104,9 +147,48 @@ impl std::fmt::Debug for RedisEvent {
                 write!(f, "SetString {{ key: {key:?}, value: {} }}", bytes(value))
             }
             Self::DeleteKey { key } => write!(f, "DeleteKey {{ key: {key:?} }}"),
-            Self::SetTtl { key, secs } => {
-                write!(f, "SetTtl {{ key: {key:?}, secs: {secs} }}")
+            Self::SetTtl { key, ttl } => {
+                write!(f, "SetTtl {{ key: {key:?}, ttl: {ttl:?} }}")
             }
+            Self::ShiftTtl { key, delta_secs } => {
+                write!(f, "ShiftTtl {{ key: {key:?}, delta_secs: {delta_secs} }}")
+            }
+            Self::RenameKey {
+                from,
+                to,
+                overwrite,
+            } => write!(
+                f,
+                "RenameKey {{ from: {from:?}, to: {to:?}, overwrite: {overwrite} }}"
+            ),
+            Self::CopyKey {
+                from,
+                to,
+                db,
+                overwrite,
+            } => write!(
+                f,
+                "CopyKey {{ from: {from:?}, to: {to:?}, db: {db:?}, overwrite: {overwrite} }}"
+            ),
+            // Fields and members are data: sizes only.
+            Self::RenameField { key, from, to } => write!(
+                f,
+                "RenameField {{ key: {key:?}, from: {}, to: {} }}",
+                bytes(from),
+                bytes(to)
+            ),
+            Self::RenameMember {
+                key,
+                kind,
+                from,
+                to,
+            } => write!(
+                f,
+                "RenameMember {{ key: {key:?}, kind: {kind:?}, from: {}, to: {} }}",
+                bytes(from),
+                bytes(to)
+            ),
+            Self::DeleteKeys { keys } => write!(f, "DeleteKeys {{ <{} keys> }}", keys.len()),
             Self::CreateKey { key, spec } => {
                 let (kind, len) = match spec {
                     NewKeySpec::String(_) => ("String", 1),
@@ -180,13 +262,20 @@ impl RedisEvent {
             | Self::AddItem { .. }
             | Self::EditItem { .. }
             | Self::DeleteItem { .. }
-            | Self::Publish { .. } => true,
+            | Self::Publish { .. }
+            | Self::ShiftTtl { .. }
+            | Self::RenameKey { .. }
+            | Self::CopyKey { .. }
+            | Self::RenameField { .. }
+            | Self::RenameMember { .. }
+            | Self::DeleteKeys { .. } => true,
         }
     }
 }
 
 impl RedisEvent {
-    /// True for writes that remove data: a key or a collection element.
+    /// True for writes that remove data: a key or a collection element,
+    /// `EXPIRE … 0`, or a rename / copy that replaces an existing key.
     /// `safety.preview = "destructive"` previews only these.
     ///
     /// No `_` arm on purpose: a new variant must pick a side.
@@ -203,12 +292,16 @@ impl RedisEvent {
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
             | Self::SetString { .. }
-            | Self::SetTtl { .. }
             | Self::CreateKey { .. }
             | Self::AddItem { .. }
             | Self::EditItem { .. }
-            | Self::Publish { .. } => false,
-            Self::DeleteKey { .. } | Self::DeleteItem { .. } => true,
+            | Self::Publish { .. }
+            | Self::ShiftTtl { .. }
+            | Self::RenameField { .. }
+            | Self::RenameMember { .. } => false,
+            Self::SetTtl { ttl, .. } => *ttl == Ttl::Expire(0),
+            Self::RenameKey { overwrite, .. } | Self::CopyKey { overwrite, .. } => *overwrite,
+            Self::DeleteKey { .. } | Self::DeleteItem { .. } | Self::DeleteKeys { .. } => true,
         }
     }
 
@@ -232,7 +325,27 @@ impl RedisEvent {
             | Self::FetchPubSubChannels => return Vec::new(),
             Self::SetString { key, value } => write_cmd::set_string(key, value),
             Self::DeleteKey { key } => write_cmd::delete_key(key),
-            Self::SetTtl { key, secs } => write_cmd::set_ttl(key, *secs),
+            Self::SetTtl { key, ttl } => write_cmd::set_ttl(key, *ttl),
+            Self::RenameKey {
+                from,
+                to,
+                overwrite,
+            } => vec![write_cmd::rename_key(from, to, *overwrite)],
+            Self::CopyKey {
+                from,
+                to,
+                db,
+                overwrite,
+            } => vec![write_cmd::copy_key(from, to, *db, *overwrite)],
+            Self::RenameField { key, from, to } => vec![write_cmd::rename_field(key, from, to)],
+            Self::RenameMember {
+                key,
+                kind,
+                from,
+                to,
+            } => vec![write_cmd::rename_member(key, *kind, from, to)],
+            Self::ShiftTtl { key, delta_secs } => return shift_ttl_preview(key, *delta_secs),
+            Self::DeleteKeys { keys } => return delete_keys_preview(keys),
             Self::CreateKey { key, spec } => write_cmd::create_key(key, spec),
             Self::AddItem { key, item } => write_cmd::add_item(key, item),
             Self::EditItem { key, edit } => write_cmd::edit_item(key, edit),
@@ -247,6 +360,108 @@ impl RedisEvent {
         }
         lines
     }
+
+    /// Lines shown under the commands of a preview: what the commands keep
+    /// or how they degrade. Empty for most writes.
+    ///
+    /// No `_` arm on purpose: a new variant must say whether it needs one.
+    #[must_use]
+    pub fn preview_notes(&self) -> Vec<String> {
+        match self {
+            Self::FetchKeys
+            | Self::BackfillMeta
+            | Self::LoadAll { .. }
+            | Self::StopLoadAll
+            | Self::FetchValue
+            | Self::SelectDb(_)
+            | Self::CountMatches { .. }
+            | Self::FetchFullValue { .. }
+            | Self::FetchPubSubChannels
+            | Self::SetString { .. }
+            | Self::DeleteKey { .. }
+            | Self::CreateKey { .. }
+            | Self::AddItem { .. }
+            | Self::EditItem { .. }
+            | Self::DeleteItem { .. }
+            | Self::Publish { .. }
+            | Self::SetTtl { .. }
+            | Self::ShiftTtl { .. }
+            | Self::DeleteKeys { .. } => Vec::new(),
+            Self::RenameKey { .. } => vec!["RENAME keeps the TTL".to_owned()],
+            Self::CopyKey { .. } => vec![
+                "COPY keeps the TTL; before Redis 6.2: DUMP + RESTORE with the TTL read first"
+                    .to_owned(),
+            ],
+            Self::RenameField { key, from, to } => rename_notes(key, None, from, to),
+            Self::RenameMember {
+                key,
+                kind,
+                from,
+                to,
+            } => rename_notes(key, Some(*kind), from, to),
+        }
+    }
+}
+
+/// Bulk delete keys shown in a preview before `…and N more`.
+pub const PREVIEW_KEYS: usize = 10;
+
+/// `UNLINK` with the first [`PREVIEW_KEYS`] keys, one per line, then
+/// `…and N more` and how many commands run.
+fn delete_keys_preview(keys: &[String]) -> Vec<String> {
+    use super::escape::quote_arg;
+    let mut lines = vec!["UNLINK".to_owned()];
+    for key in keys.iter().take(PREVIEW_KEYS) {
+        lines.push(format!(
+            "  {}",
+            quote_arg(&super::bytes::bytes_from_text(key))
+        ));
+    }
+    if keys.len() > PREVIEW_KEYS {
+        lines.push(format!("  …and {} more", keys.len() - PREVIEW_KEYS));
+    }
+    let chunks = keys.len().div_ceil(write_cmd::DELETE_CHUNK);
+    if chunks > 1 {
+        lines.push(format!(
+            "({chunks} UNLINK commands of up to {} keys)",
+            write_cmd::DELETE_CHUNK
+        ));
+    }
+    lines
+}
+
+/// `WATCH` / `TTL` / `MULTI` / `EXPIRE key <TTL ± n>` / `EXEC`.
+fn shift_ttl_preview(key: &str, delta_secs: i64) -> Vec<String> {
+    let cmd = |name: &str| {
+        let mut cmd = redis::cmd(name);
+        cmd.arg(super::bytes::Raw(key));
+        format_cmd(&cmd)
+    };
+    let sign = if delta_secs < 0 { '-' } else { '+' };
+    vec![
+        cmd("WATCH"),
+        cmd("TTL"),
+        "MULTI".to_owned(),
+        format!(
+            "{} <TTL {sign} {}>",
+            cmd("EXPIRE"),
+            delta_secs.unsigned_abs()
+        ),
+        "EXEC".to_owned(),
+    ]
+}
+
+/// The plain commands a rename script stands for, and that they run one by
+/// one if the server refuses `EVAL`.
+fn rename_notes(key: &str, kind: Option<MemberKind>, from: &str, to: &str) -> Vec<String> {
+    let mut notes = vec!["the script does, atomically:".to_owned()];
+    notes.extend(
+        write_cmd::rename_item_plain(key, kind, from, to)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    notes.push("if EVAL is refused, these run one by one (not atomic)".to_owned());
+    notes
 }
 
 #[cfg(test)]
@@ -296,6 +511,17 @@ mod tests {
                 channel: "news".into(),
                 payload: secret(),
             },
+            RedisEvent::RenameField {
+                key: k(),
+                from: secret(),
+                to: secret(),
+            },
+            RedisEvent::RenameMember {
+                key: k(),
+                kind: MemberKind::Zset,
+                from: secret(),
+                to: secret(),
+            },
         ];
         for event in events {
             let shown = format!("{event:?}");
@@ -333,11 +559,17 @@ mod tests {
             ),
             (RedisEvent::DeleteKey { key: k() }, vec![r#"DEL "user:1""#]),
             (
-                RedisEvent::SetTtl { key: k(), secs: 60 },
+                RedisEvent::SetTtl {
+                    key: k(),
+                    ttl: Ttl::Expire(60),
+                },
                 vec![r#"EXPIRE "user:1" "60""#],
             ),
             (
-                RedisEvent::SetTtl { key: k(), secs: 0 },
+                RedisEvent::SetTtl {
+                    key: k(),
+                    ttl: Ttl::Persist,
+                },
                 vec![r#"PERSIST "user:1""#],
             ),
             (
@@ -514,6 +746,178 @@ mod tests {
         }
     }
 
+    /// The power edits (sol 08): exact lines, notes, and classification.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one row per write shape
+    fn power_edits_preview_their_commands() {
+        let k = || "user:1".to_owned();
+        let cases: Vec<(RedisEvent, Vec<&str>, bool)> = vec![
+            (
+                RedisEvent::RenameKey {
+                    from: k(),
+                    to: "user:9".into(),
+                    overwrite: false,
+                },
+                vec![r#"RENAMENX "user:1" "user:9""#],
+                false,
+            ),
+            (
+                RedisEvent::RenameKey {
+                    from: k(),
+                    to: "user:9".into(),
+                    overwrite: true,
+                },
+                vec![r#"RENAME "user:1" "user:9""#],
+                true,
+            ),
+            (
+                RedisEvent::CopyKey {
+                    from: "cart:1".into(),
+                    to: "cart:1".into(),
+                    db: Some(2),
+                    overwrite: false,
+                },
+                vec![r#"COPY "cart:1" "cart:1" "DB" "2""#],
+                false,
+            ),
+            (
+                RedisEvent::CopyKey {
+                    from: "cart:1".into(),
+                    to: "cart:2".into(),
+                    db: None,
+                    overwrite: true,
+                },
+                vec![r#"COPY "cart:1" "cart:2" "REPLACE""#],
+                true,
+            ),
+            (
+                RedisEvent::SetTtl {
+                    key: k(),
+                    ttl: Ttl::Expire(0),
+                },
+                vec![r#"EXPIRE "user:1" "0""#],
+                true,
+            ),
+            (
+                RedisEvent::ShiftTtl {
+                    key: k(),
+                    delta_secs: 1800,
+                },
+                vec![
+                    r#"WATCH "user:1""#,
+                    r#"TTL "user:1""#,
+                    "MULTI",
+                    r#"EXPIRE "user:1" <TTL + 1800>"#,
+                    "EXEC",
+                ],
+                false,
+            ),
+            (
+                RedisEvent::ShiftTtl {
+                    key: k(),
+                    delta_secs: -300,
+                },
+                vec![
+                    r#"WATCH "user:1""#,
+                    r#"TTL "user:1""#,
+                    "MULTI",
+                    r#"EXPIRE "user:1" <TTL - 300>"#,
+                    "EXEC",
+                ],
+                false,
+            ),
+            (
+                RedisEvent::DeleteKeys {
+                    keys: vec!["a".into(), "b".into()],
+                },
+                vec!["UNLINK", r#"  "a""#, r#"  "b""#],
+                true,
+            ),
+        ];
+        for (event, lines, destructive) in cases {
+            assert!(event.is_write(), "{event:?}");
+            assert_eq!(event.is_destructive(), destructive, "{event:?}");
+            assert_eq!(event.preview(), lines, "{event:?}");
+        }
+
+        let rename = RedisEvent::RenameKey {
+            from: k(),
+            to: "user:9".into(),
+            overwrite: false,
+        };
+        assert_eq!(rename.preview_notes(), ["RENAME keeps the TTL"]);
+
+        let field = RedisEvent::RenameField {
+            key: k(),
+            from: "name".into(),
+            to: "full_name".into(),
+        };
+        let preview = field.preview();
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].starts_with(r#"EVAL "-- rename a hash field"#));
+        assert!(preview[0].ends_with(r#" "1" "user:1" "name" "full_name""#));
+        assert_eq!(
+            field.preview_notes(),
+            [
+                "the script does, atomically:",
+                r#"  HGET "user:1" "name""#,
+                r#"  HSETNX "user:1" "full_name" <value>"#,
+                r#"  HDEL "user:1" "name""#,
+                "if EVAL is refused, these run one by one (not atomic)",
+            ]
+        );
+        assert!(field.is_write() && !field.is_destructive());
+
+        let member = RedisEvent::RenameMember {
+            key: "board".into(),
+            kind: MemberKind::Zset,
+            from: "ada".into(),
+            to: "ada_l".into(),
+        };
+        assert!(member.preview()[0].starts_with(r#"EVAL "-- rename a zset member"#));
+        assert!(member
+            .preview_notes()
+            .contains(&r#"  ZADD "board" NX <score> "ada_l""#.to_owned()));
+        let set = RedisEvent::RenameMember {
+            key: "tags".into(),
+            kind: MemberKind::Set,
+            from: "a".into(),
+            to: "b".into(),
+        };
+        assert!(set.preview()[0].starts_with(r#"EVAL "-- rename a set member"#));
+        assert!(member.is_write() && set.is_write());
+    }
+
+    /// Up to ten keys, then `…and N more`; more than one chunk says so.
+    #[test]
+    fn bulk_delete_previews_ten_keys_and_chunks_by_500() {
+        let keys = |n: usize| -> Vec<String> { (0..n).map(|i| format!("k{i}")).collect() };
+        let preview = RedisEvent::DeleteKeys { keys: keys(47) }.preview();
+        assert_eq!(preview.len(), 1 + 10 + 1);
+        assert_eq!(preview[10], r#"  "k9""#);
+        assert_eq!(preview[11], "  …and 37 more");
+
+        let preview = RedisEvent::DeleteKeys { keys: keys(1234) }.preview();
+        assert_eq!(
+            preview.last().unwrap(),
+            "(3 UNLINK commands of up to 500 keys)"
+        );
+
+        for (n, chunks) in [(1, 1), (499, 1), (500, 1), (501, 2), (1234, 3)] {
+            let cmds = write_cmd::delete_keys(&keys(n));
+            assert_eq!(cmds.len(), chunks, "{n} keys");
+            let sizes: Vec<usize> = cmds.iter().map(|c| c.args_iter().count() - 1).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), n);
+            assert!(sizes.iter().all(|&s| s <= write_cmd::DELETE_CHUNK));
+            assert_eq!(write_cmd::delete_keys_del(&keys(n)).len(), chunks);
+        }
+        assert!(write_cmd::delete_keys(&[]).is_empty());
+        assert_eq!(
+            format!("{:?}", RedisEvent::DeleteKeys { keys: keys(3) }),
+            "DeleteKeys { <3 keys> }"
+        );
+    }
+
     #[test]
     fn reads_preview_nothing() {
         let reads = [
@@ -575,7 +979,7 @@ mod tests {
         assert!(RedisEvent::DeleteKey { key: "k".into() }.is_write());
         assert!(RedisEvent::SetTtl {
             key: "k".into(),
-            secs: 5
+            ttl: Ttl::Expire(5)
         }
         .is_write());
         assert!(RedisEvent::SetString {

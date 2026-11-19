@@ -449,6 +449,36 @@ impl KeyspaceState {
         true
     }
 
+    /// [`Self::remove_key`] for many keys (a bulk delete) in one pass over
+    /// the sweep instead of one per key. Returns how many it held.
+    pub fn remove_keys(&mut self, names: &[String]) -> usize {
+        let mut removed: Vec<u32> = names.iter().filter_map(|n| self.index_of(n)).collect();
+        if removed.is_empty() {
+            return 0;
+        }
+        removed.sort_unstable();
+        removed.dedup();
+        self.seen
+            .retain(|slot| removed.binary_search(&slot.index).is_err());
+        for slot in &mut self.seen {
+            slot.index -= super::view::shift_below(&removed, slot.index);
+        }
+        let mut i: u32 = 0;
+        self.scanned.retain(|_| {
+            let keep = removed.binary_search(&i).is_err();
+            i += 1;
+            keep
+        });
+        if let Some(meta) = self.meta.as_mut() {
+            meta.remove_many(&removed);
+        }
+        self.view.remove_many(&removed);
+        self.index_epoch += 1;
+        self.generation += 1;
+        self.refresh_tree();
+        removed.len()
+    }
+
     /// The next `SCAN` work the current page needs, or `None` when the sweep
     /// already covers it (or has ended).
     #[must_use]
@@ -1236,6 +1266,65 @@ mod tests {
             .map(|row| row.size)
             .collect();
         assert_eq!(sizes, [99, 25, 20]);
+    }
+
+    /// A bulk delete in one pass ends where removing the keys one by one
+    /// does: names, index, sorted order and metadata columns.
+    #[test]
+    fn removing_many_keys_matches_removing_them_one_by_one() {
+        use crate::redis_client::types::SortKey;
+
+        let all: Vec<String> = (0..40).map(|i| format!("k{i:02}")).collect();
+        let build = || {
+            let mut state = state_with(100);
+            state.set_sort(Some(Sort {
+                key: SortKey::Size,
+                descending: false,
+            }));
+            state.merge_batch(9, all.clone());
+            state.rebuild_view();
+            let request = state.backfill_request(100).unwrap();
+            let rows: Vec<KeyMeta> = request
+                .names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| written(name, "string", (i * 7 % 13) as u128))
+                .collect();
+            assert!(state.record_meta(&request, &rows));
+            state
+        };
+        // Unordered, repeated, and one the sweep never held.
+        let gone = names(&["k05", "k00", "k39", "k17", "k05", "nope", "k18", "k19"]);
+
+        let mut one_by_one = build();
+        for key in &gone {
+            one_by_one.remove_key(key);
+        }
+        let mut at_once = build();
+        let epoch = at_once.index_epoch;
+        assert_eq!(at_once.remove_keys(&gone), 6);
+        assert_eq!(at_once.remove_keys(&[]), 0);
+        assert_ne!(at_once.index_epoch, epoch, "index-holding work is dropped");
+
+        assert_eq!(at_once.scanned, one_by_one.scanned);
+        assert_eq!(at_once.page_keys(), one_by_one.page_keys());
+        for name in &all {
+            assert_eq!(at_once.index_of(name), one_by_one.index_of(name), "{name}");
+        }
+        let sizes = |state: &KeyspaceState| -> Vec<u128> {
+            state
+                .page_from_meta()
+                .unwrap()
+                .iter()
+                .map(|r| r.size)
+                .collect()
+        };
+        assert_eq!(sizes(&at_once), sizes(&one_by_one));
+        assert_eq!(at_once.meta_progress(), Some((34, 34)));
+        // A later SCAN answer still merges: `k01` is a duplicate, the
+        // deleted `k05` (recreated meanwhile) and `z` are new.
+        at_once.merge_batch(0, names(&["k01", "k05", "z"]));
+        assert_eq!(at_once.scanned.len(), 36);
     }
 
     #[test]

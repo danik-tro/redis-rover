@@ -133,6 +133,33 @@ impl MetaColumns {
         self.size.remove(i);
     }
 
+    /// Drop the keys at `removed` (sorted, distinct sweep indices) in one
+    /// pass; the rest move down as they do in the sweep.
+    pub fn remove_many(&mut self, removed: &[u32]) {
+        let gone = |i: usize| u32::try_from(i).is_ok_and(|i| removed.binary_search(&i).is_ok());
+        let mut i = 0;
+        let mut lost_known = 0;
+        self.types.retain(|&code| {
+            let keep = !gone(i);
+            if !keep && code != TYPE_UNKNOWN {
+                lost_known += 1;
+            }
+            i += 1;
+            keep
+        });
+        self.known -= lost_known;
+        let mut i = 0;
+        self.ttl.retain(|_| {
+            i += 1;
+            !gone(i - 1)
+        });
+        let mut i = 0;
+        self.size.retain(|_| {
+            i += 1;
+            !gone(i - 1)
+        });
+    }
+
     #[must_use]
     pub fn is_known(&self, index: u32) -> bool {
         self.types
@@ -467,6 +494,16 @@ impl KeyView {
         }
     }
 
+    /// [`Self::remove`] for many sorted, distinct indices in one pass.
+    pub fn remove_many(&mut self, removed: &[u32]) {
+        if let Some(order) = self.order.as_mut() {
+            order.retain(|i| removed.binary_search(i).is_err());
+            for i in order.iter_mut() {
+                *i -= shift_below(removed, *i);
+            }
+        }
+    }
+
     /// Merge the new sweep indices `from..to` into the built order.
     pub fn merge_new<I: SortInput + ?Sized>(&mut self, names: &I, from: u32, to: u32) {
         let (Some(sort), Some(order)) = (self.order_sort(), self.order.as_mut()) else {
@@ -613,6 +650,14 @@ pub struct SortedOrder {
     order: Vec<u32>,
     pub(super) epoch: u64,
     sort_generation: u64,
+}
+
+/// How many of the sorted indices `removed` lie below `index`: how far
+/// `index` moves down once they are gone.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // at most `removed.len()`, itself below u32::MAX
+pub fn shift_below(removed: &[u32], index: u32) -> u32 {
+    removed.partition_point(|&r| r < index) as u32
 }
 
 #[cfg(test)]

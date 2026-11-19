@@ -16,7 +16,7 @@ use super::{
     pubsub_store::ServerChannels,
     types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
-        SweepRequest, SweepResult, TypeScan, ValueState,
+        SweepRequest, SweepResult, Ttl, TypeScan, ValueState,
     },
 };
 
@@ -386,9 +386,15 @@ impl Storage {
     pub async fn set_ttl(
         &self,
         key: &str,
-        secs: i64,
+        ttl: Ttl,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        client::set_ttl(self.manager.clone(), key, secs).await
+        client::set_ttl(self.manager.clone(), key, ttl).await
+    }
+
+    /// The connection, for the `client` helpers of the power edits.
+    #[must_use]
+    pub fn manager(&self) -> ConnectionManager {
+        self.manager.clone()
     }
 
     /// Create a new key, rejecting the write if the key already exists. Delegates
