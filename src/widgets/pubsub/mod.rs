@@ -331,6 +331,16 @@ impl PubSub {
         self.popup = None;
     }
 
+    /// The add popup's text (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn popup_text(&self) -> Option<String> {
+        match &self.popup {
+            Some(Popup::Add(popup)) => Some(popup.input.lines().join("\n")),
+            _ => None,
+        }
+    }
+
     /// A key typed into the open popup (the App handles confirm / cancel).
     /// Add popup: Tab flips the channel / pattern kind. Publish popup: Tab
     /// switches fields, Enter in the channel field moves to the payload.

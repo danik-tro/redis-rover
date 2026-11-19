@@ -703,3 +703,78 @@ mod tests {
         assert!(writes(&mut events).is_empty());
     }
 }
+
+/// Undo / redo (`Ctrl-U` / `Ctrl-R`, ratatui-textarea's own keys) reach
+/// every text input: nothing on the way intercepts them.
+#[cfg(test)]
+mod undo_tests {
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    use crate::{
+        app::{
+            tests::{app_with_channels, ctrl, key, meta},
+            App,
+        },
+        target::Environment,
+    };
+
+    fn press(app: &mut App, k: KeyEvent) {
+        if let Some(action) = app.handle_key_event(k) {
+            app.update(&action);
+        }
+    }
+
+    /// Type `ab`, undo, redo; `text` reads the input after each step.
+    fn undo_redo(app: &mut App, text: impl Fn(&App) -> String) {
+        let before = text(app);
+        press(app, key(KeyCode::Char('a')));
+        press(app, key(KeyCode::Char('b')));
+        assert_eq!(text(app), format!("{before}ab"));
+        press(app, ctrl('u'));
+        press(app, ctrl('u'));
+        assert_eq!(text(app), before, "undo");
+        press(app, ctrl('r'));
+        assert_eq!(text(app), format!("{before}a"), "redo");
+    }
+
+    fn on_key(name: &str) -> App {
+        let (app, _, _) = app_with_channels();
+        let mut app = app.environment(Environment::Local);
+        *app.state.keys.lock() = Some(vec![meta(name)]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(name));
+        app
+    }
+
+    #[test]
+    fn every_text_input_undoes_and_redoes() {
+        // Rename (an overlay input), TTL, filter.
+        let mut app = on_key("k");
+        press(&mut app, key(KeyCode::F(2)));
+        undo_redo(&mut app, |app| {
+            app.keyspace.overlay_text().unwrap_or_default()
+        });
+        press(&mut app, key(KeyCode::Esc));
+        press(&mut app, key(KeyCode::Char('t')));
+        undo_redo(&mut app, |app| {
+            app.keyspace.overlay_text().unwrap_or_default()
+        });
+        press(&mut app, key(KeyCode::Esc));
+        press(&mut app, key(KeyCode::Char('f')));
+        undo_redo(&mut app, |app| app.keyspace.filter_text_for_test());
+        press(&mut app, key(KeyCode::Esc));
+
+        // The typed confirm on Prod.
+        let mut app = on_key("k").environment(Environment::Prod);
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(app.typed_confirm_open());
+        undo_redo(&mut app, |app| app.typed_text().unwrap_or_default());
+
+        // The Pub/Sub add popup.
+        let mut app = on_key("k");
+        press(&mut app, key(KeyCode::Char('b')));
+        press(&mut app, key(KeyCode::Char('a')));
+        assert!(app.pubsub.is_popup());
+        undo_redo(&mut app, |app| app.pubsub.popup_text().unwrap_or_default());
+    }
+}
