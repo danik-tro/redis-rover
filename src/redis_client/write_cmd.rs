@@ -10,7 +10,7 @@ use redis::Cmd;
 
 use super::{
     bytes::Raw,
-    types::{ItemDelete, ItemEdit, KeyItem, NewKeySpec},
+    types::{ItemDelete, ItemEdit, KeyItem, MemberKind, NewKeySpec, Ttl},
 };
 
 /// Sentinel used to delete a LIST element by index (Redis has no
@@ -87,13 +87,179 @@ pub fn delete_key(key: &str) -> Vec<Cmd> {
     vec![Cmd::del(Raw(key))]
 }
 
-/// `EXPIRE key secs`, or `PERSIST key` when `secs <= 0`.
+/// `EXPIRE key secs` (`0` deletes the key), or `PERSIST key`.
 #[must_use]
-pub fn set_ttl(key: &str, secs: i64) -> Vec<Cmd> {
-    if secs > 0 {
-        vec![Cmd::expire(Raw(key), secs)]
-    } else {
-        vec![Cmd::persist(Raw(key))]
+pub fn set_ttl(key: &str, ttl: Ttl) -> Vec<Cmd> {
+    match ttl {
+        Ttl::Expire(secs) => {
+            let mut cmd = redis::cmd("EXPIRE");
+            cmd.arg(Raw(key)).arg(secs);
+            vec![cmd]
+        }
+        Ttl::Persist => vec![Cmd::persist(Raw(key))],
+    }
+}
+
+/// Keys per `UNLINK` of a bulk delete: big enough to be quick, small enough
+/// that one command never holds the server for long.
+pub const DELETE_CHUNK: usize = 500;
+
+/// `UNLINK k1 k2 …`, one command per [`DELETE_CHUNK`] keys. They run one
+/// after the other, not in one `MULTI`.
+#[must_use]
+pub fn delete_keys(keys: &[String]) -> Vec<Cmd> {
+    keys.chunks(DELETE_CHUNK)
+        .map(|chunk| {
+            let mut cmd = redis::cmd("UNLINK");
+            for key in chunk {
+                cmd.arg(Raw(key));
+            }
+            cmd
+        })
+        .collect()
+}
+
+/// `DEL k1 k2 …` per chunk, for a server without `UNLINK` (before 4.0).
+#[must_use]
+pub fn delete_keys_del(keys: &[String]) -> Vec<Cmd> {
+    keys.chunks(DELETE_CHUNK)
+        .map(|chunk| Cmd::del(raws(chunk)))
+        .collect()
+}
+
+/// `RENAMENX from to`, or `RENAME from to` once replacing `to` was
+/// confirmed. Both keep the TTL.
+#[must_use]
+pub fn rename_key(from: &str, to: &str, overwrite: bool) -> Cmd {
+    let mut cmd = redis::cmd(if overwrite { "RENAME" } else { "RENAMENX" });
+    cmd.arg(Raw(from)).arg(Raw(to));
+    cmd
+}
+
+/// `COPY from to [DB n] [REPLACE]` (Redis 6.2+). Keeps the TTL.
+#[must_use]
+pub fn copy_key(from: &str, to: &str, db: Option<i64>, overwrite: bool) -> Cmd {
+    let mut cmd = redis::cmd("COPY");
+    cmd.arg(Raw(from)).arg(Raw(to));
+    if let Some(db) = db {
+        cmd.arg("DB").arg(db);
+    }
+    if overwrite {
+        cmd.arg("REPLACE");
+    }
+    cmd
+}
+
+/// `DUMP key`: the read half of a copy before Redis 6.2.
+#[must_use]
+pub fn dump_key(key: &str) -> Cmd {
+    let mut cmd = redis::cmd("DUMP");
+    cmd.arg(Raw(key));
+    cmd
+}
+
+/// `RESTORE to ttl_ms payload [REPLACE]`: the write half of a copy before
+/// Redis 6.2. `ttl_ms` is the source's `PTTL`; `0` (or the `-1` of a key
+/// without one) restores it without a TTL.
+#[must_use]
+pub fn restore_key(to: &str, ttl_ms: i64, payload: &[u8], overwrite: bool) -> Cmd {
+    let mut cmd = redis::cmd("RESTORE");
+    cmd.arg(Raw(to)).arg(ttl_ms.max(0)).arg(payload);
+    if overwrite {
+        cmd.arg("REPLACE");
+    }
+    cmd
+}
+
+/// What the rename scripts answer when the old name is gone.
+pub const RENAME_SOURCE_GONE: &str = "is gone, reload the value";
+
+/// `ARGV`: old field, new field.
+const RENAME_FIELD_SCRIPT: &str = "-- rename a hash field, never over an existing one
+if redis.call('HEXISTS', KEYS[1], ARGV[2]) == 1 then
+  return redis.error_reply('ERR the field already exists')
+end
+local value = redis.call('HGET', KEYS[1], ARGV[1])
+if not value then
+  return redis.error_reply('ERR the field is gone, reload the value')
+end
+redis.call('HSET', KEYS[1], ARGV[2], value)
+return redis.call('HDEL', KEYS[1], ARGV[1])";
+
+/// `ARGV`: old member, new member.
+const RENAME_SET_MEMBER_SCRIPT: &str = "-- rename a set member, never over an existing one
+if redis.call('SISMEMBER', KEYS[1], ARGV[2]) == 1 then
+  return redis.error_reply('ERR the member already exists')
+end
+if redis.call('SREM', KEYS[1], ARGV[1]) == 0 then
+  return redis.error_reply('ERR the member is gone, reload the value')
+end
+return redis.call('SADD', KEYS[1], ARGV[2])";
+
+/// `ARGV`: old member, new member. The score is kept.
+const RENAME_ZSET_MEMBER_SCRIPT: &str = "-- rename a zset member, keeping its score
+if redis.call('ZSCORE', KEYS[1], ARGV[2]) then
+  return redis.error_reply('ERR the member already exists')
+end
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not score then
+  return redis.error_reply('ERR the member is gone, reload the value')
+end
+redis.call('ZREM', KEYS[1], ARGV[1])
+return redis.call('ZADD', KEYS[1], score, ARGV[2])";
+
+/// `EVAL script 1 key from to`.
+fn rename_script(script: &str, key: &str, from: &str, to: &str) -> Cmd {
+    let mut cmd = redis::cmd("EVAL");
+    cmd.arg(script)
+        .arg(1)
+        .arg(Raw(key))
+        .arg(Raw(from))
+        .arg(Raw(to));
+    cmd
+}
+
+/// Rename a HASH field in one script: refused if `to` exists.
+#[must_use]
+pub fn rename_field(key: &str, from: &str, to: &str) -> Cmd {
+    rename_script(RENAME_FIELD_SCRIPT, key, from, to)
+}
+
+/// Rename a SET / ZSET member in one script (a ZSET keeps the score):
+/// refused if `to` exists.
+#[must_use]
+pub fn rename_member(key: &str, kind: MemberKind, from: &str, to: &str) -> Cmd {
+    let script = match kind {
+        MemberKind::Set => RENAME_SET_MEMBER_SCRIPT,
+        MemberKind::Zset => RENAME_ZSET_MEMBER_SCRIPT,
+    };
+    rename_script(script, key, from, to)
+}
+
+/// The plain commands a rename script stands for, as `redis-cli` lines;
+/// the value read in between shows as `<value>` / `<score>`. On a server
+/// that refuses `EVAL` the runner sends these one by one (not atomic).
+#[must_use]
+pub fn rename_item_plain(key: &str, kind: Option<MemberKind>, from: &str, to: &str) -> Vec<String> {
+    use super::escape::quote_arg;
+    let q = |name: &str| quote_arg(&super::bytes::bytes_from_text(name));
+    let (k, from, to) = (q(key), q(from), q(to));
+    match kind {
+        None => vec![
+            format!("HGET {k} {from}"),
+            format!("HSETNX {k} {to} <value>"),
+            format!("HDEL {k} {from}"),
+        ],
+        Some(MemberKind::Set) => vec![
+            format!("SISMEMBER {k} {from}"),
+            format!("SADD {k} {to}"),
+            format!("SREM {k} {from}"),
+        ],
+        Some(MemberKind::Zset) => vec![
+            format!("ZSCORE {k} {from}"),
+            format!("ZADD {k} NX <score> {to}"),
+            format!("ZREM {k} {from}"),
+        ],
     }
 }
 

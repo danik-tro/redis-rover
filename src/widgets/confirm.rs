@@ -22,7 +22,22 @@ pub fn typed_input(expected: &str) -> TextArea<'static> {
     } else {
         "Type the key name"
     };
+    typed_input_titled(title, expected)
+}
+
+/// [`typed_input`] with its own title (`Type the count`).
+#[must_use]
+pub fn typed_input_titled(title: &str, expected: &str) -> TextArea<'static> {
     crate::widgets::keyspace::build_input_text_area(title, expected, None)
+}
+
+/// The words of a typed confirm: `Type {expected} to {action} {object}.`
+/// and `Enter: {action} (type {what} first)`.
+pub struct TypedText<'t> {
+    pub expected: &'t str,
+    pub action: &'t str,
+    pub object: &'t str,
+    pub what: &'t str,
 }
 
 /// Narrowest popup content, so short questions don't look cramped.
@@ -58,8 +73,66 @@ impl<'a> ConfirmPopup<'a> {
         }
     }
 
+    /// A warning above the commands (a rename / copy that replaces a key,
+    /// `EXPIRE … 0`), in the environment colour.
+    #[must_use]
+    pub fn warning(mut self, warning: Option<&str>) -> Self {
+        if let Some(warning) = warning {
+            let line = Line::from(format!("⚠ {warning}")).fg(self.color).bold();
+            self.body.splice(0..0, [line, Line::from("")]);
+        }
+        self
+    }
+
+    /// Notes under the commands: what they keep, how they degrade.
+    #[must_use]
+    pub fn notes(mut self, notes: &[String]) -> Self {
+        if notes.is_empty() {
+            return self;
+        }
+        let cfg = config::get();
+        self.body.push(Line::from(""));
+        self.body.extend(
+            notes
+                .iter()
+                .map(|n| Line::from(n.clone()).fg(cfg.colors.base04)),
+        );
+        self
+    }
+
     /// The typed confirm on Prod: the command, then an input that must
-    /// hold `expected` before Enter deletes.
+    /// hold `typed.expected` before Enter runs it.
+    #[must_use]
+    pub fn typed_confirm(
+        self,
+        typed: &TypedText<'_>,
+        input: &'a TextArea<'static>,
+        matches: bool,
+    ) -> Self {
+        let cfg = config::get();
+        let TypedText {
+            expected,
+            action,
+            object,
+            what,
+        } = typed;
+        let mut popup = self;
+        popup.body.push(Line::from(""));
+        popup.body.push(
+            Line::from(format!("Type {expected} to {action} {object}.")).fg(cfg.colors.base05),
+        );
+        let waiting = Line::from(format!("Enter: {action} (type {what} first)   Esc: cancel"));
+        popup.min_width = waiting.width();
+        popup.hint = if matches {
+            Line::from(format!("Enter: {action}   Esc: cancel")).fg(cfg.colors.base04)
+        } else {
+            waiting.fg(cfg.colors.base03)
+        };
+        popup.input = Some(input);
+        popup
+    }
+
+    /// [`Self::typed_confirm`] for deleting one key.
     #[must_use]
     pub fn typed_delete(
         lines: &'a [String],
@@ -68,21 +141,13 @@ impl<'a> ConfirmPopup<'a> {
         input: &'a TextArea<'static>,
         matches: bool,
     ) -> Self {
-        let cfg = config::get();
-        let mut popup = Self::write_preview(lines, env);
-        popup.body.push(Line::from(""));
-        popup
-            .body
-            .push(Line::from(format!("Type {expected} to delete it.")).fg(cfg.colors.base05));
-        let waiting = Line::from("Enter: delete (type the name first)   Esc: cancel");
-        popup.min_width = waiting.width();
-        popup.hint = if matches {
-            Line::from("Enter: delete   Esc: cancel").fg(cfg.colors.base04)
-        } else {
-            waiting.fg(cfg.colors.base03)
+        let typed = TypedText {
+            expected,
+            action: "delete",
+            object: "it",
+            what: "the name",
         };
-        popup.input = Some(input);
-        popup
+        Self::write_preview(lines, env).typed_confirm(&typed, input, matches)
     }
 
     /// Asked before writes are allowed on Prod.

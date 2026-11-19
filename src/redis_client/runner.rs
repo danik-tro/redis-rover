@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{action::Action, config, state::SharedState};
 
+mod power;
+
 use super::{
     client,
     event::RedisEvent,
@@ -439,6 +441,9 @@ pub struct EventHandler {
     load_task: Option<JoinHandle<()>>,
     /// The load-all's own connection, opened like `backfill_storage`.
     load_storage: Option<Storage>,
+    /// The server answered `COPY` with "unknown command" (before 6.2):
+    /// copies go through `DUMP` + `RESTORE` from then on.
+    copy_unsupported: bool,
 }
 
 impl Drop for EventHandler {
@@ -485,6 +490,7 @@ impl EventHandler {
             backfill_storage: None,
             load_task: None,
             load_storage: None,
+            copy_unsupported: false,
         }
     }
 
@@ -535,7 +541,7 @@ impl EventHandler {
                     self.action_hook(Action::Error(format!("Failed to delete {key}: {err}")));
                 }
             },
-            RedisEvent::SetTtl { key, secs } => match self.storage.set_ttl(&key, secs).await {
+            RedisEvent::SetTtl { key, ttl } => match self.storage.set_ttl(&key, ttl).await {
                 Ok(()) => self.key_written(&key).await,
                 Err(err) => {
                     log::error!("SetTtl failed for {key}: {err:?}");
@@ -598,6 +604,28 @@ impl EventHandler {
                     }
                 }
             }
+            RedisEvent::ShiftTtl { key, delta_secs } => self.shift_ttl(key, delta_secs).await,
+            RedisEvent::RenameKey {
+                from,
+                to,
+                overwrite,
+            } => self.rename_key(from, to, overwrite).await,
+            RedisEvent::CopyKey {
+                from,
+                to,
+                db,
+                overwrite,
+            } => self.copy_key(from, to, db, overwrite).await,
+            RedisEvent::RenameField { key, from, to } => {
+                self.rename_item(key, None, from, to).await;
+            }
+            RedisEvent::RenameMember {
+                key,
+                kind,
+                from,
+                to,
+            } => self.rename_item(key, Some(kind), from, to).await,
+            RedisEvent::DeleteKeys { keys } => self.delete_keys(keys).await,
             RedisEvent::FetchValue => self.fetch_value(),
             RedisEvent::FetchPubSubChannels => match self.storage.pubsub_channels().await {
                 Ok(channels) => {
@@ -902,23 +930,7 @@ impl EventHandler {
     /// Only if that read fails is the sweep restarted, as every write used
     /// to do.
     async fn key_written(&self, key: &str) {
-        match self.storage.fetch_meta(&[key.to_owned()]).await {
-            Ok(rows) => {
-                let mut state = self.state.keyspace_state.lock();
-                match rows.first() {
-                    Some(row) if row.r_type.name() != "none" => state.upsert_key(row),
-                    // Deleted, or the write emptied it (the last element).
-                    _ => {
-                        state.remove_key(key);
-                    }
-                }
-            }
-            Err(err) => {
-                log::warn!("Reading a written key's metadata failed, rescanning: {err}");
-                self.state.keyspace_state.lock().rescan();
-            }
-        }
-        self.action_hook(Action::KeysChanged);
+        self.keys_written(&[key.to_owned()]).await;
     }
 
     /// Load the current keyspace page into `state.keys` and send

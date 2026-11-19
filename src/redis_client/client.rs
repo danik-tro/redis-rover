@@ -8,8 +8,8 @@ use super::bytes::{strings, Raw, Text};
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{
     json_path, ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyValue,
-    LoadedValue, NewKeySpec, RedisInfo, RedisType, ScanSweep, ValuePageInfo, ValueState,
-    JSON_PREVIEW_ITEMS, STRING_PREVIEW_BYTES,
+    LoadedValue, MemberKind, NewKeySpec, RedisInfo, RedisType, ScanSweep, Ttl, ValuePageInfo,
+    ValueState, JSON_PREVIEW_ITEMS, STRING_PREVIEW_BYTES,
 };
 use super::write_cmd;
 
@@ -639,11 +639,22 @@ async fn run_writes(mut manager: ConnectionManager, cmds: Vec<redis::Cmd>) -> Wr
 
 /// The server refuses `EVAL` itself (an ACL without scripting, a proxy
 /// that doesn't know it), as opposed to an error from inside the script.
+/// Managed services that turn scripting off answer `NOSCRIPT` or
+/// `ERR … disabled`.
 fn scripting_refused(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     err.downcast_ref::<redis::RedisError>().is_some_and(|e| {
         let text = e.to_string().to_lowercase();
-        text.contains("noperm") || text.contains("unknown command")
+        text.contains("noperm")
+            || text.contains("unknown command")
+            || text.contains("noscript")
+            || text.contains("disabled")
     })
+}
+
+/// The server doesn't know the command (`COPY` before 6.2, `UNLINK`
+/// before 4.0).
+fn unknown_command(err: &redis::RedisError) -> bool {
+    err.to_string().to_lowercase().contains("unknown command")
 }
 
 /// The LIST write without a script: check the element, then run `cmds` in
@@ -699,15 +710,294 @@ pub async fn delete_key(manager: ConnectionManager, key: &str) -> WriteResult {
     run_writes(manager, write_cmd::delete_key(key)).await
 }
 
-/// Set a key-level TTL in seconds (`EXPIRE`). A non-positive `secs` clears the
-/// TTL instead (`PERSIST`), making the key permanent. TTL is key-level in Redis
-/// and applies to every value type.
+/// Set a key-level TTL (`EXPIRE`; `0` deletes the key) or clear it
+/// (`PERSIST`). TTL is key-level in Redis and applies to every value type.
 ///
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn set_ttl(manager: ConnectionManager, key: &str, secs: i64) -> WriteResult {
-    run_writes(manager, write_cmd::set_ttl(key, secs)).await
+pub async fn set_ttl(manager: ConnectionManager, key: &str, ttl: Ttl) -> WriteResult {
+    run_writes(manager, write_cmd::set_ttl(key, ttl)).await
+}
+
+/// How a rename or copy of a key ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moved {
+    Done,
+    /// The target name is taken and `overwrite` was off: nothing changed.
+    TargetExists,
+}
+
+/// `RENAMENX from to` (`TargetExists` when it answers 0) or `RENAME`.
+///
+/// # Errors
+///
+/// Returns an error if the command fails (`from` is gone, cross-slot).
+pub async fn rename_key(
+    mut manager: ConnectionManager,
+    from: &str,
+    to: &str,
+    overwrite: bool,
+) -> Result<Moved, BoxError> {
+    let cmd = write_cmd::rename_key(from, to, overwrite);
+    if overwrite {
+        let () = cmd.query_async(&mut manager).await?;
+        return Ok(Moved::Done);
+    }
+    let renamed: i64 = cmd.query_async(&mut manager).await?;
+    Ok(if renamed == 1 {
+        Moved::Done
+    } else {
+        Moved::TargetExists
+    })
+}
+
+/// `COPY` answered "unknown command": the server is older than 6.2.
+#[derive(Debug)]
+pub struct CopyUnsupported;
+
+impl std::fmt::Display for CopyUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("COPY is not supported (Redis before 6.2)")
+    }
+}
+
+impl std::error::Error for CopyUnsupported {}
+
+/// `COPY from to [DB n] [REPLACE]`.
+///
+/// # Errors
+///
+/// [`CopyUnsupported`] before Redis 6.2 (copy with [`copy_key_dump`]
+/// instead), or the command's error.
+pub async fn copy_key(
+    mut manager: ConnectionManager,
+    from: &str,
+    to: &str,
+    db: Option<i64>,
+    overwrite: bool,
+) -> Result<Moved, BoxError> {
+    match write_cmd::copy_key(from, to, db, overwrite)
+        .query_async::<i64>(&mut manager)
+        .await
+    {
+        Ok(1) => Ok(Moved::Done),
+        // COPY answers 0 for a taken target, and for a missing source.
+        Ok(_) => {
+            let exists: bool = manager.exists(Raw(from)).await?;
+            if exists {
+                Ok(Moved::TargetExists)
+            } else {
+                Err(format!("{} is gone", super::bytes::shown(from)).into())
+            }
+        }
+        Err(err) if unknown_command(&err) => Err(Box::new(CopyUnsupported)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// A copy before Redis 6.2: `PTTL` + `DUMP from` on `source`, then
+/// `RESTORE to ttl payload [REPLACE]` on `target` (a connection to the
+/// target DB), so the TTL is kept.
+///
+/// # Errors
+///
+/// Returns an error if `from` is gone or a command fails.
+pub async fn copy_key_dump(
+    mut source: ConnectionManager,
+    mut target: ConnectionManager,
+    from: &str,
+    to: &str,
+    overwrite: bool,
+) -> Result<Moved, BoxError> {
+    let mut pipe = redis::pipe();
+    pipe.cmd("PTTL")
+        .arg(Raw(from))
+        .add_command(write_cmd::dump_key(from));
+    let (ttl_ms, payload): (i64, Option<Vec<u8>>) = pipe.query_async(&mut source).await?;
+    let Some(payload) = payload else {
+        return Err(format!("{} is gone", super::bytes::shown(from)).into());
+    };
+    match write_cmd::restore_key(to, ttl_ms, &payload, overwrite)
+        .query_async::<()>(&mut target)
+        .await
+    {
+        Ok(()) => Ok(Moved::Done),
+        Err(err) if err.to_string().contains("BUSYKEY") => Ok(Moved::TargetExists),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// `CLUSTER KEYSLOT` of two names, for the cross-slot guard of a rename /
+/// copy in cluster mode.
+///
+/// # Errors
+///
+/// Returns an error if the command fails.
+pub async fn key_slots(
+    mut manager: ConnectionManager,
+    a: &str,
+    b: &str,
+) -> Result<(i64, i64), BoxError> {
+    let mut pipe = redis::pipe();
+    pipe.cmd("CLUSTER")
+        .arg("KEYSLOT")
+        .arg(Raw(a))
+        .cmd("CLUSTER")
+        .arg("KEYSLOT")
+        .arg(Raw(b));
+    Ok(pipe.query_async(&mut manager).await?)
+}
+
+/// Attempts at a [`shift_ttl`] whose `EXEC` was aborted by a concurrent
+/// change, before giving up.
+const SHIFT_TTL_ATTEMPTS: usize = 3;
+
+/// `WATCH key`, `TTL key`, then `MULTI` / `EXPIRE key (ttl + delta)` /
+/// `EXEC`; an aborted `EXEC` (the key changed meanwhile) is retried.
+/// `manager` must be a connection of its own: `WATCH` applies to the whole
+/// connection. Returns the new TTL.
+///
+/// # Errors
+///
+/// The key is gone or has no TTL, the result would not be positive, the key
+/// kept changing, or a command failed.
+pub async fn shift_ttl(
+    mut manager: ConnectionManager,
+    key: &str,
+    delta_secs: i64,
+) -> Result<i64, BoxError> {
+    let name = super::bytes::shown(key);
+    for _ in 0..SHIFT_TTL_ATTEMPTS {
+        let () = redis::cmd("WATCH")
+            .arg(Raw(key))
+            .query_async(&mut manager)
+            .await?;
+        let ttl: i64 = manager.ttl(Raw(key)).await?;
+        let refuse = match ttl {
+            -2 => Some(format!("{name} is gone")),
+            -1 => Some(format!(
+                "{name} has no TTL to shift: enter a duration without + / -"
+            )),
+            _ if ttl.saturating_add(delta_secs) <= 0 => Some(format!(
+                "{name} would expire at once (TTL {ttl}s {delta_secs:+}s): enter 0 to delete it"
+            )),
+            _ => None,
+        };
+        if let Some(message) = refuse {
+            let () = redis::cmd("UNWATCH").query_async(&mut manager).await?;
+            return Err(message.into());
+        }
+        let new_ttl = ttl.saturating_add(delta_secs);
+        let mut pipe = redis::pipe();
+        pipe.atomic().cmd("EXPIRE").arg(Raw(key)).arg(new_ttl);
+        let reply: redis::Value = pipe.query_async(&mut manager).await?;
+        if !matches!(reply, redis::Value::Nil) {
+            return Ok(new_ttl);
+        }
+    }
+    Err(format!("{name} kept changing, try again").into())
+}
+
+/// How a field / member rename ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renamed {
+    /// In one script, atomically.
+    Script,
+    /// The server refused `EVAL`: plain commands one by one.
+    Unscripted,
+}
+
+/// Rename a HASH field (`kind: None`) or a SET / ZSET member in one script
+/// ([`write_cmd::rename_field`] / [`write_cmd::rename_member`]); where the
+/// server refuses `EVAL`, with plain commands that never overwrite or lose
+/// an element (`HSETNX`, `SADD` answering 0, `ZADD NX`), but not atomically.
+///
+/// # Errors
+///
+/// `to` exists, `from` is gone, or a command fails.
+pub async fn rename_item(
+    mut manager: ConnectionManager,
+    key: &str,
+    kind: Option<MemberKind>,
+    from: &str,
+    to: &str,
+) -> Result<Renamed, BoxError> {
+    let script = match kind {
+        None => write_cmd::rename_field(key, from, to),
+        Some(kind) => write_cmd::rename_member(key, kind, from, to),
+    };
+    match script.query_async::<redis::Value>(&mut manager).await {
+        Ok(_) => return Ok(Renamed::Script),
+        Err(err) if scripting_refused(&err) => {}
+        Err(err) => return Err(err.into()),
+    }
+    let what = if kind.is_none() { "field" } else { "member" };
+    let exists = || -> BoxError { format!("the {what} already exists").into() };
+    let gone = || -> BoxError { format!("the {what} {}", write_cmd::RENAME_SOURCE_GONE).into() };
+    match kind {
+        None => {
+            let value: Option<Vec<u8>> = manager.hget(Raw(key), Raw(from)).await?;
+            let value = value.ok_or_else(gone)?;
+            let set: bool = manager.hset_nx(Raw(key), Raw(to), value).await?;
+            if !set {
+                return Err(exists());
+            }
+            let () = manager.hdel(Raw(key), Raw(from)).await?;
+        }
+        Some(MemberKind::Set) => {
+            let present: bool = manager.sismember(Raw(key), Raw(from)).await?;
+            if !present {
+                return Err(gone());
+            }
+            let added: i64 = manager.sadd(Raw(key), Raw(to)).await?;
+            if added == 0 {
+                return Err(exists());
+            }
+            let () = manager.srem(Raw(key), Raw(from)).await?;
+        }
+        Some(MemberKind::Zset) => {
+            let score: Option<f64> = manager.zscore(Raw(key), Raw(from)).await?;
+            let score = score.ok_or_else(gone)?;
+            let added: i64 = redis::cmd("ZADD")
+                .arg(Raw(key))
+                .arg("NX")
+                .arg(score)
+                .arg(Raw(to))
+                .query_async(&mut manager)
+                .await?;
+            if added == 0 {
+                return Err(exists());
+            }
+            let () = manager.zrem(Raw(key), Raw(from)).await?;
+        }
+    }
+    Ok(Renamed::Unscripted)
+}
+
+/// `UNLINK` the keys, [`write_cmd::DELETE_CHUNK`] per command (`DEL` on a
+/// server before 4.0). Returns how many existed.
+///
+/// # Errors
+///
+/// Returns the first failing chunk's error; earlier chunks stay deleted.
+pub async fn delete_keys(mut manager: ConnectionManager, keys: &[String]) -> Result<u64, BoxError> {
+    let mut removed = 0;
+    let mut cmds = write_cmd::delete_keys(keys).into_iter().peekable();
+    // Only the first chunk can find `UNLINK` missing; then all go as `DEL`.
+    if let Some(first) = cmds.next() {
+        match first.query_async::<u64>(&mut manager).await {
+            Ok(n) => removed += n,
+            Err(err) if unknown_command(&err) => {
+                cmds = write_cmd::delete_keys_del(keys).into_iter().peekable();
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    for cmd in cmds {
+        removed += cmd.query_async::<u64>(&mut manager).await?;
+    }
+    Ok(removed)
 }
 
 /// Return whether a key already exists (`EXISTS`). Used to guard key creation so

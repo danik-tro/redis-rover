@@ -131,6 +131,18 @@ pub enum Action {
         channel: String,
         receivers: i64,
     },
+    /// A rename / copy found `to` taken and changed nothing: the App asks
+    /// whether to replace it. `db`: a copy's target DB, `None` = this one.
+    TargetExists {
+        from: String,
+        to: String,
+        db: Option<i64>,
+        copy: bool,
+    },
+    /// A bulk delete removed this many keys.
+    KeysDeleted(u64),
+    /// Something the user should know that is not an error (a toast).
+    Notice(String),
 }
 
 impl Action {
