@@ -13,7 +13,7 @@ use ratatui_textarea::TextArea;
 use crate::redis_client::{
     bytes::is_binary,
     escape::printable,
-    types::{ItemDelete, ItemEdit, KeyItem, KeyValue, RedisType},
+    types::{ItemDelete, ItemEdit, KeyItem, KeyValue, MemberKind, RedisType},
 };
 use crate::utils::{parse_ttl, TtlInput};
 
@@ -307,6 +307,41 @@ impl KeySpace {
         });
     }
 
+    /// Open the rename input for the selected hash field or set / zset
+    /// member of `key`, seeded with its name. A list element has no name,
+    /// so it gets a notice instead.
+    pub fn open_rename_item(&mut self, key: String) {
+        let (kind, from) = match self.selected_element() {
+            Some(SelectedElement::HashField { field, .. }) => (None, field),
+            Some(SelectedElement::SetMember(member)) => (Some(MemberKind::Set), member),
+            Some(SelectedElement::ZsetMember { member, .. }) => (Some(MemberKind::Zset), member),
+            Some(SelectedElement::ListIndex { .. }) | None => {
+                self.show_notice("Rename works on hash fields and set / zset members.");
+                return;
+            }
+        };
+        let title = if kind.is_none() {
+            " Rename field "
+        } else {
+            " Rename member "
+        };
+        let Some(mut text_area) = name_input(&from, title) else {
+            self.show_notice(
+                "This name has hidden or binary characters: rename it with redis-cli.",
+            );
+            return;
+        };
+        set_input_titles(
+            &mut text_area,
+            title,
+            hint_line("Enter: preview   Esc: cancel"),
+        );
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::RenameItem { key, kind, from },
+            text_area: Some(text_area),
+        });
+    }
+
     /// Open the copy input for key `from`, seeded with its name; `Tab`
     /// picks the target DB ([`Self::set_copy_db`]).
     pub fn open_copy_key(&mut self, from: String) {
@@ -453,6 +488,15 @@ impl KeySpace {
             OverlayKind::CopyKey { from, db } => {
                 let to = overlay.text_area.as_ref().map(input_text)?;
                 Some(OverlayRequest::Copy { from, to, db })
+            }
+            OverlayKind::RenameItem { key, kind, from } => {
+                let to = overlay.text_area.as_ref().map(input_text)?;
+                Some(OverlayRequest::RenameItem {
+                    key,
+                    kind,
+                    from,
+                    to,
+                })
             }
             // A TTL was parsed above while it was still open.
             OverlayKind::SetTtl | OverlayKind::Notice(_) => None,
@@ -704,6 +748,13 @@ pub enum OverlayRequest {
         from: String,
         to: String,
         db: Option<i64>,
+    },
+    /// Rename field / member `from` of `key` to `to`.
+    RenameItem {
+        key: String,
+        kind: Option<MemberKind>,
+        from: String,
+        to: String,
     },
 }
 

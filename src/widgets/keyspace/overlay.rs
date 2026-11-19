@@ -125,7 +125,8 @@ impl KeySpaceWidget {
             OverlayKind::EditValue
             | OverlayKind::SetTtl
             | OverlayKind::RenameKey { .. }
-            | OverlayKind::CopyKey { .. } => return,
+            | OverlayKind::CopyKey { .. }
+            | OverlayKind::RenameItem { .. } => return,
         };
 
         let block = Block::default()
