@@ -85,6 +85,24 @@ First public release. Requires Rust 1.97 or newer.
   key again. A deleted or expired key stays on screen, dimmed, with `key deleted ·
   HH:MM:SS`, and the cursor stays. `live.mode` (`auto`, `tracking`, `poll`, `off`) picks
   the mode or turns it off, and `--probe` reports what the server supports.
+- Power edits, each previewed like every write:
+  - Rename a key (`F2`): `RENAMENX`, keeping the TTL. A name that is taken is asked
+    about again, naming the key it would replace, before `RENAME` overwrites it (on
+    `prod` that name is typed).
+  - Copy a key (`c`, `Tab` picks the target DB): `COPY … [DB n]` on Redis 6.2+, `DUMP` +
+    `RESTORE` with the TTL before that. A taken name is asked about like a rename.
+  - TTL as a duration: `90`, `90s`, `15m`, `2h30m`, `1d`, `+10m` / `-5m` (shift the
+    current TTL, read under `WATCH`), `persist`. `0` says it deletes the key first.
+  - Rename a hash field or a set / zset member (`F2` inside the value), keeping a zset
+    score, in one script that refuses a name already there. Where `EVAL` is refused, plain
+    commands that never overwrite run instead, with a warning.
+  - Mark keys (`Space`, `Shift-m` for the page, `Shift-u` clears; `●` on the rows, `N
+    marked` in the title) and delete them together with `d`: `UNLINK` in chunks of 500,
+    the preview lists ten and `…and N more`, and `prod` asks for the count to be typed.
+  - Edit a string in `$VISUAL` / `$EDITOR` / `vi` (`Shift-e`): a private temp file that is
+    removed on every way out, then the `SET` preview with the size change. Up to 10 MiB.
+  - A rename or copy across cluster slots is refused up front.
+- Undo / redo in every text input (`Ctrl-U` / `Ctrl-R`), listed in the help.
 - `--print-target` prints the resolved target and where each setting came from (password
   masked), without connecting. `--probe` connects and reports PING, server version, role,
   cluster and RESP3 support. A pre-6.0 server reports `RESP3: no` and still exits 0.
@@ -104,6 +122,10 @@ First public release. Requires Rust 1.97 or newer.
   all and the metadata backfill get six times that, at least 30 s) and
   `connect_timeout_ms` (5 s).
 - The write preview of a STRING edit shows `SET … "KEEPTTL"`.
+- The TTL popup takes durations (see Added); an empty or unreadable TTL no longer
+  removes the TTL, it says what it accepts. `0` now means `EXPIRE … 0`, and `persist`
+  removes the TTL.
+- The help shows function keys as `F2` instead of `F(2)`.
 - A write of several commands runs in one `MULTI` / `EXEC`, and the preview shows it. A
   LIST element is edited or deleted by a short script (`EVAL`) that first checks the
   element is still the one shown; without scripting (an ACL) the check is a separate
