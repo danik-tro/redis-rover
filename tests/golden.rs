@@ -24,12 +24,12 @@ use ratatui::{
     widgets::{StatefulWidget, Widget},
 };
 use redis_rover::internals::{
-    render_help, render_typed_confirm, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget,
-    Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField,
-    JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness,
-    LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub, PubSubWidget,
-    RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast, ToastWidget,
-    TypeFilter, ValuePageInfo,
+    render_help, render_typed_confirm, render_typed_count, Clock, ConfirmPopup, ConnStatus,
+    Dashboard, DashboardWidget, Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget,
+    ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue,
+    Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub,
+    PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast,
+    ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -804,4 +804,77 @@ fn help_keyspace() {
     let mut buf = buffer(120, 40);
     render_help(buf.area, &mut buf, Mode::KeySpace);
     check("help_keyspace", &buf);
+}
+
+// ---- Power edits (sol 08) -------------------------------------------------
+
+/// `F2` on `session:7f3a9c`: its name in the input, cursor at the end.
+#[test]
+fn rename_input() {
+    init();
+    for (name, w) in [("rename_input_80", 80), ("rename_input_120", 120)] {
+        let mut keyspace = keyspace(key_rows(), page(10, 10, None));
+        assert!(keyspace.select_key_by_name("session:7f3a9c"));
+        keyspace.open_rename_key("session:7f3a9c".into());
+        check(name, &draw_keyspace(&mut keyspace, w, 20));
+    }
+}
+
+/// AC2: the name is taken; the second preview names the key it replaces.
+#[test]
+fn rename_overwrite_warning() {
+    init();
+    let event = RedisEvent::RenameKey {
+        from: "user:1".into(),
+        to: "user:9".into(),
+        overwrite: true,
+    };
+    let lines = event.preview();
+    let notes = event.preview_notes();
+    let mut buf = buffer(80, 24);
+    ConfirmPopup::write_preview(&lines, Environment::Staging)
+        .warning(Some("user:9 already exists: this replaces it"))
+        .notes(&notes)
+        .render(buf.area, &mut buf);
+    check("rename_overwrite_80", &buf);
+}
+
+/// Three marked keys: `●` on their rows, the count in the title.
+#[test]
+fn marked_rows() {
+    init();
+    for (name, w) in [("marked_rows_80", 80), ("marked_rows_120", 120)] {
+        let mut keyspace = keyspace(key_rows(), page(10, 10, None));
+        for key in ["user:1001", "session:7f3a9c", "cache:page:/home"] {
+            assert!(keyspace.select_key_by_name(key));
+            assert!(keyspace.toggle_mark());
+        }
+        assert!(keyspace.select_key_by_name("queue:jobs"));
+        check(name, &draw_keyspace(&mut keyspace, w, 20));
+    }
+}
+
+/// AC7: 47 marked keys on Staging (ten listed, `…and 37 more`), and on
+/// Prod with the count to type.
+#[test]
+fn bulk_delete_preview() {
+    init();
+    let keys: Vec<String> = (1..=47).map(|i| format!("cart:{i:04}")).collect();
+    let lines = RedisEvent::DeleteKeys { keys }.preview();
+    let mut buf = buffer(80, 24);
+    ConfirmPopup::write_preview(&lines, Environment::Staging)
+        .warning(Some("deletes 47 marked keys"))
+        .render(buf.area, &mut buf);
+    check("bulk_delete_80", &buf);
+
+    let mut buf = buffer(80, 30);
+    render_typed_count(
+        buf.area,
+        &mut buf,
+        &lines,
+        "deletes 47 marked keys",
+        "47",
+        "4",
+    );
+    check("bulk_delete_prod_80", &buf);
 }

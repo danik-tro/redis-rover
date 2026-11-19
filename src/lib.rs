@@ -174,6 +174,31 @@ pub mod internals {
         .render(area, buf);
     }
 
+    /// The bulk delete's typed confirm on Prod (the count), with its
+    /// warning, as the App draws it.
+    pub fn render_typed_count(
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        lines: &[String],
+        warning: &str,
+        count: &str,
+        typed: &str,
+    ) {
+        use ratatui::widgets::Widget;
+        let mut input = crate::widgets::confirm::typed_input_titled("Type the count", count);
+        input.insert_str(typed);
+        let text = crate::widgets::confirm::TypedText {
+            expected: count,
+            action: "delete",
+            object: "them",
+            what: "the count",
+        };
+        ConfirmPopup::write_preview(lines, Environment::Prod)
+            .warning(Some(warning))
+            .typed_confirm(&text, &input, typed == count)
+            .render(area, buf);
+    }
+
     /// The `?` help overlay for `mode`, as the App draws it.
     pub fn render_help(area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, mode: Mode) {
         crate::app::App::render_help_overlay(area, buf, mode);
