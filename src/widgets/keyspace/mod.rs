@@ -2,6 +2,7 @@ mod format;
 mod forms;
 mod input;
 mod live;
+mod marks;
 mod overlay;
 mod render;
 mod state;
@@ -21,6 +22,8 @@ use forms::{
     NewKeyDraft, NewKeyStep, NewKind, OverlayKind,
 };
 use state::{Focus, KeySpaceMode, KeySpacePopupMode, SelectedElement};
+
+use std::collections::HashSet;
 
 use crossterm::event::KeyEvent;
 use ratatui::widgets::TableState;
@@ -84,6 +87,9 @@ pub struct KeySpace {
     load_progress: Option<LoadProgress>,
     /// Liveness label, changed rows and a gone key (live updates).
     live: live::LiveView,
+    /// Keys marked for a bulk delete (`Space`), by name: they stay marked
+    /// across pages and filters.
+    marks: HashSet<String>,
 }
 
 /// What the Keys pane's bottom border says while a load runs.
@@ -166,6 +172,7 @@ impl KeySpace {
             tree_rows: None,
             load_progress: None,
             live: live::LiveView::default(),
+            marks: HashSet::new(),
         }
     }
 

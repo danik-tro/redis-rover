@@ -434,6 +434,7 @@ impl KeySpace {
     /// while the new DB loads.
     pub fn clear_for_db_switch(&mut self) {
         self.close_overlay();
+        self.clear_marks();
         self.clear_selected_value();
         self.set_keys(Vec::new());
         self.refresh();

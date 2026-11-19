@@ -179,6 +179,12 @@ impl App {
     /// `d`: delete. From the key list this deletes the whole selected key; while
     /// drilled into a collection value it deletes only the selected element.
     pub(super) fn request_delete_key(&mut self) {
+        if self.keyspace.marked_count() > 0 && !self.keyspace.is_value_focused() {
+            if !self.deny_write() {
+                self.delete_marked();
+            }
+            return;
+        }
         if self.keyspace.selected_key().is_none() || self.deny_write() {
             return;
         }

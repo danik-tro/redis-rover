@@ -2,8 +2,15 @@
 //! [`App::submit_write`]; a taken name comes back as `Action::TargetExists`
 //! and is asked about again ([`App::target_exists`]).
 
-use super::{confirm::AfterWrite, App};
+use std::time::Instant;
+
+use super::{
+    confirm::{AfterWrite, Reselect},
+    App,
+};
 use crate::{
+    action::Action,
+    mode::Mode,
     redis_client::{event::RedisEvent, types::Ttl},
     utils::TtlInput,
     widgets::keyspace::OverlayRequest,
@@ -12,7 +19,7 @@ use crate::{
 impl App {
     /// `F2`: rename the selected key, or inside a hash / set / zset the
     /// selected field / member (routed by focus, like `y`).
-    pub(super) fn request_rename(&mut self) {
+    fn request_rename(&mut self) {
         let Some((key, _)) = self.keyspace.selected_key() else {
             return;
         };
@@ -27,7 +34,7 @@ impl App {
     }
 
     /// `c`: copy the selected key (`Tab` in the input picks the DB).
-    pub(super) fn request_copy_key(&mut self) {
+    fn request_copy_key(&mut self) {
         let Some((key, _)) = self.keyspace.selected_key() else {
             return;
         };
@@ -84,6 +91,67 @@ impl App {
             TtlInput::Shift(delta_secs) => (RedisEvent::ShiftTtl { key, delta_secs }, None),
         };
         self.submit_write_warned(event, after, warning);
+    }
+
+    /// The power edits' actions: the keys that start them, and what the
+    /// runner answers.
+    pub(super) fn power_action(&mut self, action: &Action, now: Instant) {
+        match *action {
+            Action::RequestRename => self.request_rename(),
+            Action::RequestCopyKey => self.request_copy_key(),
+            Action::ToggleMark | Action::MarkAllVisible | Action::ClearMarks => {
+                self.mark(action, now);
+            }
+            Action::KeysDeleted(count) => {
+                self.keyspace.clear_marks();
+                self.toast.show(
+                    format!("{count} key{} deleted", if count == 1 { "" } else { "s" }),
+                    false,
+                    now,
+                );
+            }
+            Action::TargetExists {
+                ref from,
+                ref to,
+                db,
+                copy,
+            } => self.target_exists(from, to, db, copy),
+            _ => {}
+        }
+    }
+
+    /// `Space` / `Shift-m` / `Shift-u` on the key list. `Space` moves on to
+    /// the next key, so a run of keys is marked by holding it.
+    fn mark(&mut self, action: &Action, now: Instant) {
+        if self.mode != Mode::KeySpace || !self.keyspace.is_keys_focused() {
+            return;
+        }
+        match action {
+            Action::ToggleMark => {
+                if self.keyspace.toggle_mark() {
+                    self.scroll_down(now);
+                }
+            }
+            Action::MarkAllVisible => self.keyspace.mark_all_visible(),
+            Action::ClearMarks => self.keyspace.clear_marks(),
+            _ => {}
+        }
+    }
+
+    /// `d` with marked keys: one `DeleteKeys`, always previewed (it says
+    /// how many), the count typed on Prod.
+    pub(super) fn delete_marked(&mut self) {
+        let keys = self.keyspace.marked_keys();
+        let count = keys.len();
+        let warning = format!(
+            "deletes {count} marked key{}",
+            if count == 1 { "" } else { "s" }
+        );
+        let after = AfterWrite {
+            reselect: Reselect::Clear,
+            restore_value_row: None,
+        };
+        self.submit_write_warned(RedisEvent::DeleteKeys { keys }, after, Some(warning));
     }
 
     /// The rename / copy input was confirmed: preview the write. An empty
@@ -510,6 +578,118 @@ mod tests {
         assert!(!app.keyspace.is_input_active());
         assert!(app.keyspace.is_overlay_open(), "the notice");
         assert!(writes(&mut events).is_empty());
+    }
+
+    /// A key list of `names`, the first one selected.
+    fn on_keys(env: Environment, names: &[&str]) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
+        let (app, _, mut events) = app_with_channels();
+        let mut app = app.environment(env);
+        *app.state.keys.lock() = Some(names.iter().map(|n| meta(n)).collect());
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(names[0]));
+        while events.try_recv().is_ok() {}
+        (app, events)
+    }
+
+    /// Space marks and moves down; `d` deletes the marked keys in one
+    /// previewed `DeleteKeys`, and the marks go once it succeeded.
+    #[test]
+    fn marked_keys_are_deleted_together() {
+        let (mut app, mut events) = on_keys(Environment::Staging, &["a", "b", "c"]);
+        press(&mut app, key(KeyCode::Char(' ')));
+        press(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(app.keyspace.marked_keys(), ["a", "b"]);
+        assert_eq!(app.keyspace.selected_key().unwrap().0, "c");
+        // Space again on a marked key unmarks it.
+        press(&mut app, key(KeyCode::Char('k')));
+        press(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(app.keyspace.marked_keys(), ["a"]);
+        press(&mut app, key(KeyCode::Char('k')));
+        press(&mut app, key(KeyCode::Char(' ')));
+
+        press(&mut app, key(KeyCode::Char('d')));
+        let (lines, warning) = preview(&app);
+        assert_eq!(lines, ["UNLINK", r#"  "a""#, r#"  "b""#]);
+        assert_eq!(warning.as_deref(), Some("deletes 2 marked keys"));
+        press(&mut app, key(KeyCode::Char('y')));
+        let sent = writes(&mut events);
+        assert!(
+            matches!(&sent[..], [RedisEvent::DeleteKeys { keys }] if keys == &["a", "b"]),
+            "{sent:?}"
+        );
+        assert_eq!(app.keyspace.marked_count(), 2, "kept until it succeeds");
+        app.update(&Action::KeysDeleted(2));
+        assert_eq!(app.keyspace.marked_count(), 0);
+    }
+
+    /// `Shift-m` marks the page (again: unmarks it), `Shift-u` clears; on
+    /// Prod the count is typed before the delete.
+    #[test]
+    fn mark_all_clear_and_typed_count_on_prod() {
+        use crossterm::event::KeyModifiers;
+        let shift = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+
+        let (mut app, mut events) = on_keys(Environment::Prod, &["a", "b", "c"]);
+        press(&mut app, shift('M'));
+        assert_eq!(app.keyspace.marked_count(), 3);
+        press(&mut app, shift('M'));
+        assert_eq!(app.keyspace.marked_count(), 0);
+        press(&mut app, shift('M'));
+        press(&mut app, shift('U'));
+        assert_eq!(app.keyspace.marked_count(), 0);
+
+        press(&mut app, shift('M'));
+        press(&mut app, key(KeyCode::Char('d')));
+        assert!(app.typed_confirm_open());
+        type_text(&mut app, "2");
+        press(&mut app, key(KeyCode::Enter));
+        assert!(writes(&mut events).is_empty(), "wrong count");
+        press(&mut app, key(KeyCode::Backspace));
+        type_text(&mut app, "3");
+        press(&mut app, key(KeyCode::Enter));
+        assert!(matches!(
+            &writes(&mut events)[..],
+            [RedisEvent::DeleteKeys { keys }] if keys.len() == 3
+        ));
+    }
+
+    /// The table shows `●` on marked rows and the title the count; with
+    /// no marks the rows are drawn as before.
+    #[test]
+    fn marked_rows_show_a_dot_and_the_title_a_count() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+
+        let draw = |app: &mut App| {
+            let area = Rect::new(0, 0, 160, 12);
+            let mut buf = Buffer::empty(area);
+            crate::widgets::keyspace::KeySpaceWidget.render(area, &mut buf, &mut app.keyspace);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (mut app, _events) = on_keys(Environment::Local, &["alpha", "beta"]);
+        let plain = draw(&mut app);
+        assert!(!plain.contains('●') && !plain.contains("marked"));
+        press(&mut app, key(KeyCode::Char(' ')));
+        let marked = draw(&mut app);
+        assert!(marked.contains("Keys · 1 marked"), "{marked}");
+        assert!(marked.contains("● alpha"), "{marked}");
+        assert!(marked.contains("  beta"), "{marked}");
+    }
+
+    /// A DB switch drops the marks: they name keys of the old DB.
+    #[test]
+    fn a_db_switch_clears_the_marks() {
+        let (mut app, _events) = on_keys(Environment::Local, &["a"]);
+        press(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(app.keyspace.marked_count(), 1);
+        app.keyspace.clear_for_db_switch();
+        assert_eq!(app.keyspace.marked_count(), 0);
     }
 
     #[test]
