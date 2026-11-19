@@ -94,8 +94,10 @@ impl App {
                 self.start_full_yank(key, r_type);
                 return;
             }
-            OverlayRequest::Rename { .. } | OverlayRequest::Copy { .. } => {
-                self.submit_move(request);
+            OverlayRequest::Rename { .. }
+            | OverlayRequest::Copy { .. }
+            | OverlayRequest::RenameItem { .. } => {
+                self.submit_move(request, row);
                 return;
             }
             other => other,
@@ -118,7 +120,8 @@ impl App {
             }
             OverlayRequest::Yank { .. }
             | OverlayRequest::Rename { .. }
-            | OverlayRequest::Copy { .. } => return,
+            | OverlayRequest::Copy { .. }
+            | OverlayRequest::RenameItem { .. } => return,
         };
         self.submit_write(event, after);
     }

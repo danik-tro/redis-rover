@@ -11,7 +11,7 @@ use ratatui_textarea::{CursorMove, TextArea};
 
 use crate::{
     config,
-    redis_client::types::{NewKeySpec, RedisType},
+    redis_client::types::{MemberKind, NewKeySpec, RedisType},
     utils::group_thousands,
 };
 
@@ -88,6 +88,13 @@ pub(super) enum OverlayKind {
     /// Copy key `from` to the typed name in `db` (`None`: this DB; `Tab`
     /// picks another).
     CopyKey { from: String, db: Option<i64> },
+    /// The new name of field / member `from` of `key` (`kind: None`: a
+    /// hash field).
+    RenameItem {
+        key: String,
+        kind: Option<MemberKind>,
+        from: String,
+    },
     /// Confirm copying a large value (#27): fetching it whole may be slow.
     ConfirmYank {
         key: String,

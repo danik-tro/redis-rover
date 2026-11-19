@@ -10,7 +10,8 @@ use crate::{
 };
 
 impl App {
-    /// `F2`: rename the selected key.
+    /// `F2`: rename the selected key, or inside a hash / set / zset the
+    /// selected field / member (routed by focus, like `y`).
     pub(super) fn request_rename(&mut self) {
         let Some((key, _)) = self.keyspace.selected_key() else {
             return;
@@ -18,7 +19,11 @@ impl App {
         if self.deny_write() {
             return;
         }
-        self.keyspace.open_rename_key(key);
+        if self.keyspace.is_value_focused() {
+            self.keyspace.open_rename_item(key);
+        } else {
+            self.keyspace.open_rename_key(key);
+        }
     }
 
     /// `c`: copy the selected key (`Tab` in the input picks the DB).
@@ -83,7 +88,7 @@ impl App {
 
     /// The rename / copy input was confirmed: preview the write. An empty
     /// or unchanged name does nothing.
-    pub(super) fn submit_move(&mut self, request: OverlayRequest) {
+    pub(super) fn submit_move(&mut self, request: OverlayRequest, row: usize) {
         let now = self.clock.now();
         let (event, after) = match request {
             OverlayRequest::Rename { from, to } => {
@@ -118,6 +123,28 @@ impl App {
                     to,
                     db,
                     overwrite: false,
+                };
+                (event, after)
+            }
+            OverlayRequest::RenameItem {
+                key,
+                kind,
+                from,
+                to,
+            } => {
+                if to.is_empty() || to == from {
+                    self.toast.show("Same name: nothing to rename", false, now);
+                    return;
+                }
+                let after = AfterWrite::reselect_row(&key, row);
+                let event = match kind {
+                    None => RedisEvent::RenameField { key, from, to },
+                    Some(kind) => RedisEvent::RenameMember {
+                        key,
+                        kind,
+                        from,
+                        to,
+                    },
                 };
                 (event, after)
             }
@@ -394,6 +421,95 @@ mod tests {
             &writes(&mut events)[..],
             [RedisEvent::SetTtl { .. }]
         ));
+    }
+
+    /// An app drilled into the value of `name` (`r_type`, holding `value`).
+    fn in_value(
+        name: &str,
+        r_type: crate::redis_client::types::RedisType,
+        value: crate::redis_client::types::KeyValue,
+    ) -> (App, mpsc::UnboundedReceiver<RedisEvent>) {
+        use crate::redis_client::types::{KeyMeta, KeyValue, LoadedValue, ValuePageInfo};
+        let (mut app, events) = on_key(Environment::Local, name);
+        *app.state.keys.lock() = Some(vec![KeyMeta {
+            key: name.into(),
+            r_type,
+            size: 10,
+            ttl: -1,
+            value: KeyValue::Unknown,
+        }]);
+        app.load_new_keys();
+        assert!(app.keyspace.select_key_by_name(name));
+        app.keyspace.set_selected_value(Some(LoadedValue {
+            value,
+            page: ValuePageInfo {
+                start: 0,
+                len: 1,
+                total: Some(1),
+                has_next: false,
+                has_prev: false,
+            },
+        }));
+        app.keyspace.enter_value();
+        assert!(app.keyspace.is_value_focused());
+        (app, events)
+    }
+
+    /// AC5 / AC6 in the UI: F2 inside a hash renames the field, inside a
+    /// zset the member (the script keeps the score); the cursor stays in
+    /// the value.
+    #[test]
+    fn f2_in_a_value_renames_the_field_or_member() {
+        use crate::redis_client::types::{KeyValue, MemberKind, RedisType};
+
+        let (mut app, mut events) = in_value(
+            "user:1",
+            RedisType::Hash,
+            KeyValue::Hash(vec![("name".into(), "Ada".into())]),
+        );
+        press(&mut app, key(KeyCode::F(2)));
+        assert!(app.keyspace.is_input_active());
+        type_text(&mut app, "_full");
+        press(&mut app, key(KeyCode::Enter));
+        let (lines, _) = preview(&app);
+        assert!(lines[0].starts_with(r#"EVAL "-- rename a hash field"#));
+        press(&mut app, key(KeyCode::Char('y')));
+        let sent = writes(&mut events);
+        assert!(
+            matches!(&sent[..], [RedisEvent::RenameField { from, to, .. }]
+                if from == "name" && to == "name_full"),
+            "{sent:?}"
+        );
+        assert_eq!(app.restore_value_row, Some(0));
+
+        let (mut app, mut events) = in_value(
+            "board",
+            RedisType::Zset,
+            KeyValue::Zset(vec![("ada".into(), 42.0)]),
+        );
+        app.preview = crate::config::PreviewPolicy::Off;
+        press(&mut app, key(KeyCode::F(2)));
+        type_text(&mut app, "_l");
+        press(&mut app, key(KeyCode::Enter));
+        let sent = writes(&mut events);
+        assert!(
+            matches!(&sent[..], [RedisEvent::RenameMember { kind: MemberKind::Zset, to, .. }]
+                if to == "ada_l"),
+            "{sent:?}"
+        );
+    }
+
+    /// A list element has no name: a notice, no input.
+    #[test]
+    fn f2_on_a_list_element_explains() {
+        use crate::redis_client::types::{KeyValue, RedisType};
+
+        let (mut app, mut events) =
+            in_value("q", RedisType::List, KeyValue::List(vec!["a".into()]));
+        press(&mut app, key(KeyCode::F(2)));
+        assert!(!app.keyspace.is_input_active());
+        assert!(app.keyspace.is_overlay_open(), "the notice");
+        assert!(writes(&mut events).is_empty());
     }
 
     #[test]
