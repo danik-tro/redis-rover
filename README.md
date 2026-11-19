@@ -160,9 +160,23 @@ A profile sets it with `environment`. Without one, a loopback host (`localhost`,
 rrover -u rediss://prod-cache:6379 --token --read-only
 ```
 
-In read-only mode every write is refused: add, edit, delete, TTL changes and publish. The UI shows a notice instead of opening the edit form, the footer badge adds `· RO` and hides the write keys, and the background runner rejects any write that still gets through. `prod` and `unknown` servers start read-only. `--read-only` forces it for any server, and `--writable` lifts the default for one run.
+In read-only mode every write is refused: add, edit, delete, TTL changes, rename, copy, bulk delete and publish. The UI shows a notice instead of opening the edit form, the footer badge adds `· RO` and hides the write keys, and the background runner rejects any write that still gets through. `prod` and `unknown` servers start read-only. `--read-only` forces it for any server, and `--writable` lifts the default for one run.
 
 `Shift-r` toggles read-only during the session. On `prod`, turning it off asks first ("Allow writes to PROD?"). The runner's check follows the toggle.
+
+### Power edits
+
+Every one shows its commands first, like any write, and none replaces an existing name without saying so.
+
+- **Rename a key** (`F2`): the name opens for editing. `RENAMENX` keeps the TTL; if the new name is taken, rrover says so and asks again, naming the key it would replace (on `prod` you type that name).
+- **Copy a key** (`c`): type the new name, `Tab` picks another DB. `COPY` on Redis 6.2+, `DUMP` + `RESTORE` (keeping the TTL) before that.
+- **TTL** (`t`): `90`, `90s`, `15m`, `2h30m`, `1d`, `+10m` / `-5m` (shift the current TTL), `persist`. `0` deletes the key, and says so first.
+- **Rename a field or member** (`F2` inside a hash, set or zset): one script, which keeps a zset score and refuses a name that already exists. If the server refuses `EVAL`, plain commands run one by one instead (never overwriting), and rrover warns that it wasn't atomic.
+- **Mark and bulk delete**: `Space` marks a key (and moves on), `Shift-m` marks the page, `Shift-u` clears. Marked rows show `●` and the key list `N marked`; `d` then deletes them all with `UNLINK` (500 per command). On `prod` you type the count.
+- **Edit in `$EDITOR`** (`Shift-e` on a string): opens the value in `$VISUAL`, `$EDITOR` or `vi`, in a temp file only you can read, removed afterwards. The preview shows the `SET` and the size change. Up to 10 MiB.
+- **Undo / redo** in any text input: `Ctrl-U` / `Ctrl-R`.
+
+In cluster mode a rename or copy between two hash slots is refused with a message.
 
 ### Sorting, type filter and tree view
 
@@ -295,7 +309,13 @@ Press `?` in the app for the full list. Defaults:
 | `i` | Add an item to the open collection |
 | `e` | Edit the value, or the selected item |
 | `d` | Delete the key, or the selected item (shows the command first) |
-| `t` | Set TTL |
+| `t` | Set TTL (`90s`, `2h30m`, `+10m`, `persist`) |
+| `F2` | Rename the key, or the selected field / member inside a value |
+| `c` | Copy the key (`Tab` in the input picks the DB) |
+| `Space` | Mark / unmark the key for `d` |
+| `Shift-m` / `Shift-u` | Mark every key on the page / clear the marks |
+| `Shift-e` | Edit a string in `$EDITOR` |
+| `Ctrl-U` / `Ctrl-R` | Undo / redo in a text input |
 | `s` | Switch database |
 | `m` | Open the metrics dashboard |
 | `b` | Open Pub/Sub |
