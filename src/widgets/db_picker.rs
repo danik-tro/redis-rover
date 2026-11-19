@@ -30,12 +30,16 @@ pub struct DbPicker {
     list: ListState,
     /// Digits typed so far, to jump to a DB by number.
     typed: String,
+    /// Another title and Enter label than switching (`None`): a copy's
+    /// target DB.
+    purpose: Option<(&'static str, &'static str)>,
 }
 
 impl DbPicker {
     /// Open the picker on `current`. Lists `0..db_count`, plus any higher DB
     /// that `INFO` reports keys for.
     pub fn open(&mut self, db_count: usize, current: i64, keyspace: &BTreeMap<i64, u64>) {
+        self.purpose = None;
         let count = i64::try_from(db_count).unwrap_or(i64::MAX);
         let mut dbs: Vec<i64> = (0..count).collect();
         dbs.extend(keyspace.keys().filter(|&&db| db >= count));
@@ -69,6 +73,18 @@ impl DbPicker {
             .selected()
             .and_then(|i| self.rows.get(i))
             .map(|(db, _)| *db)
+    }
+
+    /// Show `title` and `Enter {action}` instead of switching DBs, until
+    /// the next [`Self::open`].
+    pub fn set_title(&mut self, title: &'static str, action: &'static str) {
+        self.purpose = Some((title, action));
+    }
+
+    /// Opened by [`Self::set_title`] to choose a DB, not to switch to it.
+    #[must_use]
+    pub fn is_choosing(&self) -> bool {
+        self.purpose.is_some()
     }
 
     /// `j` / `k` / arrows move, digits jump to a DB by number.
@@ -154,8 +170,18 @@ impl StatefulWidget for DbPickerWidget {
             .border_type(BorderType::Rounded)
             .fg(cfg.colors.base04)
             .bg(cfg.colors.base00)
-            .title(" Select database ")
-            .title_bottom(Line::from(" Enter switch · Esc cancel ").centered());
+            .title(
+                state
+                    .purpose
+                    .map_or(" Select database ", |(title, _)| title),
+            )
+            .title_bottom(
+                Line::from(format!(
+                    " Enter {} · Esc cancel ",
+                    state.purpose.map_or("switch", |(_, action)| action)
+                ))
+                .centered(),
+            );
 
         let items = state.rows.iter().map(|(db, keys)| {
             let marker = if *db == state.current { "●" } else { " " };

@@ -1,7 +1,6 @@
 
 
 
-
                                      ╭─────────────────── Help ────────────────────╮
                                      │ Scroll down                         j       │
                                      │ Scroll up                           k       │
@@ -21,6 +20,8 @@
                                      │ Edit value / item (drill in first)  e       │
                                      │ Delete key / item (in value)        d       │
                                      │ Set TTL                             t       │
+                                     │ Rename key / field / member         F2      │
+                                     │ Copy key (Tab: target DB)           c       │
                                      │ Copy value / item                   y       │
                                      │ Copy key name                       Shift-Y │
                                      │ Wrap text value on / off            w       │

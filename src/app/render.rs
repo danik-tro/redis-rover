@@ -50,6 +50,8 @@ const WRITE_COMMANDS: &[Command] = &[
     Command::EditValue,
     Command::DeleteKey,
     Command::SetTtl,
+    Command::Rename,
+    Command::CopyKey,
     Command::PubSubPublish,
 ];
 
@@ -163,6 +165,8 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::EditValue, "Edit value / item (drill in first)"),
     (Command::DeleteKey, "Delete key / item (in value)"),
     (Command::SetTtl, "Set TTL"),
+    (Command::Rename, "Rename key / field / member"),
+    (Command::CopyKey, "Copy key (Tab: target DB)"),
     (Command::YankValue, "Copy value / item"),
     (Command::YankKey, "Copy key name"),
     (Command::ToggleWrap, "Wrap text value on / off"),

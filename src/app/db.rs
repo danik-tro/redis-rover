@@ -32,6 +32,10 @@ impl App {
     pub(super) fn confirm_db_picker(&mut self) {
         let selected = self.db_picker.selected();
         self.db_picker.close();
+        if self.db_picker.is_choosing() {
+            self.confirm_copy_db(selected);
+            return;
+        }
         let Some(db) = selected else {
             return;
         };

@@ -1,12 +1,14 @@
 use super::{
-    build_input_text_area, input_text, ActionOverlay, ActiveField, AddItemDraft, EditItemDraft,
-    FilterPreview, Focus, KeySpace, KeySpaceMode, KeySpacePopupMode, OverlayKind, ScrollOutcome,
-    SelectedElement,
+    build_input_text_area, input_text, set_input_titles, ActionOverlay, ActiveField, AddItemDraft,
+    EditItemDraft, FilterPreview, Focus, KeySpace, KeySpaceMode, KeySpacePopupMode, OverlayKind,
+    ScrollOutcome, SelectedElement,
 };
 
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{style::Stylize, text::Line};
+use ratatui_textarea::TextArea;
 
 use crate::redis_client::{
     bytes::is_binary,
@@ -279,6 +281,71 @@ impl KeySpace {
         });
     }
 
+    /// Open the rename input for key `from`, seeded with its name (cursor
+    /// at the end). Names with hidden characters can't be typed back, so
+    /// they are refused with a notice.
+    pub fn open_rename_key(&mut self, from: String) {
+        let Some(mut text_area) = name_input(&from, " Rename key ") else {
+            self.show_notice(
+                "This name has hidden or binary characters: rename it with redis-cli.",
+            );
+            return;
+        };
+        set_input_titles(
+            &mut text_area,
+            " Rename key ",
+            hint_line("Enter: preview   Esc: cancel"),
+        );
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::RenameKey { from },
+            text_area: Some(text_area),
+        });
+    }
+
+    /// Open the copy input for key `from`, seeded with its name; `Tab`
+    /// picks the target DB ([`Self::set_copy_db`]).
+    pub fn open_copy_key(&mut self, from: String) {
+        let Some(text_area) = name_input(&from, " Copy key ") else {
+            self.show_notice("This name has hidden or binary characters: copy it with redis-cli.");
+            return;
+        };
+        self.action_overlay = Some(ActionOverlay {
+            kind: OverlayKind::CopyKey { from, db: None },
+            text_area: Some(text_area),
+        });
+        self.set_copy_db(None);
+    }
+
+    /// The copy input is open (`Tab` picks the target DB).
+    #[must_use]
+    pub fn is_copy_open(&self) -> bool {
+        matches!(
+            self.action_overlay.as_ref().map(|o| &o.kind),
+            Some(OverlayKind::CopyKey { .. })
+        )
+    }
+
+    /// The copy's target DB (`None`: this one), shown in its title.
+    pub fn set_copy_db(&mut self, target: Option<i64>) {
+        let Some(ActionOverlay {
+            kind: OverlayKind::CopyKey { db, .. },
+            text_area: Some(text_area),
+        }) = self.action_overlay.as_mut()
+        else {
+            return;
+        };
+        *db = target;
+        let title = match target {
+            Some(db) => format!(" Copy key to DB {db} "),
+            None => " Copy key (this DB) ".to_owned(),
+        };
+        set_input_titles(
+            text_area,
+            &title,
+            hint_line("Tab: target DB   Enter: preview   Esc: cancel"),
+        );
+    }
+
     /// Open the value editor. STRING values pre-fill the editor; a truncated
     /// or binary STRING or any other type opens a read-only notice instead,
     /// so a cut-off preview or `�` placeholders are never written back.
@@ -364,6 +431,14 @@ impl KeySpace {
             }
             OverlayKind::ConfirmYank { key, r_type, .. } => {
                 Some(OverlayRequest::Yank { key, r_type })
+            }
+            OverlayKind::RenameKey { from } => {
+                let to = overlay.text_area.as_ref().map(input_text)?;
+                Some(OverlayRequest::Rename { from, to })
+            }
+            OverlayKind::CopyKey { from, db } => {
+                let to = overlay.text_area.as_ref().map(input_text)?;
+                Some(OverlayRequest::Copy { from, to, db })
             }
             OverlayKind::Notice(_) => None,
         }
@@ -604,6 +679,35 @@ pub enum OverlayRequest {
     DeleteItem(ItemDelete),
     SetString(String),
     SetTtl(i64),
+    /// Rename key `from` to `to` (as typed: may be empty or unchanged).
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Copy key `from` to `to` in `db` (`None`: this DB).
+    Copy {
+        from: String,
+        to: String,
+        db: Option<i64>,
+    },
+}
+
+/// A one-line input seeded with `name`, or `None` when the name holds a
+/// character that can't be typed back as itself (a control, format or
+/// non-UTF-8 byte): editing it would write a different name.
+fn name_input(name: &str, title: &str) -> Option<TextArea<'static>> {
+    if name
+        .chars()
+        .any(crate::redis_client::escape::is_hidden_char)
+    {
+        return None;
+    }
+    Some(build_input_text_area(title, "New name", Some(name)))
+}
+
+/// A key hint for an input's bottom border.
+fn hint_line(text: &str) -> Line<'static> {
+    Line::from(format!(" {text} ")).fg(crate::config::get().colors.base04)
 }
 
 #[cfg(test)]

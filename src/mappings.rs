@@ -48,6 +48,8 @@ impl From<Command> for Action {
             Command::ToggleTree => Self::ToggleTree,
             Command::LoadAll => Self::LoadAll,
             Command::GoToOpenKey => Self::GoToOpenKey,
+            Command::Rename => Self::RequestRename,
+            Command::CopyKey => Self::RequestCopyKey,
         }
     }
 }

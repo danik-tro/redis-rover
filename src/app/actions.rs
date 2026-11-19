@@ -137,6 +137,8 @@ impl App {
             Action::RequestEditValue => self.request_edit_value(),
             Action::RequestAddKey => self.request_add_key(),
             Action::RequestAddItem => self.request_add_item(),
+            Action::RequestRename => self.request_rename(),
+            Action::RequestCopyKey => self.request_copy_key(),
             Action::OpenDbPicker => self.open_db_picker(),
             Action::DbSwitched => self.db_switched(),
             Action::OpenKeyChanged {

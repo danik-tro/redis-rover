@@ -78,6 +78,8 @@ pub enum Action {
     RequestEditValue,
     RequestAddKey,
     RequestAddItem,
+    RequestRename,
+    RequestCopyKey,
     ToggleDashboard,
     ToggleMetricsPause,
     ResetMetrics,

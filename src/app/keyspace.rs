@@ -89,10 +89,17 @@ impl App {
             // Notice-only overlay: nothing to do, it's already been dismissed.
             return;
         };
-        if let OverlayRequest::Yank { key, r_type } = request {
-            self.start_full_yank(key, r_type);
-            return;
-        }
+        let request = match request {
+            OverlayRequest::Yank { key, r_type } => {
+                self.start_full_yank(key, r_type);
+                return;
+            }
+            OverlayRequest::Rename { .. } | OverlayRequest::Copy { .. } => {
+                self.submit_move(request);
+                return;
+            }
+            other => other,
+        };
         let Some((key, _)) = self.keyspace.selected_key() else {
             return;
         };
@@ -113,7 +120,9 @@ impl App {
                 };
                 (RedisEvent::SetTtl { key, ttl }, after)
             }
-            OverlayRequest::Yank { .. } => return,
+            OverlayRequest::Yank { .. }
+            | OverlayRequest::Rename { .. }
+            | OverlayRequest::Copy { .. } => return,
         };
         self.submit_write(event, after);
     }

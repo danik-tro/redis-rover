@@ -48,4 +48,8 @@ pub enum Command {
     ToggleTree,
     LoadAll,
     GoToOpenKey,
+    /// Rename the selected key, or the field / member in a hash, set, zset.
+    Rename,
+    /// Copy the selected key, to this DB or another one.
+    CopyKey,
 }
