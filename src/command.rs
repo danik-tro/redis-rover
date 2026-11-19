@@ -52,4 +52,9 @@ pub enum Command {
     Rename,
     /// Copy the selected key, to this DB or another one.
     CopyKey,
+    /// Mark / unmark the selected key for a bulk delete.
+    ToggleMark,
+    /// Mark every key on the page (again: unmark them).
+    MarkAllVisible,
+    ClearMarks,
 }

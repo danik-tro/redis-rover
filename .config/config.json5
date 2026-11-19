@@ -34,6 +34,9 @@
       "<g><o>": "GoToOpenKey",
       "<F2>": "Rename",
       "c": "CopyKey",
+      "<Space>": "ToggleMark",
+      "<Shift-m>": "MarkAllVisible",
+      "<Shift-u>": "ClearMarks",
       "?": "ToggleHelp",
     },
     "Dashboard": {

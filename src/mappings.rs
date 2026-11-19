@@ -50,6 +50,9 @@ impl From<Command> for Action {
             Command::GoToOpenKey => Self::GoToOpenKey,
             Command::Rename => Self::RequestRename,
             Command::CopyKey => Self::RequestCopyKey,
+            Command::ToggleMark => Self::ToggleMark,
+            Command::MarkAllVisible => Self::MarkAllVisible,
+            Command::ClearMarks => Self::ClearMarks,
         }
     }
 }

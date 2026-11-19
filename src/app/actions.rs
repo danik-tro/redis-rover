@@ -104,21 +104,7 @@ impl App {
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(now),
             Action::ScrollUp => self.scroll_up(now),
-            Action::ScrollLeft | Action::ScrollRight => {
-                let right = *action == Action::ScrollRight;
-                if self.mode == Mode::PubSub {
-                    self.pubsub.pan_detail(right);
-                } else if !self.fold_tree(right) {
-                    self.keyspace.pan_text(right);
-                }
-            }
-            Action::ToggleWrap => {
-                if self.mode == Mode::PubSub {
-                    self.pubsub.toggle_detail_wrap();
-                } else {
-                    self.keyspace.toggle_wrap();
-                }
-            }
+            Action::ScrollLeft | Action::ScrollRight | Action::ToggleWrap => self.pan(action),
             Action::YankValue => self.yank_value(),
             Action::YankKey => self.yank_key(),
             Action::YankReady => self.finish_yank(),
@@ -137,8 +123,6 @@ impl App {
             Action::RequestEditValue => self.request_edit_value(),
             Action::RequestAddKey => self.request_add_key(),
             Action::RequestAddItem => self.request_add_item(),
-            Action::RequestRename => self.request_rename(),
-            Action::RequestCopyKey => self.request_copy_key(),
             Action::OpenDbPicker => self.open_db_picker(),
             Action::DbSwitched => self.db_switched(),
             Action::OpenKeyChanged {
@@ -149,7 +133,13 @@ impl App {
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
-            Action::KeysDeleted(_) | Action::TargetExists { .. } => self.write_outcome(action, now),
+            Action::RequestRename
+            | Action::RequestCopyKey
+            | Action::ToggleMark
+            | Action::MarkAllVisible
+            | Action::ClearMarks
+            | Action::KeysDeleted(_)
+            | Action::TargetExists { .. } => self.power_action(action, now),
             Action::FilterMatchCount {
                 ref pattern,
                 count,
@@ -172,21 +162,23 @@ impl App {
         }
     }
 
-    /// What the runner says about a power edit (sol 08).
-    fn write_outcome(&mut self, action: &Action, now: Instant) {
-        match *action {
-            Action::KeysDeleted(count) => self.toast.show(
-                format!("{count} key{} deleted", if count == 1 { "" } else { "s" }),
-                false,
-                now,
-            ),
-            Action::TargetExists {
-                ref from,
-                ref to,
-                db,
-                copy,
-            } => self.target_exists(from, to, db, copy),
-            _ => {}
+    /// `←` / `→` (fold a tree group, else pan text) and `w`, in the open
+    /// value or the Pub/Sub message detail.
+    fn pan(&mut self, action: &Action) {
+        let pubsub = self.mode == Mode::PubSub;
+        if *action == Action::ToggleWrap {
+            if pubsub {
+                self.pubsub.toggle_detail_wrap();
+            } else {
+                self.keyspace.toggle_wrap();
+            }
+            return;
+        }
+        let right = *action == Action::ScrollRight;
+        if pubsub {
+            self.pubsub.pan_detail(right);
+        } else if !self.fold_tree(right) {
+            self.keyspace.pan_text(right);
         }
     }
 

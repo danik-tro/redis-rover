@@ -457,6 +457,9 @@ impl StatefulWidget for KeySpaceWidget {
                         format_count(usize::try_from(checked).unwrap_or(usize::MAX))
                     ),
                     _ if state.loading => " Keys · loading… ".to_owned(),
+                    _ if !state.marks.is_empty() => {
+                        format!(" Keys · {} marked ", format_count(state.marks.len()))
+                    }
                     _ => " Keys ".to_owned(),
                 },
                 !value_focused,
@@ -596,6 +599,8 @@ impl StatefulWidget for KeySpaceWidget {
         // Cell fg beats the row highlight, so the selected row needs a
         // brighter "dim" or `∞` / `—` / size vanish into its background.
         let selected = state.table.selected();
+        // Marks cost nothing while there are none: no lookup per row.
+        let marking = !state.marks.is_empty();
         let rows = state.keys.iter().enumerate().map(|(i, meta)| {
             let tree_row = state.tree_rows.as_ref().and_then(|rows| rows.get(i));
             if let Some(PageRow::Group {
@@ -623,10 +628,18 @@ impl StatefulWidget for KeySpaceWidget {
                     }
                 }));
             }
-            let indent = match tree_row {
+            let mut indent = match tree_row {
                 Some(PageRow::Leaf { depth }) => "  ".repeat(usize::from(*depth) + 1),
                 _ => String::new(),
             };
+            if marking {
+                let mark = if state.marks.contains(&meta.key) {
+                    "● "
+                } else {
+                    "  "
+                };
+                indent.insert_str(0, mark);
+            }
             let dim = if selected == Some(i) {
                 cfg.colors.base05
             } else {
