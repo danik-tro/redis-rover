@@ -15,6 +15,7 @@ use crate::redis_client::{
     escape::printable,
     types::{ItemDelete, ItemEdit, KeyItem, KeyValue, RedisType},
 };
+use crate::utils::{parse_ttl, TtlInput};
 
 impl KeySpace {
     pub fn is_popup(&self) -> bool {
@@ -269,15 +270,19 @@ impl KeySpace {
         });
     }
 
-    /// Open a TTL input prompt (seconds). Empty / non-positive clears the TTL.
+    /// Open the TTL input: a duration ([`parse_ttl`]), `+` / `-` to shift
+    /// the current TTL, `persist` to remove it.
     pub fn open_set_ttl(&mut self) {
+        let mut text_area =
+            build_input_text_area(" TTL ", "90s · 15m · 2h30m · +10m · persist", None);
+        set_input_titles(
+            &mut text_area,
+            " TTL ",
+            hint_line("Enter: preview   Esc: cancel"),
+        );
         self.action_overlay = Some(ActionOverlay {
             kind: OverlayKind::SetTtl,
-            text_area: Some(build_input_text_area(
-                "TTL (seconds, empty = persist)",
-                "Enter seconds",
-                None,
-            )),
+            text_area: Some(text_area),
         });
     }
 
@@ -406,6 +411,25 @@ impl KeySpace {
     /// Resolve the open overlay into a pending write request, consuming the
     /// overlay. Returns `None` for notice-only overlays (nothing to do).
     pub fn take_overlay_request(&mut self) -> Option<OverlayRequest> {
+        // A TTL that doesn't parse keeps the input open, with the reason.
+        if let Some(ActionOverlay {
+            kind: OverlayKind::SetTtl,
+            text_area: Some(text_area),
+        }) = self.action_overlay.as_mut()
+        {
+            match parse_ttl(&input_text(text_area)) {
+                Ok(ttl) => {
+                    self.action_overlay = None;
+                    return Some(OverlayRequest::SetTtl(ttl));
+                }
+                Err(err) => {
+                    let error =
+                        Line::from(format!(" {err} ")).fg(crate::config::get().colors.base08);
+                    set_input_titles(text_area, " TTL ", error);
+                    return None;
+                }
+            }
+        }
         let overlay = self.action_overlay.take()?;
         match overlay.kind {
             OverlayKind::ConfirmDelete => Some(OverlayRequest::Delete),
@@ -419,16 +443,6 @@ impl KeySpace {
                     .map_or_else(String::new, input_text);
                 Some(OverlayRequest::SetString(value))
             }
-            OverlayKind::SetTtl => {
-                let raw = overlay
-                    .text_area
-                    .as_ref()
-                    .map(input_text)
-                    .unwrap_or_default();
-                // Empty or unparsable / non-positive ⇒ clear the TTL (persist).
-                let secs = raw.trim().parse::<i64>().unwrap_or(0);
-                Some(OverlayRequest::SetTtl(secs))
-            }
             OverlayKind::ConfirmYank { key, r_type, .. } => {
                 Some(OverlayRequest::Yank { key, r_type })
             }
@@ -440,7 +454,8 @@ impl KeySpace {
                 let to = overlay.text_area.as_ref().map(input_text)?;
                 Some(OverlayRequest::Copy { from, to, db })
             }
-            OverlayKind::Notice(_) => None,
+            // A TTL was parsed above while it was still open.
+            OverlayKind::SetTtl | OverlayKind::Notice(_) => None,
         }
     }
 
@@ -678,7 +693,7 @@ pub enum OverlayRequest {
     Delete,
     DeleteItem(ItemDelete),
     SetString(String),
-    SetTtl(i64),
+    SetTtl(TtlInput),
     /// Rename key `from` to `to` (as typed: may be empty or unchanged).
     Rename {
         from: String,
