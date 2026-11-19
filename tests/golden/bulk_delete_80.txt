@@ -1,0 +1,21 @@
+
+
+
+                       ╭─────── Run on STAGING? ────────╮
+                       │ ⚠ deletes 47 marked keys       │
+                       │                                │
+                       │ UNLINK                         │
+                       │   "cart:0001"                  │
+                       │   "cart:0002"                  │
+                       │   "cart:0003"                  │
+                       │   "cart:0004"                  │
+                       │   "cart:0005"                  │
+                       │   "cart:0006"                  │
+                       │   "cart:0007"                  │
+                       │   "cart:0008"                  │
+                       │   "cart:0009"                  │
+                       │   "cart:0010"                  │
+                       │   …and 37 more                 │
+                       │                                │
+                       │     y: run   n/Esc: cancel     │
+                       ╰────────────────────────────────╯

@@ -599,8 +599,11 @@ impl StatefulWidget for KeySpaceWidget {
         // Cell fg beats the row highlight, so the selected row needs a
         // brighter "dim" or `∞` / `—` / size vanish into its background.
         let selected = state.table.selected();
-        // Marks cost nothing while there are none: no lookup per row.
+        // Marks cost nothing while there are none: no lookup per row. They
+        // go before the name, or before the type when a narrow pane leaves
+        // the name no room (80 columns).
         let marking = !state.marks.is_empty();
+        let mark_in_type = marking && key_width < 4 && columns.first() == Some(&Column::Type);
         let rows = state.keys.iter().enumerate().map(|(i, meta)| {
             let tree_row = state.tree_rows.as_ref().and_then(|rows| rows.get(i));
             if let Some(PageRow::Group {
@@ -632,13 +635,9 @@ impl StatefulWidget for KeySpaceWidget {
                 Some(PageRow::Leaf { depth }) => "  ".repeat(usize::from(*depth) + 1),
                 _ => String::new(),
             };
-            if marking {
-                let mark = if state.marks.contains(&meta.key) {
-                    "● "
-                } else {
-                    "  "
-                };
-                indent.insert_str(0, mark);
+            let marked = marking && state.marks.contains(&meta.key);
+            if marking && !mark_in_type {
+                indent.insert_str(0, if marked { "● " } else { "  " });
             }
             let dim = if selected == Some(i) {
                 cfg.colors.base05
@@ -653,6 +652,12 @@ impl StatefulWidget for KeySpaceWidget {
             };
             Row::new(columns.iter().map(|column| {
                 match column {
+                    Column::Type if mark_in_type => {
+                        let badge: ratatui::text::Text = (&meta.r_type).into();
+                        let mut spans = vec![Span::raw(if marked { "●" } else { " " })];
+                        spans.extend(badge.lines.into_iter().flat_map(|line| line.spans));
+                        Cell::from(Line::from(spans))
+                    }
                     Column::Type => {
                         let badge: ratatui::text::Text = (&meta.r_type).into();
                         Cell::from(badge)

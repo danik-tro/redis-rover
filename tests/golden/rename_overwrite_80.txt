@@ -1,0 +1,17 @@
+
+
+
+
+
+
+
+
+                  ╭───────────── Run on STAGING? ─────────────╮
+                  │ ⚠ user:9 already exists: this replaces it │
+                  │                                           │
+                  │ RENAME "user:1" "user:9"                  │
+                  │                                           │
+                  │ RENAME keeps the TTL                      │
+                  │                                           │
+                  │          y: run   n/Esc: cancel           │
+                  ╰───────────────────────────────────────────╯
