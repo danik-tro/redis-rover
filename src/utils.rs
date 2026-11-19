@@ -296,6 +296,141 @@ pub fn group_thousands(n: usize) -> String {
     out
 }
 
+/// A TTL as typed in the TTL popup ([`parse_ttl`]).
+// Used by the TTL popup from step 4 of sol 08 on.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlInput {
+    /// Expire in this many seconds; `0` deletes the key.
+    Set(u64),
+    /// Move the current TTL by this many seconds (`+10m`, `-5m`).
+    Shift(i64),
+    /// Remove the TTL (`PERSIST`).
+    Persist,
+}
+
+/// What the TTL popup accepts, for its error message and hint.
+#[allow(dead_code)]
+pub const TTL_HELP: &str = "use 90, 90s, 15m, 2h30m, 1d, +10m, -5m or persist";
+
+/// Parse a TTL: `90` / `90s` (seconds), `15m`, `2h30m`, `1d`, each unit at
+/// most once and from the largest down; a leading `+` / `-` shifts the
+/// current TTL; `persist` removes it.
+///
+/// # Errors
+///
+/// A message naming the accepted forms when `text` is none of them.
+#[allow(dead_code)]
+pub fn parse_ttl(text: &str) -> Result<TtlInput, String> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("persist") {
+        return Ok(TtlInput::Persist);
+    }
+    let bad = || format!("“{text}” is not a TTL: {TTL_HELP}");
+    let (sign, body) = match text.as_bytes().first() {
+        Some(b'+') => (Some(1), &text[1..]),
+        Some(b'-') => (Some(-1), &text[1..]),
+        _ => (None, text),
+    };
+    let secs = parse_duration_secs(body).ok_or_else(bad)?;
+    match sign {
+        None => Ok(TtlInput::Set(secs)),
+        Some(sign) => {
+            let secs = i64::try_from(secs).map_err(|_| bad())?;
+            Ok(TtlInput::Shift(sign * secs))
+        }
+    }
+}
+
+/// Duration units, largest first, with their length in seconds.
+const UNITS: [(u8, u64); 4] = [(b'd', 86_400), (b'h', 3_600), (b'm', 60), (b's', 1)];
+
+#[allow(dead_code)]
+/// `90`, `90s`, `2h30m`, `1d`: units `d h m s` in that order, each once.
+fn parse_duration_secs(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        return text.parse().ok();
+    }
+    let mut total: u64 = 0;
+    let mut next_unit = 0;
+    let mut digits = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_digit() {
+            digits.push(char::from(byte));
+            continue;
+        }
+        let at = UNITS[next_unit..]
+            .iter()
+            .position(|(unit, _)| unit.eq_ignore_ascii_case(&byte))?
+            + next_unit;
+        if digits.is_empty() {
+            return None;
+        }
+        let n: u64 = digits.parse().ok()?;
+        total = total.checked_add(n.checked_mul(UNITS[at].1)?)?;
+        digits.clear();
+        next_unit = at + 1;
+    }
+    // Trailing digits without a unit (`1h30`).
+    digits.is_empty().then_some(total)
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::{parse_ttl, TtlInput};
+
+    #[test]
+    fn accepts_every_documented_form() {
+        for (text, want) in [
+            ("90", TtlInput::Set(90)),
+            ("90s", TtlInput::Set(90)),
+            ("15m", TtlInput::Set(900)),
+            ("2h30m", TtlInput::Set(9_000)),
+            ("1d", TtlInput::Set(86_400)),
+            ("1d2h3m4s", TtlInput::Set(93_784)),
+            (" 2H ", TtlInput::Set(7_200)),
+            ("+10m", TtlInput::Shift(600)),
+            ("-5m", TtlInput::Shift(-300)),
+            ("+30", TtlInput::Shift(30)),
+            ("-1", TtlInput::Shift(-1)),
+            ("persist", TtlInput::Persist),
+            ("PERSIST", TtlInput::Persist),
+            ("0", TtlInput::Set(0)),
+            ("0s", TtlInput::Set(0)),
+        ] {
+            assert_eq!(parse_ttl(text), Ok(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_input_with_the_accepted_forms() {
+        for text in [
+            "",
+            "  ",
+            "5x",
+            "1m1h",
+            "1h1h",
+            "h",
+            "1h30",
+            "+",
+            "-",
+            "+persist",
+            "--5m",
+            "+-5m",
+            "1.5h",
+            "abc",
+            "99999999999999999999",
+            "999999999999999999d",
+        ] {
+            let err = parse_ttl(text).expect_err(text);
+            assert!(err.contains("15m") && err.contains("persist"), "{err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod format_tests {
     use super::*;
