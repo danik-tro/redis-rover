@@ -626,6 +626,7 @@ impl EventHandler {
                 to,
             } => self.rename_item(key, Some(kind), from, to).await,
             RedisEvent::DeleteKeys { keys } => self.delete_keys(keys).await,
+            RedisEvent::ApplyValueEdit { key, edit } => self.apply_value_edit(key, edit).await,
             RedisEvent::FetchValue => self.fetch_value(),
             RedisEvent::FetchPubSubChannels => match self.storage.pubsub_channels().await {
                 Ok(channels) => {

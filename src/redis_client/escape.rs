@@ -28,6 +28,31 @@ pub fn format_cmd(cmd: &Cmd) -> String {
     out
 }
 
+/// [`format_cmd`] showing at most `max_args` arguments after the command
+/// name, then `…(+N more)`: a bulk write's line stays readable.
+#[must_use]
+pub fn format_cmd_brief(cmd: &Cmd, max_args: usize) -> String {
+    let total = cmd.args_iter().count().saturating_sub(1);
+    if total <= max_args {
+        return format_cmd(cmd);
+    }
+    let mut out = String::new();
+    for (i, arg) in cmd.args_iter().take(max_args + 1).enumerate() {
+        let bytes = match arg {
+            Arg::Simple(bytes) => bytes,
+            _ => b"?".as_slice(),
+        };
+        if i == 0 {
+            out.push_str(&String::from_utf8_lossy(bytes));
+        } else {
+            out.push(' ');
+            out.push_str(&quote_arg(bytes));
+        }
+    }
+    let _ = write!(out, " …(+{} more)", total - max_args);
+    out
+}
+
 /// A character that changes how the text around it is drawn without being
 /// visible itself: a control character, a Unicode format character (`Cf`:
 /// bidi overrides and isolates, zero-width space / joiner, soft hyphen,

@@ -3,8 +3,8 @@ use super::{KeySpace, LoadProgress};
 use crate::{
     redis_client::escape::printable,
     redis_client::types::{
-        ItemDelete, JsonPreview, JsonPreviewKind, KeyMeta, KeyValue, KeyspaceState, LoadedValue,
-        Sort,
+        ItemDelete, ItemEdit, JsonPreview, JsonPreviewKind, KeyMeta, KeyValue, KeyspaceState,
+        LoadedValue, Sort,
     },
     widgets::text_view::{TextCache, TextView},
 };
@@ -124,6 +124,60 @@ pub enum ScrollOutcome {
     PastEnd,
     /// `k` on the first row of a value page that has a previous page.
     PastStart,
+}
+
+/// Which part of the selected element `Shift-e` opens in `$EDITOR`, and
+/// how the saved text becomes an item edit: a list element's value (only
+/// while it is still the one shown), a hash field's value, a set member, a
+/// zset member's score.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemSlot {
+    ListIndex { index: usize, expected: String },
+    HashValue { field: String },
+    SetMember { member: String },
+    ZsetScore { member: String },
+}
+
+impl ItemSlot {
+    /// The edit that writes `text`.
+    ///
+    /// # Errors
+    ///
+    /// A zset score that isn't a number (or `inf` / `-inf`), or an empty
+    /// set member.
+    pub fn into_edit(self, text: String) -> Result<ItemEdit, String> {
+        Ok(match self {
+            Self::ListIndex { index, expected } => ItemEdit::ListSet {
+                index,
+                expected,
+                value: text,
+            },
+            Self::HashValue { field } => ItemEdit::HashSet { field, value: text },
+            Self::SetMember { member } => {
+                if text.is_empty() {
+                    return Err("a set member can't be empty".to_owned());
+                }
+                ItemEdit::SetReplace {
+                    old: member,
+                    new: text,
+                }
+            }
+            Self::ZsetScore { member } => {
+                let score = crate::redis_client::value_edit::parse_score(&text)
+                    .ok_or_else(|| format!("{:?} is not a score", text.trim()))?;
+                ItemEdit::ZsetScore { member, score }
+            }
+        })
+    }
+}
+
+/// A score as `$EDITOR` shows it: `42`, `1.5`, `inf`, `-inf`.
+fn score_text(score: f64) -> String {
+    if score.is_infinite() {
+        if score > 0.0 { "inf" } else { "-inf" }.to_owned()
+    } else {
+        score.to_string()
+    }
 }
 
 /// The concrete collection element the value-table cursor points at, resolved
@@ -318,6 +372,25 @@ impl KeySpace {
             | KeyValue::JsonPreview(_)
             | KeyValue::Unknown => None,
         }
+    }
+
+    /// The selected element's text for `$EDITOR`, and where it goes back.
+    #[must_use]
+    pub fn selected_item_for_editor(&self) -> Option<(String, ItemSlot)> {
+        Some(match self.selected_element()? {
+            SelectedElement::ListIndex { index, value } => (
+                value.clone(),
+                ItemSlot::ListIndex {
+                    index,
+                    expected: value,
+                },
+            ),
+            SelectedElement::HashField { field, value } => (value, ItemSlot::HashValue { field }),
+            SelectedElement::SetMember(member) => (member.clone(), ItemSlot::SetMember { member }),
+            SelectedElement::ZsetMember { member, score } => {
+                (score_text(score), ItemSlot::ZsetScore { member })
+            }
+        })
     }
 
     /// The field the cursor is on in a JSON object preview, if value-focused.

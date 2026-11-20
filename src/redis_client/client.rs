@@ -828,6 +828,37 @@ pub async fn copy_key_dump(
     }
 }
 
+/// Apply a collection edited whole in `$EDITOR`: its writes in one
+/// `MULTI`. A list is `DEL` + `RPUSH`; its `PTTL` is read first and put
+/// back with `PEXPIRE` in the same transaction.
+///
+/// # Errors
+///
+/// Returns an error if a command fails (the transaction then wrote
+/// nothing).
+pub async fn apply_value_edit(
+    mut manager: ConnectionManager,
+    key: &str,
+    edit: &super::value_edit::ValueEdit,
+) -> WriteResult {
+    let mut cmds = write_cmd::apply_value_edit(key, edit);
+    if matches!(edit, super::value_edit::ValueEdit::List { items } if !items.is_empty()) {
+        let ttl_ms: i64 = manager.pttl(Raw(key)).await?;
+        if ttl_ms > 0 {
+            let mut pexpire = redis::cmd("PEXPIRE");
+            pexpire.arg(Raw(key)).arg(ttl_ms);
+            cmds.push(pexpire);
+        }
+    }
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    for cmd in cmds {
+        pipe.add_command(cmd).ignore();
+    }
+    let () = pipe.query_async(&mut manager).await?;
+    Ok(())
+}
+
 /// `CLUSTER KEYSLOT` of two names, for the cross-slot guard of a rename /
 /// copy in cluster mode.
 ///

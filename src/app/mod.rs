@@ -109,8 +109,9 @@ pub struct App {
     keyspace: KeySpace,
     dashboard: Dashboard,
     db_picker: DbPicker,
-    /// `Shift-e` fetched this key's value for the editor (`YankReady`).
-    external_edit: Option<String>,
+    /// `Shift-e` fetched this key's value (of this type) for the editor
+    /// (`YankReady`).
+    external_edit: Option<(String, crate::redis_client::types::RedisType)>,
     /// An edit waiting for the event loop, which owns the terminal.
     editor_job: Option<editor::EditorJob>,
     pubsub: PubSub,

@@ -17,7 +17,7 @@
     │ Add new key                           a                 Close popup / overlay                 Esc             │
     │ Add item (in collection)              i                 Toggle read-only                      Shift-R         │
     │ Edit value / item (drill in first)    e                 Toggle this help                      ?               │
-    │ Edit a string in $EDITOR              Shift-E           Quit                                  Ctrl-c          │
+    │ Edit value / item in $EDITOR          Shift-E           Quit                                  Ctrl-c          │
     │ Delete key / item (in value)          d                 Undo / redo in a text input           Ctrl-U / Ctrl-R │
     │ Set TTL                               t                                                                       │
     ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

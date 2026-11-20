@@ -164,7 +164,7 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::AddKey, "Add new key"),
     (Command::AddItem, "Add item (in collection)"),
     (Command::EditValue, "Edit value / item (drill in first)"),
-    (Command::EditExternal, "Edit a string in $EDITOR"),
+    (Command::EditExternal, "Edit value / item in $EDITOR"),
     (Command::DeleteKey, "Delete key / item (in value)"),
     (Command::SetTtl, "Set TTL"),
     (Command::Rename, "Rename key / field / member"),

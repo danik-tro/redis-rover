@@ -9,6 +9,7 @@ use crate::{
         bytes::shown,
         client::{self, CopyUnsupported, Moved, Renamed},
         types::MemberKind,
+        value_edit::ValueEdit,
     },
 };
 
@@ -156,6 +157,24 @@ impl EventHandler {
                 log::error!("Renaming a {what} in {key} failed: {err:?}");
                 self.action_hook(Action::Error(format!(
                     "Failed to rename the {what} in {}: {err}",
+                    shown(&key)
+                )));
+            }
+        }
+    }
+
+    /// A collection edited whole in `$EDITOR`: one `MULTI`, then the value
+    /// and the key's row are fetched again.
+    pub(super) async fn apply_value_edit(&mut self, key: String, edit: ValueEdit) {
+        match client::apply_value_edit(self.storage.manager(), &key, &edit).await {
+            Ok(()) => {
+                self.action_hook(Action::RequestSelectedValue);
+                self.keys_written(&[key]).await;
+            }
+            Err(err) => {
+                log::error!("ApplyValueEdit failed for {key}: {err:?}");
+                self.action_hook(Action::Error(format!(
+                    "Failed to save {}: {err}",
                     shown(&key)
                 )));
             }
