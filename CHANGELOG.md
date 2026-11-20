@@ -99,8 +99,11 @@ First public release. Requires Rust 1.97 or newer.
   - Mark keys (`Space`, `Shift-m` for the page, `Shift-u` clears; `●` on the rows, `N
     marked` in the title) and delete them together with `d`: `UNLINK` in chunks of 500,
     the preview lists ten and `…and N more`, and `prod` asks for the count to be typed.
-  - Edit a string in `$VISUAL` / `$EDITOR` / `vi` (`Shift-e`): a private temp file that is
-    removed on every way out, then the `SET` preview with the size change. Up to 10 MiB.
+  - Edit in `$VISUAL` / `$EDITOR` / `vi` (`Shift-e`), in a private temp file that is
+    removed on every way out, up to 10 MiB: a string value (the `SET` preview shows the
+    size change); a whole hash, list, set or zset as JSON, written back as only what
+    changed in one `MULTI` (a changed list is replaced and keeps its TTL); or, inside a
+    value, the selected list element, hash field value, set member or zset score.
   - A rename or copy across cluster slots is refused up front.
 - Undo / redo in every text input (`Ctrl-U` / `Ctrl-R`), listed in the help.
 - `--print-target` prints the resolved target and where each setting came from (password
@@ -125,7 +128,8 @@ First public release. Requires Rust 1.97 or newer.
 - The TTL popup takes durations (see Added); an empty or unreadable TTL no longer
   removes the TTL, it says what it accepts. `0` now means `EXPIRE … 0`, and `persist`
   removes the TTL.
-- The help shows function keys as `F2` instead of `F(2)`.
+- The help shows function keys as `F2` instead of `F(2)`, flows into columns in a short
+  window, and pages with `n` / `p` when it still doesn't fit.
 - A write of several commands runs in one `MULTI` / `EXEC`, and the preview shows it. A
   LIST element is edited or deleted by a short script (`EVAL`) that first checks the
   element is still the one shown; without scripting (an ACL) the check is a separate
