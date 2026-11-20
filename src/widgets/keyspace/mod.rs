@@ -14,7 +14,7 @@ use format::{format_bytes_u128, format_ttl, format_ttl_detail, value_footer};
 pub(crate) use forms::{build_input_text_area, input_text, set_input_titles};
 pub use input::OverlayRequest;
 pub use render::KeySpaceWidget;
-pub use state::{PageInfo, ScrollOutcome};
+pub use state::{ItemSlot, PageInfo, ScrollOutcome};
 pub use type_menu::{TypeMenu, TypeMenuOutcome};
 
 use forms::{

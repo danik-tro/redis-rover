@@ -16,7 +16,7 @@
                                 │ Add new key                           a               │
                                 │ Add item (in collection)              i               │
                                 │ Edit value / item (drill in first)    e               │
-                                │ Edit a string in $EDITOR              Shift-E         │
+                                │ Edit value / item in $EDITOR          Shift-E         │
                                 │ Delete key / item (in value)          d               │
                                 │ Set TTL                               t               │
                                 │ Rename key / field / member           F2              │

@@ -142,6 +142,7 @@ pub mod internals {
         KeyspaceState, LoadedValue, MemberKind, NewKeySpec, PageRow, RedisInfo, RedisType, Sort,
         SortKey, SweepApply, SweepResult, Ttl, TypeFilter, TypeScan, ValuePageInfo,
     };
+    pub use crate::redis_client::value_edit::{diff, Diff, ValueEdit};
     pub use crate::state::{FrameData, SharedState};
     pub use crate::target::Environment;
     pub use crate::widgets::confirm::ConfirmPopup;

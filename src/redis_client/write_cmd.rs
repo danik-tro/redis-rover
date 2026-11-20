@@ -11,6 +11,7 @@ use redis::Cmd;
 use super::{
     bytes::Raw,
     types::{ItemDelete, ItemEdit, KeyItem, MemberKind, NewKeySpec, Ttl},
+    value_edit::ValueEdit,
 };
 
 /// Sentinel used to delete a LIST element by index (Redis has no
@@ -117,6 +118,61 @@ pub fn delete_keys(keys: &[String]) -> Vec<Cmd> {
             cmd
         })
         .collect()
+}
+
+/// The writes of a collection edited whole in `$EDITOR`, at most
+/// [`DELETE_CHUNK`] elements per command; they run in one `MULTI`. A list
+/// is `DEL` + `RPUSH` (the caller puts its TTL back).
+#[must_use]
+pub fn apply_value_edit(key: &str, edit: &ValueEdit) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    match edit {
+        ValueEdit::Hash { set, del } => {
+            for chunk in set.chunks(DELETE_CHUNK) {
+                let mut cmd = redis::cmd("HSET");
+                cmd.arg(Raw(key));
+                for (field, value) in chunk {
+                    cmd.arg(Raw(field)).arg(Raw(value));
+                }
+                cmds.push(cmd);
+            }
+            cmds.extend(
+                del.chunks(DELETE_CHUNK)
+                    .map(|c| Cmd::hdel(Raw(key), raws(c))),
+            );
+        }
+        ValueEdit::Set { add, remove } => {
+            cmds.extend(
+                add.chunks(DELETE_CHUNK)
+                    .map(|c| Cmd::sadd(Raw(key), raws(c))),
+            );
+            cmds.extend(
+                remove
+                    .chunks(DELETE_CHUNK)
+                    .map(|c| Cmd::srem(Raw(key), raws(c))),
+            );
+        }
+        ValueEdit::Zset { add, remove } => {
+            for chunk in add.chunks(DELETE_CHUNK) {
+                let scored: Vec<(f64, Raw)> = chunk.iter().map(|(m, s)| (*s, Raw(m))).collect();
+                cmds.push(Cmd::zadd_multiple(Raw(key), &scored));
+            }
+            cmds.extend(
+                remove
+                    .chunks(DELETE_CHUNK)
+                    .map(|c| Cmd::zrem(Raw(key), raws(c))),
+            );
+        }
+        ValueEdit::List { items } => {
+            cmds.push(Cmd::del(Raw(key)));
+            cmds.extend(
+                items
+                    .chunks(DELETE_CHUNK)
+                    .map(|c| Cmd::rpush(Raw(key), raws(c))),
+            );
+        }
+    }
+    cmds
 }
 
 /// `DEL k1 k2 …` per chunk, for a server without `UNLINK` (before 4.0).

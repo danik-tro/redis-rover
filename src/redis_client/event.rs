@@ -1,6 +1,7 @@
 use super::{
     escape::format_cmd,
     types::{ItemDelete, ItemEdit, KeyItem, MemberKind, NewKeySpec, RedisType, Ttl},
+    value_edit::ValueEdit,
     write_cmd,
 };
 
@@ -90,6 +91,12 @@ pub enum RedisEvent {
     /// `UNLINK` marked keys, [`write_cmd::DELETE_CHUNK`] per command.
     DeleteKeys {
         keys: Vec<String>,
+    },
+    /// A hash / list / set / zset edited whole in `$EDITOR`: the writes that
+    /// make Redis match it, in one `MULTI` (a list keeps its TTL).
+    ApplyValueEdit {
+        key: String,
+        edit: ValueEdit,
     },
     /// Create a new key from the add-key wizard. Rejected if the key exists.
     CreateKey {
@@ -189,6 +196,11 @@ impl std::fmt::Debug for RedisEvent {
                 bytes(to)
             ),
             Self::DeleteKeys { keys } => write!(f, "DeleteKeys {{ <{} keys> }}", keys.len()),
+            Self::ApplyValueEdit { key, edit } => write!(
+                f,
+                "ApplyValueEdit {{ key: {key:?}, <{} changes> }}",
+                edit.changes()
+            ),
             Self::CreateKey { key, spec } => {
                 let (kind, len) = match spec {
                     NewKeySpec::String(_) => ("String", 1),
@@ -268,7 +280,8 @@ impl RedisEvent {
             | Self::CopyKey { .. }
             | Self::RenameField { .. }
             | Self::RenameMember { .. }
-            | Self::DeleteKeys { .. } => true,
+            | Self::DeleteKeys { .. }
+            | Self::ApplyValueEdit { .. } => true,
         }
     }
 }
@@ -302,6 +315,7 @@ impl RedisEvent {
             Self::SetTtl { ttl, .. } => *ttl == Ttl::Expire(0),
             Self::RenameKey { overwrite, .. } | Self::CopyKey { overwrite, .. } => *overwrite,
             Self::DeleteKey { .. } | Self::DeleteItem { .. } | Self::DeleteKeys { .. } => true,
+            Self::ApplyValueEdit { edit, .. } => edit.removes(),
         }
     }
 
@@ -346,6 +360,7 @@ impl RedisEvent {
             } => vec![write_cmd::rename_member(key, *kind, from, to)],
             Self::ShiftTtl { key, delta_secs } => return shift_ttl_preview(key, *delta_secs),
             Self::DeleteKeys { keys } => return delete_keys_preview(keys),
+            Self::ApplyValueEdit { key, edit } => return value_edit_preview(key, edit),
             Self::CreateKey { key, spec } => write_cmd::create_key(key, spec),
             Self::AddItem { key, item } => write_cmd::add_item(key, item),
             Self::EditItem { key, edit } => write_cmd::edit_item(key, edit),
@@ -387,6 +402,14 @@ impl RedisEvent {
             | Self::SetTtl { .. }
             | Self::ShiftTtl { .. }
             | Self::DeleteKeys { .. } => Vec::new(),
+            Self::ApplyValueEdit { edit, .. } => match edit {
+                ValueEdit::List { .. } => vec![
+                    "the list is replaced whole and keeps its TTL; changes others made since it \
+                     was opened are lost"
+                        .to_owned(),
+                ],
+                _ => vec!["only the elements you changed are written".to_owned()],
+            },
             Self::RenameKey { .. } => vec!["RENAME keeps the TTL".to_owned()],
             Self::CopyKey { .. } => vec![
                 "COPY keeps the TTL; before Redis 6.2: DUMP + RESTORE with the TTL read first"
@@ -427,6 +450,40 @@ fn delete_keys_preview(keys: &[String]) -> Vec<String> {
             write_cmd::DELETE_CHUNK
         ));
     }
+    lines
+}
+
+/// Command lines of a preview before `…and N more commands`.
+const PREVIEW_COMMANDS: usize = 12;
+/// Arguments of one command line shown before `…(+N more)`.
+const PREVIEW_ARGS: usize = 9;
+
+/// The writes of a whole-value edit, each line cut short, inside
+/// `MULTI` / `EXEC`.
+fn value_edit_preview(key: &str, edit: &ValueEdit) -> Vec<String> {
+    use super::escape::format_cmd_brief;
+    let cmds = write_cmd::apply_value_edit(key, edit);
+    let mut lines = vec!["MULTI".to_owned()];
+    lines.extend(
+        cmds.iter()
+            .take(PREVIEW_COMMANDS)
+            .map(|cmd| format_cmd_brief(cmd, PREVIEW_ARGS)),
+    );
+    if cmds.len() > PREVIEW_COMMANDS {
+        lines.push(format!(
+            "…and {} more commands",
+            cmds.len() - PREVIEW_COMMANDS
+        ));
+    }
+    if matches!(edit, ValueEdit::List { .. }) {
+        let mut pexpire = redis::cmd("PEXPIRE");
+        pexpire.arg(super::bytes::Raw(key));
+        lines.push(format!(
+            "{} <PTTL>   (if it had a TTL)",
+            format_cmd(&pexpire)
+        ));
+    }
+    lines.push("EXEC".to_owned());
     lines
 }
 
@@ -886,6 +943,59 @@ mod tests {
         };
         assert!(set.preview()[0].starts_with(r#"EVAL "-- rename a set member"#));
         assert!(member.is_write() && set.is_write());
+    }
+
+    /// A whole-value edit: brief lines in one `MULTI`, a list's TTL line,
+    /// sizes only in `Debug`.
+    #[test]
+    fn a_whole_value_edit_previews_its_transaction() {
+        let hash = RedisEvent::ApplyValueEdit {
+            key: "u".into(),
+            edit: ValueEdit::Hash {
+                set: vec![("name".into(), "s3cr3t".into())],
+                del: vec!["old".into()],
+            },
+        };
+        assert_eq!(
+            hash.preview(),
+            [
+                "MULTI",
+                r#"HSET "u" "name" "s3cr3t""#,
+                r#"HDEL "u" "old""#,
+                "EXEC"
+            ]
+        );
+        assert!(hash.is_write() && hash.is_destructive());
+        assert_eq!(
+            format!("{hash:?}"),
+            r#"ApplyValueEdit { key: "u", <2 changes> }"#
+        );
+
+        let items: Vec<String> = (0..1200).map(|i| format!("i{i}")).collect();
+        let list = RedisEvent::ApplyValueEdit {
+            key: "q".into(),
+            edit: ValueEdit::List { items },
+        };
+        let lines = list.preview();
+        assert_eq!(lines[1], r#"DEL "q""#);
+        assert!(lines[2].starts_with(r#"RPUSH "q" "i0""#));
+        assert!(lines[2].ends_with("…(+492 more)"), "{}", lines[2]);
+        assert_eq!(
+            lines.len(),
+            1 + 1 + 3 + 1 + 1,
+            "MULTI DEL 3×RPUSH PEXPIRE EXEC"
+        );
+        assert!(lines[5].starts_with(r#"PEXPIRE "q" <PTTL>"#));
+        assert!(list.preview_notes()[0].contains("replaced whole"));
+
+        let add_only = RedisEvent::ApplyValueEdit {
+            key: "s".into(),
+            edit: ValueEdit::Set {
+                add: vec!["a".into()],
+                remove: vec![],
+            },
+        };
+        assert!(!add_only.is_destructive());
     }
 
     /// Up to ten keys, then `…and N more`; more than one chunk says so.

@@ -23,9 +23,10 @@ use clap::Parser;
 use redis::AsyncCommands;
 use redis_rover::{
     internals::{
-        text_from_bytes, Action, ConnStatus, EntryKind, ItemDelete, ItemEdit, JsonPreview,
-        JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, MemberKind, NewKeySpec,
-        PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, Ttl, TypeFilter,
+        diff, text_from_bytes, Action, ConnStatus, Diff, EntryKind, ItemDelete, ItemEdit,
+        JsonPreview, JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, MemberKind,
+        NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, Ttl,
+        TypeFilter, ValueEdit,
     },
     Cli,
 };
@@ -1024,6 +1025,12 @@ async fn read_only_rejects_every_write() {
             to: "z".into(),
         },
         RedisEvent::DeleteKeys { keys: keys.clone() },
+        RedisEvent::ApplyValueEdit {
+            key: list.clone(),
+            edit: ValueEdit::List {
+                items: vec!["x".into()],
+            },
+        },
     ];
     for event in writes {
         assert!(event.is_write(), "{event:?} must count as a write");
@@ -3010,5 +3017,90 @@ async fn renames_fall_back_when_scripting_is_refused() {
     assert_eq!(write_done(&mut h, member).await, Action::KeysChanged);
     let score: Option<f64> = admin.zscore(&zset, "ada_l").await.expect("ZSCORE");
     assert_eq!(score, Some(42.0));
+    h.shutdown().await;
+}
+
+/// `Shift-e` on a whole collection: the document `y` copies, edited and
+/// diffed, is written in one transaction; only what changed moves, and a
+/// list keeps its TTL.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn whole_values_edited_as_json_round_trip() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let p = support::prefix("wholeedit");
+    let (hash, list, set, zset) = (
+        format!("{p}h"),
+        format!("{p}l"),
+        format!("{p}s"),
+        format!("{p}z"),
+    );
+    let _: () = admin
+        .hset_multiple(&hash, &[("name", "Ada"), ("email", "a@x")])
+        .await
+        .expect("seed");
+    let _: () = admin.rpush(&list, &["a", "b"]).await.expect("seed");
+    let _: () = admin.expire(&list, 600).await.expect("seed");
+    let _: () = admin.sadd(&set, &["a", "b"]).await.expect("seed");
+    let _: () = admin.zadd(&zset, "ada", 42).await.expect("seed");
+    let mut h = Harness::new(server.client(0), false).await;
+
+    let fetched = |key: &str, r_type: RedisType| RedisEvent::FetchFullValue {
+        key: key.to_owned(),
+        r_type,
+    };
+    for (key, r_type, edited) in [
+        (
+            &hash,
+            RedisType::Hash,
+            r#"{"name": "Ada L", "city": "London"}"#,
+        ),
+        (&list, RedisType::List, r#"["b", "a", "c"]"#),
+        (&set, RedisType::Set, r#"["b", "c"]"#),
+        (
+            &zset,
+            RedisType::Zset,
+            r#"[{"member": "ada", "score": 43}, {"member": "bob", "score": "inf"}]"#,
+        ),
+    ] {
+        h.send(fetched(key, r_type.clone()));
+        h.expect("the whole value", |a| *a == Action::YankReady)
+            .await;
+        let (_, text) = h.state.yank.lock().take().expect("the value");
+        let edit = match diff(&r_type, &text, edited).expect("diffs") {
+            Diff::Changed { edit, .. } => edit,
+            Diff::Same => panic!("{r_type:?}: no change found"),
+        };
+        let done = write_done(
+            &mut h,
+            RedisEvent::ApplyValueEdit {
+                key: key.clone(),
+                edit,
+            },
+        )
+        .await;
+        assert_eq!(done, Action::KeysChanged, "{r_type:?}");
+    }
+
+    let fields: std::collections::HashMap<String, String> =
+        admin.hgetall(&hash).await.expect("HGETALL");
+    assert_eq!(
+        fields,
+        [("name", "Ada L"), ("city", "London")]
+            .map(|(f, v)| (f.to_owned(), v.to_owned()))
+            .into()
+    );
+    let items: Vec<String> = admin.lrange(&list, 0, -1).await.expect("LRANGE");
+    assert_eq!(items, ["b", "a", "c"]);
+    let ttl: i64 = admin.ttl(&list).await.expect("TTL");
+    assert!((590..=600).contains(&ttl), "the list kept its TTL: {ttl}");
+    let mut members: Vec<String> = admin.smembers(&set).await.expect("SMEMBERS");
+    members.sort();
+    assert_eq!(members, ["b", "c"]);
+    let scores: Vec<(String, f64)> = admin.zrange_withscores(&zset, 0, -1).await.expect("ZRANGE");
+    assert_eq!(
+        scores,
+        [("ada".to_owned(), 43.0), ("bob".to_owned(), f64::INFINITY)]
+    );
     h.shutdown().await;
 }
