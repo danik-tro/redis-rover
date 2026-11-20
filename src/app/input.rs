@@ -54,6 +54,10 @@ impl App {
             return self.handle_confirm_key(key);
         }
 
+        if self.page_help(key) {
+            return None;
+        }
+
         // The DB picker is modal: Enter switches, Esc cancels, the rest moves
         // the selection. Global bindings (Ctrl-c) still work.
         if self.db_picker.is_open() {
@@ -166,6 +170,28 @@ impl App {
         }
 
         self.handle_keybindings(key)
+    }
+
+    /// A `?` help too big for the window pages with n / p (or j / k,
+    /// arrows, `PageUp` / `PageDown`). Returns whether `key` turned a page;
+    /// any other key acts as before.
+    fn page_help(&mut self, key: KeyEvent) -> bool {
+        if !self.help_is_open() || self.help_pages < 2 {
+            return false;
+        }
+        let forward = match key.code {
+            KeyCode::Char('n' | 'j') | KeyCode::Down | KeyCode::PageDown => true,
+            KeyCode::Char('p' | 'k') | KeyCode::Up | KeyCode::PageUp => false,
+            _ => return false,
+        };
+        self.help_page = if forward {
+            (self.help_page + 1) % self.help_pages
+        } else {
+            (self.help_page + self.help_pages - 1) % self.help_pages
+        };
+        // Paging keeps it open as long as a fresh `?` would.
+        self.help_opened_at = Some(self.clock.now());
+        true
     }
 
     /// The focused text input, if a paste may go anywhere at all.
@@ -392,6 +418,32 @@ mod tests {
         std::iter::from_fn(|| events.try_recv().ok())
             .filter(RedisEvent::is_write)
             .collect()
+    }
+
+    /// A help too tall for the window pages with `n` / `p` (and wraps);
+    /// the page keys don't scroll the key list underneath.
+    #[test]
+    fn a_help_that_does_not_fit_pages() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+
+        let (mut app, _events) = on_key(Environment::Local, "k");
+        press(&mut app, key(KeyCode::Char('?')));
+        assert!(app.help_is_open());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        crate::app::render::AppWidget.render(area, &mut buf, &mut app);
+        assert_eq!(app.help_pages, 2);
+
+        press(&mut app, key(KeyCode::Char('n')));
+        assert!(app.help_is_open());
+        assert_eq!(app.help_page, 1);
+        press(&mut app, key(KeyCode::Char('n')));
+        assert_eq!(app.help_page, 0, "wraps around");
+        press(&mut app, key(KeyCode::Char('p')));
+        assert_eq!(app.help_page, 1);
+        press(&mut app, key(KeyCode::Char('?')));
+        assert!(!app.help_is_open());
+        assert_eq!(app.keyspace.selected_key().unwrap().0, "k");
     }
 
     /// #67: the same letters delete the key when typed, and do nothing when

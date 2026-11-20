@@ -1,0 +1,24 @@
+            ╭──────────────────────── Help ─────────────────────────╮
+            │ Mark all keys on the page             Shift-M         │
+            │ Clear marks                           Shift-U         │
+            │ Copy value / item                     y               │
+            │ Copy key name                         Shift-Y         │
+            │ Wrap text value on / off              w               │
+            │ Pan text left (wrap off)              Left            │
+            │ Pan text right (wrap off)             Right           │
+            │ Switch database                       s               │
+            │ Open metrics dashboard                m               │
+            │ Open Pub/Sub                          b               │
+            │ Close popup / overlay                 Esc             │
+            │ Toggle read-only                      Shift-R         │
+            │ Toggle this help                      ?               │
+            │ Quit                                  Ctrl-c          │
+            │ Undo / redo in a text input           Ctrl-U / Ctrl-R │
+            │                                                       │
+            │                                                       │
+            │                                                       │
+            │                                                       │
+            │                                                       │
+            │                                                       │
+            │                                                       │
+            ╰────────────────── 2/2 · n / p: page ──────────────────╯

@@ -203,4 +203,14 @@ pub mod internals {
     pub fn render_help(area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, mode: Mode) {
         crate::app::App::render_help_overlay(area, buf, mode);
     }
+
+    /// Page `page` of the `?` help; returns the page count.
+    pub fn render_help_page(
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        mode: Mode,
+        page: usize,
+    ) -> usize {
+        crate::app::App::render_help_page(area, buf, mode, page)
+    }
 }

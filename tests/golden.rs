@@ -24,12 +24,12 @@ use ratatui::{
     widgets::{StatefulWidget, Widget},
 };
 use redis_rover::internals::{
-    render_help, render_typed_confirm, render_typed_count, Clock, ConfirmPopup, ConnStatus,
-    Dashboard, DashboardWidget, Environment, FixedClock, FrameData, Info, InfoSnapshot, InfoWidget,
-    ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue,
-    Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo, PageRow, PubSub,
-    PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey, Target, Toast,
-    ToastWidget, TypeFilter, ValuePageInfo,
+    render_help, render_help_page, render_typed_confirm, render_typed_count, Clock, ConfirmPopup,
+    ConnStatus, Dashboard, DashboardWidget, Environment, FixedClock, FrameData, Info, InfoSnapshot,
+    InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
+    KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo,
+    PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey,
+    Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -804,6 +804,23 @@ fn help_keyspace() {
     let mut buf = buffer(120, 40);
     render_help(buf.area, &mut buf, Mode::KeySpace);
     check("help_keyspace", &buf);
+}
+
+/// A shorter window: two columns at 120; at 80 one column in two pages.
+#[test]
+fn help_keyspace_small() {
+    init();
+    let mut buf = buffer(120, 24);
+    assert_eq!(render_help_page(buf.area, &mut buf, Mode::KeySpace, 0), 1);
+    check("help_keyspace_120x24", &buf);
+    for page in 0..2 {
+        let mut buf = buffer(80, 24);
+        assert_eq!(
+            render_help_page(buf.area, &mut buf, Mode::KeySpace, page),
+            2
+        );
+        check(&format!("help_keyspace_80x24_{}", page + 1), &buf);
+    }
 }
 
 // ---- Power edits (sol 08) -------------------------------------------------
