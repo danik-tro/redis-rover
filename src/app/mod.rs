@@ -62,6 +62,10 @@ pub struct App {
     /// When the `?` help overlay was opened. `None` means it's hidden. The
     /// overlay auto-dismisses after [`HELP_TIMEOUT`] or on the next command.
     help_opened_at: Option<Instant>,
+    /// The `?` help's page, when it doesn't fit the window, and how many
+    /// pages the last frame had.
+    help_page: usize,
+    help_pages: usize,
     /// After a non-destructive edit (value/TTL), the name of the key to keep
     /// selected once the post-write keyspace refresh lands, so the cursor stays
     /// put instead of snapping back to the top.
@@ -215,6 +219,8 @@ impl App {
             previous_mode: None,
             error_message: None,
             help_opened_at: None,
+            help_page: 0,
+            help_pages: 1,
             reselect_key: None,
             restore_value_row: None,
             restore_value_pending: false,

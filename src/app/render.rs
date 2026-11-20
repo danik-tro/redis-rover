@@ -212,6 +212,39 @@ fn help_columns(rows: &[(String, String)]) -> (usize, usize) {
     (label_width, label_width + HELP_GAP + keys_width)
 }
 
+/// Columns between two columns of the `?` help.
+const HELP_COLUMN_GAP: usize = 3;
+
+/// How the `?` help's rows are laid out in the area: as many columns as the
+/// height needs (each `rows` tall, balanced), but no more than fit across.
+/// What still doesn't fit is counted on the bottom border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelpGrid {
+    columns: usize,
+    rows: usize,
+}
+
+impl HelpGrid {
+    fn fit(count: usize, row_width: usize, area: Rect) -> Self {
+        let max_rows = usize::from(area.height.saturating_sub(2)).max(1);
+        let needed = count.div_ceil(max_rows).max(1);
+        // Borders and padding take 4 columns.
+        let room = usize::from(area.width).saturating_sub(4);
+        let across = ((room + HELP_COLUMN_GAP) / (row_width + HELP_COLUMN_GAP)).max(1);
+        let columns = needed.min(across);
+        let rows = if columns == needed {
+            count.div_ceil(columns)
+        } else {
+            max_rows
+        };
+        Self { columns, rows }
+    }
+
+    fn width(self, row_width: usize) -> usize {
+        self.columns * row_width + (self.columns - 1) * HELP_COLUMN_GAP
+    }
+}
+
 impl App {
     pub(super) fn draw(&mut self, tui: &mut tui::Tui) -> Result<()> {
         tui.draw(|frame| {
@@ -354,7 +387,8 @@ impl StatefulWidget for AppWidget {
                 Mode::Popup(_) => state.previous_mode.unwrap_or(Mode::KeySpace),
                 m => m,
             };
-            App::render_help_overlay(area, buf, mode);
+            state.help_pages = App::render_help_page(area, buf, mode, state.help_page);
+            state.help_page = state.help_page.min(state.help_pages.saturating_sub(1));
         }
         state.render_confirm(main, buf);
         // Last: above every mode, popup and overlay.
@@ -446,6 +480,12 @@ impl App {
     /// content — both width and height are derived from the rows — and is
     /// clamped to the available area.
     pub(crate) fn render_help_overlay(area: Rect, buf: &mut Buffer, mode: Mode) {
+        Self::render_help_page(area, buf, mode, 0);
+    }
+
+    /// The `?` help, page `page` of what fits in `area`. Returns how many
+    /// pages there are (1 when everything fits).
+    pub(crate) fn render_help_page(area: Rect, buf: &mut Buffer, mode: Mode, page: usize) -> usize {
         let cfg = config::get();
         let keybindings = &cfg.keybindings;
 
@@ -481,15 +521,19 @@ impl App {
             );
         }
 
-        // "Extend" the box to its content, clamped to the available area:
-        // borders (2) and one column of padding on each side (2).
+        let (label_width, row_width) = help_columns(&rows);
+        let grid = HelpGrid::fit(rows.len(), row_width, area);
+        let per_page = (grid.columns * grid.rows).max(1);
+        let pages = rows.len().div_ceil(per_page).max(1);
+        let page = page.min(pages - 1);
+        let rows = &rows[page * per_page..rows.len().min((page + 1) * per_page)];
         let title = " Help ";
-        let (label_width, content_width) = help_columns(&rows);
-        let inner_width = content_width.max(title.width());
+        let inner_width = grid.width(row_width).max(title.width());
+        // Borders (2) and one column of padding on each side (2).
         let popup_w = u16::try_from(inner_width + 4)
             .unwrap_or(u16::MAX)
             .min(area.width);
-        let popup_h = u16::try_from(rows.len() + 2)
+        let popup_h = u16::try_from(grid.rows + 2)
             .unwrap_or(u16::MAX)
             .min(area.height);
 
@@ -508,7 +552,7 @@ impl App {
         .flex(Flex::Center)
         .areas(popup_area);
 
-        let block = Block::default()
+        let mut block = Block::default()
             .title(title)
             .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
@@ -517,20 +561,84 @@ impl App {
             .bg(cfg.colors.base00)
             .fg(cfg.colors.base05)
             .padding(ratatui::widgets::Padding::horizontal(1));
-
-        let lines: Vec<Line> = rows
-            .iter()
-            .map(|(label, keys)| {
-                let pad = label_width - label.width() + HELP_GAP;
-                Line::from(vec![
-                    Span::raw(format!("{label}{}", " ".repeat(pad))),
-                    Span::styled(keys.clone(), cfg.colors.base04),
-                ])
-            })
-            .collect();
-
+        if pages > 1 {
+            block = block.title_bottom(
+                Line::from(format!(" {}/{pages} · n / p: page ", page + 1))
+                    .fg(cfg.colors.base0a)
+                    .centered(),
+            );
+        }
+        let inner = block.inner(popup_area);
         Clear.render(popup_area, buf);
-        Paragraph::new(lines).block(block).render(popup_area, buf);
+        block.render(popup_area, buf);
+
+        let line = |(label, keys): &(String, String)| {
+            let pad = label_width - label.width() + HELP_GAP;
+            Line::from(vec![
+                Span::raw(format!("{label}{}", " ".repeat(pad))),
+                Span::styled(keys.clone(), cfg.colors.base04),
+            ])
+        };
+        // Column-major: read down the first column, then the next.
+        let step = u16::try_from(row_width + HELP_COLUMN_GAP).unwrap_or(u16::MAX);
+        for (i, chunk) in rows.chunks(grid.rows.max(1)).enumerate() {
+            let x = inner
+                .x
+                .saturating_add(step.saturating_mul(u16::try_from(i).unwrap_or(u16::MAX)));
+            if x >= inner.right() {
+                break;
+            }
+            let column = Rect {
+                x,
+                width: (inner.right() - x).min(u16::try_from(row_width).unwrap_or(u16::MAX)),
+                ..inner
+            };
+            Paragraph::new(chunk.iter().map(line).collect::<Vec<_>>()).render(column, buf);
+        }
+        pages
+    }
+}
+
+#[cfg(test)]
+mod help_grid_tests {
+    use super::HelpGrid;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn rows_flow_into_as_many_columns_as_fit() {
+        let area = |w, h| Rect::new(0, 0, w, h);
+        // Tall enough: one column.
+        assert_eq!(
+            HelpGrid::fit(37, 50, area(120, 40)),
+            HelpGrid {
+                columns: 1,
+                rows: 37
+            }
+        );
+        // 22 rows of room: two balanced columns of 19.
+        assert_eq!(
+            HelpGrid::fit(37, 50, area(120, 24)),
+            HelpGrid {
+                columns: 2,
+                rows: 19
+            }
+        );
+        // Two don't fit across 80: one full column, the rest counted.
+        assert_eq!(
+            HelpGrid::fit(37, 50, area(80, 24)),
+            HelpGrid {
+                columns: 1,
+                rows: 22
+            }
+        );
+        // Very wide and short: three columns.
+        assert_eq!(
+            HelpGrid::fit(37, 50, area(200, 16)),
+            HelpGrid {
+                columns: 3,
+                rows: 13
+            }
+        );
     }
 }
 

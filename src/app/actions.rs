@@ -240,6 +240,7 @@ impl App {
     }
 
     pub(super) fn toggle_help(&mut self, now: Instant) {
+        self.help_page = 0;
         self.help_opened_at = if self.help_opened_at.is_some() {
             None
         } else {

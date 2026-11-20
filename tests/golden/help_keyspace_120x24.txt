@@ -1,0 +1,23 @@
+
+
+    ╭──────────────────────────────────────────────────── Help ─────────────────────────────────────────────────────╮
+    │ Scroll down                           j                 Rename key / field / member           F2              │
+    │ Scroll up                             k                 Copy key (Tab: target DB)             c               │
+    │ Next page (keys or open value)        n                 Mark / unmark key (d deletes marked)  Space           │
+    │ Previous page (keys or open value)    p                 Mark all keys on the page             Shift-M         │
+    │ Refresh keyspace                      r                 Clear marks                           Shift-U         │
+    │ Set filter pattern                    f                 Copy value / item                     y               │
+    │ Delete filter pattern                 l                 Copy key name                         Shift-Y         │
+    │ Sort by key / type / TTL / size       o                 Wrap text value on / off              w               │
+    │ Show only some types                  Shift-T           Pan text left (wrap off)              Left            │
+    │ Tree view (←/→ fold, Enter opens)     v                 Pan text right (wrap off)             Right           │
+    │ Load all keys (Esc stops)             Shift-A           Switch database                       s               │
+    │ Go to the open key                    g o               Open metrics dashboard                m               │
+    │ Enter value / JSON field / confirm    Enter             Open Pub/Sub                          b               │
+    │ Add new key                           a                 Close popup / overlay                 Esc             │
+    │ Add item (in collection)              i                 Toggle read-only                      Shift-R         │
+    │ Edit value / item (drill in first)    e                 Toggle this help                      ?               │
+    │ Edit a string in $EDITOR              Shift-E           Quit                                  Ctrl-c          │
+    │ Delete key / item (in value)          d                 Undo / redo in a text input           Ctrl-U / Ctrl-R │
+    │ Set TTL                               t                                                                       │
+    ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
