@@ -173,8 +173,13 @@ Every one shows its commands first, like any write, and none replaces an existin
 - **TTL** (`t`): `90`, `90s`, `15m`, `2h30m`, `1d`, `+10m` / `-5m` (shift the current TTL), `persist`. `0` deletes the key, and says so first.
 - **Rename a field or member** (`F2` inside a hash, set or zset): one script, which keeps a zset score and refuses a name that already exists. If the server refuses `EVAL`, plain commands run one by one instead (never overwriting), and rrover warns that it wasn't atomic.
 - **Mark and bulk delete**: `Space` marks a key (and moves on), `Shift-m` marks the page, `Shift-u` clears. Marked rows show `●` and the key list `N marked`; `d` then deletes them all with `UNLINK` (500 per command). On `prod` you type the count.
-- **Edit in `$EDITOR`** (`Shift-e` on a string): opens the value in `$VISUAL`, `$EDITOR` or `vi`, in a temp file only you can read, removed afterwards. The preview shows the `SET` and the size change. Up to 10 MiB.
+- **Edit in `$EDITOR`** (`Shift-e`): opens it in `$VISUAL`, `$EDITOR` or `vi`, in a temp file only you can read, removed afterwards. Up to 10 MiB.
+  - On a string key: the value; the preview shows the `SET` and the size change.
+  - On a hash, list, set or zset key: the whole value as JSON (what `y` copies: a hash is `{"field": "value"}`, a list or set `["a", "b"]`, a zset `[{"member": "a", "score": 1}]`). On save rrover writes only what you changed (`HSET` / `HDEL`, `SADD` / `SREM`, `ZADD` / `ZREM`) in one `MULTI`; a changed list is replaced whole (`DEL` + `RPUSH`) and keeps its TTL. Emptying it says it deletes the key.
+  - Inside a value: the selected element — a list element, a hash field's value, a set member or a zset score.
 - **Undo / redo** in any text input: `Ctrl-U` / `Ctrl-R`.
+
+The `?` help shows as many columns as the window needs; if it still doesn't fit, `n` / `p` turn its pages.
 
 In cluster mode a rename or copy between two hash slots is refused with a message.
 
@@ -314,7 +319,7 @@ Press `?` in the app for the full list. Defaults:
 | `c` | Copy the key (`Tab` in the input picks the DB) |
 | `Space` | Mark / unmark the key for `d` |
 | `Shift-m` / `Shift-u` | Mark every key on the page / clear the marks |
-| `Shift-e` | Edit a string in `$EDITOR` |
+| `Shift-e` | Edit the value, or the selected item, in `$EDITOR` |
 | `Ctrl-U` / `Ctrl-R` | Undo / redo in a text input |
 | `s` | Switch database |
 | `m` | Open the metrics dashboard |
