@@ -153,17 +153,12 @@ impl KeySpaceWidget {
             return;
         }
 
-        let view_area = match value_footer(loaded, state.value_loading, &state.json_path) {
-            Some(footer) => {
-                let [value_area, footer_area] =
-                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(view_area);
-                Paragraph::new(Line::from(footer).fg(cfg.colors.base03))
-                    .alignment(Alignment::Right)
-                    .render(footer_area, buf);
-                value_area
-            }
-            None => view_area,
-        };
+        let footer = value_footer(loaded, state.value_loading, &state.json_path);
+        if matches!(loaded.value, KeyValue::Stream(_)) {
+            state.render_stream(footer, view_area, buf);
+            return;
+        }
+        let view_area = render_value_footer(footer, view_area, buf);
 
         let mut rows = Rows {
             table: &mut state.value_table,
@@ -353,11 +348,24 @@ impl Column {
 }
 
 /// Selection marker shared by the key and value tables.
-fn highlight_symbol() -> Span<'static> {
+/// `footer` on the last row of `area`; returns the rows above it.
+pub(super) fn render_value_footer(footer: Option<String>, area: Rect, buf: &mut Buffer) -> Rect {
+    let Some(footer) = footer else {
+        return area;
+    };
+    let [value_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    Paragraph::new(Line::from(footer).fg(config::get().colors.base03))
+        .alignment(Alignment::Right)
+        .render(footer_area, buf);
+    value_area
+}
+
+pub(super) fn highlight_symbol() -> Span<'static> {
     Span::from("▌ ").fg(config::get().colors.base0d)
 }
 
-fn selected_row_style() -> Style {
+pub(super) fn selected_row_style() -> Style {
     Style::new().bg(config::get().colors.base02).bold()
 }
 
@@ -370,7 +378,7 @@ fn render_rule(area: Rect, buf: &mut Buffer) {
 
 /// Draws the rule into the blank row a table header leaves via
 /// `bottom_margin(1)`, underlining the header.
-fn render_header_rule(table_area: Rect, buf: &mut Buffer) {
+pub(super) fn render_header_rule(table_area: Rect, buf: &mut Buffer) {
     if table_area.height < 2 {
         return;
     }

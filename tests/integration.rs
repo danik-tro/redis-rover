@@ -3781,3 +3781,60 @@ async fn stream_groups_consumers_and_pending() {
 async fn stream_groups_on_redis_6_0() {
     stream_groups_on("6.0-alpine", false).await;
 }
+
+/// AC6: 10k entries and two groups: the newest page within 200 ms, and both
+/// groups with their pending counts.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stream_of_10k_opens_fast_with_both_groups() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let mut pipe = redis::pipe();
+    for i in 1..=10_000 {
+        pipe.cmd("XADD")
+            .arg("big")
+            .arg(format!("{i}-0"))
+            .arg("n")
+            .arg(i)
+            .arg("payload")
+            .arg("some value")
+            .ignore();
+    }
+    let () = pipe.query_async(&mut admin).await.expect("seed");
+    for group in ["billing", "audit"] {
+        let () = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg("big")
+            .arg(group)
+            .arg("0")
+            .query_async(&mut admin)
+            .await
+            .expect("XGROUP");
+    }
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("audit")
+        .arg("w")
+        .arg("COUNT")
+        .arg(7)
+        .arg("STREAMS")
+        .arg("big")
+        .arg(">")
+        .query_async(&mut admin)
+        .await
+        .expect("XREADGROUP");
+
+    let mut h = Harness::new(server.client(0), true).await;
+    h.state.value_state.lock().select("big", RedisType::Stream);
+    let started = Instant::now();
+    let stream = load_stream(&mut h).await;
+    let took = started.elapsed();
+    eprintln!("newest page of 10k entries in {took:?}");
+    assert!(took < Duration::from_millis(200), "took {took:?}");
+    assert_eq!(stream.length, 10_000);
+    assert_eq!(stream.entries[0].id, "10000-0");
+    let groups = stream.groups.expect("groups");
+    let pending = |name: &str| groups.iter().find(|g| g.name == name).map(|g| g.pending);
+    assert_eq!((pending("billing"), pending("audit")), (Some(0), Some(7)));
+    h.shutdown().await;
+}

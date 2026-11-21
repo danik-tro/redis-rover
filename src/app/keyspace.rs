@@ -146,6 +146,12 @@ impl App {
     /// Enter: focus the value, or, on a field of a JSON preview, open that
     /// field (#49).
     pub(super) fn enter_value(&mut self) {
+        if self.keyspace.is_stream_focused() {
+            if let Some((key, group)) = self.keyspace.open_stream_row() {
+                self.send_redis_event(RedisEvent::FetchStreamGroup { key, group });
+            }
+            return;
+        }
         let Some(field) = self.keyspace.selected_json_field() else {
             self.keyspace.enter_value();
             return;
@@ -318,7 +324,7 @@ impl App {
     /// `row` once it lands. Ignored while a page is already loading, so holding
     /// `j` can't skip pages the user never saw.
     fn turn_value_page(&mut self, forward: bool, row: usize) {
-        if self.keyspace.is_value_loading() {
+        if self.keyspace.is_value_loading() || self.keyspace.stream_blocks_paging() {
             return;
         }
         let moved = {

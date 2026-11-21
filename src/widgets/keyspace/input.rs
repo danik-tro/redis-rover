@@ -105,7 +105,13 @@ impl KeySpace {
                 self.scroll_to(next);
                 ScrollOutcome::Moved
             }
-            Focus::Value => self.scroll_value(true),
+            Focus::Value => {
+                if self.scroll_stream_open(true) {
+                    ScrollOutcome::Moved
+                } else {
+                    self.scroll_value(true)
+                }
+            }
             Focus::Text => {
                 self.scroll_text(true, 1);
                 ScrollOutcome::Moved
@@ -125,7 +131,13 @@ impl KeySpace {
                 self.scroll_to(previous);
                 ScrollOutcome::Moved
             }
-            Focus::Value => self.scroll_value(false),
+            Focus::Value => {
+                if self.scroll_stream_open(false) {
+                    ScrollOutcome::Moved
+                } else {
+                    self.scroll_value(false)
+                }
+            }
             Focus::Text => {
                 self.scroll_text(false, 1);
                 ScrollOutcome::Moved
@@ -153,9 +165,11 @@ impl KeySpace {
             self.value_table.select(None);
             return ScrollOutcome::Moved;
         }
+        // The groups table is whole: its cursor never turns the entries page.
         let page = self
             .selected_value
             .as_ref()
+            .filter(|_| !self.stream_blocks_paging())
             .map(|loaded| loaded.page)
             .unwrap_or_default();
         let next = match (self.value_table.selected(), forward) {
@@ -229,6 +243,9 @@ impl KeySpace {
 
     /// Pan the focused text value sideways. Only with wrap off.
     pub fn pan_text(&mut self, right: bool) {
+        if self.pan_stream_open(right) {
+            return;
+        }
         if self.focus == Focus::Text {
             self.text_view.pan(right);
         }
@@ -236,6 +253,9 @@ impl KeySpace {
 
     /// Turn line wrapping of text values on / off.
     pub fn toggle_wrap(&mut self) {
+        if self.wrap_stream_open() {
+            return;
+        }
         self.text_view.toggle_wrap();
     }
 

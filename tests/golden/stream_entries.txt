@@ -1,0 +1,20 @@
+╭ Keys ──────────────────────────────────╮╭ Values · focused ──────────────────────────────────────────────────────────╮
+│ filter *                               ││ Key   events:orders                                                        │
+│ ────────────────────────────────────── ││ Type  stream                                                               │
+│   Type   Key            TTL       Size ││ TTL   No expiry                                                            │
+│ ────────────────────────────────────── ││ Size  8.00 KiB                                                             │
+│   hash   user:1001        ∞      312 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   hash   user:1002        ∞      296 B ││ [Entries 10,000]  Groups 2  last 1700000003000-0                           │
+│   str    session:7…      1h       96 B ││   ID              Time     #   Fields                                      │
+│   list   queue:jobs       ∞   2.00 KiB ││ ────────────────────────────────────────────────────────────────────────── │
+│   set    tags:popu…       ∞      540 B ││ ▌ 1700000003000-0 22:13:23 3   event=paid order=1042 total=19.90           │
+│   zset   leaderboa…      1d   1.17 KiB ││   1700000002000-1 22:13:22 2   event=created doc={"id":1041,"items":2}     │
+│ ▌ stream events:or…       ∞   8.00 KiB ││   1700000001000-0 22:13:21 1   event=created                               │
+│   json   doc:setti…       ∞      420 B ││                                                                            │
+│   str    cache:pag…      2m  14.65 KiB ││                                                                            │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+╰ Page 1 · 1–10 of 10 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯

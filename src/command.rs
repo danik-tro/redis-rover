@@ -87,4 +87,6 @@ pub enum Command {
     SlowlogEnter,
     /// `SLOWLOG RESET`, after its preview.
     SlowlogReset,
+    /// In a stream: entries ↔ consumer groups.
+    StreamTab,
 }

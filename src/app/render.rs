@@ -227,6 +227,7 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::LoadAll, "Load all keys (Esc stops)"),
     (Command::GoToOpenKey, "Go to the open key"),
     (Command::EnterValue, "Enter value / JSON field / confirm"),
+    (Command::StreamTab, "Stream: entries / groups"),
     (Command::AddKey, "Add new key"),
     (Command::AddItem, "Add item (in collection)"),
     (Command::EditValue, "Edit value / item (drill in first)"),

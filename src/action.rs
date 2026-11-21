@@ -181,6 +181,8 @@ pub enum Action {
     SlowlogLoaded,
     /// A consumer group is waiting in `SharedState::stream_group`.
     StreamGroupLoaded,
+    /// `Tab` on a stream: entries ↔ consumer groups.
+    StreamTab,
 }
 
 impl Action {

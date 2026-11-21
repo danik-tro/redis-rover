@@ -1,0 +1,24 @@
+╭ Keys ──────────────────────────────────╮╭ Values · focused ──────────────────────────────────────────────────────────╮
+│ filter *                               ││ Key   events:orders                                                        │
+│ ────────────────────────────────────── ││ Type  stream                                                               │
+│   Type   Key            TTL       Size ││ TTL   No expiry                                                            │
+│ ────────────────────────────────────── ││ Size  8.00 KiB                                                             │
+│   hash   user:1001        ∞      312 B ││ ────────────────────────────────────────────────────────────────────────── │
+│   hash   user:1002        ∞      296 B ││ Entries 10,000  [Groups 2]  last 1700000003000-0                           │
+│   str    session:7…      1h       96 B ││ Group billing                                                              │
+│   list   queue:jobs       ∞   2.00 KiB ││ Consumers (2)                                                              │
+│   set    tags:popu…       ∞      540 B ││ NAME      PENDING      IDLE                                                │
+│   zset   leaderboa…      1d   1.17 KiB ││ worker-1        2     1.50s                                                │
+│ ▌ stream events:or…       ∞   8.00 KiB ││ worker-2        1    90.00s                                                │
+│   json   doc:setti…       ∞      420 B ││                                                                            │
+│   str    cache:pag…      2m  14.65 KiB ││ Pending (first 2)                                                          │
+│   MBblo… bloom:ema…       ∞   1.00 KiB ││ ID               CONSUMER      IDLE  DELIV                                 │
+│                                        ││ 1700000001000-0  worker-1     1.50s      1                                 │
+│                                        ││ 1700000002000-1  worker-2    90.00s      4                                 │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                                                            │
+│                                        ││                                          j/k scroll · w no-wrap · Esc back │
+╰ Page 1 · 1–10 of 10 10/page · cursor 0 ╯╰────────────────────────────────────────────────────────────────────────────╯
