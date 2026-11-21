@@ -25,14 +25,14 @@ use ratatui::{
 };
 use redis_rover::internals::{
     parse_line, render_help, render_help_page, render_monitor_confirm, render_typed_confirm,
-    render_typed_count, Clock, ConfirmPopup, ConnStatus, ConsumerInfo, Dashboard, DashboardWidget,
-    Environment, FixedClock, FrameData, GroupDetail, GroupInfo, Info, InfoSnapshot, InfoWidget,
-    ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue,
-    Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, Monitor, MonitorLimits,
-    MonitorStatus, MonitorStore, MonitorWidget, PageInfo, PageRow, PendingEntry, PubSub,
-    PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Slowlog, SlowlogData,
-    SlowlogEntry, SlowlogWidget, Sort, SortKey, StreamEntry, StreamValue, Target, Toast,
-    ToastWidget, TypeFilter, ValuePageInfo,
+    render_typed_count, Clock, ClusterMetrics, ClusterSummary, ConfirmPopup, ConnStatus,
+    ConsumerInfo, Dashboard, DashboardWidget, Environment, FixedClock, FrameData, GroupDetail,
+    GroupInfo, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind,
+    KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MasterNode,
+    MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore, MonitorWidget,
+    PageInfo, PageRow, PendingEntry, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
+    SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey, StreamEntry,
+    StreamValue, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -868,6 +868,81 @@ fn dashboard_120() {
     let mut buf = buffer(width, height);
     DashboardWidget { frame: &frame }.render(buf.area, &mut buf, &mut dashboard);
     check("dashboard_120", &buf);
+}
+
+/// Three masters, each with its own load, like the info task records them.
+fn cluster_dashboard() -> Dashboard {
+    let mut nodes = ClusterMetrics::new(120);
+    let master = |id: &str, port, slots| MasterNode {
+        id: id.to_owned(),
+        host: "10.0.1.7".to_owned(),
+        port,
+        slots: vec![slots],
+    };
+    let masters = [
+        master("a", 7000, (0, 5460)),
+        master("b", 7001, (5461, 10922)),
+        master("c", 7002, (10923, 16383)),
+    ];
+    nodes.sync(&masters);
+    let t0 = Instant::now();
+    for (load, id) in (1..=3u64).zip(["a", "b", "c"]) {
+        for i in 0..40u64 {
+            let mut s = InfoSnapshot::empty(t0 + Duration::from_secs(i));
+            s.total_commands = Some(i * 100 * load);
+            s.used_memory = Some(load * 4 * 1024 * 1024);
+            s.connected_clients = Some(load + 1);
+            s.total_keys = Some(load * 10_000);
+            s.cluster_enabled = true;
+            nodes.record(id, Some(s));
+        }
+    }
+    // The last master stopped answering.
+    nodes.record("c", None);
+    let summary = ClusterSummary {
+        state_ok: true,
+        known_nodes: 6,
+        size: 3,
+        slots_ok: 16384,
+        slots_pfail: 0,
+        slots_fail: 0,
+    };
+    nodes.set_cluster(Some(&summary));
+    let mut main = history();
+    main.set_cluster(Some(summary));
+    Dashboard::new(Arc::new(Mutex::new(main))).with_nodes(Arc::new(Mutex::new(nodes)))
+}
+
+fn draw_cluster_dashboard(mut dashboard: Dashboard, name: &str, width: u16, height: u16) {
+    let frame = FrameData {
+        metrics: dashboard.live_window(width),
+        cluster_view: dashboard.cluster_view(),
+        ..FrameData::default()
+    };
+    let mut buf = buffer(width, height);
+    DashboardWidget { frame: &frame }.render(buf.area, &mut buf, &mut dashboard);
+    check(name, &buf);
+}
+
+#[test]
+fn cluster_overview_120() {
+    init();
+    draw_cluster_dashboard(cluster_dashboard(), "cluster_overview_120", 120, 20);
+}
+
+#[test]
+fn cluster_overview_80() {
+    init();
+    draw_cluster_dashboard(cluster_dashboard(), "cluster_overview_80", 80, 16);
+}
+
+/// `Tab` from the overview: the first master's charts, picked in the row.
+#[test]
+fn cluster_node_picker_120() {
+    init();
+    let mut dashboard = cluster_dashboard();
+    dashboard.next_node();
+    draw_cluster_dashboard(dashboard, "cluster_node_picker_120", 120, 24);
 }
 
 // ---- Pub/Sub --------------------------------------------------------------
