@@ -1139,7 +1139,7 @@ pub async fn rename_item(
 ///
 /// Returns the first failing chunk's error; earlier chunks stay deleted.
 pub async fn delete_keys(manager: Conn, keys: &[String]) -> Result<u64, BoxError> {
-    if matches!(manager, Conn::Single(_)) {
+    if !manager.is_cluster() {
         return delete_chunks(manager, keys).await;
     }
     // On a cluster one command may only name keys of one slot.

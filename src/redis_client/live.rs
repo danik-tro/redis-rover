@@ -45,6 +45,7 @@ use super::{
     conn::{client_at, Conn},
     pubsub::backoff,
     runner::Link,
+    sentinel::ServerClient,
     types::ValueState,
 };
 use crate::{
@@ -161,7 +162,7 @@ pub enum KeyChange {
 /// The connection opens on the first `Track`.
 /// `value_state` is the App's: polling fingerprints the page it shows.
 pub async fn run(
-    client: redis::Client,
+    client: impl Into<ServerClient>,
     config: LiveConfig,
     value_state: Arc<Mutex<ValueState>>,
     masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
@@ -169,7 +170,7 @@ pub async fn run(
     action_tx: Sender<Action>,
     cancel: CancellationToken,
 ) {
-    let mut task = LiveTask::new(client, config, value_state, masters, action_tx);
+    let mut task = LiveTask::new(client.into(), config, value_state, masters, action_tx);
     loop {
         let retry_at = task.retry.map(|(_, at)| at);
         let poll_at = task.poll.as_ref().and_then(|poll| poll.next_at);
@@ -181,6 +182,7 @@ pub async fn run(
             },
             push = next_push(task.conn.as_mut()) => task.on_push(push).await,
             () = sleep_until(retry_at) => task.reconnect().await,
+            () = task.client.changed() => task.new_master(),
             () = sleep_until(poll_at) => task.poll().await,
             () = sleep_until(notice_at) => task.flush_notice(Instant::now()),
             () = cancel.cancelled() => break,
@@ -212,9 +214,9 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 struct LiveTask {
-    /// The client the app started with; the connection is built from it
-    /// with the tracked key's DB.
-    client: redis::Client,
+    /// The server, or behind Sentinel whichever is the master now; the
+    /// connection is built from it with the tracked key's DB.
+    client: ServerClient,
     config: LiveConfig,
     /// The App's value state: what polling fingerprints.
     value_state: Arc<Mutex<ValueState>>,
@@ -279,13 +281,13 @@ struct View {
 
 impl LiveTask {
     fn new(
-        client: redis::Client,
+        client: ServerClient,
         config: LiveConfig,
         value_state: Arc<Mutex<ValueState>>,
         masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
         action_tx: Sender<Action>,
     ) -> Self {
-        let db = client.get_connection_info().redis_settings().db();
+        let db = client.current().get_connection_info().redis_settings().db();
         Self {
             client,
             config,
@@ -415,7 +417,8 @@ impl LiveTask {
 
     /// A client on `self.db` and, on a cluster, on the open key's master.
     fn db_client(&self) -> redis::RedisResult<redis::Client> {
-        let info = self.client.get_connection_info().clone();
+        let current = self.client.current();
+        let info = current.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(self.db);
         let client = redis::Client::open(info.set_redis_settings(settings))?;
         match self.owner() {
@@ -674,6 +677,15 @@ impl LiveTask {
     fn schedule(&mut self, attempt: u32) {
         self.retry = Some((attempt, Instant::now() + backoff(attempt)));
         self.set_status(Liveness::NotLive("reconnecting".to_owned()));
+    }
+
+    /// Sentinel named another master: leave the old node even if it is
+    /// still up, as a replica.
+    fn new_master(&mut self) {
+        if let Some(poll) = &mut self.poll {
+            poll.conn = None;
+        }
+        self.lost("the master changed");
     }
 
     /// The connection is gone: say so, then reconnect.
@@ -941,7 +953,7 @@ mod tests {
     fn task(config: LiveConfig) -> (LiveTask, mpsc::Receiver<Action>) {
         let (tx, rx) = mpsc::channel(16);
         let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
-        let task = LiveTask::new(client, config, Arc::default(), Arc::default(), tx);
+        let task = LiveTask::new(client.into(), config, Arc::default(), Arc::default(), tx);
         (task, rx)
     }
 

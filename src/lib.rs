@@ -32,6 +32,7 @@ use color_eyre::eyre::Result;
 use redis_client::{
     conn::{reports_cluster, ClusterClients, Conn, Connector},
     runner::{connect_at_startup, connect_cluster, Link, Runner},
+    sentinel::FollowConn,
 };
 use state::SharedState;
 use target::ClusterMode;
@@ -143,6 +144,15 @@ async fn open_session(
     client: &redis::Client,
     cluster: Option<ClusterClients>,
 ) -> std::result::Result<Session, Box<dyn std::error::Error + Sync + Send>> {
+    if let Some(route) = target.master_route(client) {
+        let db = client.get_connection_info().redis_settings().db();
+        let conn = FollowConn::open(route.clone(), db, Link::Interactive).await?;
+        return Ok(Session {
+            conn: Conn::Follow(conn),
+            connector: Connector::sentinel(client.clone(), route),
+            warning: None,
+        });
+    }
     let single = Connector::single(client.clone());
     let cluster = match (target.cluster, cluster) {
         (ClusterMode::On, Some(cluster)) => {
@@ -224,6 +234,7 @@ pub mod internals {
     pub use crate::redis_client::runner::{
         connect, connect_cluster, Link, Runner, VALUE_FETCH_DELAY_MS,
     };
+    pub use crate::redis_client::sentinel::{FollowConn, MasterRoute, SentinelTarget};
     pub use crate::redis_client::slowlog::{SlowlogData, SlowlogEntry};
     pub use crate::redis_client::storage::Storage;
     pub use crate::redis_client::types::{

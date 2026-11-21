@@ -21,6 +21,7 @@ use super::{
     conn::client_at,
     monitor_store::{parse_line, MonitorStatus, MonitorStore, ParsedLine},
     pubsub::{backoff, is_connection_error},
+    sentinel::ServerClient,
 };
 
 /// How long opening the connection may take.
@@ -102,7 +103,7 @@ type Lines = Pin<Box<dyn Stream<Item = Value> + Send>>;
 
 /// Run the MONITOR task until `cancel` fires or the command channel closes.
 pub async fn run(
-    client: redis::Client,
+    client: impl Into<ServerClient>,
     store: Arc<Mutex<MonitorStore>>,
     node: Arc<Mutex<Option<(String, u16)>>>,
     max_rate: u64,
@@ -110,7 +111,7 @@ pub async fn run(
     cancel: CancellationToken,
 ) {
     let mut task = MonitorTask {
-        client,
+        client: client.into(),
         store,
         node,
         sampler: Sampler::new(max_rate),
@@ -128,6 +129,7 @@ pub async fn run(
                 None => break,
             },
             () = sleep_until(retry_at) => task.reconnect().await,
+            () = task.client.changed() => task.lost(),
             value = next_value(task.conn.as_mut()) => match value {
                 Some(value) => task.ingest(&value),
                 None => task.lost(),
@@ -153,7 +155,8 @@ async fn sleep_until(at: Option<Instant>) {
 struct MonitorTask {
     /// The cluster node to watch (`SharedState::ops_node`).
     node: Arc<Mutex<Option<(String, u16)>>>,
-    client: redis::Client,
+    /// The server, or behind Sentinel whichever is the master now.
+    client: ServerClient,
     store: Arc<Mutex<MonitorStore>>,
     sampler: Sampler,
     conn: Option<Lines>,
@@ -184,8 +187,9 @@ impl MonitorTask {
         self.store.lock().set_status(MonitorStatus::Connecting);
         // On a cluster, the node picked on the screen.
         let picked = self.node.lock().clone();
+        let base = self.client.current();
         let client = match picked {
-            Some((host, port)) => match client_at(&self.client, &host, port) {
+            Some((host, port)) => match client_at(&base, &host, port) {
                 Ok(client) => client,
                 Err(err) => {
                     self.store
@@ -194,7 +198,7 @@ impl MonitorTask {
                     return;
                 }
             },
-            None => self.client.clone(),
+            None => base,
         };
         let opened = tokio::time::timeout(CONNECT_TIMEOUT, client.get_async_monitor()).await;
         match opened {
