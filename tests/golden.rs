@@ -30,9 +30,10 @@ use redis_rover::internals::{
     GroupInfo, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind,
     KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MasterNode,
     MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore, MonitorWidget,
-    PageInfo, PageRow, PendingEntry, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey, StreamEntry,
-    StreamValue, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    NodeStrip, PageInfo, PageRow, PendingEntry, PubSub, PubSubWidget, RedisEvent, RedisInfo,
+    RedisType, SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey,
+    StreamEntry, StreamValue, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    MONITOR_NODE_WARNING,
 };
 
 static SETUP: Once = Once::new();
@@ -943,6 +944,22 @@ fn cluster_node_picker_120() {
     let mut dashboard = cluster_dashboard();
     dashboard.next_node();
     draw_cluster_dashboard(dashboard, "cluster_node_picker_120", 120, 24);
+}
+
+/// The node row of the MONITOR screen at 80 columns, with its warning.
+#[test]
+fn monitor_node_strip_80() {
+    init();
+    let strip = NodeStrip {
+        labels: ["10.0.1.7:7000", "10.0.1.7:7001", "10.0.1.7:7002"]
+            .map(str::to_owned)
+            .to_vec(),
+        selected: 1,
+        warning: Some(MONITOR_NODE_WARNING),
+    };
+    let mut buf = buffer(80, 2);
+    strip.render_above(buf.area, &mut buf);
+    check("monitor_node_strip_80", &buf);
 }
 
 // ---- Pub/Sub --------------------------------------------------------------

@@ -12,8 +12,8 @@ mod support;
 use cluster_support::ClusterFixture;
 use redis::AsyncCommands;
 use redis_rover::internals::{
-    connect_cluster, Action, KeyspaceState, Link, MasterNode, MemberKind, NewKeySpec, RedisEvent,
-    Storage, SweepApply, Ttl, ValueEdit,
+    connect_cluster, Action, KeyspaceState, Link, MasterNode, MemberKind, MonitorCmd,
+    MonitorStatus, NewKeySpec, RedisEvent, Storage, SweepApply, Ttl, ValueEdit,
 };
 use support::Harness;
 
@@ -352,4 +352,65 @@ async fn a_failover_restarts_the_sweep() {
 fn sorted(mut keys: Vec<String>) -> Vec<String> {
     keys.sort();
     keys
+}
+
+/// The Slowlog and MONITOR follow the picked node, not the home node.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn slowlog_and_monitor_follow_the_picked_node() {
+    let fixture = ClusterFixture::start();
+    // `foo` (slot 12182) lives on 7102; the home node is 7100.
+    let node = redis::Client::open("redis://127.0.0.1:7102").unwrap();
+    let mut direct = node.get_multiplexed_async_connection().await.unwrap();
+    let () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("slowlog-log-slower-than")
+        .arg(0)
+        .query_async(&mut direct)
+        .await
+        .unwrap();
+    let () = direct.set("foo", "marker-on-7102").await.unwrap();
+
+    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    harness.fetch_page().await;
+    *harness.state.ops_node.lock() = Some(("127.0.0.1".to_owned(), 7102));
+
+    harness.send(RedisEvent::FetchSlowlog);
+    harness
+        .expect("the slowlog", |a| matches!(a, Action::SlowlogLoaded))
+        .await;
+    let data = harness.state.slowlog.lock().take().unwrap();
+    assert!(
+        data.entries
+            .iter()
+            .any(|entry| entry.args.iter().any(|arg| arg == "marker-on-7102")),
+        "{data:?}"
+    );
+
+    harness.monitor(MonitorCmd::Start);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while *harness.state.monitor.lock().status() != MonitorStatus::Running {
+        assert!(tokio::time::Instant::now() < deadline, "MONITOR never ran");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let () = direct.set("foo", "seen-by-monitor").await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let seen = harness
+            .state
+            .monitor
+            .lock()
+            .iter()
+            .any(|line| line.line.args.iter().any(|arg| arg == "seen-by-monitor"));
+        if seen {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the line never came"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    harness.monitor(MonitorCmd::Stop);
+    harness.shutdown().await;
 }
