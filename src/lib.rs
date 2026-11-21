@@ -134,6 +134,10 @@ pub mod internals {
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
+    pub use crate::redis_client::monitor::MonitorCmd;
+    pub use crate::redis_client::monitor_store::{
+        parse_line, MonitorLimits, MonitorStatus, MonitorStore, ParsedLine,
+    };
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
     pub use crate::redis_client::runner::{connect, Link, Runner, VALUE_FETCH_DELAY_MS};

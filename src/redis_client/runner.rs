@@ -23,6 +23,7 @@ use super::{
     client,
     event::RedisEvent,
     live::{self, LiveCmd},
+    monitor::{self, MonitorCmd},
     pubsub::{self, PubSubCmd},
     storage::{Storage, TypeScanRejected},
     types::{RedisType, SweepApply, ValueState},
@@ -79,6 +80,11 @@ pub struct Runner {
     pubsub_tx: UnboundedSender<PubSubCmd>,
     /// Taken by `start` when the Pub/Sub task is spawned.
     pubsub_rx: Option<UnboundedReceiver<PubSubCmd>>,
+    /// Owns the dedicated MONITOR connection (opened on `MonitorCmd::Start`).
+    monitor_task: JoinHandle<()>,
+    monitor_tx: UnboundedSender<MonitorCmd>,
+    /// Taken by `start` when the MONITOR task is spawned.
+    monitor_rx: Option<UnboundedReceiver<MonitorCmd>>,
     /// Follows the open key (`live.mode`); not spawned when it is `off`.
     live_task: JoinHandle<()>,
     live_tx: UnboundedSender<LiveCmd>,
@@ -108,6 +114,8 @@ impl Runner {
         let state_task = tokio::spawn(async {});
         let pubsub_task = tokio::spawn(async {});
         let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
+        let monitor_task = tokio::spawn(async {});
+        let (monitor_tx, monitor_rx) = mpsc::unbounded_channel();
         let live_task = tokio::spawn(async {});
         let (live_tx, live_rx) = mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
@@ -125,6 +133,9 @@ impl Runner {
             pubsub_task,
             pubsub_tx,
             pubsub_rx: Some(pubsub_rx),
+            monitor_task,
+            monitor_tx,
+            monitor_rx: Some(monitor_rx),
             live_task,
             live_tx,
             live_rx: Some(live_rx),
@@ -165,6 +176,12 @@ impl Runner {
         self.pubsub_tx.clone()
     }
 
+    /// Control channel of the MONITOR task.
+    #[must_use]
+    pub fn monitor_tx(&self) -> UnboundedSender<MonitorCmd> {
+        self.monitor_tx.clone()
+    }
+
     /// Control channel of the live task.
     #[must_use]
     pub fn live_tx(&self) -> UnboundedSender<LiveCmd> {
@@ -175,7 +192,23 @@ impl Runner {
         self.launch_refresh_info_task();
         self.launch_refresh_state_task();
         self.launch_pubsub_task();
+        self.launch_monitor_task();
         self.launch_live_task();
+    }
+
+    /// Spawn the MONITOR task. It idles until `MonitorCmd::Start`, so the
+    /// server pays nothing for a session that never starts it.
+    fn launch_monitor_task(&mut self) {
+        let Some(cmd_rx) = self.monitor_rx.take() else {
+            return;
+        };
+        self.monitor_task = tokio::spawn(monitor::run(
+            self.client.clone(),
+            self.state.monitor.clone(),
+            config::get().monitor.max_rate(),
+            cmd_rx,
+            self.cancellation_token.clone(),
+        ));
     }
 
     /// Spawn the live task unless `live.mode` is `off`. It opens its
@@ -223,6 +256,7 @@ impl Runner {
         let info_abort = self.info_task.abort_handle();
         let state_abort = self.state_task.abort_handle();
         let pubsub_abort = self.pubsub_task.abort_handle();
+        let monitor_abort = self.monitor_task.abort_handle();
         let live_abort = self.live_task.abort_handle();
 
         let timeout = Duration::from_secs(2);
@@ -231,6 +265,7 @@ impl Runner {
                 self.info_task,
                 self.state_task,
                 self.pubsub_task,
+                self.monitor_task,
                 self.live_task
             );
         })
@@ -241,6 +276,7 @@ impl Runner {
             info_abort.abort();
             state_abort.abort();
             pubsub_abort.abort();
+            monitor_abort.abort();
             live_abort.abort();
         }
     }

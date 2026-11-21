@@ -246,7 +246,7 @@ impl PubSubTask {
     }
 }
 
-fn is_connection_error(err: &redis::RedisError) -> bool {
+pub(super) fn is_connection_error(err: &redis::RedisError) -> bool {
     err.is_connection_dropped() || err.is_io_error() || err.is_connection_refusal()
 }
 

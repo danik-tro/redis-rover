@@ -25,8 +25,8 @@ use redis_rover::{
     internals::{
         diff, text_from_bytes, Action, ConnStatus, Diff, EntryKind, ItemDelete, ItemEdit,
         JsonPreview, JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, MemberKind,
-        NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort, SortKey, Target, Ttl,
-        TypeFilter, ValueEdit,
+        MonitorCmd, MonitorStatus, NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort,
+        SortKey, Target, Ttl, TypeFilter, ValueEdit,
     },
     Cli,
 };
@@ -3102,5 +3102,153 @@ async fn whole_values_edited_as_json_round_trip() {
         scores,
         [("ada".to_owned(), 43.0), ("bob".to_owned(), f64::INFINITY)]
     );
+    h.shutdown().await;
+}
+
+// ---- MONITOR ---------------------------------------------------------------
+
+/// Poll `check` until it holds, or fail with `what` after `WAIT`.
+async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !check() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `id` of every client in MONITOR mode (flag `O` in `CLIENT LIST`).
+async fn monitor_clients(admin: &mut redis::aio::ConnectionManager) -> Vec<String> {
+    let list: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query_async(admin)
+        .await
+        .expect("CLIENT LIST");
+    list.lines()
+        .filter(|line| {
+            line.split(' ')
+                .any(|f| f.strip_prefix("flags=").is_some_and(|v| v.contains('O')))
+        })
+        .filter_map(|line| {
+            line.split(' ')
+                .find_map(|f| f.strip_prefix("id=").map(str::to_owned))
+        })
+        .collect()
+}
+
+/// Whether the store holds `SET key value`.
+fn holds_set(h: &Harness, key: &str, value: &str) -> bool {
+    h.state
+        .monitor
+        .lock()
+        .iter()
+        .any(|l| l.line.cmd.eq_ignore_ascii_case("SET") && l.line.args == [key, value])
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn monitor_start_line_and_stop_closes_the_connection() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let h = Harness::new(server.client(0), false).await;
+    assert!(
+        monitor_clients(&mut admin).await.is_empty(),
+        "idle until started"
+    );
+
+    h.monitor(MonitorCmd::Start);
+    let store = h.state.monitor.clone();
+    wait_until("running", || {
+        *store.lock().status() == MonitorStatus::Running
+    })
+    .await;
+    assert_eq!(monitor_clients(&mut admin).await.len(), 1);
+
+    let () = admin.set("a", "1").await.expect("SET");
+    wait_until("line", || holds_set(&h, "a", "1")).await;
+
+    h.monitor(MonitorCmd::Stop);
+    wait_until("stopped", || {
+        *store.lock().status() == MonitorStatus::Stopped
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !monitor_clients(&mut admin).await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the monitor client is still connected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn monitor_reconnects_after_a_kill() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let h = Harness::new(server.client(0), false).await;
+    h.monitor(MonitorCmd::Start);
+    let store = h.state.monitor.clone();
+    wait_until("running", || {
+        *store.lock().status() == MonitorStatus::Running
+    })
+    .await;
+
+    let ids = monitor_clients(&mut admin).await;
+    assert_eq!(ids.len(), 1);
+    let _: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(&ids[0])
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL");
+    wait_until("noticed", || {
+        matches!(
+            store.lock().status(),
+            MonitorStatus::Reconnecting { attempt: 1, .. }
+        )
+    })
+    .await;
+    wait_until("back", || *store.lock().status() == MonitorStatus::Running).await;
+
+    let () = admin.set("after", "1").await.expect("SET");
+    wait_until("line after reconnect", || holds_set(&h, "after", "1")).await;
+    h.shutdown().await;
+}
+
+/// A server that refuses MONITOR is reported once and never retried.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn monitor_refused_by_an_acl_is_final() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("limited")
+        .arg("on")
+        .arg(">pw")
+        .arg("~*")
+        .arg("+@all")
+        .arg("-monitor")
+        .query_async(&mut admin)
+        .await
+        .expect("ACL SETUSER");
+    let url = format!("redis://limited:pw@{}:{}/0", server.host, server.port);
+    let h = Harness::new(redis::Client::open(url).expect("url"), false).await;
+
+    h.monitor(MonitorCmd::Start);
+    let store = h.state.monitor.clone();
+    wait_until("refused", || {
+        matches!(store.lock().status(), MonitorStatus::Failed(_))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        matches!(store.lock().status(), MonitorStatus::Failed(_)),
+        "no retry"
+    );
+    assert!(monitor_clients(&mut admin).await.is_empty());
     h.shutdown().await;
 }

@@ -19,7 +19,7 @@ use std::{
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 use redis_rover::internals::{
-    Action, LiveCmd, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
+    Action, LiveCmd, MonitorCmd, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -301,6 +301,7 @@ pub struct Harness {
     events: mpsc::UnboundedSender<RedisEvent>,
     pubsub: mpsc::UnboundedSender<PubSubCmd>,
     live: mpsc::UnboundedSender<LiveCmd>,
+    monitor: mpsc::UnboundedSender<MonitorCmd>,
     actions: mpsc::Receiver<Action>,
     runner: Runner,
     cancel: CancellationToken,
@@ -328,12 +329,14 @@ impl Harness {
         let events = runner.tx();
         let pubsub = runner.pubsub_tx();
         let live = runner.live_tx();
+        let monitor = runner.monitor_tx();
         runner.start();
         Ok(Self {
             state,
             events,
             pubsub,
             live,
+            monitor,
             actions,
             runner,
             cancel,
@@ -356,6 +359,10 @@ impl Harness {
 
     pub fn live(&self, cmd: LiveCmd) {
         self.live.send(cmd).expect("live task is listening");
+    }
+
+    pub fn monitor(&self, cmd: MonitorCmd) {
+        self.monitor.send(cmd).expect("MONITOR task is listening");
     }
 
     /// Wait for the first action that `matches`, skipping (and remembering)
