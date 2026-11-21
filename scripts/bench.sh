@@ -5,6 +5,7 @@
 #
 #   scripts/bench.sh            all benches, including 10M keys (slow, ~2 GB RAM)
 #   scripts/bench.sh --quick    skip 10M
+#   scripts/bench.sh --short    100k only (skip 1M and 10M)
 #   OUT=path scripts/bench.sh   write the summary somewhere else
 #
 # Times come from criterion (target/criterion/**/new/), memory from the
@@ -14,9 +15,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 large=1
-if [[ "${1:-}" == "--quick" ]]; then
-    large=0
-    shift
+short=0
+case "${1:-}" in
+    --quick)
+        large=0
+        shift
+        ;;
+    --short)
+        large=0
+        short=1
+        shift
+        ;;
+esac
+if [[ "$short" == 1 ]]; then
+    export RROVER_BENCH_SHORT=1
+else
+    unset RROVER_BENCH_SHORT
 fi
 out="${OUT:-${CARGO_TARGET_DIR:-target}/bench-summary.md}"
 target="${CARGO_TARGET_DIR:-target}"
@@ -53,6 +67,7 @@ from pathlib import Path
 (target, out, started, commit, cpu, mem_bytes, os_name, arch, rustc, date,
  large) = sys.argv[1:]
 started = int(started)
+short = os.environ.get("RROVER_BENCH_SHORT") == "1"
 crit = Path(target) / "criterion"
 
 BUDGET_NS = 16e6  # 16 ms per frame
@@ -125,8 +140,9 @@ if large != "1":
     for bid in ORDER:
         if bid in by_id:
             order_rows.append(by_id.pop(bid))
-        elif bid.endswith("/10M"):
-            order_rows.append(f"| `{bid}` | not run (`--quick`) | | | |")
+        elif bid.endswith("/10M") or (short and bid.endswith("/1M")):
+            flag = "--short" if short else "--quick"
+            order_rows.append(f"| `{bid}` | not run (`{flag}`) | | | |")
     rows = order_rows + list(by_id.values())
 
 text = f"""# Benchmark summary

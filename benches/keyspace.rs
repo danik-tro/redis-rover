@@ -2,6 +2,7 @@
 //! sorting the loaded keys. Synthetic key names, no Redis.
 //!
 //! 10M keys runs only with `RROVER_BENCH_LARGE=1` (slow, about 2 GB of RAM).
+//! `RROVER_BENCH_SHORT=1` keeps only 100k and takes precedence over it.
 
 mod support;
 
@@ -99,6 +100,9 @@ fn page_turn(state: &mut KeyspaceState, batch: Vec<String>) -> Vec<String> {
 }
 
 fn sizes() -> Vec<(usize, &'static str)> {
+    if std::env::var_os("RROVER_BENCH_SHORT").is_some_and(|v| v == "1") {
+        return vec![(100_000, "100k")];
+    }
     let mut sizes = vec![(100_000, "100k"), (1_000_000, "1M")];
     if std::env::var_os("RROVER_BENCH_LARGE").is_some_and(|v| v == "1") {
         sizes.push((10_000_000, "10M"));
