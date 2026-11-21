@@ -40,6 +40,24 @@ impl Conn {
         }
     }
 
+    /// This connection, with everything sent to the node at `host:port`.
+    /// For commands without a key (`SCAN`, `DBSIZE`, `INFO`): routed by slot
+    /// they would silently reach another node while the client's slot map
+    /// is stale, since no `MOVED` corrects them. One server is every node.
+    #[must_use]
+    pub fn on_address(&self, host: &str, port: u16) -> Self {
+        match self {
+            Self::Cluster(conn) | Self::Node(conn, _) => Self::Node(
+                conn.clone(),
+                SingleNodeRoutingInfo::ByAddress {
+                    host: host.to_owned(),
+                    port,
+                },
+            ),
+            single @ Self::Single(_) => single.clone(),
+        }
+    }
+
     /// This connection, with everything sent to the master of `slot`. One
     /// server serves every slot.
     #[must_use]

@@ -82,6 +82,36 @@ async fn types_on(conn: &mut Conn, keys: &[String]) -> redis::RedisResult<Vec<St
     pipe.query_async(conn).await
 }
 
+/// The masters as one node sees them: `CLUSTER SHARDS`, or `CLUSTER SLOTS`
+/// on a server before Redis 7.
+async fn masters_from(mut conn: Conn) -> redis::RedisResult<Vec<MasterNode>> {
+    let shards = redis::cmd("CLUSTER")
+        .arg("SHARDS")
+        .query_async::<redis::Value>(&mut conn)
+        .await;
+    let masters = match shards {
+        Ok(reply) => parse_shards(&reply),
+        // An older server, or an ACL without it.
+        Err(err) if err.code().is_some() => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    if !masters.is_empty() {
+        return Ok(masters);
+    }
+    let reply = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query_async::<redis::Value>(&mut conn)
+        .await?;
+    let masters = parse_slots(&reply);
+    if masters.is_empty() {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::UnexpectedReturnType,
+            "the cluster reports no masters",
+        )));
+    }
+    Ok(masters)
+}
+
 /// Most `SCAN` steps one [`Storage::scan_until`] call runs.
 const SCAN_SLICE_STEPS: usize = 50;
 /// How long one [`Storage::scan_until`] call keeps starting new steps.
@@ -103,8 +133,10 @@ pub struct Storage {
     /// service or a fork that lacks it): stop asking on this connection and
     /// show sizes as unknown. Shared by the clones of this `Storage`.
     memory_usage_refused: Arc<AtomicBool>,
-    /// The cluster's masters, read once and shared by the clones.
-    masters: Arc<Mutex<Option<Arc<Vec<MasterNode>>>>>,
+    /// The cluster's masters (empty until read). Shared with every
+    /// connection of the session through [`Self::sharing_masters`], so a
+    /// topology change reroutes them all at once.
+    masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
 }
 
 impl Storage {
@@ -114,6 +146,13 @@ impl Storage {
             memory_usage_refused: Arc::new(AtomicBool::new(false)),
             masters: Arc::default(),
         }
+    }
+
+    /// Keep the list of masters in `cell` (`SharedState::masters`).
+    #[must_use]
+    pub fn sharing_masters(mut self, cell: Arc<Mutex<Arc<Vec<MasterNode>>>>) -> Self {
+        self.masters = cell;
+        self
     }
 
     /// This session browses a whole cluster.
@@ -128,12 +167,29 @@ impl Storage {
     ///
     /// As [`Self::masters`].
     pub async fn cached_masters(&self) -> redis::RedisResult<Arc<Vec<MasterNode>>> {
-        if let Some(masters) = self.masters.lock().clone() {
-            return Ok(masters);
+        let known = Arc::clone(&self.masters.lock());
+        if !known.is_empty() {
+            return Ok(known);
         }
         let masters = Arc::new(self.masters().await?);
-        *self.masters.lock() = Some(Arc::clone(&masters));
+        *self.masters.lock() = Arc::clone(&masters);
         Ok(masters)
+    }
+
+    /// A connection to the master that owns `slot`, by its address.
+    fn master_conn(&self, masters: &[MasterNode], slot: u16) -> Conn {
+        masters
+            .iter()
+            .find(|master| {
+                master
+                    .slots
+                    .iter()
+                    .any(|&(start, end)| (start..=end).contains(&slot))
+            })
+            .map_or_else(
+                || self.manager.on_slot(slot),
+                |master| self.manager.on_address(&master.host, master.port),
+            )
     }
 
     /// One connection per master, or this connection on one server.
@@ -144,8 +200,7 @@ impl Storage {
         let masters = self.cached_masters().await?;
         Ok(masters
             .iter()
-            .filter_map(MasterNode::route_slot)
-            .map(|slot| self.manager.on_slot(slot))
+            .map(|master| self.manager.on_address(&master.host, master.port))
             .collect())
     }
 
@@ -210,7 +265,10 @@ impl Storage {
         };
         // On a cluster the cursor only means something on its own master.
         let mut conn = match request.node {
-            Some(slot) => self.manager.on_slot(slot),
+            Some(slot) => {
+                let masters = self.cached_masters().await?;
+                self.master_conn(&masters, slot)
+            }
             None => self.manager.clone(),
         };
         let started = Instant::now();
@@ -267,39 +325,31 @@ impl Storage {
         }
     }
 
-    /// The cluster's masters, in slot order: `CLUSTER SHARDS`, or
-    /// `CLUSTER SLOTS` on a server before Redis 7.
+    /// The cluster's masters, in slot order, asked of the home node and
+    /// then of each other known master, since any of them may be the one
+    /// that just failed.
     ///
     /// # Errors
     ///
-    /// Both commands fail, or the reply names no master.
+    /// No node answers, or none names a master.
     pub async fn masters(&self) -> redis::RedisResult<Vec<MasterNode>> {
-        let mut conn = self.manager.home();
-        let shards = redis::cmd("CLUSTER")
-            .arg("SHARDS")
-            .query_async::<redis::Value>(&mut conn)
-            .await;
-        let masters = match shards {
-            Ok(reply) => parse_shards(&reply),
-            // An older server, or an ACL without it.
-            Err(err) if err.code().is_some() => Vec::new(),
-            Err(err) => return Err(err),
-        };
-        if !masters.is_empty() {
-            return Ok(masters);
+        let known = Arc::clone(&self.masters.lock());
+        let others = known
+            .iter()
+            .map(|master| self.manager.on_address(&master.host, master.port));
+        let mut last = None;
+        for conn in std::iter::once(self.manager.home()).chain(others) {
+            match masters_from(conn).await {
+                Ok(masters) => return Ok(masters),
+                Err(err) => last = Some(err),
+            }
         }
-        let reply = redis::cmd("CLUSTER")
-            .arg("SLOTS")
-            .query_async::<redis::Value>(&mut conn)
-            .await?;
-        let masters = parse_slots(&reply);
-        if masters.is_empty() {
-            return Err(redis::RedisError::from((
+        Err(last.unwrap_or_else(|| {
+            redis::RedisError::from((
                 redis::ErrorKind::UnexpectedReturnType,
                 "the cluster reports no masters",
-            )));
-        }
-        Ok(masters)
+            ))
+        }))
     }
 
     /// Count the keys matching `pattern` with a full `SCAN` sweep, stopping
@@ -393,7 +443,7 @@ impl Storage {
         let groups = group_by_node(keys, &masters);
         let replies = try_join_all(groups.iter().map(|group| {
             let names: Vec<&String> = group.indices.iter().map(|&i| &keys[i]).collect();
-            let conn = self.manager.on_slot(group.slot);
+            let conn = self.master_conn(&masters, group.slot);
             async move { self.meta_on(conn, &names).await }
         }))
         .await?;

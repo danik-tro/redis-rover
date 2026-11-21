@@ -24,7 +24,7 @@ mod power;
 
 use super::{
     client,
-    cluster::MasterNode,
+    cluster::{is_topology_error, topology_update, MasterNode, TopologyUpdate},
     conn::{Conn, Connector},
     event::RedisEvent,
     live::{self, LiveCmd},
@@ -48,6 +48,13 @@ const BACKFILL_NOTIFY: Duration = Duration::from_millis(250);
 
 /// Least time between two `LoadAllProgress` actions.
 const LOAD_NOTIFY: Duration = Duration::from_millis(250);
+
+/// Failed `INFO` samples in a row before a cluster counts as down: a
+/// failover takes a few seconds and heals by itself.
+const CLUSTER_INFO_PATIENCE: u32 = 15;
+
+/// The toast of a topology change.
+const TOPOLOGY_CHANGED: &str = "cluster topology changed · rescanning";
 
 /// What a connection is used for, which decides its reply timeout
 /// (`connection.response_timeout_ms` in the config).
@@ -305,7 +312,7 @@ impl Runner {
 
         let action_tx = self.action_tx.clone();
         let state = self.state.clone();
-        let storage = Storage::new(manager);
+        let storage = Storage::new(manager).sharing_masters(state.masters.clone());
         let connector = self.connector.clone();
         let read_only = Arc::clone(&self.read_only);
 
@@ -314,7 +321,7 @@ impl Runner {
             // never holds back a keys page queued behind it on the socket.
             let db = *state.db.lock();
             let value_storage = match connector.open(db, Link::Interactive).await {
-                Ok(manager) => Storage::new(manager),
+                Ok(manager) => Storage::new(manager).sharing_masters(state.masters.clone()),
                 Err(err) => {
                     log::warn!("Opening the value connection failed, sharing the main one: {err}");
                     storage.clone()
@@ -379,7 +386,8 @@ impl Runner {
         let info_seq = self.state.info_seq.clone();
         let metrics = self.state.metrics.clone();
         let mut manager = self.manager.clone();
-        let totals = Storage::new(manager.clone());
+        let totals = Storage::new(manager.clone()).sharing_masters(self.state.masters.clone());
+        let state = self.state.clone();
         let cancellation_token = self.cancellation_token.clone();
         let action_tx = self.action_tx.clone();
 
@@ -389,6 +397,8 @@ impl Runner {
             // Report only the first failure of an outage; INFO is polled every
             // tick, so reporting each one would re-open the popup every tick.
             let mut info_failing = false;
+            // Failed samples in a row: a failover costs a few of them.
+            let mut info_failures: u32 = 0;
             // Counts successful samples; CLUSTER INFO is polled every 5th one.
             let mut tick_no: u64 = 0;
             // The last cluster-wide key count, kept through a failed one.
@@ -397,6 +407,9 @@ impl Runner {
             loop {
                 tokio::select! {
                     _ = refresh_interval.tick() => {
+                        if totals.is_cluster() {
+                            watch_topology(&totals, &state, &action_tx).await;
+                        }
                         let info_res = client::redis_info_with_snapshot(&mut manager).await;
 
                         match info_res {
@@ -412,6 +425,7 @@ impl Runner {
                                     redis_info.whole_cluster = true;
                                 }
                                 info_failing = false;
+                                info_failures = 0;
                                 tick_no += 1;
                                 {
                                     let mut m = metrics.lock();
@@ -436,7 +450,10 @@ impl Runner {
                                 log::error!("Failed to fetch INFO: {err}");
                                 metrics.lock().mark_unavailable();
                                 info_seq.fetch_add(1, Ordering::Release);
-                                if !info_failing {
+                                info_failures = info_failures.saturating_add(1);
+                                let outage = !totals.is_cluster()
+                                    || info_failures >= CLUSTER_INFO_PATIENCE;
+                                if outage && !info_failing {
                                     info_failing = true;
                                     crate::action::try_send_action(
                                         &action_tx,
@@ -453,6 +470,41 @@ impl Runner {
             }
         });
     }
+}
+
+/// Compare the cluster's masters with the ones in use. On a change (a
+/// failover, a reshard) restart the sweep with a new generation, so results
+/// from the old topology are dropped, and tell the App. While a failed
+/// master's slots have no owner yet nothing changes.
+async fn watch_topology(storage: &Storage, state: &SharedState, tx: &ActionSender<Action>) {
+    let fresh = match storage.masters().await {
+        Ok(fresh) => fresh,
+        Err(err) => {
+            log::debug!("Reading the cluster topology failed: {err}");
+            return;
+        }
+    };
+    let known = Arc::clone(&state.masters.lock());
+    if known.is_empty() {
+        // First read: nothing to compare with, and no sweep to restart.
+        *state.masters.lock() = Arc::new(fresh);
+        return;
+    }
+    if topology_update(&known, &fresh) != TopologyUpdate::Changed {
+        return;
+    }
+    log::info!("Cluster topology changed: {fresh:?}");
+    let slots: Vec<u16> = fresh.iter().filter_map(MasterNode::route_slot).collect();
+    *state.masters.lock() = Arc::new(fresh);
+    {
+        let mut keyspace = state.keyspace_state.lock();
+        // A failover keeps the slots, so the list alone may not restart it.
+        if !keyspace.set_sweep_nodes(&slots) {
+            keyspace.rescan();
+        }
+    }
+    crate::action::try_send_action(tx, Action::Notice(TOPOLOGY_CHANGED.to_owned()));
+    crate::action::try_send_action(tx, Action::KeysChanged);
 }
 
 /// How a `FetchKeys` ended.
@@ -781,8 +833,9 @@ impl EventHandler {
                 {
                     task.abort();
                 }
-                self.storage = Storage::new(manager);
-                self.value_storage = Storage::new(value_manager);
+                let masters = &self.state.masters;
+                self.storage = Storage::new(manager).sharing_masters(masters.clone());
+                self.value_storage = Storage::new(value_manager).sharing_masters(masters.clone());
                 self.yank_storage = None;
                 self.backfill_storage = None;
                 self.load_storage = None;
@@ -940,7 +993,7 @@ impl EventHandler {
     async fn open_side_storage(&self, what: &str) -> Option<Storage> {
         let db = *self.state.db.lock();
         match self.connect_db(db, Link::Bulk).await {
-            Ok(manager) => Some(Storage::new(manager)),
+            Ok(manager) => Some(Storage::new(manager).sharing_masters(self.state.masters.clone())),
             Err(err) => {
                 log::warn!("Opening the {what} connection failed: {err}");
                 None
@@ -1042,6 +1095,14 @@ impl EventHandler {
                 self.keys_unfinished = true;
                 self.action_hook(Action::KeysScanning(checked));
             }
+            // The topology watch rescans once the cluster has settled.
+            Err(err) if self.storage.is_cluster() && is_topology_error(err.as_ref()) => {
+                log::warn!("FetchKeys hit a topology change: {err}");
+                self.action_hook(Action::Notice(
+                    "cluster node unreachable · waiting for failover".to_owned(),
+                ));
+                self.action_hook(Action::KeysLoadAborted);
+            }
             Err(err) => {
                 log::error!("FetchKeys failed: {err:?}");
                 self.action_hook(Action::Error(format!("Failed to fetch keys: {err}")));
@@ -1063,7 +1124,6 @@ impl EventHandler {
         if self.storage.is_cluster() {
             let masters = self.storage.cached_masters().await?;
             let slots: Vec<u16> = masters.iter().filter_map(MasterNode::route_slot).collect();
-            *self.state.masters.lock() = masters;
             self.state.keyspace_state.lock().set_sweep_nodes(&slots);
         }
         let mut scanned = false;
