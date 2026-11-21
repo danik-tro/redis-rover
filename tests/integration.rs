@@ -10,6 +10,7 @@
 //! its channels, the way `App` does: `RedisEvent`s in, `Action`s out, results
 //! in `SharedState`.
 
+mod cluster_support;
 mod support;
 
 use std::{
@@ -3610,18 +3611,74 @@ async fn shard_is_unavailable_on_redis_6() {
     h.shutdown().await;
 }
 
-/// On a cluster the shard connection must go to the node owning the slot.
-///
-/// TODO(cluster): route `SSUBSCRIBE` to the owner, then seed a cluster here.
-/// Skipped until `RROVER_TEST_CLUSTER_URL` names one, so the suite stays green.
+/// On a cluster each shard subscription goes to the node owning its slot,
+/// and keeps receiving after that node fails over.
 #[tokio::test]
-#[ignore = "needs a Redis cluster at RROVER_TEST_CLUSTER_URL"]
+#[ignore = "needs Docker"]
 async fn shard_subscribes_on_the_slot_owner_in_a_cluster() {
-    if std::env::var_os("RROVER_TEST_CLUSTER_URL").is_none() {
-        eprintln!("skipped: set RROVER_TEST_CLUSTER_URL to a Redis cluster");
-        return;
+    let fixture = cluster_support::ClusterFixture::start();
+    let cluster = fixture.client();
+    let mut admin = cluster.get_async_connection().await.expect("connect");
+    let mut h = Harness::cluster(fixture.seed(), fixture.clients()).await;
+    h.fetch_page().await;
+
+    // These hash to slots on three different masters.
+    let channels = ["foo", "bar", "c"];
+    for channel in channels {
+        let target = Target::Shard(channel.into());
+        h.state.pubsub.lock().add(target.clone());
+        h.pubsub(PubSubCmd::Subscribe(target));
     }
-    unimplemented!("SSUBSCRIBE is not routed to the slot owner yet");
+    let store = h.state.pubsub.clone();
+    for (index, channel) in channels.into_iter().enumerate() {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let heard: i64 = redis::cmd("SPUBLISH")
+                .arg(channel)
+                .arg("hi")
+                .query_async(&mut admin)
+                .await
+                .expect("SPUBLISH");
+            if heard > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{channel}: no owner"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        wait_until(channel, || store.lock().subs[index].stats.total >= 1).await;
+        let guard = store.lock();
+        let buffer = &guard.subs[index].buffer;
+        let message = buffer.range(0, buffer.len()).next().expect("a message");
+        assert_eq!(message.channel, channel);
+        assert_eq!(message.payload.copy_text(), "hi");
+    }
+
+    // `bar` is on 7100: kill it, the subscription follows the new master.
+    let before = store.lock().subs[1].stats.total;
+    fixture.kill_node(7100);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // One attempt may wait on the dead node: the deadline still holds.
+        let mut publish = redis::cmd("SPUBLISH");
+        publish.arg("bar").arg("after");
+        let heard = tokio::time::timeout(
+            Duration::from_secs(2),
+            publish.query_async::<i64>(&mut admin),
+        )
+        .await;
+        if matches!(heard, Ok(Ok(n)) if n > 0) && store.lock().subs[1].stats.total > before {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no message after the failover"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    h.shutdown().await;
 }
 
 // ---- Streams ---------------------------------------------------------------
