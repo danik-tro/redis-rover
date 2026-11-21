@@ -325,15 +325,7 @@ pub fn resolve(
 
     let profile_tls = profile.and_then(|p| p.tls.as_ref());
     let tls = merge_tls(&cli.tls, profile_tls)?;
-    let tls_source = if cli.tls.any() {
-        Source::Flag("--tls-*")
-    } else if profile_tls.is_some() {
-        profile_source()
-    } else if matches!(info.addr(), redis::ConnectionAddr::TcpTls { .. }) {
-        Source::Url
-    } else {
-        Source::Default
-    };
+    let tls_source = tls_source(cli, profile_tls.is_some(), &info, &profile_source);
 
     let password = password_source(cli, profile, &info);
 
@@ -373,15 +365,8 @@ pub fn resolve(
     let profile_read_only = profile
         .and_then(|p| p.read_only)
         .filter(|read_only| *read_only || !url_replaced || !environment.default_read_only());
-    let (read_only, read_only_source) = if cli.read_only {
-        (true, Source::Flag("--read-only"))
-    } else if cli.writable {
-        (false, Source::Flag("--writable"))
-    } else if let Some(read_only) = profile_read_only {
-        (read_only, profile_source())
-    } else {
-        (environment.default_read_only(), Source::Environment)
-    };
+    let (read_only, read_only_source) =
+        read_only_choice(cli, profile_read_only, environment, &profile_source);
 
     Ok(Target {
         profile: name.map(str::to_owned),
@@ -399,6 +384,42 @@ pub fn resolve(
         tls_source,
         password,
     })
+}
+
+/// Where the TLS settings came from.
+fn tls_source(
+    cli: &Cli,
+    in_profile: bool,
+    info: &ConnectionInfo,
+    profile_source: &dyn Fn() -> Source,
+) -> Source {
+    if cli.tls.any() {
+        Source::Flag("--tls-*")
+    } else if in_profile {
+        profile_source()
+    } else if matches!(info.addr(), redis::ConnectionAddr::TcpTls { .. }) {
+        Source::Url
+    } else {
+        Source::Default
+    }
+}
+
+/// `--read-only` > `--writable` > the profile > the environment's default.
+fn read_only_choice(
+    cli: &Cli,
+    profile: Option<bool>,
+    environment: Environment,
+    profile_source: &dyn Fn() -> Source,
+) -> (bool, Source) {
+    if cli.read_only {
+        (true, Source::Flag("--read-only"))
+    } else if cli.writable {
+        (false, Source::Flag("--writable"))
+    } else if let Some(read_only) = profile {
+        (read_only, profile_source())
+    } else {
+        (environment.default_read_only(), Source::Environment)
+    }
 }
 
 /// `--token` > profile `password_command` > the URL's password.
