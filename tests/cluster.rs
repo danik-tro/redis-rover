@@ -278,3 +278,78 @@ async fn cross_slot_moves_are_refused() {
     assert!(foo && !bar);
     harness.shutdown().await;
 }
+
+/// AC3: a killed master is reported, the sweep restarts, and reads and writes
+/// go on with the promoted replica.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_failover_restarts_the_sweep() {
+    let fixture = ClusterFixture::start();
+    let client = fixture.client();
+    let mut con = client.get_async_connection().await.unwrap();
+    let keys: Vec<String> = (0..600).map(|i| format!("failover:{i}")).collect();
+    for key in &keys {
+        let () = con.set(key, "v").await.unwrap();
+    }
+    // Replicas must hold the keys before their master dies.
+    let _: i64 = redis::cmd("WAIT")
+        .arg(1)
+        .arg(2000)
+        .query_async(&mut con)
+        .await
+        .unwrap_or_default();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    assert_eq!(
+        sorted(harness.fetch_all_pages().await),
+        sorted(keys.clone())
+    );
+    let generation = harness.state.keyspace_state.lock().generation;
+
+    // The master of slot 0, which also answers the node-wide commands.
+    fixture.kill_node(7100);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let seen = harness.drain(std::time::Duration::from_millis(500)).await;
+        if seen.iter().any(|action| {
+            matches!(action, Action::Notice(text) if text == "cluster topology changed · rescanning")
+        }) {
+            break;
+        }
+        assert!(
+            !seen.iter().any(|action| matches!(action, Action::Error(_))),
+            "a failover is not an error popup: {seen:?}"
+        );
+        assert!(tokio::time::Instant::now() < deadline, "no topology toast");
+    }
+    assert!(harness.state.keyspace_state.lock().generation > generation);
+
+    assert_eq!(
+        sorted(harness.fetch_all_pages().await),
+        sorted(keys.clone())
+    );
+    write(
+        &mut harness,
+        RedisEvent::SetString {
+            key: "foo".into(),
+            value: "after".into(),
+        },
+    )
+    .await;
+    // `bar` lived on the killed master.
+    write(
+        &mut harness,
+        RedisEvent::SetString {
+            key: "bar".into(),
+            value: "after".into(),
+        },
+    )
+    .await;
+    harness.shutdown().await;
+}
+
+fn sorted(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
+}
