@@ -59,4 +59,14 @@ pub enum Command {
     ClearMarks,
     /// Edit the selected STRING in `$VISUAL` / `$EDITOR` / `vi`.
     EditExternal,
+    /// Jump to the MONITOR screen.
+    GoToMonitor,
+    /// Jump to the Slowlog screen.
+    GoToSlowlog,
+    /// Jump to the Pub/Sub tab.
+    GoToPubSub,
+    /// Jump to the metrics dashboard.
+    GoToDashboard,
+    /// Leave a server screen for the key list.
+    LeaveScreen,
 }

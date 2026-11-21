@@ -1,40 +1,32 @@
 
-                                ╭──────────────────────── Help ─────────────────────────╮
-                                │ Scroll down                           j               │
-                                │ Scroll up                             k               │
-                                │ Next page (keys or open value)        n               │
-                                │ Previous page (keys or open value)    p               │
-                                │ Refresh keyspace                      r               │
-                                │ Set filter pattern                    f               │
-                                │ Delete filter pattern                 l               │
-                                │ Sort by key / type / TTL / size       o               │
-                                │ Show only some types                  Shift-T         │
-                                │ Tree view (←/→ fold, Enter opens)     v               │
-                                │ Load all keys (Esc stops)             Shift-A         │
-                                │ Go to the open key                    g o             │
-                                │ Enter value / JSON field / confirm    Enter           │
-                                │ Add new key                           a               │
-                                │ Add item (in collection)              i               │
-                                │ Edit value / item (drill in first)    e               │
-                                │ Edit value / item in $EDITOR          Shift-E         │
-                                │ Delete key / item (in value)          d               │
-                                │ Set TTL                               t               │
-                                │ Rename key / field / member           F2              │
-                                │ Copy key (Tab: target DB)             c               │
-                                │ Mark / unmark key (d deletes marked)  Space           │
-                                │ Mark all keys on the page             Shift-M         │
-                                │ Clear marks                           Shift-U         │
-                                │ Copy value / item                     y               │
-                                │ Copy key name                         Shift-Y         │
-                                │ Wrap text value on / off              w               │
-                                │ Pan text left (wrap off)              Left            │
-                                │ Pan text right (wrap off)             Right           │
-                                │ Switch database                       s               │
-                                │ Open metrics dashboard                m               │
-                                │ Open Pub/Sub                          b               │
-                                │ Close popup / overlay                 Esc             │
-                                │ Toggle read-only                      Shift-R         │
-                                │ Toggle this help                      ?               │
-                                │ Quit                                  Ctrl-c          │
-                                │ Undo / redo in a text input           Ctrl-U / Ctrl-R │
-                                ╰───────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+    ╭──────────────────────────────────────────────────── Help ─────────────────────────────────────────────────────╮
+    │ Scroll down                           j                 Mark / unmark key (d deletes marked)  Space           │
+    │ Scroll up                             k                 Mark all keys on the page             Shift-M         │
+    │ Next page (keys or open value)        n                 Clear marks                           Shift-U         │
+    │ Previous page (keys or open value)    p                 Copy value / item                     y               │
+    │ Refresh keyspace                      r                 Copy key name                         Shift-Y         │
+    │ Set filter pattern                    f                 Wrap text value on / off              w               │
+    │ Delete filter pattern                 l                 Pan text left (wrap off)              Left            │
+    │ Sort by key / type / TTL / size       o                 Pan text right (wrap off)             Right           │
+    │ Show only some types                  Shift-T           Switch database                       s               │
+    │ Tree view (←/→ fold, Enter opens)     v                 Open metrics dashboard                m               │
+    │ Load all keys (Esc stops)             Shift-A           Open Pub/Sub                          b               │
+    │ Go to the open key                    g o               Close popup / overlay                 Esc             │
+    │ Enter value / JSON field / confirm    Enter             Toggle read-only                      Shift-R         │
+    │ Add new key                           a                 Toggle this help                      ?               │
+    │ Add item (in collection)              i                 Quit                                  Ctrl-c          │
+    │ Edit value / item (drill in first)    e                 Go to MONITOR                         g m             │
+    │ Edit value / item in $EDITOR          Shift-E           Go to Slowlog                         g s             │
+    │ Delete key / item (in value)          d                 Go to Pub/Sub                         g p             │
+    │ Set TTL                               t                 Go to metrics dashboard               g d             │
+    │ Rename key / field / member           F2                Undo / redo in a text input           Ctrl-U / Ctrl-R │
+    │ Copy key (Tab: target DB)             c                                                                       │
+    ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

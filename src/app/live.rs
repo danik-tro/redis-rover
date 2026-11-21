@@ -10,7 +10,6 @@ use crate::redis_client::{
 use std::time::{Duration, SystemTime};
 
 use super::App;
-use crate::mode::Mode;
 
 /// How long rows a live refetch changed stay highlighted.
 pub(super) const CHANGED_HIGHLIGHT: Duration = Duration::from_millis(1500);
@@ -37,10 +36,10 @@ impl App {
         self.send_live(cmd);
     }
 
-    /// Polling waits while the key list is off screen (dashboard,
-    /// Pub/Sub), like the metadata backfill.
+    /// Polling waits while a server screen hides the key list, like the
+    /// metadata backfill.
     pub(super) fn sync_live_pause(&mut self) {
-        let paused = matches!(self.mode, Mode::Dashboard | Mode::PubSub);
+        let paused = self.mode.hides_key_list();
         if paused != self.live.paused {
             self.live.paused = paused;
             self.send_live(LiveCmd::Pause(paused));

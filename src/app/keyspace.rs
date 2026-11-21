@@ -441,7 +441,7 @@ impl App {
     /// each draw, so a resize (or the cluster banner appearing) re-pages the
     /// sweep. The selected key stays selected and on screen.
     pub(super) fn sync_page_size(&mut self) {
-        if matches!(self.mode, Mode::Dashboard | Mode::PubSub) {
+        if self.mode.hides_key_list() {
             return;
         }
         let rows = self.keyspace.visible_rows();
@@ -562,9 +562,9 @@ impl App {
         }
     }
 
-    /// The backfill waits while the user is on the dashboard or Pub/Sub.
+    /// The backfill waits while a server screen hides the key list.
     fn backfill_paused(&self) -> bool {
-        matches!(self.mode, Mode::Dashboard | Mode::PubSub)
+        self.mode.hides_key_list()
     }
 
     /// The mode changed: pause the backfill on another screen, resume it on

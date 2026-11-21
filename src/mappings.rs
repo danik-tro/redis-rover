@@ -54,6 +54,11 @@ impl From<Command> for Action {
             Command::MarkAllVisible => Self::MarkAllVisible,
             Command::ClearMarks => Self::ClearMarks,
             Command::EditExternal => Self::RequestEditExternal,
+            Command::GoToMonitor => Self::GoToMonitor,
+            Command::GoToSlowlog => Self::GoToSlowlog,
+            Command::GoToPubSub => Self::GoToPubSub,
+            Command::GoToDashboard => Self::GoToDashboard,
+            Command::LeaveScreen => Self::LeaveScreen,
         }
     }
 }
