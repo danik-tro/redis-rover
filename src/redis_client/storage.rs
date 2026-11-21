@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use parking_lot::Mutex;
 use redis::{FromRedisValue, ScanOptions};
 
@@ -16,6 +16,7 @@ use super::{
     client,
     cluster::{group_by_node, merge_groups, parse_shards, parse_slots, MasterNode},
     conn::Conn,
+    metrics::InfoSnapshot,
     pubsub_store::ServerChannels,
     slowlog::{parse_config_int, parse_entries, SlowlogData, SLOWLOG_FETCH},
     types::{
@@ -202,6 +203,28 @@ impl Storage {
             .iter()
             .map(|master| self.manager.on_address(&master.host, master.port))
             .collect())
+    }
+
+    /// One `INFO` sample per master, taken at the same time (`None` for a
+    /// master that didn't answer).
+    ///
+    /// # Errors
+    ///
+    /// The list of masters can't be read.
+    pub async fn node_snapshots(&self) -> redis::RedisResult<Vec<(String, Option<InfoSnapshot>)>> {
+        let masters = self.cached_masters().await?;
+        let samples = masters.iter().map(|master| {
+            let mut conn = self.manager.on_address(&master.host, master.port);
+            let id = master.id.clone();
+            async move {
+                let raw = redis::cmd("INFO").query_async::<String>(&mut conn).await;
+                let snapshot = raw
+                    .ok()
+                    .map(|raw| InfoSnapshot::from_map(&client::parse_info(&raw), Instant::now()));
+                (id, snapshot)
+            }
+        });
+        Ok(join_all(samples).await)
     }
 
     /// `DBSIZE`, summed over every master.

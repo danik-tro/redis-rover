@@ -202,6 +202,11 @@ const DASHBOARD_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::ResetMetrics, "Reset history"),
     (Command::NextChart, "Next chart"),
     (Command::PrevChart, "Previous chart"),
+    (Command::NextNode, "Next node (one server: next chart)"),
+    (
+        Command::PrevNode,
+        "Previous node (one server: previous chart)",
+    ),
     (Command::ToggleAllCharts, "Toggle all charts"),
     (Command::TogglePubSub, "Open Pub/Sub"),
     (Command::ToggleReadOnly, "Toggle read-only"),
@@ -339,6 +344,11 @@ impl App {
         let mode = self.view_mode();
         self.frame.metrics = if mode == Mode::Dashboard {
             self.dashboard.live_window(main.width)
+        } else {
+            None
+        };
+        self.frame.cluster_view = if mode == Mode::Dashboard {
+            self.dashboard.cluster_view()
         } else {
             None
         };

@@ -17,6 +17,7 @@ impl App {
 
     pub(super) fn reset_metrics(&mut self) {
         self.state.metrics.lock().reset();
+        self.state.cluster_metrics.lock().reset();
         // The footer's CPU figure comes from the metrics.
         self.state
             .info_seq

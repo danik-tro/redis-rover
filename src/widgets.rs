@@ -5,6 +5,7 @@ pub mod info;
 pub mod keyspace;
 pub mod local_time;
 pub mod monitor;
+pub mod node_picker;
 pub mod pubsub;
 pub mod slowlog;
 pub mod text_view;

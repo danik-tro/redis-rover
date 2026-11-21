@@ -25,6 +25,8 @@ pub enum Command {
     ResetMetrics,
     NextChart,
     PrevChart,
+    NextNode,
+    PrevNode,
     ToggleAllCharts,
     SelectDb,
     ScrollLeft,

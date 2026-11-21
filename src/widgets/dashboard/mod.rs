@@ -4,8 +4,10 @@
     clippy::cast_precision_loss
 )]
 
+mod overview;
 mod panels;
 
+use overview::render_overview;
 use panels::{empty_state, render_compact, render_full, render_tiles};
 
 use std::sync::Arc;
@@ -25,9 +27,10 @@ use ratatui::{
 
 use crate::{
     config,
-    redis_client::metrics::{MetricsHistory, Series},
+    redis_client::metrics::{ClusterMetrics, ClusterSummary, MetricsHistory, NodeRow, Series},
     state::FrameData,
     utils::{fmt_bytes, fmt_compact, fmt_rate_bytes, format_duration},
+    widgets::node_picker::picker_line,
 };
 
 /// Minimum inner size for the full chart grid.
@@ -43,6 +46,21 @@ pub struct Dashboard {
     frozen: Option<MetricsHistory>,
     selected: Metric,
     all_charts: bool,
+    /// One history per master of a cluster.
+    nodes: Arc<Mutex<ClusterMetrics>>,
+    /// The master whose charts show; `None` is the overview.
+    node: Option<String>,
+    /// The overview as it was when paused.
+    frozen_view: Option<ClusterView>,
+}
+
+/// What a cluster's dashboard shows above and instead of the charts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClusterView {
+    pub summary: Option<ClusterSummary>,
+    pub rows: Vec<NodeRow>,
+    /// Index in `rows` of the node on screen; `None` is the overview.
+    pub selected: Option<usize>,
 }
 
 /// One chartable metric; the dashboard shows the selected one full-size.
@@ -102,7 +120,90 @@ impl Dashboard {
             frozen: None,
             selected: Metric::Ops,
             all_charts: false,
+            nodes: Arc::default(),
+            node: None,
+            frozen_view: None,
         }
+    }
+
+    /// Read the masters' histories from `nodes`.
+    #[must_use]
+    pub fn with_nodes(mut self, nodes: Arc<Mutex<ClusterMetrics>>) -> Self {
+        self.nodes = nodes;
+        self
+    }
+
+    /// `Tab`: on a cluster, the next stop of overview → each master →
+    /// overview. On one server there are no nodes: the next chart.
+    pub fn next_node(&mut self) {
+        if !self.step_node(1) {
+            self.next_chart();
+        }
+    }
+
+    /// `Shift-Tab`: [`Self::next_node`] backwards.
+    pub fn prev_node(&mut self) {
+        if !self.step_node(-1) {
+            self.prev_chart();
+        }
+    }
+
+    /// Returns `false` when there are no nodes to step through.
+    fn step_node(&mut self, delta: isize) -> bool {
+        let ids = self.nodes.lock().ids();
+        if ids.is_empty() {
+            return false;
+        }
+        let stops = ids.len() + 1;
+        let at = self
+            .node
+            .as_ref()
+            .and_then(|node| ids.iter().position(|id| id == node))
+            .map_or(0, |index| index + 1);
+        let next = if delta >= 0 {
+            (at + 1) % stops
+        } else {
+            (at + stops - 1) % stops
+        };
+        self.node = next.checked_sub(1).map(|index| ids[index].clone());
+        // The frozen copy is of the node that was on screen.
+        self.unpause();
+        true
+    }
+
+    /// The picker and overview for this frame; `None` on one server.
+    #[must_use]
+    pub fn cluster_view(&self) -> Option<ClusterView> {
+        if let Some(view) = &self.frozen_view {
+            return Some(view.clone());
+        }
+        let rows = {
+            let nodes = self.nodes.lock();
+            if nodes.is_empty() {
+                return None;
+            }
+            nodes.rows()
+        };
+        let summary = self.metrics.lock().cluster.clone();
+        let selected = self
+            .node
+            .as_ref()
+            .and_then(|node| rows.iter().position(|row| &row.id == node));
+        Some(ClusterView {
+            summary,
+            rows,
+            selected,
+        })
+    }
+
+    /// The whole history of what is on screen.
+    fn current_history(&self) -> MetricsHistory {
+        if let Some(node) = &self.node {
+            if let Some(history) = self.nodes.lock().history(node) {
+                return history.clone();
+            }
+        }
+        self.metrics.lock().clone()
     }
 
     /// Select the next metric (and leave the all-charts overview).
@@ -124,15 +225,18 @@ impl Dashboard {
 
     /// Freeze the view on the current history, or resume live data.
     pub fn toggle_pause(&mut self) {
-        self.frozen = match self.frozen {
-            Some(_) => None,
-            None => Some(self.metrics.lock().clone()),
-        };
+        if self.frozen.is_some() {
+            self.unpause();
+        } else {
+            self.frozen_view = self.cluster_view();
+            self.frozen = Some(self.current_history());
+        }
     }
 
     /// Resume live data (no-op when not paused).
     pub fn unpause(&mut self) {
         self.frozen = None;
+        self.frozen_view = None;
     }
 
     #[must_use]
@@ -147,7 +251,13 @@ impl Dashboard {
         if self.is_paused() {
             return None;
         }
-        Some(self.metrics.lock().window(usize::from(width) * 2))
+        let n = usize::from(width) * 2;
+        if let Some(node) = &self.node {
+            if let Some(window) = self.nodes.lock().window(node, n) {
+                return Some(window);
+            }
+        }
+        Some(self.metrics.lock().window(n))
     }
 }
 
@@ -405,10 +515,24 @@ impl StatefulWidget for DashboardWidget<'_> {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(cfg.colors.base04))
             .fg(cfg.colors.base05);
-        let inner = block.inner(area);
+        let mut inner = block.inner(area);
         block.render(area, buf);
         if inner.is_empty() {
             return;
+        }
+
+        if let Some(view) = &self.frame.cluster_view {
+            let [picker, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            let mut labels = vec!["overview".to_owned()];
+            labels.extend(view.rows.iter().map(|row| row.addr.clone()));
+            let at = view.selected.map_or(0, |index| index + 1);
+            picker_line(&labels, at, picker.width).render(picker, buf);
+            if view.selected.is_none() {
+                render_overview(view, paused, rest, buf);
+                return;
+            }
+            inner = rest;
         }
 
         if !state.all_charts && inner.height >= 6 {
@@ -463,6 +587,40 @@ mod tests {
     fn dashboard(h: MetricsHistory) -> (Dashboard, Arc<Mutex<MetricsHistory>>) {
         let shared = Arc::new(Mutex::new(h));
         (Dashboard::new(shared.clone()), shared)
+    }
+
+    #[test]
+    fn tab_walks_the_nodes_on_a_cluster_and_the_charts_otherwise() {
+        use crate::redis_client::cluster::MasterNode;
+
+        let (mut single, _) = dashboard(history(3));
+        single.next_node();
+        assert!(single.selected == Metric::Memory, "one server: next chart");
+        single.prev_node();
+        assert!(single.selected == Metric::Ops);
+        assert!(single.cluster_view().is_none());
+
+        let mut nodes = ClusterMetrics::new(10);
+        let master = |id: &str, port| MasterNode {
+            id: id.into(),
+            host: "h".into(),
+            port,
+            slots: vec![(port, port)],
+        };
+        nodes.sync(&[master("a", 1), master("b", 2)]);
+        let (cluster, _) = dashboard(history(3));
+        let mut cluster = cluster.with_nodes(Arc::new(Mutex::new(nodes)));
+        let at = |d: &Dashboard| d.cluster_view().unwrap().selected;
+        assert_eq!(at(&cluster), None, "starts on the overview");
+        cluster.next_node();
+        assert_eq!(at(&cluster), Some(0));
+        cluster.next_node();
+        assert_eq!(at(&cluster), Some(1));
+        cluster.next_node();
+        assert_eq!(at(&cluster), None, "wraps to the overview");
+        cluster.prev_node();
+        assert_eq!(at(&cluster), Some(1));
+        assert!(cluster.selected == Metric::Ops, "the chart stays");
     }
 
     fn render_to_string(d: &mut Dashboard, w: u16, h: u16) -> String {

@@ -409,6 +409,7 @@ impl Runner {
                     _ = refresh_interval.tick() => {
                         if totals.is_cluster() {
                             watch_topology(&totals, &state, &action_tx).await;
+                            sample_nodes(&totals, &state).await;
                         }
                         let info_res = client::redis_info_with_snapshot(&mut manager).await;
 
@@ -441,7 +442,10 @@ impl Runner {
                                 if cluster_enabled && tick_no % 5 == 1 {
                                     // No lock is held across this await.
                                     match client::cluster_info(&mut manager).await {
-                                        Ok(c) => metrics.lock().set_cluster(Some(c)),
+                                        Ok(c) => {
+                                            state.cluster_metrics.lock().set_cluster(Some(&c));
+                                            metrics.lock().set_cluster(Some(c));
+                                        }
                                         Err(err) => log::warn!("Failed to fetch CLUSTER INFO: {err}"),
                                     }
                                 }
@@ -505,6 +509,24 @@ async fn watch_topology(storage: &Storage, state: &SharedState, tx: &ActionSende
     }
     crate::action::try_send_action(tx, Action::Notice(TOPOLOGY_CHANGED.to_owned()));
     crate::action::try_send_action(tx, Action::KeysChanged);
+}
+
+/// One `INFO` per master into `SharedState::cluster_metrics`, for the
+/// cluster dashboard. No lock is held across the requests.
+async fn sample_nodes(storage: &Storage, state: &SharedState) {
+    let samples = match storage.node_snapshots().await {
+        Ok(samples) => samples,
+        Err(err) => {
+            log::debug!("Sampling the cluster's masters failed: {err}");
+            return;
+        }
+    };
+    let masters = Arc::clone(&state.masters.lock());
+    let mut metrics = state.cluster_metrics.lock();
+    metrics.sync(&masters);
+    for (id, snapshot) in samples {
+        metrics.record(&id, snapshot);
+    }
 }
 
 /// How a `FetchKeys` ended.

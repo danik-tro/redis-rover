@@ -89,6 +89,9 @@ pub enum Action {
     ResetMetrics,
     NextChart,
     PrevChart,
+    /// `Tab` on the dashboard: the next node of a cluster.
+    NextNode,
+    PrevNode,
     ToggleAllCharts,
     OpenDbPicker,
     /// The runner connected to the newly selected DB; reload the keyspace.

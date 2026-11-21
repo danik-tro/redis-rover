@@ -224,7 +224,8 @@ impl App {
 
         let summary = Info::new(target);
         let keyspace = KeySpace::new(Vec::new());
-        let dashboard = Dashboard::new(state.metrics.clone());
+        let dashboard =
+            Dashboard::new(state.metrics.clone()).with_nodes(state.cluster_metrics.clone());
         let pubsub = PubSub::new(state.pubsub.clone());
         let monitor = Box::new(Monitor::new(state.monitor.clone()));
 

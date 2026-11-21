@@ -5,6 +5,8 @@
 
 use std::{collections::HashMap, collections::VecDeque, time::Instant};
 
+use super::cluster::MasterNode;
+
 /// Bounded ring buffer of samples; the oldest point is evicted at capacity.
 #[derive(Clone, Debug)]
 pub struct Series {
@@ -286,6 +288,137 @@ pub fn parse_cluster_info(raw: &str) -> ClusterSummary {
         slots_ok: n("cluster_slots_ok"),
         slots_pfail: n("cluster_slots_pfail"),
         slots_fail: n("cluster_slots_fail"),
+    }
+}
+
+/// One master's latest figures, for the cluster overview.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeRow {
+    pub id: String,
+    /// `host:port`.
+    pub addr: String,
+    /// Its last `INFO` answered.
+    pub up: bool,
+    pub ops: Option<f64>,
+    pub memory: Option<f64>,
+    pub keys: Option<f64>,
+    pub clients: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeMetrics {
+    id: String,
+    addr: String,
+    up: bool,
+    history: MetricsHistory,
+}
+
+/// A [`MetricsHistory`] per master of a cluster, in slot order. Empty on one
+/// server.
+#[derive(Clone, Debug, Default)]
+pub struct ClusterMetrics {
+    capacity: usize,
+    nodes: Vec<NodeMetrics>,
+}
+
+impl ClusterMetrics {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Follow the cluster's masters: a known one keeps its history, a new
+    /// one starts empty, one that is gone is dropped.
+    pub fn sync(&mut self, masters: &[MasterNode]) {
+        let mut old = std::mem::take(&mut self.nodes);
+        self.nodes = masters
+            .iter()
+            .map(|master| {
+                let addr = format!("{}:{}", master.host, master.port);
+                match old.iter().position(|node| node.id == master.id) {
+                    Some(index) => {
+                        let mut node = old.swap_remove(index);
+                        node.addr = addr;
+                        node
+                    }
+                    None => NodeMetrics {
+                        id: master.id.clone(),
+                        addr,
+                        up: true,
+                        history: MetricsHistory::new(self.capacity),
+                    },
+                }
+            })
+            .collect();
+    }
+
+    /// Record one master's `INFO` sample, or that it didn't answer.
+    pub fn record(&mut self, id: &str, snapshot: Option<InfoSnapshot>) {
+        let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) else {
+            return;
+        };
+        node.up = snapshot.is_some();
+        match snapshot {
+            Some(snapshot) => node.history.record(snapshot),
+            None => node.history.mark_unavailable(),
+        }
+    }
+
+    /// The `CLUSTER INFO` summary, shown in each node's stat tiles.
+    pub fn set_cluster(&mut self, summary: Option<&ClusterSummary>) {
+        for node in &mut self.nodes {
+            node.history.set_cluster(summary.cloned());
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for node in &mut self.nodes {
+            node.history.reset();
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    #[must_use]
+    pub fn ids(&self) -> Vec<String> {
+        self.nodes.iter().map(|node| node.id.clone()).collect()
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> Vec<NodeRow> {
+        self.nodes
+            .iter()
+            .map(|node| NodeRow {
+                id: node.id.clone(),
+                addr: node.addr.clone(),
+                up: node.up,
+                ops: node.history.ops.last(),
+                memory: node.history.used_memory.last(),
+                keys: node.history.total_keys.last(),
+                clients: node.history.clients.last(),
+            })
+            .collect()
+    }
+
+    /// The last `n` samples of the master `id`.
+    #[must_use]
+    pub fn window(&self, id: &str, n: usize) -> Option<MetricsHistory> {
+        self.history(id).map(|history| history.window(n))
+    }
+
+    /// The whole history of the master `id`.
+    #[must_use]
+    pub fn history(&self, id: &str) -> Option<&MetricsHistory> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| &node.history)
     }
 }
 

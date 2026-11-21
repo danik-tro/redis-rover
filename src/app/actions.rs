@@ -100,6 +100,8 @@ impl App {
             | Action::SlowlogLoaded => self.handle_slowlog_action(action),
             Action::NextChart => self.dashboard.next_chart(),
             Action::PrevChart => self.dashboard.prev_chart(),
+            Action::NextNode => self.dashboard.next_node(),
+            Action::PrevNode => self.dashboard.prev_node(),
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
             Action::ToggleMetricsPause => self.dashboard.toggle_pause(),
             Action::ResetMetrics => self.reset_metrics(),
