@@ -104,6 +104,7 @@ pub async fn run(args: Cli) -> Result<()> {
     )
     .read_only_flag(watcher.read_only_flag())
     .live_tx(watcher.live_tx())
+    .monitor_tx(watcher.monitor_tx())
     .environment(target.environment);
 
     watcher.start();
@@ -153,9 +154,37 @@ pub mod internals {
     pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
     pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, LoadProgress, PageInfo};
+    pub use crate::widgets::monitor::{Monitor, MonitorWidget};
     pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};
+
+    /// The MONITOR start confirm on `env`, `typed` in its input on Prod.
+    pub fn render_monitor_confirm(
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        env: Environment,
+        typed: &str,
+    ) {
+        use crate::widgets::confirm::{typed_input_titled, TypedText};
+        use ratatui::widgets::Widget;
+        let popup = ConfirmPopup::start_monitor(env);
+        if env == Environment::Prod {
+            let mut input = typed_input_titled("Type monitor", "monitor");
+            input.insert_str(typed);
+            let text = TypedText {
+                expected: "monitor",
+                action: "start",
+                object: "MONITOR",
+                what: "monitor",
+            };
+            popup
+                .typed_confirm(&text, &input, typed == "monitor")
+                .render(area, buf);
+        } else {
+            popup.render(area, buf);
+        }
+    }
 
     /// The typed confirm on Prod with `typed` in its input, as the App
     /// draws it.

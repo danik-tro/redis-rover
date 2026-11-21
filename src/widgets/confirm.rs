@@ -187,6 +187,29 @@ impl<'a> ConfirmPopup<'a> {
         }
     }
 
+    /// Before MONITOR starts: what it costs the server.
+    #[must_use]
+    pub fn start_monitor(env: Environment) -> Self {
+        let cfg = config::get();
+        Self {
+            title: format!(" Start MONITOR on {}? ", env.label()),
+            body: vec![
+                Line::from("MONITOR makes the server send every command here."),
+                Line::from("It costs server CPU, and more the busier it is."),
+                Line::from(if cfg.monitor.keep_running {
+                    "It keeps running after you leave (monitor.keep_running)."
+                } else {
+                    "It stops when you leave this screen."
+                })
+                .fg(cfg.colors.base04),
+            ],
+            hint: Line::from("y: start   n/Esc: cancel").fg(cfg.colors.base04),
+            color: cfg.colors.env(env),
+            input: None,
+            min_width: MIN_CONTENT_WIDTH,
+        }
+    }
+
     /// `g o` while the filter hides the open key.
     #[must_use]
     pub fn clear_filter_for(key: &str, env: Environment) -> Self {

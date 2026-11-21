@@ -1,5 +1,5 @@
 use super::render::{pane_areas, PaneAreas};
-use super::{row_at, LogCursor, Pane, PubSub, Row, RECONNECT_MARKER, TOP_CHANNELS};
+use super::{row_at, LogBuffer, LogCursor, Pane, PubSub, Row, RECONNECT_MARKER, TOP_CHANNELS};
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,9 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     config,
     pubsub_notify::NotifyState,
-    redis_client::pubsub_store::{
-        ConnStatus, EntryKind, MessageBuffer, PubSubMessage, PubSubStore, Subscription,
-    },
+    redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubMessage, PubSubStore, Subscription},
     utils::{fmt_bytes, group_thousands},
     widgets::{keyspace::truncate_to_width, local_time},
 };
@@ -270,7 +268,7 @@ pub(super) fn log_view(
 }
 
 /// `following`, or `paused · +128 new` (and `· older messages evicted`).
-pub(super) fn log_state(cursor: &LogCursor, buf: &MessageBuffer) -> String {
+pub(crate) fn log_state(cursor: &LogCursor, buf: &impl LogBuffer) -> String {
     if !cursor.is_paused() {
         return "following".into();
     }

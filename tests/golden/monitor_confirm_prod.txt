@@ -1,0 +1,18 @@
+
+
+
+
+
+
+              ╭───────────── Start MONITOR on PROD? ──────────────╮
+              │ MONITOR makes the server send every command here. │
+              │ It costs server CPU, and more the busier it is.   │
+              │ It stops when you leave this screen.              │
+              │                                                   │
+              │ Type monitor to start MONITOR.                    │
+              │                                                   │
+              │ ╭Type monitor───────────────────────────────────╮ │
+              │ │mon                                            │ │
+              │ ╰───────────────────────────────────────────────╯ │
+              │  Enter: start (type monitor first)   Esc: cancel  │
+              ╰───────────────────────────────────────────────────╯

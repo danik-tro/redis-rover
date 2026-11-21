@@ -27,6 +27,8 @@ enum PasteTarget {
     },
     /// The filter popup.
     Filter,
+    /// The MONITOR screen's filter.
+    MonitorFilter,
     /// The edit-value / TTL overlay.
     Overlay,
     /// The add-key wizard on its name or element step.
@@ -81,7 +83,11 @@ impl App {
         }
 
         // Keep a half-open keyspace overlay from swallowing dashboard keys.
-        if matches!(self.mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog) {
+        if self.mode == Mode::Monitor {
+            return self.handle_monitor_key(key);
+        }
+
+        if matches!(self.mode, Mode::Dashboard | Mode::Slowlog) {
             // Esc backs out of the help overlay first; any other key (`m`)
             // goes through as a real command.
             if is_cancel && self.help_is_open() {
@@ -212,7 +218,13 @@ impl App {
                 multiline: self.pubsub.is_payload_focused(),
             });
         }
-        if matches!(self.mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog)
+        if self.mode == Mode::Monitor {
+            return self
+                .monitor
+                .is_filter_open()
+                .then_some(PasteTarget::MonitorFilter);
+        }
+        if matches!(self.mode, Mode::Dashboard | Mode::Slowlog)
             || self.keyspace.is_sort_menu_open()
             || self.keyspace.is_type_menu_open()
         {
@@ -274,6 +286,7 @@ impl App {
                 }
                 PasteTarget::PubSubPopup { .. } => self.pubsub.handle_popup_key(key),
                 PasteTarget::Filter => self.keyspace.handle_key(key, now),
+                PasteTarget::MonitorFilter => self.monitor.filter_key(key),
                 PasteTarget::Overlay => self.keyspace.handle_overlay_key(key),
                 PasteTarget::Wizard => self.keyspace.handle_wizard_key(key),
                 PasteTarget::AddItem => self.keyspace.handle_add_item_key(key),
@@ -336,7 +349,7 @@ impl App {
             == KeyResolution::Command(Command::Quit)
     }
 
-    fn handle_keybindings(&mut self, mut key: KeyEvent) -> Option<Action> {
+    pub(super) fn handle_keybindings(&mut self, mut key: KeyEvent) -> Option<Action> {
         // Symbol keys like `?` arrive with `SHIFT` set on most terminals, but
         // the config writes them literally (no modifier). Drop a lone `SHIFT`
         // on punctuation/symbol chars so those bindings match.

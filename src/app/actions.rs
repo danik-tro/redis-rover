@@ -53,6 +53,7 @@ impl App {
         if self.mode != mode {
             self.sync_backfill_pause();
             self.sync_live_pause();
+            self.sync_monitor_run();
         }
     }
 
@@ -68,6 +69,9 @@ impl App {
         self.redraw.dirty |= changed;
     }
 
+    // One flat dispatch table: every arm is a call, and no `_` arm, so a new
+    // action has to be routed here.
+    #[allow(clippy::too_many_lines)]
     fn apply(&mut self, action: &Action, now: Instant, help_open: bool) {
         match *action {
             Action::Tick => self.tick(now, help_open),
@@ -76,11 +80,16 @@ impl App {
             Action::Resize(..) | Action::Render | Action::Refresh => {}
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
-            Action::GoToMonitor => self.go_to(Mode::Monitor),
-            Action::GoToSlowlog => self.go_to(Mode::Slowlog),
-            Action::GoToPubSub => self.go_to(Mode::PubSub),
-            Action::GoToDashboard => self.go_to(Mode::Dashboard),
-            Action::LeaveScreen => self.leave_screen(),
+            Action::GoToMonitor
+            | Action::GoToSlowlog
+            | Action::GoToPubSub
+            | Action::GoToDashboard
+            | Action::LeaveScreen => self.navigate(action),
+            Action::MonitorToggle
+            | Action::MonitorFilter
+            | Action::MonitorTogglePause
+            | Action::MonitorClear
+            | Action::MonitorEnter => self.handle_monitor_action(action),
             Action::NextChart => self.dashboard.next_chart(),
             Action::PrevChart => self.dashboard.prev_chart(),
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
@@ -174,6 +183,13 @@ impl App {
     /// value or the Pub/Sub message detail.
     fn pan(&mut self, action: &Action) {
         let pubsub = self.mode == Mode::PubSub;
+        if self.mode == Mode::Monitor {
+            match action {
+                Action::ToggleWrap => self.monitor.toggle_detail_wrap(),
+                _ => self.monitor.pan_detail(*action == Action::ScrollRight),
+            }
+            return;
+        }
         if *action == Action::ToggleWrap {
             if pubsub {
                 self.pubsub.toggle_detail_wrap();
