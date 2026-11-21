@@ -353,8 +353,10 @@ mod tests {
     async fn the_temp_file_is_private_and_always_removed() {
         use std::os::unix::fs::PermissionsExt;
 
-        // The "editor" checks the mode and the content, then edits.
-        let check = "sh -c 'test \"$(stat -f %Lp \"$0\" 2>/dev/null || stat -c %a \"$0\")\" = 600 \
+        // The "editor" checks the mode and the content, then edits. GNU form
+        // first: GNU `stat -f` means filesystem status and prints to stdout
+        // before failing, while BSD `stat -c` fails without printing.
+        let check = "sh -c 'test \"$(stat -c %a \"$0\" 2>/dev/null || stat -f %Lp \"$0\")\" = 600 \
                      && grep -q hello \"$0\" && printf world > \"$0\"'";
         assert_eq!(edit("hello", check).await, Edited::Changed("world".into()));
         assert!(leftovers().is_empty(), "{:?}", leftovers());
