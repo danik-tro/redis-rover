@@ -501,9 +501,12 @@ mod tests {
         }
 
         // Discovery sees our channel, with our connection among its subscribers.
-        let manager = redis::aio::ConnectionManager::new(client.clone())
-            .await
-            .unwrap();
+        let manager = crate::redis_client::runner::connect(
+            client.clone(),
+            crate::redis_client::runner::Link::Interactive,
+        )
+        .await
+        .unwrap();
         let server = Storage::new(manager).pubsub_channels().await.unwrap();
         let (_, subs) = server
             .channels
