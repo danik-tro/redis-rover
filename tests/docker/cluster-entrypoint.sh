@@ -46,6 +46,20 @@ done
 redis-cli --cluster create $nodes --cluster-replicas 1 --cluster-yes >/data/create.log
 
 until redis-cli -p "${PORTS%% *}" cluster info | grep -q 'cluster_state:ok'; do sleep 0.1; done
+
+# A replica that never finished its first sync refuses to fail over, so the
+# cluster isn't ready until every replica is linked to its master.
+total=$(echo "$PORTS" | wc -w)
+while :; do
+    linked=0
+    for port in $PORTS; do
+        if redis-cli -p "$port" info replication | grep -q 'master_link_status:up'; then
+            linked=$((linked + 1))
+        fi
+    done
+    [ "$linked" -ge $((total / 2)) ] && break
+    sleep 0.1
+done
 touch /data/ready
 echo "cluster ready"
 
