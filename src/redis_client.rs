@@ -1,5 +1,6 @@
 pub mod bytes;
 pub mod client;
+pub mod cluster;
 pub mod conn;
 pub mod escape;
 pub mod event;

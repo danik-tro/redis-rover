@@ -207,6 +207,7 @@ pub mod internals {
     pub use crate::mode::Mode;
     pub use crate::probe::report as probe_report;
     pub use crate::redis_client::bytes::text_from_bytes;
+    pub use crate::redis_client::cluster::MasterNode;
     pub use crate::redis_client::conn::Conn;
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
@@ -217,8 +218,11 @@ pub mod internals {
     };
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
-    pub use crate::redis_client::runner::{connect, Link, Runner, VALUE_FETCH_DELAY_MS};
+    pub use crate::redis_client::runner::{
+        connect, connect_cluster, Link, Runner, VALUE_FETCH_DELAY_MS,
+    };
     pub use crate::redis_client::slowlog::{SlowlogData, SlowlogEntry};
+    pub use crate::redis_client::storage::Storage;
     pub use crate::redis_client::types::{
         ConsumerInfo, GroupDetail, GroupInfo, ItemDelete, ItemEdit, JsonField, JsonPreview,
         JsonPreviewKind, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, MemberKind,
