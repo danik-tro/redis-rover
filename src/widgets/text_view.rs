@@ -178,6 +178,7 @@ impl TextCache {
             | KeyValue::Set(_)
             | KeyValue::Hash(_)
             | KeyValue::Zset(_)
+            | KeyValue::Stream(_)
             | KeyValue::Unknown => None,
         }
     }

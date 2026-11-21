@@ -698,6 +698,11 @@ impl EventHandler {
                     }
                 }
             }
+            RedisEvent::FetchStreamGroup { key, group } => {
+                let detail = self.value_storage.stream_group(&key, &group).await;
+                *self.state.stream_group.lock() = Some(detail);
+                self.action_hook(Action::StreamGroupLoaded);
+            }
             RedisEvent::FetchSlowlog => self.load_slowlog().await,
             RedisEvent::SlowlogReset => match self.storage.slowlog_reset().await {
                 Ok(()) => self.load_slowlog().await,

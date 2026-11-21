@@ -1,5 +1,6 @@
 mod glob;
 mod keyspace;
+mod stream;
 mod tree;
 mod type_filter;
 mod value;
@@ -7,6 +8,11 @@ mod view;
 
 pub use glob::glob_match;
 pub use keyspace::{KeyspaceState, SweepApply, SweepRequest, SweepResult};
+pub use stream::{
+    parse_consumers, parse_entries as parse_stream_entries, parse_groups, parse_last_id,
+    parse_pending, prev_id, ConsumerInfo, GroupDetail, GroupInfo, PendingEntry, StreamEntry,
+    StreamValue,
+};
 pub use tree::{PageRow, DEFAULT_SEPARATOR};
 pub use type_filter::{TypeFilter, TypeScan, STANDARD_TYPES};
 pub use value::{
@@ -147,6 +153,8 @@ pub enum KeyValue {
     /// The shape of a `RedisJSON` document (or field) above
     /// `keyspace.json_preview_bytes`, read without fetching it whole (#49).
     JsonPreview(JsonPreview),
+    /// One page of a stream, newest first.
+    Stream(StreamValue),
     Unknown,
 }
 

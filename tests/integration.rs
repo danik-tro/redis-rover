@@ -3623,3 +3623,161 @@ async fn shard_subscribes_on_the_slot_owner_in_a_cluster() {
     }
     unimplemented!("SSUBSCRIBE is not routed to the slot owner yet");
 }
+
+// ---- Streams ---------------------------------------------------------------
+
+/// Open `key` with `page_size` rows and load the current page.
+async fn load_stream(h: &mut Harness) -> redis_rover::internals::StreamValue {
+    h.send(RedisEvent::FetchValue);
+    h.expect("value", |a| *a == Action::LoadSelectedValueIntoView)
+        .await;
+    let loaded = h.state.selected_value.lock().clone().expect("a value");
+    match loaded.value {
+        KeyValue::Stream(stream) => stream,
+        other => panic!("not a stream: {other:?}"),
+    }
+}
+
+async fn xadd(admin: &mut redis::aio::ConnectionManager, key: &str, id: &str, value: &str) {
+    let _: String = redis::cmd("XADD")
+        .arg(key)
+        .arg(id)
+        .arg("field")
+        .arg(value)
+        .query_async(admin)
+        .await
+        .expect("XADD");
+}
+
+/// Pages cross a millisecond boundary (sequence 0), so the ID decrement is
+/// exercised, on the oldest server image and the current one.
+async fn stream_pages_on(tag: &str) {
+    let server = support::start_redis_tag(tag).await;
+    let mut admin = server.admin(0).await;
+    for (i, id) in ["5-0", "5-1", "6-0", "6-1", "7-0", "7-1", "8-0"]
+        .iter()
+        .enumerate()
+    {
+        xadd(&mut admin, "s", id, &format!("v{i}")).await;
+    }
+    let mut h = Harness::new(server.client(0), false).await;
+    {
+        let mut value = h.state.value_state.lock();
+        value.select("s", RedisType::Stream);
+        value.page_size = 3;
+    }
+    let ids = |s: &redis_rover::internals::StreamValue| {
+        s.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
+    };
+    let first = load_stream(&mut h).await;
+    assert_eq!(ids(&first), ["8-0", "7-1", "7-0"], "{tag}");
+    assert_eq!((first.length, first.last_id.as_str()), (7, "8-0"));
+
+    assert!(h.state.value_state.lock().next_page());
+    assert_eq!(
+        ids(&load_stream(&mut h).await),
+        ["6-1", "6-0", "5-1"],
+        "{tag}"
+    );
+    assert!(h.state.value_state.lock().next_page());
+    assert_eq!(ids(&load_stream(&mut h).await), ["5-0"], "{tag}");
+    assert!(!h.state.value_state.lock().next_page(), "the last page");
+
+    // A new entry doesn't shift a page already reached.
+    xadd(&mut admin, "s", "9-0", "new").await;
+    assert!(h.state.value_state.lock().previous_page());
+    assert_eq!(
+        ids(&load_stream(&mut h).await),
+        ["6-1", "6-0", "5-1"],
+        "{tag}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stream_pages_across_three_pages() {
+    stream_pages_on("7-alpine").await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stream_pages_on_redis_6_0() {
+    stream_pages_on("6.0-alpine").await;
+}
+
+async fn stream_groups_on(tag: &str, has_lag: bool) {
+    let server = support::start_redis_tag(tag).await;
+    let mut admin = server.admin(0).await;
+    for id in ["1-0", "2-0", "3-0"] {
+        xadd(&mut admin, "s", id, "v").await;
+    }
+    for group in ["billing", "audit"] {
+        let () = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg("s")
+            .arg(group)
+            .arg("0")
+            .query_async(&mut admin)
+            .await
+            .expect("XGROUP");
+    }
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("billing")
+        .arg("worker-1")
+        .arg("COUNT")
+        .arg(2)
+        .arg("STREAMS")
+        .arg("s")
+        .arg(">")
+        .query_async(&mut admin)
+        .await
+        .expect("XREADGROUP");
+
+    let mut h = Harness::new(server.client(0), true).await;
+    h.state.value_state.lock().select("s", RedisType::Stream);
+    let stream = load_stream(&mut h).await;
+    let groups = stream.groups.expect("groups");
+    assert_eq!(groups.len(), 2, "{tag}");
+    let billing = groups
+        .iter()
+        .find(|g| g.name == "billing")
+        .expect("billing");
+    assert_eq!((billing.consumers, billing.pending), (1, 2), "{tag}");
+    assert_eq!(billing.last_delivered, "2-0", "{tag}");
+    assert_eq!(billing.lag, has_lag.then_some(1), "{tag}");
+
+    h.send(RedisEvent::FetchStreamGroup {
+        key: "s".into(),
+        group: "billing".into(),
+    });
+    h.expect("group", |a| *a == Action::StreamGroupLoaded).await;
+    let detail = h.state.stream_group.lock().take().expect("detail");
+    assert_eq!(detail.error, None);
+    assert_eq!(detail.consumers.len(), 1);
+    assert_eq!(
+        (
+            detail.consumers[0].name.as_str(),
+            detail.consumers[0].pending
+        ),
+        ("worker-1", 2)
+    );
+    let pending: Vec<_> = detail.pending.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(pending, ["1-0", "2-0"]);
+    assert_eq!(detail.pending[0].consumer, "worker-1");
+    assert_eq!(detail.pending[0].deliveries, 1);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stream_groups_consumers_and_pending() {
+    stream_groups_on("7-alpine", true).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn stream_groups_on_redis_6_0() {
+    stream_groups_on("6.0-alpine", false).await;
+}

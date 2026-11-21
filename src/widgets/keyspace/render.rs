@@ -202,6 +202,7 @@ impl KeySpaceWidget {
             KeyValue::String { .. }
             | KeyValue::Json(_)
             | KeyValue::JsonPreview(_)
+            | KeyValue::Stream(_)
             | KeyValue::Unknown => {
                 Self::render_placeholder(
                     vec![Line::from("Viewer for this type isn't supported yet")],

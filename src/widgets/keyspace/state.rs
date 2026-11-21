@@ -312,6 +312,7 @@ impl KeySpace {
             Some(KeyValue::List(items) | KeyValue::Set(items)) => items.len(),
             Some(KeyValue::Hash(entries)) => entries.len(),
             Some(KeyValue::Zset(entries)) => entries.len(),
+            Some(KeyValue::Stream(stream)) => stream.entries.len(),
             Some(KeyValue::JsonPreview(JsonPreview {
                 kind: JsonPreviewKind::Object { fields, .. },
                 ..
@@ -367,9 +368,11 @@ impl KeySpace {
                 member: m.clone(),
                 score: *s,
             }),
+            // Read-only: no element to edit or delete.
             KeyValue::String { .. }
             | KeyValue::Json(_)
             | KeyValue::JsonPreview(_)
+            | KeyValue::Stream(_)
             | KeyValue::Unknown => None,
         }
     }

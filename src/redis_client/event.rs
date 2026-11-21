@@ -125,6 +125,12 @@ pub enum RedisEvent {
     FetchSlowlog,
     /// `SLOWLOG RESET`.
     SlowlogReset,
+    /// `XINFO CONSUMERS` and `XPENDING` of a group into
+    /// `SharedState::stream_group`.
+    FetchStreamGroup {
+        key: String,
+        group: String,
+    },
     /// `PUBLISH channel payload`. The payload travels in the event, not in an
     /// `Action`, so it isn't debug-logged as one.
     Publish {
@@ -254,6 +260,9 @@ impl std::fmt::Debug for RedisEvent {
             Self::FetchPubSubChannels => f.write_str("FetchPubSubChannels"),
             Self::FetchSlowlog => f.write_str("FetchSlowlog"),
             Self::SlowlogReset => f.write_str("SlowlogReset"),
+            Self::FetchStreamGroup { key, group } => {
+                write!(f, "FetchStreamGroup {{ key: {key:?}, group: {group:?} }}")
+            }
             Self::Publish { channel, payload } => write!(
                 f,
                 "Publish {{ channel: {channel:?}, payload: {} }}",
@@ -284,7 +293,8 @@ impl RedisEvent {
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
-            | Self::FetchSlowlog => false,
+            | Self::FetchSlowlog
+            | Self::FetchStreamGroup { .. } => false,
             Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::SetTtl { .. }
@@ -325,6 +335,7 @@ impl RedisEvent {
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
             | Self::FetchSlowlog
+            | Self::FetchStreamGroup { .. }
             | Self::SetString { .. }
             | Self::CreateKey { .. }
             | Self::AddItem { .. }
@@ -362,7 +373,8 @@ impl RedisEvent {
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
-            | Self::FetchSlowlog => return Vec::new(),
+            | Self::FetchSlowlog
+            | Self::FetchStreamGroup { .. } => return Vec::new(),
             // No argument to quote: read as it is typed.
             Self::SlowlogReset => return vec!["SLOWLOG RESET".to_owned()],
             Self::SetString { key, value } => write_cmd::set_string(key, value),
@@ -422,6 +434,7 @@ impl RedisEvent {
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
             | Self::FetchSlowlog
+            | Self::FetchStreamGroup { .. }
             | Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::CreateKey { .. }

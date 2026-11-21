@@ -207,6 +207,7 @@ fn changed_rows(old: &KeyValue, new: &KeyValue) -> Vec<usize> {
             .collect(),
         (KeyValue::Set(old), KeyValue::Set(new)) => new_rows(old, new),
         (KeyValue::Hash(old), KeyValue::Hash(new)) => new_rows(old, new),
+        (KeyValue::Stream(old), KeyValue::Stream(new)) => new_rows(&old.entries, &new.entries),
         (KeyValue::Zset(old), KeyValue::Zset(new)) => {
             let row = |(member, score): &(String, f64)| (member.clone(), score.to_bits());
             new_rows(old.iter().map(row), new.iter().map(row))

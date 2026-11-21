@@ -12,7 +12,7 @@ use crate::{
         monitor_store::MonitorStore,
         pubsub_store::PubSubStore,
         slowlog::SlowlogData,
-        types::{KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
+        types::{GroupDetail, KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
     widgets::{info::FooterText, monitor::MonitorView, pubsub::PubSubView},
 };
@@ -48,6 +48,8 @@ pub struct SharedState {
     pub monitor: Arc<Mutex<MonitorStore>>,
     /// The last slowlog load, until the App takes it (`SlowlogLoaded`).
     pub slowlog: Arc<Mutex<Option<SlowlogData>>>,
+    /// The stream group asked for last, until the App takes it.
+    pub stream_group: Arc<Mutex<Option<GroupDetail>>>,
 }
 
 /// Redis's default `databases` setting.
@@ -74,6 +76,7 @@ impl Default for SharedState {
                 config::get().monitor.limits(),
             ))),
             slowlog: Arc::new(Mutex::new(None)),
+            stream_group: Arc::new(Mutex::new(None)),
         }
     }
 }
