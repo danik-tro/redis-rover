@@ -269,12 +269,20 @@ async fn a_write_updates_the_sweep_without_a_rescan() {
     assert!(!after.contains(&victim));
     assert_eq!(after[..3], page[..3], "the rows before it didn't move");
     assert_eq!(after[3..99], page[4..], "the rows after it moved up");
-    // Filling the page's last row scanned on from where the sweep was.
+    // Filling the page's last row scans on from where the sweep was, but
+    // only if the delete left it short of two full pages: SCAN batch sizes
+    // vary, so the sweep may have held a spare key.
+    let (held, held_cursor) = (loaded - 1, cursor);
     let (cursor, loaded) = {
         let ks = h.state.keyspace_state.lock();
         (ks.sweep_cursor, ks.scanned.len())
     };
-    assert!(cursor != 0 && loaded > 200);
+    assert_ne!(cursor, 0, "the sweep is still part way");
+    if held >= 200 {
+        assert_eq!((cursor, loaded), (held_cursor, held), "no SCAN was needed");
+    } else {
+        assert!(loaded >= 200, "the sweep scanned on to fill the page");
+    }
 
     // Create: the new key joins the loaded ones.
     let fresh = format!("{p}fresh");
