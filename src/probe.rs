@@ -121,8 +121,17 @@ fn role_line(role: &RedisResult<Value>) -> String {
 fn cluster_line(cluster: &RedisResult<String>) -> String {
     match cluster {
         Ok(raw) => {
-            let state = parse_info(raw).get("cluster_state").copied().unwrap_or("?");
-            format!("yes (state {state})")
+            let fields = parse_info(raw);
+            let state = fields.get("cluster_state").copied().unwrap_or("?");
+            match (
+                fields.get("cluster_size"),
+                fields.get("cluster_known_nodes"),
+            ) {
+                (Some(masters), Some(nodes)) => {
+                    format!("yes (state {state}, {masters} masters, {nodes} nodes)")
+                }
+                _ => format!("yes (state {state})"),
+            }
         }
         Err(e) if e.to_string().to_lowercase().contains("disabled") => "no".to_owned(),
         Err(e) => format!("n/a ({e})"),
@@ -214,6 +223,12 @@ mod tests {
                 "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n".into()
             )),
             "yes (state ok)"
+        );
+        assert_eq!(
+            cluster_line(&Ok(
+                "cluster_state:ok\r\ncluster_known_nodes:6\r\ncluster_size:3\r\n".into()
+            )),
+            "yes (state ok, 3 masters, 6 nodes)"
         );
 
         let role = Ok(Value::Array(vec![Value::BulkString(b"master".to_vec())]));

@@ -193,7 +193,7 @@ impl Storage {
         for key in keys {
             pipe.cmd("TYPE").arg(Raw(key));
         }
-        let mut manager = self.manager.clone();
+        let mut manager = self.manager.home();
         pipe.query_async(&mut manager).await
     }
 
@@ -286,7 +286,7 @@ impl Storage {
             }
             pipe.cmd("TTL").arg(Raw(key));
         }
-        let mut manager = self.manager.clone();
+        let mut manager = self.manager.home();
         let raw: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
 
         let mut metas = Vec::with_capacity(keys.len());

@@ -12,7 +12,10 @@ use std::{
 };
 
 use color_eyre::eyre::{eyre, Result};
-use redis::{ConnectionInfo, IntoConnectionInfo};
+use redis::{
+    cluster::{ClusterClient, ClusterClientBuilder},
+    ConnectionInfo, IntoConnectionInfo,
+};
 use serde::Deserialize;
 
 use crate::cli::{apply_tls_flags, Cli, TlsArgs};
@@ -30,11 +33,26 @@ pub struct Profile {
     /// Shell command that prints the password (`op read …`, `pass show …`).
     #[serde(alias = "passwordCommand")]
     pub password_command: Option<String>,
-    /// Inferred from the host when unset ([`Environment::infer`]).
+    /// Inferred from the hosts when unset ([`Environment::infer`]).
     pub environment: Option<Environment>,
     /// Overrides the environment's default; `--read-only` / `--writable` win.
     #[serde(alias = "readOnly")]
     pub read_only: Option<bool>,
+    /// `true`: connect as a cluster client. `false`: stay on the one node
+    /// even if it is in a cluster. Unset: detect it from `INFO cluster`.
+    pub cluster: Option<bool>,
+}
+
+/// Whether the session uses the cluster client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClusterMode {
+    /// Ask the server (`INFO cluster`) after connecting.
+    #[default]
+    Auto,
+    /// `redis-cluster://` or profile `cluster: true`.
+    On,
+    /// Profile `cluster: false`.
+    Off,
 }
 
 /// How much protection a connection gets: `Prod` and `Unknown` start
@@ -74,6 +92,17 @@ impl Environment {
         } else {
             Self::Unknown
         }
+    }
+
+    /// [`Environment::infer`] over every seed: `Local` only if all of them
+    /// are loopback, since a session can reach any of them.
+    #[must_use]
+    pub fn infer_all<'a>(addrs: impl IntoIterator<Item = &'a redis::ConnectionAddr>) -> Self {
+        addrs
+            .into_iter()
+            .map(Self::infer)
+            .max_by_key(|env| env.strictness())
+            .unwrap_or(Self::Unknown)
     }
 
     /// How much protection the environment gives: `Local` < `Staging` <
@@ -221,7 +250,13 @@ pub struct Target {
     /// The profile used, if any.
     pub profile: Option<String>,
     /// Address, DB and URL credentials (no `password_command` / token yet).
+    /// On a cluster, the first seed.
     info: ConnectionInfo,
+    /// Every seed of a `redis-cluster://` URL, the first one included.
+    /// Empty for any other URL.
+    seeds: Vec<redis::ConnectionAddr>,
+    pub cluster: ClusterMode,
+    pub cluster_source: Source,
     pub url_source: Source,
     pub db_source: Source,
     /// The `--tls-*` flags merged over the profile's `tls`.
@@ -274,12 +309,7 @@ pub fn resolve(
     } else {
         (DEFAULT_URL, Source::Default)
     };
-    let mut info = url
-        .into_connection_info()
-        .map_err(|e| TargetError::InvalidUrl {
-            source: url_source.clone(),
-            detail: e.to_string(),
-        })?;
+    let (mut info, seeds) = parse_url(url, &url_source)?;
 
     let db_source = if let Some(db) = cli.db {
         info = with_db(info, db);
@@ -305,15 +335,7 @@ pub fn resolve(
         Source::Default
     };
 
-    let password = if cli.token {
-        PasswordSource::Token
-    } else if let Some(cmd) = profile.and_then(|p| p.password_command.clone()) {
-        PasswordSource::Command(cmd)
-    } else if info.redis_settings().password().is_some() {
-        PasswordSource::Url
-    } else {
-        PasswordSource::None
-    };
+    let password = password_source(cli, profile, &info);
 
     // `--url` replaced the profile's own URL: the profile describes another
     // server, so its `environment` and `read_only: false` can only add
@@ -321,7 +343,26 @@ pub fn resolve(
     // must not come up as LOCAL and writable).
     let url_replaced = cli.url.is_some() && profile.is_some_and(|p| p.url.is_some());
     let override_source = || Source::UrlOverridesProfile(name.unwrap_or_default().to_owned());
-    let inferred = Environment::infer(info.addr());
+    let inferred = if seeds.is_empty() {
+        Environment::infer(info.addr())
+    } else {
+        Environment::infer_all(&seeds)
+    };
+
+    // A replaced URL is another server: the profile's `cluster` says nothing
+    // about it.
+    let profile_cluster = profile.and_then(|p| p.cluster).filter(|_| !url_replaced);
+    let (cluster, cluster_source) = match (seeds.is_empty(), profile_cluster) {
+        (false, _) => (ClusterMode::On, Source::Url),
+        (true, Some(true)) => (ClusterMode::On, profile_source()),
+        (true, Some(false)) => (ClusterMode::Off, profile_source()),
+        (true, None) => (ClusterMode::Auto, Source::Default),
+    };
+    if cluster == ClusterMode::On && info.redis_settings().db() != 0 {
+        return Err(TargetError::Config(
+            "Redis Cluster only has DB 0".to_owned(),
+        ));
+    }
     let (environment, env_source) = match profile.and_then(|p| p.environment) {
         Some(env) if url_replaced && inferred.strictness() > env.strictness() => {
             (inferred, override_source())
@@ -349,6 +390,9 @@ pub fn resolve(
         read_only,
         read_only_source,
         info,
+        seeds,
+        cluster,
+        cluster_source,
         url_source,
         db_source,
         tls,
@@ -357,9 +401,95 @@ pub fn resolve(
     })
 }
 
+/// `--token` > profile `password_command` > the URL's password.
+fn password_source(cli: &Cli, profile: Option<&Profile>, info: &ConnectionInfo) -> PasswordSource {
+    if cli.token {
+        PasswordSource::Token
+    } else if let Some(cmd) = profile.and_then(|p| p.password_command.clone()) {
+        PasswordSource::Command(cmd)
+    } else if info.redis_settings().password().is_some() {
+        PasswordSource::Url
+    } else {
+        PasswordSource::None
+    }
+}
+
+/// The connection settings of `url` (its first seed on a cluster URL) and
+/// the address of every seed (empty for any other URL).
+fn parse_url(
+    url: &str,
+    source: &Source,
+) -> Result<(ConnectionInfo, Vec<redis::ConnectionAddr>), TargetError> {
+    let invalid = |detail: String| TargetError::InvalidUrl {
+        source: source.clone(),
+        detail,
+    };
+    let seed_urls = cluster_seed_urls(url).map_err(invalid)?;
+    let info = seed_urls
+        .as_ref()
+        .and_then(|seeds| seeds.first())
+        .map_or(url, String::as_str)
+        .into_connection_info()
+        .map_err(|e| invalid(e.to_string()))?;
+    let seeds = seed_urls
+        .iter()
+        .flatten()
+        .map(|seed| {
+            seed.as_str()
+                .into_connection_info()
+                .map(|seed| seed.addr().clone())
+                .map_err(|e| invalid(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((info, seeds))
+}
+
 fn with_db(info: ConnectionInfo, db: i64) -> ConnectionInfo {
     let settings = info.redis_settings().clone().set_db(db);
     info.set_redis_settings(settings)
+}
+
+/// `redis-cluster://[user:pw@]h1:7000,h2:7001[/0]` as one `redis://` URL per
+/// seed; `None` for any other scheme. Errors never quote the URL, which may
+/// hold a password.
+fn cluster_seed_urls(url: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(rest) = url.strip_prefix("redis-cluster://") else {
+        return Ok(None);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (credentials, hosts) = match authority.rsplit_once('@') {
+        Some((credentials, hosts)) => (format!("{credentials}@"), hosts),
+        None => (String::new(), authority),
+    };
+    let seeds: Vec<String> = hosts
+        .split(',')
+        .map(|host| format!("redis://{credentials}{}{tail}", host.trim()))
+        .collect();
+    if hosts.split(',').any(|host| host.trim().is_empty()) {
+        return Err("a redis-cluster:// URL needs host:port seeds, separated by commas".to_owned());
+    }
+    Ok(Some(seeds))
+}
+
+/// Whether `url` parses as a connection URL, `redis-cluster://` included.
+///
+/// # Errors
+///
+/// The reason it doesn't, without the URL itself.
+pub fn validate_url(url: &str) -> Result<(), String> {
+    match cluster_seed_urls(url)? {
+        Some(seeds) => seeds.iter().try_for_each(|seed| {
+            seed.as_str()
+                .into_connection_info()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }),
+        None => url
+            .into_connection_info()
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// The URL picks a DB: `redis://host/3`, or `?db=3` on a unix socket.
@@ -456,6 +586,67 @@ impl Target {
         };
         client.map_err(|e| eyre!(e))
     }
+
+    /// The client plus, unless the profile turned it off, a cluster client
+    /// over the seeds. Runs the password prompt or command once. In
+    /// [`ClusterMode::Auto`] a target that can't be a cluster (a unix socket,
+    /// a DB other than 0) gets none.
+    ///
+    /// # Errors
+    ///
+    /// See [`Target::client`]; in [`ClusterMode::On`], also an invalid
+    /// cluster configuration.
+    pub fn clients(&self) -> Result<(redis::Client, Option<ClusterClient>)> {
+        let info = self.connection_info()?;
+        let client = if self.tls.has_certificates() {
+            redis::Client::build_with_tls(info.clone(), self.tls.load_certificates()?)
+        } else {
+            redis::Client::open(info.clone())
+        }
+        .map_err(|e| eyre!(e))?;
+        if self.cluster == ClusterMode::Off {
+            return Ok((client, None));
+        }
+        let cluster = self.cluster_client(&info);
+        match (self.cluster, cluster) {
+            (_, Ok(cluster)) => Ok((client, Some(cluster))),
+            (ClusterMode::On, Err(err)) => Err(err),
+            (_, Err(err)) => {
+                log::debug!("No cluster client for this target: {err}");
+                Ok((client, None))
+            }
+        }
+    }
+
+    fn cluster_client(&self, info: &ConnectionInfo) -> Result<ClusterClient> {
+        if info.redis_settings().db() != 0 || matches!(info.addr(), redis::ConnectionAddr::Unix(_))
+        {
+            return Err(eyre!("not a cluster target"));
+        }
+        let nodes: Vec<ConnectionInfo> = if self.seeds.is_empty() {
+            vec![info.clone()]
+        } else {
+            self.seeds
+                .iter()
+                .map(|addr| info.clone().set_addr(addr.clone()))
+                .collect()
+        };
+        let mut builder = ClusterClientBuilder::new(nodes);
+        if self.tls.has_certificates() {
+            builder = builder.certs(self.tls.load_certificates()?);
+        }
+        builder.build().map_err(|e| eyre!(e))
+    }
+
+    /// What the footer and `--probe` call this target (no credentials).
+    #[must_use]
+    pub fn label(&self, info: &ConnectionInfo) -> String {
+        if self.seeds.is_empty() {
+            return crate::cli::connection_label(info);
+        }
+        let hosts: Vec<String> = self.seeds.iter().map(ToString::to_string).collect();
+        format!("redis-cluster://{}", hosts.join(","))
+    }
 }
 
 impl Target {
@@ -475,9 +666,23 @@ impl Target {
         }
         rows.push((
             "target",
-            crate::cli::connection_label(&info),
+            self.label(&info),
             Some(self.url_source.to_string()),
         ));
+        // `Auto` is only known after connecting; see `--probe`.
+        match self.cluster {
+            ClusterMode::Auto => {}
+            ClusterMode::On => rows.push((
+                "cluster",
+                "yes".to_owned(),
+                Some(self.cluster_source.to_string()),
+            )),
+            ClusterMode::Off => rows.push((
+                "cluster",
+                "no (one node)".to_owned(),
+                Some(self.cluster_source.to_string()),
+            )),
+        }
         rows.push((
             "db",
             redis.db().to_string(),
@@ -949,6 +1154,106 @@ mod tests {
             "{}",
             t.report().unwrap()
         );
+    }
+
+    #[test]
+    fn cluster_resolution_order() {
+        use super::ClusterMode::{Auto, Off, On};
+        let map = HashMap::from([
+            (
+                "on".to_owned(),
+                Profile {
+                    url: Some("redis://10.0.0.1:7000".into()),
+                    cluster: Some(true),
+                    ..Profile::default()
+                },
+            ),
+            (
+                "off".to_owned(),
+                Profile {
+                    url: Some("redis://10.0.0.1:7000".into()),
+                    cluster: Some(false),
+                    ..Profile::default()
+                },
+            ),
+        ]);
+        // (args, mode, source)
+        let cases: &[(&[&str], super::ClusterMode, Source)] = &[
+            (&[], Auto, Source::Default),
+            (&["--url", "redis://h:1"], Auto, Source::Default),
+            (&["--url", "redis-cluster://a:1,b:2"], On, Source::Url),
+            (&["on"], On, Source::Profile("on".into())),
+            (&["off"], Off, Source::Profile("off".into())),
+            // `--url` replaced the profile's server.
+            (&["on", "--url", "redis://h:1"], Auto, Source::Default),
+            (&["off", "--url", "redis-cluster://a:1"], On, Source::Url),
+        ];
+        for (args, mode, source) in cases {
+            let t = resolve(&cli(args), &map, None).unwrap();
+            assert_eq!(t.cluster, *mode, "{args:?}");
+            assert_eq!(&t.cluster_source, source, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn cluster_url_keeps_every_seed_and_its_credentials() {
+        let t = resolve(
+            &cli(&[
+                "--url",
+                "redis-cluster://u:s3cret@10.0.0.1:7000,10.0.0.2:7001/0",
+            ]),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(host_port(t.info()), ("10.0.0.1".to_owned(), 7000));
+        assert_eq!(t.info().redis_settings().password(), Some("s3cret"));
+        assert_eq!(t.seeds.len(), 2);
+        let report = t.report().unwrap();
+        assert!(!report.contains("s3cret"), "{report}");
+        assert!(
+            report.contains("redis-cluster://10.0.0.1:7000,10.0.0.2:7001"),
+            "{report}"
+        );
+        assert!(report.contains("cluster"), "{report}");
+    }
+
+    #[test]
+    fn bad_cluster_urls_are_refused_without_quoting_them() {
+        for url in [
+            "redis-cluster://",
+            "redis-cluster://u:s3cret@a:1,,b:2",
+            "redis-cluster://u:s3cret@a:notaport",
+        ] {
+            let err = resolve(&cli(&[]), &HashMap::new(), Some(url))
+                .err()
+                .unwrap_or_else(|| panic!("{url} accepted"))
+                .to_string();
+            assert!(!err.contains("s3cret"), "{err}");
+        }
+        let err = resolve(
+            &cli(&["--url", "redis-cluster://a:1", "--db", "2"]),
+            &HashMap::new(),
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("DB 0"), "{err}");
+    }
+
+    #[test]
+    fn a_cluster_is_local_only_if_every_seed_is_loopback() {
+        use super::Environment::{Local, Unknown};
+        let cases = [
+            ("redis-cluster://127.0.0.1:7000,localhost:7001", Local),
+            ("redis-cluster://127.0.0.1:7000,10.0.0.2:7001", Unknown),
+            ("redis-cluster://10.0.0.2:7001,127.0.0.1:7000", Unknown),
+        ];
+        for (url, env) in cases {
+            let t = resolve(&cli(&["--url", url]), &HashMap::new(), None).unwrap();
+            assert_eq!(t.environment, env, "{url}");
+        }
     }
 
     #[test]

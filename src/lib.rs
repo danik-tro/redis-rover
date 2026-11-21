@@ -29,8 +29,13 @@ pub use redis_client::escape::printable_lines;
 pub use target::TargetError;
 
 use color_eyre::eyre::Result;
-use redis_client::runner::{connect_at_startup, Runner};
+use redis::cluster::ClusterClient;
+use redis_client::{
+    conn::{reports_cluster, Conn, Connector},
+    runner::{connect_at_startup, connect_cluster, Link, Runner},
+};
 use state::SharedState;
+use target::ClusterMode;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -65,8 +70,9 @@ pub async fn run(args: Cli) -> Result<()> {
     // already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
     if args.probe {
-        let client = resolve_target(&args)?.client()?;
-        let label = cli::connection_label(client.get_connection_info());
+        let target = resolve_target(&args)?;
+        let client = target.client()?;
+        let label = target.label(client.get_connection_info());
         print!("{}", probe::report(&client, &label).await?);
         return Ok(());
     }
@@ -80,14 +86,18 @@ pub async fn run(args: Cli) -> Result<()> {
     let state = SharedState::default();
 
     let target = resolve_target(&args)?;
-    let client = target.client()?;
-    let label = cli::connection_label(client.get_connection_info());
+    let (client, cluster) = target.clients()?;
+    let label = target.label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
-    let manager = connect_at_startup(client.clone())
+    let session = open_session(&target, &client, cluster)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
+    if let Some(warning) = session.warning {
+        action::try_send_action(&tx, action::Action::Notice(warning));
+    }
 
-    let mut watcher = Runner::new(client, manager.clone(), state.clone(), tx.clone())
+    let mut watcher = Runner::new(client, session.conn, state.clone(), tx.clone())
+        .connector(session.connector)
         .cancellation_token(cancellation_token.clone())
         .read_only(target.read_only);
 
@@ -112,6 +122,72 @@ pub async fn run(args: Cli) -> Result<()> {
     run_result?;
 
     Ok(())
+}
+
+/// The session's first connection and how to open the others.
+struct Session {
+    conn: Conn,
+    connector: Connector,
+    /// Shown as a toast once the app runs.
+    warning: Option<String>,
+}
+
+/// Connect as `target` asks. In [`ClusterMode::Auto`] one node is asked
+/// (`INFO cluster`) and, if it is in a cluster, the cluster client takes
+/// over with it as the seed. If that fails (nodes announce addresses this
+/// machine can't reach, as behind a port forward) the session stays on the
+/// one node, as it always did, and says so.
+async fn open_session(
+    target: &target::Target,
+    client: &redis::Client,
+    cluster: Option<ClusterClient>,
+) -> std::result::Result<Session, Box<dyn std::error::Error + Sync + Send>> {
+    let single = Connector::single(client.clone());
+    let cluster = match (target.cluster, cluster) {
+        (ClusterMode::On, Some(cluster)) => {
+            let conn = connect_cluster(&cluster, Link::Interactive).await?;
+            return Ok(Session {
+                conn,
+                connector: Connector::cluster(client.clone(), cluster),
+                warning: None,
+            });
+        }
+        (_, cluster) => cluster,
+    };
+    let mut conn = connect_at_startup(client.clone()).await?;
+    let Some(cluster) = cluster else {
+        return Ok(Session {
+            conn,
+            connector: single,
+            warning: None,
+        });
+    };
+    let info: redis::RedisResult<String> = redis::cmd("INFO")
+        .arg("cluster")
+        .query_async(&mut conn)
+        .await;
+    if !info.is_ok_and(|info| reports_cluster(&info)) {
+        return Ok(Session {
+            conn,
+            connector: single,
+            warning: None,
+        });
+    }
+    match connect_cluster(&cluster, Link::Interactive).await {
+        Ok(conn) => Ok(Session {
+            conn,
+            connector: Connector::cluster(client.clone(), cluster),
+            warning: None,
+        }),
+        Err(err) => {
+            log::warn!("Cluster client failed, staying on one node: {err}");
+            Ok(Session {
+                conn,
+                connector: single,
+                warning: Some("cluster nodes unreachable · showing this node only".to_owned()),
+            })
+        }
+    }
 }
 
 /// The connection target from the flags, the config's profiles and

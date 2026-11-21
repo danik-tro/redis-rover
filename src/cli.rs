@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, ValueHint};
 use color_eyre::eyre::{bail, eyre, Result};
-use redis::{ClientTlsConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, TlsCertificates};
+use redis::{ClientTlsConfig, ConnectionAddr, ConnectionInfo, TlsCertificates};
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 
 use crate::utils::version;
@@ -44,7 +44,7 @@ pub struct Cli {
         short,
         long,
         value_name = "URL",
-        help = "Redis connection URL. Default: the profile's url, then $REDIS_URL, then redis://localhost:6379",
+        help = "Redis connection URL (redis://, rediss://, unix://, or redis-cluster://h1:p1,h2:p2). Default: the profile's url, then $REDIS_URL, then redis://localhost:6379",
         value_parser = parse_redis_url,
     )]
     pub url: Option<String>,
@@ -201,8 +201,8 @@ pub(crate) fn apply_tls_flags(info: ConnectionInfo, tls: &TlsArgs) -> Result<Con
 /// descriptive error instead of a generic "something went wrong" later. Returns
 /// the original string unchanged on success.
 fn parse_redis_url(s: &str) -> Result<String, String> {
-    s.into_connection_info()
-        .map(|_| s.to_string())
+    crate::target::validate_url(s)
+        .map(|()| s.to_string())
         .map_err(|e| format!("invalid Redis URL: {e}"))
 }
 
