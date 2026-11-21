@@ -77,12 +77,26 @@ impl App {
     /// Ctrl-s in the publish popup. Under `--read-only` the popup stays open
     /// with its notice (the runner would reject the write anyway).
     pub(super) fn confirm_publish(&mut self) {
+        let sharded = self.pubsub.publish_is_sharded();
         if let Some((channel, payload)) = self.pubsub.take_publish_request() {
-            self.submit_write(
-                RedisEvent::Publish { channel, payload },
-                super::confirm::AfterWrite::default(),
-            );
+            let event = if sharded {
+                RedisEvent::SPublish { channel, payload }
+            } else {
+                RedisEvent::Publish { channel, payload }
+            };
+            self.submit_write(event, super::confirm::AfterWrite::default());
         }
+    }
+
+    /// Tell the tab whether this server has sharded Pub/Sub. Before the
+    /// first `INFO` it is offered, and the server's answer decides.
+    pub(super) fn sync_shard_support(&mut self) {
+        self.pubsub.shards = self
+            .state
+            .info
+            .lock()
+            .as_ref()
+            .is_none_or(crate::redis_client::types::RedisInfo::supports_shards);
     }
 
     /// Ask the runner for the server's channels (tab open, `r`).

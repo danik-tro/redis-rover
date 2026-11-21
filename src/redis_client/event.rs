@@ -131,6 +131,12 @@ pub enum RedisEvent {
         channel: String,
         payload: String,
     },
+    /// `SPUBLISH channel payload` (Redis 7+). Like [`Self::Publish`], the
+    /// payload never reaches an `Action`.
+    SPublish {
+        channel: String,
+        payload: String,
+    },
 }
 
 /// Prints the variant and the key (or channel, pattern, DB); values,
@@ -253,6 +259,11 @@ impl std::fmt::Debug for RedisEvent {
                 "Publish {{ channel: {channel:?}, payload: {} }}",
                 bytes(payload)
             ),
+            Self::SPublish { channel, payload } => write!(
+                f,
+                "SPublish {{ channel: {channel:?}, payload: {} }}",
+                bytes(payload)
+            ),
         }
     }
 }
@@ -282,6 +293,7 @@ impl RedisEvent {
             | Self::EditItem { .. }
             | Self::DeleteItem { .. }
             | Self::Publish { .. }
+            | Self::SPublish { .. }
             | Self::ShiftTtl { .. }
             | Self::RenameKey { .. }
             | Self::CopyKey { .. }
@@ -318,6 +330,7 @@ impl RedisEvent {
             | Self::AddItem { .. }
             | Self::EditItem { .. }
             | Self::Publish { .. }
+            | Self::SPublish { .. }
             | Self::ShiftTtl { .. }
             | Self::RenameField { .. }
             | Self::RenameMember { .. } => false,
@@ -381,6 +394,7 @@ impl RedisEvent {
             Self::EditItem { key, edit } => write_cmd::edit_item(key, edit),
             Self::DeleteItem { key, delete } => write_cmd::delete_item(key, delete),
             Self::Publish { channel, payload } => write_cmd::publish(channel, payload),
+            Self::SPublish { channel, payload } => write_cmd::spublish(channel, payload),
         };
         let mut lines: Vec<String> = cmds.iter().map(format_cmd).collect();
         // Several commands run as one transaction (`client::run_writes`).
@@ -415,6 +429,7 @@ impl RedisEvent {
             | Self::EditItem { .. }
             | Self::DeleteItem { .. }
             | Self::Publish { .. }
+            | Self::SPublish { .. }
             | Self::SetTtl { .. }
             | Self::ShiftTtl { .. }
             | Self::SlowlogReset
@@ -582,6 +597,10 @@ mod tests {
                 delete: ItemDelete::SetMember(secret()),
             },
             RedisEvent::Publish {
+                channel: "news".into(),
+                payload: secret(),
+            },
+            RedisEvent::SPublish {
                 channel: "news".into(),
                 payload: secret(),
             },
@@ -814,6 +833,13 @@ mod tests {
                 vec![r#"PUBLISH "news" "line 1\nline 2""#],
             ),
             (RedisEvent::SlowlogReset, vec!["SLOWLOG RESET"]),
+            (
+                RedisEvent::SPublish {
+                    channel: "orders".into(),
+                    payload: "hi".into(),
+                },
+                vec![r#"SPUBLISH "orders" "hi""#],
+            ),
         ];
         for (event, lines) in cases {
             assert!(event.is_write(), "{event:?}");

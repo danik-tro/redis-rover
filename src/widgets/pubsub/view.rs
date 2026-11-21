@@ -13,7 +13,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     config,
     pubsub_notify::NotifyState,
-    redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubMessage, PubSubStore, Subscription},
+    redis_client::pubsub_store::{
+        ConnStatus, EntryKind, PubSubMessage, PubSubStore, Subscription, Target,
+    },
     utils::{fmt_bytes, group_thousands},
     widgets::{keyspace::truncate_to_width, local_time},
 };
@@ -115,19 +117,14 @@ pub(super) fn list_lines(
         lines.push(Line::styled(" a add subscription", cfg.colors.base03));
     }
     for sub in &store.subs {
-        let dot = if sub.target.is_pattern() {
-            cfg.colors.base0e
-        } else {
-            cfg.colors.base0d
+        let dot = match sub.target {
+            Target::Channel(_) => Span::styled(" ● ", cfg.colors.base0d),
+            Target::Pattern(_) => Span::styled(" ● ", cfg.colors.base0e),
+            Target::Shard(_) => Span::styled(" ◆ ", cfg.colors.base0c),
         };
         push_row(
             &mut lines,
-            list_row(
-                Span::styled(" ● ", dot),
-                sub.target.name(),
-                sub_suffix(sub, now),
-                width,
-            ),
+            list_row(dot, sub.target.name(), sub_suffix(sub, now), width),
         );
     }
 

@@ -548,6 +548,15 @@ impl Storage {
         }
     }
 
+    pub async fn spublish(&self, channel: &str, payload: &str) -> redis::RedisResult<i64> {
+        let mut manager = self.manager.clone();
+        let mut receivers = 0;
+        for cmd in super::write_cmd::spublish(channel, payload) {
+            receivers = cmd.query_async(&mut manager).await?;
+        }
+        Ok(receivers)
+    }
+
     pub async fn publish(
         &self,
         channel: &str,

@@ -2,7 +2,7 @@ use super::READ_ONLY_PUBLISH;
 
 use ratatui::{
     buffer::Buffer,
-    crossterm::event::{KeyCode, KeyEvent},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
@@ -21,10 +21,12 @@ pub(super) struct AddPopup {
     /// Set once the user flips the kind with Tab; otherwise the kind follows
     /// the text (glob characters mean pattern).
     pub(super) kind_override: Option<TargetKind>,
+    /// The server has sharded Pub/Sub; otherwise shard is dimmed and skipped.
+    pub(super) shards: bool,
 }
 
 impl AddPopup {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(shards: bool) -> Self {
         let cfg = config::get();
         let mut input = TextArea::default();
         input.set_placeholder_text("channel or pattern, e.g. orders:*");
@@ -38,6 +40,7 @@ impl AddPopup {
         Self {
             input,
             kind_override: None,
+            shards,
         }
     }
 
@@ -64,10 +67,14 @@ pub(super) struct PublishPopup {
     focus: PublishField,
     /// `--read-only`: shown with a notice, sending is refused.
     pub(super) read_only: bool,
+    /// Sends `SPUBLISH` instead of `PUBLISH` (Ctrl-t).
+    pub(super) sharded: bool,
+    /// The server has sharded Pub/Sub.
+    shards: bool,
 }
 
 impl PublishPopup {
-    pub(super) fn new(prefill: String, read_only: bool) -> Self {
+    pub(super) fn new(prefill: String, read_only: bool, shards: bool, sharded: bool) -> Self {
         let focus = if prefill.is_empty() {
             PublishField::Channel
         } else {
@@ -83,6 +90,8 @@ impl PublishPopup {
             payload,
             focus,
             read_only,
+            sharded: sharded && shards,
+            shards,
         };
         popup.style_fields();
         popup
@@ -132,6 +141,10 @@ impl PublishPopup {
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.sharded = self.shards && !self.sharded;
+            return;
+        }
         match (key.code, self.focus) {
             (KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter, PublishField::Channel) => {
                 self.focus(PublishField::Payload);
@@ -181,17 +194,25 @@ pub(super) fn render_add_popup(popup: &AddPopup, area: Rect, buf: &mut Buffer) {
     .areas(popup_area);
     popup.input.render(input_area, buf);
 
-    let (channel, pattern) = kind_labels(popup.kind());
+    let kind = popup.kind();
+    let (channel, pattern, shard) = kind_labels(kind);
     let on = Style::new().fg(cfg.colors.base0a).bold();
     let off = Style::new().fg(cfg.colors.base03);
-    let (channel_style, pattern_style) = match popup.kind() {
-        TargetKind::Channel => (on, off),
-        TargetKind::Pattern => (off, on),
+    let style = |this: TargetKind| if kind == this { on } else { off };
+    let shard = if popup.shards {
+        Span::styled(shard, style(TargetKind::Shard))
+    } else {
+        Span::styled(
+            "shard (needs Redis 7)",
+            off.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+        )
     };
     Paragraph::new(Line::from(vec![
-        Span::styled(channel, channel_style),
+        Span::styled(channel, style(TargetKind::Channel)),
         Span::styled(" / ", off),
-        Span::styled(pattern, pattern_style),
+        Span::styled(pattern, style(TargetKind::Pattern)),
+        Span::styled(" / ", off),
+        shard,
     ]))
     .alignment(Alignment::Center)
     .render(kind_area, buf);
@@ -219,7 +240,11 @@ pub(super) fn render_publish_popup(popup: &PublishPopup, area: Rect, buf: &mut B
     .areas(popup_area);
     Clear.render(popup_area, buf);
     let block = Block::default()
-        .title(" Publish ")
+        .title(if popup.sharded {
+            " SPUBLISH "
+        } else {
+            " Publish "
+        })
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -242,19 +267,32 @@ pub(super) fn render_publish_popup(popup: &PublishPopup, area: Rect, buf: &mut B
             .alignment(Alignment::Center)
             .render(notice_area, buf);
         "Tab field · Esc cancel"
-    } else {
+    } else if !popup.shards {
+        Paragraph::new(Line::styled(
+            "SPUBLISH needs Redis 7",
+            Style::new()
+                .fg(cfg.colors.base03)
+                .add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Center)
+        .render(notice_area, buf);
         "Tab field · Ctrl-s send · Esc cancel"
+    } else if popup.sharded {
+        "Tab field · Ctrl-t PUBLISH · Ctrl-s send · Esc cancel"
+    } else {
+        "Tab field · Ctrl-t SPUBLISH · Ctrl-s send · Esc cancel"
     };
     Paragraph::new(Line::styled(hint, cfg.colors.base03))
         .alignment(Alignment::Center)
         .render(hint_area, buf);
 }
 
-/// `[channel] / pattern`: the selected kind is bracketed.
-fn kind_labels(kind: TargetKind) -> (&'static str, &'static str) {
+/// `[channel] / pattern / shard`: the selected kind is bracketed.
+fn kind_labels(kind: TargetKind) -> (&'static str, &'static str, &'static str) {
     match kind {
-        TargetKind::Channel => ("[channel]", "pattern"),
-        TargetKind::Pattern => ("channel", "[pattern]"),
+        TargetKind::Channel => ("[channel]", "pattern", "shard"),
+        TargetKind::Pattern => ("channel", "[pattern]", "shard"),
+        TargetKind::Shard => ("channel", "pattern", "[shard]"),
     }
 }
 
@@ -281,6 +319,8 @@ mod tests {
             },
             TargetKind::Pattern
         );
+        // Pattern → shard → channel.
+        p.handle_popup_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
         p.handle_popup_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(
             p.take_add_request(),
@@ -329,7 +369,78 @@ mod tests {
 
     #[test]
     fn kind_label_brackets_the_selected_kind() {
-        assert_eq!(kind_labels(TargetKind::Channel), ("[channel]", "pattern"));
-        assert_eq!(kind_labels(TargetKind::Pattern), ("channel", "[pattern]"));
+        assert_eq!(
+            kind_labels(TargetKind::Channel),
+            ("[channel]", "pattern", "shard")
+        );
+        assert_eq!(
+            kind_labels(TargetKind::Pattern),
+            ("channel", "[pattern]", "shard")
+        );
+        assert_eq!(
+            kind_labels(TargetKind::Shard),
+            ("channel", "pattern", "[shard]")
+        );
+    }
+
+    #[test]
+    fn tab_reaches_shard_only_when_the_server_has_it() {
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        let mut p = widget();
+        p.open_add();
+        type_text(&mut p, "orders");
+        p.handle_popup_key(tab);
+        p.handle_popup_key(tab);
+        assert_eq!(p.take_add_request(), Some(Target::Shard("orders".into())));
+
+        p.shards = false;
+        p.open_add();
+        type_text(&mut p, "orders");
+        p.handle_popup_key(tab);
+        p.handle_popup_key(tab);
+        assert_eq!(p.take_add_request(), Some(Target::Channel("orders".into())));
+    }
+
+    #[test]
+    fn the_add_popup_says_why_shard_is_dimmed() {
+        let area = Rect::new(0, 0, 70, 12);
+        let mut buf = Buffer::empty(area);
+        render_add_popup(&AddPopup::new(false), area, &mut buf);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("shard (needs Redis 7)"), "{text}");
+    }
+
+    #[test]
+    fn ctrl_t_toggles_spublish_where_the_server_has_it() {
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let mut p = widget();
+        p.open_publish(false);
+        assert!(!p.publish_is_sharded());
+        p.handle_popup_key(ctrl_t);
+        assert!(p.publish_is_sharded());
+        p.handle_popup_key(ctrl_t);
+        assert!(!p.publish_is_sharded());
+
+        p.shards = false;
+        p.open_publish(false);
+        p.handle_popup_key(ctrl_t);
+        assert!(!p.publish_is_sharded());
+    }
+
+    #[test]
+    fn publishing_from_a_shard_subscription_starts_on_spublish() {
+        let mut p = widget();
+        p.store.lock().add(Target::Shard("orders".into()));
+        p.open_publish(false);
+        assert!(p.publish_is_sharded());
+        type_text(&mut p, "hi");
+        assert_eq!(
+            p.take_publish_request(),
+            Some(("orders".into(), "hi".into()))
+        );
     }
 }

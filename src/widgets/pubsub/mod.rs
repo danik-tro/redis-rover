@@ -85,7 +85,7 @@ pub fn publish_prefill(store: &PubSubStore, row: Option<&Row>) -> String {
         Some(Row::Server(name)) => name.clone(),
         Some(Row::Sub(i)) => match store.subs.get(*i) {
             Some(sub) => match &sub.target {
-                Target::Channel(name) => name.clone(),
+                Target::Channel(name) | Target::Shard(name) => name.clone(),
                 Target::Pattern(_) => sub
                     .buffer
                     .last_n(usize::MAX)
@@ -107,6 +107,8 @@ pub struct PubSub {
     popup: Option<Popup>,
     /// The server runs in cluster mode: `PUBSUB CHANNELS` is this node's view.
     pub cluster_mode: bool,
+    /// The server has sharded Pub/Sub (Redis 7+), as far as `INFO` tells.
+    pub shards: bool,
     focus: Pane,
     /// Log position of the selected subscription.
     log: LogCursor,
@@ -120,6 +122,7 @@ impl PubSub {
             selected: 0,
             popup: None,
             cluster_mode: false,
+            shards: true,
             focus: Pane::List,
             log: LogCursor::default(),
             detail: None,
@@ -298,17 +301,28 @@ impl PubSub {
     }
 
     pub fn open_add(&mut self) {
-        self.popup = Some(Popup::Add(Box::new(AddPopup::new())));
+        self.popup = Some(Popup::Add(Box::new(AddPopup::new(self.shards))));
     }
 
     /// Open the publish popup, prefilled from the selection.
     pub fn open_publish(&mut self, read_only: bool) {
-        let prefill = {
+        let (prefill, sharded) = {
             let store = self.store.lock();
-            publish_prefill(&store, row_at(&store, self.selected).as_ref())
+            let row = row_at(&store, self.selected);
+            let sharded = matches!(
+                row,
+                Some(Row::Sub(i)) if matches!(
+                    store.subs.get(i).map(|s| &s.target),
+                    Some(Target::Shard(_))
+                )
+            );
+            (publish_prefill(&store, row.as_ref()), sharded)
         };
         self.popup = Some(Popup::Publish(Box::new(PublishPopup::new(
-            prefill, read_only,
+            prefill,
+            read_only,
+            self.shards,
+            sharded,
         ))));
     }
 
@@ -350,7 +364,7 @@ impl PubSub {
         match self.popup.as_mut() {
             Some(Popup::Add(popup)) => {
                 if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-                    popup.kind_override = Some(popup.kind().flipped());
+                    popup.kind_override = Some(popup.kind().next(popup.shards));
                     return;
                 }
                 popup.input.input(key);
@@ -372,6 +386,12 @@ impl PubSub {
         let kind = popup.kind();
         let name = popup.text().trim().to_owned();
         (!name.is_empty()).then(|| Target::new(kind, name))
+    }
+
+    /// The open publish popup sends `SPUBLISH`.
+    #[must_use]
+    pub fn publish_is_sharded(&self) -> bool {
+        matches!(&self.popup, Some(Popup::Publish(popup)) if popup.sharded)
     }
 
     /// `(channel, payload)` to publish, closing the popup. `None` keeps the

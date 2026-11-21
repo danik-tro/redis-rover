@@ -93,6 +93,14 @@ impl RedisInfo {
         self.keyspace.get(&db).copied().unwrap_or_default()
     }
 
+    /// The server has sharded Pub/Sub (Redis 7+). An unreadable version
+    /// counts as yes: the server's own answer is then what the user sees.
+    #[must_use]
+    pub fn supports_shards(&self) -> bool {
+        let major = self.common.version.split('.').next().unwrap_or_default();
+        major.parse::<u32>().map_or(true, |major| major >= 7)
+    }
+
     #[must_use]
     pub fn redis_version(&self) -> String {
         format!("Redis version: {}", self.common.version)

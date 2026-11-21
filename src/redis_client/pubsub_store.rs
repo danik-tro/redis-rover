@@ -29,6 +29,8 @@ pub enum Target {
     Channel(String),
     /// `PSUBSCRIBE pattern`
     Pattern(String),
+    /// `SSUBSCRIBE shard-channel` (Redis 7+)
+    Shard(String),
 }
 
 impl Target {
@@ -38,13 +40,14 @@ impl Target {
         match kind {
             TargetKind::Channel => Self::Channel(name),
             TargetKind::Pattern => Self::Pattern(name),
+            TargetKind::Shard => Self::Shard(name),
         }
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Channel(name) | Self::Pattern(name) => name,
+            Self::Channel(name) | Self::Pattern(name) | Self::Shard(name) => name,
         }
     }
 
@@ -59,6 +62,7 @@ impl fmt::Display for Target {
         match self {
             Self::Channel(name) => f.write_str(name),
             Self::Pattern(name) => write!(f, "{name} (pattern)"),
+            Self::Shard(name) => write!(f, "{name} (shard)"),
         }
     }
 }
@@ -68,14 +72,18 @@ impl fmt::Display for Target {
 pub enum TargetKind {
     Channel,
     Pattern,
+    Shard,
 }
 
 impl TargetKind {
+    /// The next kind for `Tab`: channel → pattern → shard. Shard is skipped
+    /// on a server without sharded Pub/Sub.
     #[must_use]
-    pub fn flipped(self) -> Self {
+    pub fn next(self, shards: bool) -> Self {
         match self {
             Self::Channel => Self::Pattern,
-            Self::Pattern => Self::Channel,
+            Self::Pattern if shards => Self::Shard,
+            Self::Pattern | Self::Shard => Self::Channel,
         }
     }
 }
@@ -698,6 +706,16 @@ impl PubSubStore {
         }
     }
 
+    /// Store a message of shard channel `channel` (`SSUBSCRIBE`).
+    pub fn push_shard(&mut self, channel: &str, payload: &[u8], now: SystemTime) {
+        let shard = |s: &&mut Subscription| matches!(&s.target, Target::Shard(c) if c == channel);
+        if let Some(sub) = self.subs.iter_mut().find(shard) {
+            sub.buffer.push(channel, payload, now);
+            sub.stats.record(payload.len(), now, None);
+            self.version += 1;
+        }
+    }
+
     /// Store a message received from Redis.
     pub fn push_msg(&mut self, msg: &redis::Msg, now: SystemTime) {
         let pattern: Option<String> = msg.get_pattern().ok().flatten();
@@ -731,6 +749,34 @@ mod tests {
 
     fn seqs(buf: &MessageBuffer) -> Vec<u64> {
         buf.last_n(usize::MAX).map(|m| m.seq).collect()
+    }
+
+    #[test]
+    fn a_shard_message_reaches_only_its_shard_subscription() {
+        let mut store = PubSubStore::new(LIMITS);
+        store.add(Target::Channel("orders".into()));
+        store.add(Target::Shard("orders".into()));
+        let before = store.version();
+        store.push_shard("orders", b"hi", at(0));
+        assert!(store.version() > before);
+        assert_eq!(store.subs[0].buffer.len(), 0);
+        assert_eq!(store.subs[1].buffer.len(), 1);
+        assert_eq!(store.subs[1].stats.total, 1);
+
+        store.push("orders", None, b"plain", at(0));
+        assert_eq!(store.subs[0].buffer.len(), 1, "a plain message stays out");
+        assert_eq!(store.subs[1].buffer.len(), 1);
+        store.push_shard("other", b"x", at(0));
+        assert_eq!(store.subs[1].buffer.len(), 1);
+    }
+
+    #[test]
+    fn tab_cycles_the_kinds_and_skips_shard_when_unsupported() {
+        use TargetKind::{Channel, Pattern, Shard};
+        assert_eq!(Channel.next(true), Pattern);
+        assert_eq!(Pattern.next(true), Shard);
+        assert_eq!(Shard.next(true), Channel);
+        assert_eq!(Pattern.next(false), Channel);
     }
 
     #[test]
@@ -861,7 +907,7 @@ mod tests {
         assert_eq!(detect_kind("h?llo"), TargetKind::Pattern);
         assert_eq!(detect_kind("h[ae]llo"), TargetKind::Pattern);
         assert_eq!(detect_kind(""), TargetKind::Channel);
-        assert_eq!(TargetKind::Channel.flipped(), TargetKind::Pattern);
+        assert_eq!(TargetKind::Channel.next(false), TargetKind::Pattern);
     }
 
     #[test]

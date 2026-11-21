@@ -864,6 +864,27 @@ fn monitor_confirm_prod() {
     check("monitor_confirm_prod", &buf);
 }
 
+#[test]
+fn pubsub_shard_in_list() {
+    init();
+    let store = SharedState::default().pubsub;
+    {
+        let mut store = store.lock();
+        store.status = ConnStatus::Connected;
+        store.add(Target::Channel("chat".into()));
+        store.add(Target::Pattern("audit:*".into()));
+        store.add(Target::Shard("orders".into()));
+        store.push_shard("orders", br#"{"id":1}"#, at(1));
+    }
+    let clock = FixedClock::new(at(5));
+    let mut pubsub = PubSub::new(store);
+    let area = Rect::new(0, 0, 110, 16);
+    let mut buf = Buffer::empty(area);
+    let view = pubsub.build_view(area, clock.now(), clock.wall());
+    PubSubWidget { view }.render(area, &mut buf, &mut pubsub);
+    check("pubsub_shard_in_list", &buf);
+}
+
 // ---- Slowlog ---------------------------------------------------------------
 
 #[test]
