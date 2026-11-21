@@ -37,3 +37,35 @@ async fn sweep_covers_every_master() {
     }
     assert_eq!(state.scanned.len(), 3000);
 }
+
+/// `fetch_meta` answers for keys on all masters, in page order, and the
+/// counts cover the whole cluster.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn metadata_and_counts_cover_every_master() {
+    let fixture = ClusterFixture::start();
+    let client = fixture.client();
+    let mut seed = client.get_async_connection().await.unwrap();
+    let keys: Vec<String> = (0..500).map(|i| format!("meta:{i}")).collect();
+    for key in &keys {
+        let () = seed.set(key, "value").await.unwrap();
+    }
+    let () = seed.set("other", "value").await.unwrap();
+
+    let storage = Storage::new(connect_cluster(&client, Link::Interactive).await.unwrap());
+    let metas = storage.fetch_meta(&keys).await.unwrap();
+    let names: Vec<&String> = metas.iter().map(|meta| &meta.key).collect();
+    assert_eq!(names, keys.iter().collect::<Vec<_>>());
+    assert!(metas.iter().all(|meta| meta.r_type.name() == "string"));
+
+    assert_eq!(storage.total_keys().await.unwrap(), 501);
+    let budget = std::time::Duration::from_secs(5);
+    assert_eq!(
+        storage.count_matches("*", 200, budget).await.unwrap(),
+        (501, true)
+    );
+    assert_eq!(
+        storage.count_matches("meta:*", 200, budget).await.unwrap(),
+        (500, true)
+    );
+}
