@@ -222,7 +222,10 @@ impl App {
     fn handle_pubsub_action(&mut self, action: &Action) {
         match *action {
             Action::TogglePubSub => self.toggle_pubsub(),
-            Action::PubSubAdd => self.pubsub.open_add(),
+            Action::PubSubAdd => {
+                self.sync_shard_support();
+                self.pubsub.open_add();
+            }
             Action::PubSubRemove => self.remove_subscription(),
             Action::PubSubClear => {
                 if let Some(index) = self.pubsub.selected_sub() {
@@ -231,7 +234,10 @@ impl App {
                 }
             }
             Action::PubSubRefresh => self.fetch_pubsub_channels(),
-            Action::PubSubPublish => self.pubsub.open_publish(self.is_read_only()),
+            Action::PubSubPublish => {
+                self.sync_shard_support();
+                self.pubsub.open_publish(self.is_read_only());
+            }
             Action::PubSubEnter => self.pubsub_enter(),
             Action::PubSubFocus => self.pubsub.toggle_focus(),
             Action::PubSubTogglePause => {

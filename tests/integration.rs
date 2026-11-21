@@ -1032,6 +1032,10 @@ async fn read_only_rejects_every_write() {
             },
         },
         RedisEvent::SlowlogReset,
+        RedisEvent::SPublish {
+            channel: format!("{p}shard"),
+            payload: "hello".into(),
+        },
     ];
     for event in writes {
         assert!(event.is_write(), "{event:?} must count as a write");
@@ -3481,4 +3485,141 @@ async fn slowlog_refusals_stay_inline() {
     let error = data.error.expect("refused");
     assert!(error.to_lowercase().contains("permission"), "{error}");
     h.shutdown().await;
+}
+
+// ---- Sharded Pub/Sub -------------------------------------------------------
+
+/// `SPUBLISH channel payload` until someone receives it (the `SSUBSCRIBE`
+/// may still be in flight).
+async fn spublish_until_heard(admin: &mut redis::aio::ConnectionManager, channel: &str) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let heard: i64 = redis::cmd("SPUBLISH")
+            .arg(channel)
+            .arg("hi")
+            .query_async(admin)
+            .await
+            .expect("SPUBLISH");
+        if heard > 0 {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn shard_round_trip_and_unsubscribe() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let mut h = Harness::new(server.client(0), false).await;
+    let target = Target::Shard("orders".into());
+    h.state.pubsub.lock().add(target.clone());
+    h.pubsub(PubSubCmd::Subscribe(target.clone()));
+
+    spublish_until_heard(&mut admin, "orders").await;
+    let store = h.state.pubsub.clone();
+    wait_until("message", || store.lock().subs[0].stats.total >= 1).await;
+    {
+        let guard = store.lock();
+        let buffer = &guard.subs[0].buffer;
+        let message = buffer.range(0, buffer.len()).next().expect("a message");
+        assert_eq!(message.channel, "orders");
+        assert_eq!(message.payload.copy_text(), "hi");
+    }
+
+    // Our own SPUBLISH goes through the write path.
+    h.send(RedisEvent::SPublish {
+        channel: "orders".into(),
+        payload: "second".into(),
+    });
+    let published = h
+        .expect("published", |a| matches!(a, Action::Published { .. }))
+        .await;
+    assert!(matches!(published, Action::Published { receivers: 1, .. }));
+
+    store.lock().remove(&target);
+    h.pubsub(PubSubCmd::Unsubscribe(target));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let heard: i64 = redis::cmd("SPUBLISH")
+            .arg("orders")
+            .arg("x")
+            .query_async(&mut admin)
+            .await
+            .expect("SPUBLISH");
+        if heard == 0 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "still subscribed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn shard_resubscribes_after_a_lost_connection() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    let h = Harness::new(server.client(0), false).await;
+    let target = Target::Shard("orders".into());
+    h.state.pubsub.lock().add(target.clone());
+    h.pubsub(PubSubCmd::Subscribe(target));
+    spublish_until_heard(&mut admin, "orders").await;
+
+    let _: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("TYPE")
+        .arg("pubsub")
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL");
+    let store = h.state.pubsub.clone();
+    wait_until("noticed", || {
+        matches!(store.lock().status, ConnStatus::Reconnecting { .. })
+    })
+    .await;
+    wait_until("back", || store.lock().status == ConnStatus::Connected).await;
+    let before = store.lock().subs[0].stats.total;
+    spublish_until_heard(&mut admin, "orders").await;
+    wait_until("message after reconnect", || {
+        store.lock().subs[0].stats.total > before
+    })
+    .await;
+    h.shutdown().await;
+}
+
+/// Redis 6.0 has no sharded Pub/Sub: `INFO` says so, and a shard target
+/// that is tried anyway is refused without taking the task down.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn shard_is_unavailable_on_redis_6() {
+    let server = support::start_redis_tag("6.0-alpine").await;
+    let mut h = Harness::new(server.client(0), false).await;
+    let info = h.state.info.clone();
+    wait_until("INFO", || info.lock().is_some()).await;
+    assert!(!info.lock().as_ref().expect("info").supports_shards());
+
+    let target = Target::Shard("orders".into());
+    h.state.pubsub.lock().add(target.clone());
+    h.pubsub(PubSubCmd::Subscribe(target));
+    h.expect("refused", |a| matches!(a, Action::Error(_))).await;
+    assert!(h.state.pubsub.lock().subs.is_empty());
+    h.shutdown().await;
+}
+
+/// On a cluster the shard connection must go to the node owning the slot.
+///
+/// TODO(cluster): route `SSUBSCRIBE` to the owner, then seed a cluster here.
+/// Skipped until `RROVER_TEST_CLUSTER_URL` names one, so the suite stays green.
+#[tokio::test]
+#[ignore = "needs a Redis cluster at RROVER_TEST_CLUSTER_URL"]
+async fn shard_subscribes_on_the_slot_owner_in_a_cluster() {
+    if std::env::var_os("RROVER_TEST_CLUSTER_URL").is_none() {
+        eprintln!("skipped: set RROVER_TEST_CLUSTER_URL to a Redis cluster");
+        return;
+    }
+    unimplemented!("SSUBSCRIBE is not routed to the slot owner yet");
 }

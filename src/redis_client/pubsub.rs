@@ -9,16 +9,22 @@ use std::{sync::Arc, time::Duration, time::SystemTime};
 
 use futures::StreamExt;
 use parking_lot::Mutex;
-use redis::aio::{PubSubSink, PubSubStream};
+use redis::{
+    aio::{MultiplexedConnection, PubSubSink, PubSubStream},
+    AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
+};
 use tokio::{
-    sync::mpsc::{Sender, UnboundedReceiver},
+    sync::mpsc::{self, Sender, UnboundedReceiver},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::action::{try_send_action, Action};
 
-use super::pubsub_store::{ConnStatus, PubSubStore, Target};
+use super::{
+    bytes::{text_from_bytes, Raw},
+    pubsub_store::{ConnStatus, PubSubStore, Target},
+};
 
 /// How long opening the Pub/Sub connection may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +65,7 @@ pub async fn run(
         store,
         action_tx,
         conn: None,
+        shard: None,
         retry: None,
         lost_targets: Vec::new(),
     };
@@ -72,6 +79,10 @@ pub async fn run(
             msg = next_msg(task.conn.as_mut()) => match msg {
                 Some(msg) => task.store.lock().push_msg(&msg, SystemTime::now()),
                 None => task.lost("the server closed the connection"),
+            },
+            push = next_push(task.shard.as_mut()) => match push {
+                Some(push) => task.on_push(&push),
+                None => task.lost("the shard connection closed"),
             },
             () = sleep_until(retry_at) => task.reconnect().await,
             () = cancel.cancelled() => break,
@@ -87,6 +98,14 @@ async fn next_msg(conn: Option<&mut (PubSubSink, PubSubStream)>) -> Option<redis
     }
 }
 
+/// Next push of the shard connection; never resolves without one.
+async fn next_push(shard: Option<&mut ShardConn>) -> Option<PushInfo> {
+    match shard {
+        Some(shard) => shard.pushes.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Sleep until `at`; never resolves without one.
 async fn sleep_until(at: Option<Instant>) {
     match at {
@@ -95,11 +114,20 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
+/// The RESP3 connection for shard channels: `aio::PubSub` has no
+/// `SSUBSCRIBE`, so messages arrive as pushes on a multiplexed connection.
+struct ShardConn {
+    conn: MultiplexedConnection,
+    pushes: UnboundedReceiver<PushInfo>,
+}
+
 struct PubSubTask {
     client: redis::Client,
     store: Arc<Mutex<PubSubStore>>,
     action_tx: Sender<Action>,
     conn: Option<(PubSubSink, PubSubStream)>,
+    /// Opened with the first shard target; lost and reconnected with `conn`.
+    shard: Option<ShardConn>,
     /// Pending reconnect: attempt number and when it starts.
     retry: Option<(u32, Instant)>,
     /// Targets held when the connection dropped; they get a marker row once
@@ -136,12 +164,15 @@ impl PubSubTask {
                 }
             }
             PubSubCmd::Unsubscribe(target) => {
-                let Some((sink, _)) = self.conn.as_mut() else {
-                    return;
-                };
-                let res = match &target {
-                    Target::Channel(name) => sink.unsubscribe(name).await,
-                    Target::Pattern(name) => sink.punsubscribe(name).await,
+                let res = match (&target, self.conn.as_mut(), self.shard.as_mut()) {
+                    (Target::Channel(name), Some((sink, _)), _) => sink.unsubscribe(name).await,
+                    (Target::Pattern(name), Some((sink, _)), _) => sink.punsubscribe(name).await,
+                    (Target::Shard(name), _, Some(shard)) => redis::cmd("SUNSUBSCRIBE")
+                        .arg(Raw(name))
+                        .query_async::<Value>(&mut shard.conn)
+                        .await
+                        .map(|_| ()),
+                    _ => return,
                 };
                 if let Err(err) = res {
                     log::warn!("Unsubscribe from {target} failed: {err}");
@@ -154,12 +185,65 @@ impl PubSubTask {
     }
 
     async fn subscribe(&mut self, target: &Target) -> redis::RedisResult<()> {
+        if let Target::Shard(name) = target {
+            // TODO(cluster): connect to the node that owns the channel's
+            // slot. On a cluster this node answers MOVED for the others.
+            if self.shard.is_none() {
+                self.shard = Some(self.open_shard().await?);
+            }
+            let Some(shard) = self.shard.as_mut() else {
+                return Ok(());
+            };
+            return redis::cmd("SSUBSCRIBE")
+                .arg(Raw(name))
+                .query_async::<Value>(&mut shard.conn)
+                .await
+                .map(|_| ());
+        }
         let Some((sink, _)) = self.conn.as_mut() else {
             return Ok(());
         };
         match target {
             Target::Channel(name) => sink.subscribe(name).await,
             Target::Pattern(name) => sink.psubscribe(name).await,
+            Target::Shard(_) => Ok(()),
+        }
+    }
+
+    /// A RESP3 connection whose pushes come to this task.
+    async fn open_shard(&self) -> redis::RedisResult<ShardConn> {
+        let info = self.client.get_connection_info().clone();
+        let settings = info
+            .redis_settings()
+            .clone()
+            .set_protocol(ProtocolVersion::RESP3);
+        let client = redis::Client::open(info.set_redis_settings(settings))?;
+        let (tx, pushes) = mpsc::unbounded_channel();
+        let config = AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(CONNECT_TIMEOUT))
+            .set_response_timeout(Some(CONNECT_TIMEOUT))
+            .set_push_sender(tx);
+        let conn = client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await?;
+        Ok(ShardConn { conn, pushes })
+    }
+
+    /// A push from the shard connection.
+    fn on_push(&mut self, push: &PushInfo) {
+        match push.kind {
+            PushKind::SMessage => {
+                if let [Value::BulkString(channel), Value::BulkString(payload)] =
+                    push.data.as_slice()
+                {
+                    let channel = text_from_bytes(channel);
+                    self.store
+                        .lock()
+                        .push_shard(&channel, payload, SystemTime::now());
+                }
+            }
+            PushKind::Disconnection => self.lost("the shard connection closed"),
+            _ => {}
         }
     }
 
@@ -183,6 +267,7 @@ impl PubSubTask {
             if let Err(err) = self.subscribe(&target).await {
                 if is_connection_error(&err) {
                     self.conn = None;
+                    self.shard = None;
                     return Err(err.to_string());
                 }
                 failed.push(format!("{target}: {err}"));
@@ -233,6 +318,7 @@ impl PubSubTask {
     /// The connection is gone: keep subscriptions and buffers, reconnect.
     /// The header shows the state, so there is no popup.
     fn lost(&mut self, reason: &str) {
+        self.shard = None;
         if self.conn.take().is_none() {
             return;
         }

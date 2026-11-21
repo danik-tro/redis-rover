@@ -687,6 +687,17 @@ impl EventHandler {
                     }
                 }
             }
+            RedisEvent::SPublish { channel, payload } => {
+                match self.storage.spublish(&channel, &payload).await {
+                    Ok(receivers) => self.action_hook(Action::Published { channel, receivers }),
+                    Err(err) => {
+                        log::error!("SPUBLISH to {channel} failed: {err:?}");
+                        self.action_hook(Action::Error(format!(
+                            "Failed to publish to shard channel {channel}: {err}"
+                        )));
+                    }
+                }
+            }
             RedisEvent::FetchSlowlog => self.load_slowlog().await,
             RedisEvent::SlowlogReset => match self.storage.slowlog_reset().await {
                 Ok(()) => self.load_slowlog().await,

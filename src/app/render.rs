@@ -181,10 +181,10 @@ const PUBSUB_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleWrap, "Wrap message detail on / off"),
     (Command::ScrollLeft, "Pan detail left (wrap off)"),
     (Command::ScrollRight, "Pan detail right (wrap off)"),
-    (Command::PubSubAdd, "Add subscription (channel or pattern)"),
+    (Command::PubSubAdd, "Add subscription (Tab: kind)"),
     (Command::PubSubRemove, "Unsubscribe and drop messages"),
     (Command::PubSubClear, "Clear messages and stats"),
-    (Command::PubSubPublish, "Publish a message"),
+    (Command::PubSubPublish, "Publish (Ctrl-t: SPUBLISH)"),
     (
         Command::PubSubToggleNotify,
         "Toggle notifications (also un-mutes)",
