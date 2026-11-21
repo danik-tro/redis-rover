@@ -208,7 +208,7 @@ pub mod internals {
     pub use crate::probe::report as probe_report;
     pub use crate::redis_client::bytes::text_from_bytes;
     pub use crate::redis_client::cluster::MasterNode;
-    pub use crate::redis_client::conn::Conn;
+    pub use crate::redis_client::conn::{Conn, Connector};
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};

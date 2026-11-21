@@ -90,6 +90,11 @@ impl ClusterFixture {
         }
     }
 
+    /// A plain client on the first seed.
+    pub fn seed(&self) -> redis::Client {
+        redis::Client::open(self.seeds[0].as_str()).expect("valid seed")
+    }
+
     pub fn client(&self) -> ClusterClient {
         ClusterClient::new(self.seeds.clone()).expect("valid seeds")
     }

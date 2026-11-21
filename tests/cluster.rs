@@ -6,12 +6,16 @@
 //! ```
 
 mod cluster_support;
+#[path = "support/mod.rs"]
+mod support;
 
 use cluster_support::ClusterFixture;
 use redis::AsyncCommands;
 use redis_rover::internals::{
-    connect_cluster, KeyspaceState, Link, MasterNode, Storage, SweepApply,
+    connect_cluster, Action, KeyspaceState, Link, MasterNode, MemberKind, NewKeySpec, RedisEvent,
+    Storage, SweepApply, Ttl, ValueEdit,
 };
+use support::Harness;
 
 /// The sweep walks every master and finds each key exactly once.
 #[tokio::test]
@@ -68,4 +72,209 @@ async fn metadata_and_counts_cover_every_master() {
         storage.count_matches("meta:*", 200, budget).await.unwrap(),
         (500, true)
     );
+}
+
+/// Send one write and wait until the runner reports it done.
+async fn write(harness: &mut Harness, event: RedisEvent) {
+    let what = format!("{event:?}");
+    harness.send(event);
+    let action = harness
+        .expect(&what, |a| {
+            matches!(a, Action::KeysChanged | Action::Error(_))
+        })
+        .await;
+    assert_eq!(action, Action::KeysChanged, "{what}");
+}
+
+/// AC2: every kind of write works on keys that live on different masters,
+/// and none fails with `CROSSSLOT`. `foo`, `bar` and `c` are on three masters.
+#[tokio::test]
+#[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)] // one step per kind of write
+async fn writes_reach_every_master() {
+    let fixture = ClusterFixture::start();
+    let client = fixture.client();
+    let mut con = client.get_async_connection().await.unwrap();
+    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    harness.fetch_page().await;
+
+    for key in ["foo", "bar", "c"] {
+        write(
+            &mut harness,
+            RedisEvent::CreateKey {
+                key: key.into(),
+                spec: NewKeySpec::String("v1".into()),
+            },
+        )
+        .await;
+        write(
+            &mut harness,
+            RedisEvent::SetString {
+                key: key.into(),
+                value: "v2".into(),
+            },
+        )
+        .await;
+        let value: String = con.get(key).await.unwrap();
+        assert_eq!(value, "v2", "{key}");
+
+        // WATCH + MULTI must land on the key's node.
+        write(
+            &mut harness,
+            RedisEvent::SetTtl {
+                key: key.into(),
+                ttl: Ttl::Expire(1000),
+            },
+        )
+        .await;
+        write(
+            &mut harness,
+            RedisEvent::ShiftTtl {
+                key: key.into(),
+                delta_secs: 500,
+            },
+        )
+        .await;
+        let ttl: i64 = con.ttl(key).await.unwrap();
+        assert!(ttl > 1000, "{key}: {ttl}");
+
+        // RENAME and COPY inside one slot, through a hash tag.
+        let (from, to, copy) = (
+            format!("{{{key}}}:from"),
+            format!("{{{key}}}:to"),
+            format!("{{{key}}}:copy"),
+        );
+        let () = con.set(&from, "moved").await.unwrap();
+        write(
+            &mut harness,
+            RedisEvent::RenameKey {
+                from: from.clone(),
+                to: to.clone(),
+                overwrite: false,
+            },
+        )
+        .await;
+        write(
+            &mut harness,
+            RedisEvent::CopyKey {
+                from: to.clone(),
+                to: copy.clone(),
+                db: None,
+                overwrite: false,
+            },
+        )
+        .await;
+        let value: String = con.get(&copy).await.unwrap();
+        assert_eq!(value, "moved", "{key}");
+
+        // EVAL routed by its key.
+        let hash = format!("{{{key}}}:hash");
+        let () = con.hset(&hash, "old", "x").await.unwrap();
+        write(
+            &mut harness,
+            RedisEvent::RenameField {
+                key: hash.clone(),
+                from: "old".into(),
+                to: "new".into(),
+            },
+        )
+        .await;
+        let renamed: Option<String> = con.hget(&hash, "new").await.unwrap();
+        assert_eq!(renamed.as_deref(), Some("x"), "{key}");
+
+        let set = format!("{{{key}}}:set");
+        let () = con.sadd(&set, "old").await.unwrap();
+        write(
+            &mut harness,
+            RedisEvent::RenameMember {
+                key: set.clone(),
+                kind: MemberKind::Set,
+                from: "old".into(),
+                to: "new".into(),
+            },
+        )
+        .await;
+
+        // MULTI with the TTL put back.
+        let list = format!("{{{key}}}:list");
+        let () = con.rpush(&list, "a").await.unwrap();
+        let () = con.expire(&list, 1000).await.unwrap();
+        write(
+            &mut harness,
+            RedisEvent::ApplyValueEdit {
+                key: list.clone(),
+                edit: ValueEdit::List {
+                    items: vec!["x".into(), "y".into()],
+                },
+            },
+        )
+        .await;
+        let items: Vec<String> = con.lrange(&list, 0, -1).await.unwrap();
+        assert_eq!(items, ["x", "y"], "{key}");
+        let ttl: i64 = con.ttl(&list).await.unwrap();
+        assert!(ttl > 0, "{key}: the list kept its TTL");
+    }
+
+    // One bulk delete across every master and many slots.
+    let mut marked: Vec<String> = (0..1200).map(|i| format!("bulk:{i}")).collect();
+    for key in &marked {
+        let () = con.set(key, 1).await.unwrap();
+    }
+    marked.extend(["foo".to_owned(), "bar".to_owned(), "c".to_owned()]);
+    harness.send(RedisEvent::DeleteKeys {
+        keys: marked.clone(),
+    });
+    let action = harness
+        .expect("the bulk delete", |a| {
+            matches!(a, Action::KeysDeleted(_) | Action::Error(_))
+        })
+        .await;
+    assert_eq!(action, Action::KeysDeleted(1203));
+    for key in ["foo", "bar", "c", "bulk:0", "bulk:1199"] {
+        let exists: bool = con.exists(key).await.unwrap();
+        assert!(!exists, "{key}");
+    }
+    harness.shutdown().await;
+}
+
+/// AC7: a rename or copy across slots is refused with both slot numbers and
+/// changes nothing.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn cross_slot_moves_are_refused() {
+    let fixture = ClusterFixture::start();
+    let client = fixture.client();
+    let mut con = client.get_async_connection().await.unwrap();
+    let () = con.set("foo", "v").await.unwrap();
+    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+
+    for event in [
+        RedisEvent::RenameKey {
+            from: "foo".into(),
+            to: "bar".into(),
+            overwrite: false,
+        },
+        RedisEvent::CopyKey {
+            from: "foo".into(),
+            to: "bar".into(),
+            db: None,
+            overwrite: false,
+        },
+    ] {
+        harness.send(event);
+        let Action::Error(message) = harness
+            .expect("the refusal", |a| matches!(a, Action::Error(_)))
+            .await
+        else {
+            unreachable!("expect matched an Error");
+        };
+        assert!(message.contains("12182 vs 5061"), "{message}");
+        assert!(message.contains("hash tag"), "{message}");
+    }
+    let (foo, bar): (bool, bool) = (
+        con.exists("foo").await.unwrap(),
+        con.exists("bar").await.unwrap(),
+    );
+    assert!(foo && !bar);
+    harness.shutdown().await;
 }
