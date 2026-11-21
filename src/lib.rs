@@ -211,7 +211,9 @@ pub mod internals {
     pub use crate::redis_client::conn::{Conn, Connector};
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
-    pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};
+    pub use crate::redis_client::metrics::{
+        ClusterMetrics, ClusterSummary, InfoSnapshot, MetricsHistory,
+    };
     pub use crate::redis_client::monitor::MonitorCmd;
     pub use crate::redis_client::monitor_store::{
         parse_line, MonitorLimits, MonitorStatus, MonitorStore, ParsedLine,

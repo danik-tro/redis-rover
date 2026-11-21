@@ -9,13 +9,13 @@ use crate::{
     config,
     redis_client::{
         cluster::MasterNode,
-        metrics::MetricsHistory,
+        metrics::{ClusterMetrics, MetricsHistory},
         monitor_store::MonitorStore,
         pubsub_store::PubSubStore,
         slowlog::SlowlogData,
         types::{GroupDetail, KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
-    widgets::{info::FooterText, monitor::MonitorView, pubsub::PubSubView},
+    widgets::{dashboard::ClusterView, info::FooterText, monitor::MonitorView, pubsub::PubSubView},
 };
 
 #[derive(Clone, Debug)]
@@ -54,6 +54,8 @@ pub struct SharedState {
     /// A cluster's masters, as the sweep last read them (empty on one
     /// server). The command preview names the target node from it.
     pub masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
+    /// A metrics history per master, for the cluster dashboard.
+    pub cluster_metrics: Arc<Mutex<ClusterMetrics>>,
 }
 
 /// Redis's default `databases` setting.
@@ -63,6 +65,9 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             masters: Arc::default(),
+            cluster_metrics: Arc::new(Mutex::new(ClusterMetrics::new(
+                config::get().dashboard.history(),
+            ))),
             info: Arc::new(Mutex::new(None)),
             info_seq: Arc::new(AtomicU64::new(0)),
             keys: Arc::new(Mutex::new(None)),
@@ -101,6 +106,9 @@ pub struct FrameData {
     /// Metrics window for the dashboard's width; `None` outside the
     /// dashboard and while it is paused (it draws its frozen copy then).
     pub metrics: Option<MetricsHistory>,
+    /// The node picker and overview of a cluster's dashboard; `None` on one
+    /// server and outside the dashboard.
+    pub cluster_view: Option<ClusterView>,
     /// The Pub/Sub tab's rows; `None` outside the tab. Taken by the widget
     /// when it draws.
     pub pubsub: Option<PubSubView>,

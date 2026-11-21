@@ -25,6 +25,8 @@ impl From<Command> for Action {
             Command::ResetMetrics => Self::ResetMetrics,
             Command::NextChart => Self::NextChart,
             Command::PrevChart => Self::PrevChart,
+            Command::NextNode => Self::NextNode,
+            Command::PrevNode => Self::PrevNode,
             Command::ToggleAllCharts => Self::ToggleAllCharts,
             Command::SelectDb => Self::OpenDbPicker,
             Command::ScrollLeft => Self::ScrollLeft,
