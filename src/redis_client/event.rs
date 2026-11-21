@@ -417,6 +417,44 @@ impl RedisEvent {
         lines
     }
 
+    /// The keys a write lands on, which on a cluster decide its node (a
+    /// rename / copy stays in its source's slot). Empty for reads.
+    ///
+    /// No `_` arm on purpose: a new variant must say which keys it writes.
+    #[must_use]
+    pub fn target_keys(&self) -> Vec<&str> {
+        match self {
+            Self::FetchKeys
+            | Self::BackfillMeta
+            | Self::LoadAll { .. }
+            | Self::StopLoadAll
+            | Self::FetchValue
+            | Self::SelectDb(_)
+            | Self::CountMatches { .. }
+            | Self::FetchFullValue { .. }
+            | Self::FetchPubSubChannels
+            | Self::FetchSlowlog
+            | Self::FetchStreamGroup { .. }
+            | Self::Publish { .. }
+            | Self::SlowlogReset => Vec::new(),
+            Self::SetString { key, .. }
+            | Self::DeleteKey { key }
+            | Self::CreateKey { key, .. }
+            | Self::AddItem { key, .. }
+            | Self::EditItem { key, .. }
+            | Self::DeleteItem { key, .. }
+            | Self::SetTtl { key, .. }
+            | Self::ShiftTtl { key, .. }
+            | Self::RenameField { key, .. }
+            | Self::RenameMember { key, .. }
+            | Self::ApplyValueEdit { key, .. } => vec![key.as_str()],
+            // A shard channel is hashed to a slot like a key.
+            Self::SPublish { channel, .. } => vec![channel.as_str()],
+            Self::RenameKey { from, .. } | Self::CopyKey { from, .. } => vec![from.as_str()],
+            Self::DeleteKeys { keys } => keys.iter().map(String::as_str).collect(),
+        }
+    }
+
     /// Lines shown under the commands of a preview: what the commands keep
     /// or how they degrade. Empty for most writes.
     ///

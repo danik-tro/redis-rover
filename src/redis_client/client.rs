@@ -1008,23 +1008,6 @@ pub async fn apply_value_edit(
     Ok(())
 }
 
-/// `CLUSTER KEYSLOT` of two names, for the cross-slot guard of a rename /
-/// copy in cluster mode.
-///
-/// # Errors
-///
-/// Returns an error if the command fails.
-pub async fn key_slots(mut manager: Conn, a: &str, b: &str) -> Result<(i64, i64), BoxError> {
-    let mut pipe = redis::pipe();
-    pipe.cmd("CLUSTER")
-        .arg("KEYSLOT")
-        .arg(Raw(a))
-        .cmd("CLUSTER")
-        .arg("KEYSLOT")
-        .arg(Raw(b));
-    Ok(pipe.query_async(&mut manager).await?)
-}
-
 /// Attempts at a [`shift_ttl`] whose `EXEC` was aborted by a concurrent
 /// change, before giving up.
 const SHIFT_TTL_ATTEMPTS: usize = 3;
@@ -1038,7 +1021,9 @@ const SHIFT_TTL_ATTEMPTS: usize = 3;
 ///
 /// The key is gone or has no TTL, the result would not be positive, the key
 /// kept changing, or a command failed.
-pub async fn shift_ttl(mut manager: Conn, key: &str, delta_secs: i64) -> Result<i64, BoxError> {
+pub async fn shift_ttl(manager: Conn, key: &str, delta_secs: i64) -> Result<i64, BoxError> {
+    // `WATCH` and its `EXEC` must reach the same node.
+    let mut manager = manager.on_slot(super::cluster::key_slot(key));
     let name = super::bytes::shown(key);
     for _ in 0..SHIFT_TTL_ATTEMPTS {
         let () = redis::cmd("WATCH")
@@ -1153,7 +1138,20 @@ pub async fn rename_item(
 /// # Errors
 ///
 /// Returns the first failing chunk's error; earlier chunks stay deleted.
-pub async fn delete_keys(mut manager: Conn, keys: &[String]) -> Result<u64, BoxError> {
+pub async fn delete_keys(manager: Conn, keys: &[String]) -> Result<u64, BoxError> {
+    if matches!(manager, Conn::Single(_)) {
+        return delete_chunks(manager, keys).await;
+    }
+    // On a cluster one command may only name keys of one slot.
+    let mut removed = 0;
+    for group in super::cluster::by_slot(keys) {
+        removed += delete_chunks(manager.clone(), &group).await?;
+    }
+    Ok(removed)
+}
+
+/// [`delete_keys`] for keys one command may name together.
+async fn delete_chunks(mut manager: Conn, keys: &[String]) -> Result<u64, BoxError> {
     let mut removed = 0;
     let mut cmds = write_cmd::delete_keys(keys).into_iter().peekable();
     // Only the first chunk can find `UNLINK` missing; then all go as `DEL`.
