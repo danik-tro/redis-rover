@@ -10,7 +10,7 @@ const EXIT_CONFIG: u8 = 3;
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Cli::parse();
-    match redis_rover::run(args).await {
+    match Box::pin(redis_rover::run(args)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // The error can quote the server (or a proxy in front of it).
