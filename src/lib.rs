@@ -29,9 +29,8 @@ pub use redis_client::escape::printable_lines;
 pub use target::TargetError;
 
 use color_eyre::eyre::Result;
-use redis::cluster::ClusterClient;
 use redis_client::{
-    conn::{reports_cluster, Conn, Connector},
+    conn::{reports_cluster, ClusterClients, Conn, Connector},
     runner::{connect_at_startup, connect_cluster, Link, Runner},
 };
 use state::SharedState;
@@ -140,12 +139,12 @@ struct Session {
 async fn open_session(
     target: &target::Target,
     client: &redis::Client,
-    cluster: Option<ClusterClient>,
+    cluster: Option<ClusterClients>,
 ) -> std::result::Result<Session, Box<dyn std::error::Error + Sync + Send>> {
     let single = Connector::single(client.clone());
     let cluster = match (target.cluster, cluster) {
         (ClusterMode::On, Some(cluster)) => {
-            let conn = connect_cluster(&cluster, Link::Interactive).await?;
+            let conn = connect_cluster(&cluster.plain, Link::Interactive).await?;
             return Ok(Session {
                 conn,
                 connector: Connector::cluster(client.clone(), cluster),
@@ -173,7 +172,7 @@ async fn open_session(
             warning: None,
         });
     }
-    match connect_cluster(&cluster, Link::Interactive).await {
+    match connect_cluster(&cluster.plain, Link::Interactive).await {
         Ok(conn) => Ok(Session {
             conn,
             connector: Connector::cluster(client.clone(), cluster),
@@ -208,7 +207,7 @@ pub mod internals {
     pub use crate::probe::report as probe_report;
     pub use crate::redis_client::bytes::text_from_bytes;
     pub use crate::redis_client::cluster::MasterNode;
-    pub use crate::redis_client::conn::{Conn, Connector};
+    pub use crate::redis_client::conn::{ClusterClients, Conn, Connector};
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
     pub use crate::redis_client::metrics::{

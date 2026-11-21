@@ -249,6 +249,7 @@ impl Runner {
             self.client.clone(),
             config,
             self.state.value_state.clone(),
+            self.state.masters.clone(),
             cmd_rx,
             self.action_tx.clone(),
             self.cancellation_token.clone(),
@@ -263,6 +264,8 @@ impl Runner {
         };
         self.pubsub_task = tokio::spawn(pubsub::run(
             self.client.clone(),
+            self.connector.shard_client(),
+            self.state.masters.clone(),
             self.state.pubsub.clone(),
             cmd_rx,
             self.action_tx.clone(),

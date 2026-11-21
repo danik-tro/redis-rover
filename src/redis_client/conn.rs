@@ -150,12 +150,20 @@ impl ConnectionLike for Conn {
     }
 }
 
+/// The cluster clients of a session, built from the same seeds.
+#[derive(Clone)]
+pub struct ClusterClients {
+    pub plain: ClusterClient,
+    /// RESP3, for sharded Pub/Sub: its messages arrive as pushes.
+    pub resp3: ClusterClient,
+}
+
 /// Opens the session's connections: to one server (on any DB) or to the
 /// cluster (DB 0 only).
 #[derive(Clone)]
 pub struct Connector {
     client: redis::Client,
-    cluster: Option<ClusterClient>,
+    cluster: Option<ClusterClients>,
 }
 
 impl Connector {
@@ -168,11 +176,17 @@ impl Connector {
     }
 
     #[must_use]
-    pub fn cluster(client: redis::Client, cluster: ClusterClient) -> Self {
+    pub fn cluster(client: redis::Client, cluster: ClusterClients) -> Self {
         Self {
             client,
             cluster: Some(cluster),
         }
+    }
+
+    /// The RESP3 cluster client; `None` on one server.
+    #[must_use]
+    pub fn shard_client(&self) -> Option<ClusterClient> {
+        self.cluster.as_ref().map(|cluster| cluster.resp3.clone())
     }
 
     /// A new connection for `link`. `db` is ignored on a cluster.
@@ -182,7 +196,7 @@ impl Connector {
     /// The server can't be reached or the attempts time out.
     pub async fn open(&self, db: i64, link: Link) -> Result<Conn, ConnectError> {
         if let Some(cluster) = &self.cluster {
-            return runner::connect_cluster(cluster, link).await;
+            return runner::connect_cluster(&cluster.plain, link).await;
         }
         let info = self.client.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(db);

@@ -12,13 +12,13 @@ use std::{
 };
 
 use color_eyre::eyre::{eyre, Result};
-use redis::{
-    cluster::{ClusterClient, ClusterClientBuilder},
-    ConnectionInfo, IntoConnectionInfo,
-};
+use redis::{cluster::ClusterClientBuilder, ConnectionInfo, IntoConnectionInfo};
 use serde::Deserialize;
 
-use crate::cli::{apply_tls_flags, Cli, TlsArgs};
+use crate::{
+    cli::{apply_tls_flags, Cli, TlsArgs},
+    redis_client::conn::ClusterClients,
+};
 
 /// Used when neither `--url`, a profile nor `REDIS_URL` names a server.
 pub const DEFAULT_URL: &str = "redis://localhost:6379";
@@ -596,7 +596,7 @@ impl Target {
     ///
     /// See [`Target::client`]; in [`ClusterMode::On`], also an invalid
     /// cluster configuration.
-    pub fn clients(&self) -> Result<(redis::Client, Option<ClusterClient>)> {
+    pub fn clients(&self) -> Result<(redis::Client, Option<ClusterClients>)> {
         let info = self.connection_info()?;
         let client = if self.tls.has_certificates() {
             redis::Client::build_with_tls(info.clone(), self.tls.load_certificates()?)
@@ -607,7 +607,7 @@ impl Target {
         if self.cluster == ClusterMode::Off {
             return Ok((client, None));
         }
-        let cluster = self.cluster_client(&info);
+        let cluster = self.cluster_clients(&info);
         match (self.cluster, cluster) {
             (_, Ok(cluster)) => Ok((client, Some(cluster))),
             (ClusterMode::On, Err(err)) => Err(err),
@@ -618,7 +618,7 @@ impl Target {
         }
     }
 
-    fn cluster_client(&self, info: &ConnectionInfo) -> Result<ClusterClient> {
+    fn cluster_clients(&self, info: &ConnectionInfo) -> Result<ClusterClients> {
         if info.redis_settings().db() != 0 || matches!(info.addr(), redis::ConnectionAddr::Unix(_))
         {
             return Err(eyre!("not a cluster target"));
@@ -631,11 +631,21 @@ impl Target {
                 .map(|addr| info.clone().set_addr(addr.clone()))
                 .collect()
         };
-        let mut builder = ClusterClientBuilder::new(nodes);
-        if self.tls.has_certificates() {
-            builder = builder.certs(self.tls.load_certificates()?);
-        }
-        builder.build().map_err(|e| eyre!(e))
+        let builder = || -> Result<ClusterClientBuilder> {
+            let builder = ClusterClientBuilder::new(nodes.clone());
+            Ok(if self.tls.has_certificates() {
+                builder.certs(self.tls.load_certificates()?)
+            } else {
+                builder
+            })
+        };
+        Ok(ClusterClients {
+            plain: builder()?.build().map_err(|e| eyre!(e))?,
+            resp3: builder()?
+                .use_protocol(redis::ProtocolVersion::RESP3)
+                .build()
+                .map_err(|e| eyre!(e))?,
+        })
     }
 
     /// What the footer and `--probe` call this target (no credentials).

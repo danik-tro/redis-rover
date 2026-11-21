@@ -62,12 +62,7 @@ pub fn group_by_node<K: AsRef<str>>(keys: &[K], masters: &[MasterNode]) -> Vec<N
         let slot = key_slot(key.as_ref());
         let route = masters
             .iter()
-            .find(|master| {
-                master
-                    .slots
-                    .iter()
-                    .any(|&(start, end)| (start..=end).contains(&slot))
-            })
+            .find(|master| master.owns(slot))
             .and_then(MasterNode::route_slot)
             .unwrap_or(slot);
         match groups.iter_mut().find(|group| group.slot == route) {
@@ -189,6 +184,36 @@ pub fn is_topology_error(err: &(dyn std::error::Error + Send + Sync + 'static)) 
         })
 }
 
+/// The node a `MOVED` / `ASK` reply points to.
+///
+/// A redirect inside a pipeline has no accessor in redis-rs: the error only
+/// lists its failures as text, so it is read from there.
+#[must_use]
+pub fn redirect_target(err: &redis::RedisError) -> Option<(String, u16)> {
+    if let Some((addr, _slot)) = err.redirect_node() {
+        return split_address(addr);
+    }
+    pipeline_redirect(&err.to_string())
+}
+
+/// The first `Moved: <slot> <host:port>` or `Ask: …` of a pipeline error.
+fn pipeline_redirect(text: &str) -> Option<(String, u16)> {
+    let failures = text.strip_prefix("Pipeline failures:")?;
+    ["Moved: ", "Ask: "]
+        .iter()
+        .filter_map(|tag| failures.find(tag).map(|at| &failures[at + tag.len()..]))
+        .find_map(|rest| {
+            let mut words = rest.split_whitespace();
+            words.next()?.parse::<u16>().ok()?;
+            split_address(words.next()?.trim_end_matches([')', ',', ']']))
+        })
+}
+
+fn split_address(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    Some((host.to_owned(), port.parse().ok()?))
+}
+
 /// Put each group's replies back at their keys' positions. `None` if a group
 /// answered with the wrong number of replies.
 #[must_use]
@@ -217,6 +242,14 @@ pub struct MasterNode {
 }
 
 impl MasterNode {
+    /// Whether this master serves `slot`.
+    #[must_use]
+    pub fn owns(&self, slot: u16) -> bool {
+        self.slots
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&slot))
+    }
+
     /// A slot this node owns, which routes a command to it and keeps doing
     /// so whatever address the client knows the node by.
     #[must_use]
@@ -370,8 +403,8 @@ mod tests {
 
     use super::{
         by_slot, cross_slot_refusal, group_by_node, is_topology_error, key_slot, merge_groups,
-        parse_shards, parse_slots, target_note, topology_update, MasterNode, NodeGroup,
-        TopologyUpdate,
+        parse_shards, parse_slots, pipeline_redirect, redirect_target, target_note,
+        topology_update, MasterNode, NodeGroup, TopologyUpdate,
     };
 
     fn bulk(text: &str) -> Value {
@@ -554,6 +587,35 @@ mod tests {
         }
         let io = redis::RedisError::from((redis::ErrorKind::Io, "gone"));
         assert!(is_topology_error(&io));
+    }
+
+    #[test]
+    fn a_moved_reply_names_the_new_owner() {
+        use redis::{ErrorKind, RedisError, ServerErrorKind};
+        let moved = RedisError::from((
+            ErrorKind::Server(ServerErrorKind::Moved),
+            "MOVED",
+            "3999 10.0.0.7:7001".to_owned(),
+        ));
+        assert_eq!(redirect_target(&moved), Some(("10.0.0.7".to_owned(), 7001)));
+        let other = RedisError::from((ErrorKind::Io, "gone"));
+        assert_eq!(redirect_target(&other), None);
+    }
+
+    #[test]
+    fn a_redirect_inside_a_pipeline_is_found() {
+        let text = "Pipeline failures: [(Index 1, error: Moved: 7365 127.0.0.1:7102), \
+                    (Index 2, error: Moved: 7365 127.0.0.1:7102)]";
+        assert_eq!(
+            pipeline_redirect(text),
+            Some(("127.0.0.1".to_owned(), 7102))
+        );
+        let ask = "Pipeline failures: [(Index 0, error: Ask: 12 10.0.0.1:7001)]";
+        assert_eq!(pipeline_redirect(ask), Some(("10.0.0.1".to_owned(), 7001)));
+        let other = "Pipeline failures: [(Index 0, error: WRONGTYPE no)]";
+        assert_eq!(pipeline_redirect(other), None);
+        // A value that merely mentions it, outside a pipeline failure.
+        assert_eq!(pipeline_redirect("Moved: 1 10.0.0.1:7001"), None);
     }
 
     #[test]
