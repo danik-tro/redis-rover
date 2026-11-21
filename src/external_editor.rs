@@ -142,7 +142,15 @@ fn describe(status: std::process::ExitStatus) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
+        // A shell that stays as the editor's parent (dash) doesn't die of
+        // the signal: it exits with 128 + the signal number.
+        let from_shell = || {
+            status
+                .code()
+                .filter(|code| (129..=192).contains(code))
+                .map(|code| code - 128)
+        };
+        if let Some(signal) = status.signal().or_else(from_shell) {
             return format!("signal {signal}");
         }
     }
