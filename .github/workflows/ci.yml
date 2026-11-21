@@ -157,3 +157,10 @@ jobs:
       # the regular Tests job stays Docker-free.
       - name: Integration tests
         run: cargo +1.97.1 test --locked --test integration -- --ignored --test-threads=1
+
+      # One container each (tests/docker), on fixed ports: one test at a time.
+      - name: Cluster tests
+        run: cargo +1.97.1 test --locked --test cluster -- --ignored --test-threads=1
+
+      - name: Sentinel tests
+        run: cargo +1.97.1 test --locked --test sentinel -- --ignored --test-threads=1
