@@ -66,7 +66,11 @@ impl FooterText {
             os,
             memory,
             clients,
-            db_status: db_status(key.1, info, cluster),
+            db_status: db_status(
+                key.1,
+                info,
+                cluster && !info.is_some_and(|i| i.whole_cluster),
+            ),
             cpu: cpu_pct.map_or_else(|| "CPU: -".to_string(), |v| format!("CPU: {v:.1} %")),
         }
     }
@@ -109,14 +113,15 @@ pub fn build_hint(keybindings: &KeyBindings, mode: Mode, entries: &[(Command, &s
         .join("  ")
 }
 
-/// `db 3 · 120 keys`, or `db 3` before the first `INFO` arrives. In cluster
-/// mode `INFO` only counts the connected node's keys, so that is spelled out.
-fn db_status(db: i64, info: Option<&RedisInfo>, cluster: bool) -> String {
+/// `db 3 · 120 keys`, or `db 3` before the first `INFO` arrives. `one_node`:
+/// a session on one node of a cluster counts only that node's keys, so that
+/// is spelled out.
+fn db_status(db: i64, info: Option<&RedisInfo>, one_node: bool) -> String {
     match info {
         Some(info) => {
             let keys = info.db_keys(db);
             let noun = if keys == 1 { "key" } else { "keys" };
-            let scope = if cluster { " (this node)" } else { "" };
+            let scope = if one_node { " (this node)" } else { "" };
             format!("db {db} · {keys} {noun}{scope}")
         }
         None => format!("db {db}"),

@@ -24,6 +24,7 @@ mod power;
 
 use super::{
     client,
+    cluster::MasterNode,
     conn::{Conn, Connector},
     event::RedisEvent,
     live::{self, LiveCmd},
@@ -378,6 +379,7 @@ impl Runner {
         let info_seq = self.state.info_seq.clone();
         let metrics = self.state.metrics.clone();
         let mut manager = self.manager.clone();
+        let totals = Storage::new(manager.clone());
         let cancellation_token = self.cancellation_token.clone();
         let action_tx = self.action_tx.clone();
 
@@ -389,6 +391,8 @@ impl Runner {
             let mut info_failing = false;
             // Counts successful samples; CLUSTER INFO is polled every 5th one.
             let mut tick_no: u64 = 0;
+            // The last cluster-wide key count, kept through a failed one.
+            let mut cluster_keys: u64 = 0;
 
             loop {
                 tokio::select! {
@@ -396,8 +400,17 @@ impl Runner {
                         let info_res = client::redis_info_with_snapshot(&mut manager).await;
 
                         match info_res {
-                            Ok((redis_info, snapshot)) => {
+                            Ok((mut redis_info, snapshot)) => {
                                 let cluster_enabled = snapshot.cluster_enabled;
+                                if totals.is_cluster() {
+                                    // No lock is held across this await.
+                                    match totals.total_keys().await {
+                                        Ok(total) => cluster_keys = total,
+                                        Err(err) => log::warn!("Cluster DBSIZE failed: {err}"),
+                                    }
+                                    redis_info.keyspace.insert(0, cluster_keys);
+                                    redis_info.whole_cluster = true;
+                                }
                                 info_failing = false;
                                 tick_no += 1;
                                 {
@@ -1047,6 +1060,11 @@ impl EventHandler {
     /// the lock, scans without it, and merges the raw keys back under it. If
     /// SCAN repeated keys and the page is still short, it asks again.
     async fn fetch_page(&self) -> Result<Fetched, FetchError> {
+        if self.storage.is_cluster() {
+            let masters = self.storage.cached_masters().await?;
+            let slots: Vec<u16> = masters.iter().filter_map(MasterNode::route_slot).collect();
+            self.state.keyspace_state.lock().set_sweep_nodes(&slots);
+        }
         let mut scanned = false;
         loop {
             let Some(request) = self.state.keyspace_state.lock().sweep_request() else {

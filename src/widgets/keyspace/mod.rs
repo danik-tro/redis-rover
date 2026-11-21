@@ -69,7 +69,8 @@ pub struct KeySpace {
     new_key: Option<NewKeyDraft>,
     add_item: Option<AddItemDraft>,
     edit_item: Option<EditItemDraft>,
-    /// Connected server runs in cluster mode: SCAN only sees this node, so a
+    /// The session is on one node of a cluster (`cluster: false`, or its
+    /// nodes can't be reached): SCAN only sees this node, so a
     /// warning banner is shown above the table.
     pub cluster_mode: bool,
     /// Key rows that fit in the table on the last render (0 before the first
