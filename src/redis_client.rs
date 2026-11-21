@@ -9,6 +9,7 @@ pub mod monitor_store;
 pub mod pubsub;
 pub mod pubsub_store;
 pub mod runner;
+pub mod slowlog;
 pub mod storage;
 pub mod types;
 pub mod value_edit;

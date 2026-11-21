@@ -121,6 +121,10 @@ pub enum RedisEvent {
     /// List the server's active channels (`PUBSUB CHANNELS` / `NUMSUB` /
     /// `NUMPAT`) into `SharedState::pubsub`.
     FetchPubSubChannels,
+    /// `SLOWLOG GET` and its two settings into `SharedState::slowlog`.
+    FetchSlowlog,
+    /// `SLOWLOG RESET`.
+    SlowlogReset,
     /// `PUBLISH channel payload`. The payload travels in the event, not in an
     /// `Action`, so it isn't debug-logged as one.
     Publish {
@@ -242,6 +246,8 @@ impl std::fmt::Debug for RedisEvent {
                 write!(f, "DeleteItem {{ key: {key:?}, delete: {kind} }}")
             }
             Self::FetchPubSubChannels => f.write_str("FetchPubSubChannels"),
+            Self::FetchSlowlog => f.write_str("FetchSlowlog"),
+            Self::SlowlogReset => f.write_str("SlowlogReset"),
             Self::Publish { channel, payload } => write!(
                 f,
                 "Publish {{ channel: {channel:?}, payload: {} }}",
@@ -266,7 +272,8 @@ impl RedisEvent {
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
-            | Self::FetchPubSubChannels => false,
+            | Self::FetchPubSubChannels
+            | Self::FetchSlowlog => false,
             Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::SetTtl { .. }
@@ -281,6 +288,7 @@ impl RedisEvent {
             | Self::RenameField { .. }
             | Self::RenameMember { .. }
             | Self::DeleteKeys { .. }
+            | Self::SlowlogReset
             | Self::ApplyValueEdit { .. } => true,
         }
     }
@@ -304,6 +312,7 @@ impl RedisEvent {
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
+            | Self::FetchSlowlog
             | Self::SetString { .. }
             | Self::CreateKey { .. }
             | Self::AddItem { .. }
@@ -314,7 +323,10 @@ impl RedisEvent {
             | Self::RenameMember { .. } => false,
             Self::SetTtl { ttl, .. } => *ttl == Ttl::Expire(0),
             Self::RenameKey { overwrite, .. } | Self::CopyKey { overwrite, .. } => *overwrite,
-            Self::DeleteKey { .. } | Self::DeleteItem { .. } | Self::DeleteKeys { .. } => true,
+            Self::DeleteKey { .. }
+            | Self::DeleteItem { .. }
+            | Self::DeleteKeys { .. }
+            | Self::SlowlogReset => true,
             Self::ApplyValueEdit { edit, .. } => edit.removes(),
         }
     }
@@ -336,7 +348,10 @@ impl RedisEvent {
             | Self::SelectDb(_)
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
-            | Self::FetchPubSubChannels => return Vec::new(),
+            | Self::FetchPubSubChannels
+            | Self::FetchSlowlog => return Vec::new(),
+            // No argument to quote: read as it is typed.
+            Self::SlowlogReset => return vec!["SLOWLOG RESET".to_owned()],
             Self::SetString { key, value } => write_cmd::set_string(key, value),
             Self::DeleteKey { key } => write_cmd::delete_key(key),
             Self::SetTtl { key, ttl } => write_cmd::set_ttl(key, *ttl),
@@ -392,6 +407,7 @@ impl RedisEvent {
             | Self::CountMatches { .. }
             | Self::FetchFullValue { .. }
             | Self::FetchPubSubChannels
+            | Self::FetchSlowlog
             | Self::SetString { .. }
             | Self::DeleteKey { .. }
             | Self::CreateKey { .. }
@@ -401,6 +417,7 @@ impl RedisEvent {
             | Self::Publish { .. }
             | Self::SetTtl { .. }
             | Self::ShiftTtl { .. }
+            | Self::SlowlogReset
             | Self::DeleteKeys { .. } => Vec::new(),
             Self::ApplyValueEdit { edit, .. } => match edit {
                 ValueEdit::List { .. } => vec![
@@ -796,6 +813,7 @@ mod tests {
                 },
                 vec![r#"PUBLISH "news" "line 1\nline 2""#],
             ),
+            (RedisEvent::SlowlogReset, vec!["SLOWLOG RESET"]),
         ];
         for (event, lines) in cases {
             assert!(event.is_write(), "{event:?}");

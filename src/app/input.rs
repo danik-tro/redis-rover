@@ -78,16 +78,15 @@ impl App {
             return None;
         }
 
-        if self.mode == Mode::PubSub {
-            return self.handle_pubsub_key(key);
+        match self.mode {
+            Mode::PubSub => return self.handle_pubsub_key(key),
+            Mode::Monitor => return self.handle_monitor_key(key),
+            Mode::Slowlog => return self.handle_slowlog_key(key),
+            _ => {}
         }
 
         // Keep a half-open keyspace overlay from swallowing dashboard keys.
-        if self.mode == Mode::Monitor {
-            return self.handle_monitor_key(key);
-        }
-
-        if matches!(self.mode, Mode::Dashboard | Mode::Slowlog) {
+        if self.mode == Mode::Dashboard {
             // Esc backs out of the help overlay first; any other key (`m`)
             // goes through as a real command.
             if is_cancel && self.help_is_open() {

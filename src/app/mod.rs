@@ -13,6 +13,7 @@ mod navigation;
 mod power;
 mod pubsub;
 mod render;
+mod slowlog;
 
 use std::{
     sync::{
@@ -49,7 +50,7 @@ use crate::{
     tui,
     widgets::{
         dashboard::Dashboard, db_picker::DbPicker, info::Info, keyspace::KeySpace,
-        monitor::Monitor, pubsub::PubSub, toast::Toast,
+        monitor::Monitor, pubsub::PubSub, slowlog::Slowlog, toast::Toast,
     },
 };
 
@@ -126,6 +127,7 @@ pub struct App {
     /// Boxed: its text input would make the `run` future too large.
     monitor: Box<Monitor>,
     monitor_link: MonitorLink,
+    slowlog: Slowlog,
     /// Read-only: refuse writes before any input is asked for. The same
     /// flag the runner checks (`Runner::read_only_flag`).
     read_only: Arc<AtomicBool>,
@@ -262,6 +264,7 @@ impl App {
             pubsub_return: Mode::KeySpace,
             monitor,
             monitor_link: MonitorLink::default(),
+            slowlog: Slowlog::default(),
             read_only: Arc::new(AtomicBool::new(false)),
             environment: Environment::Local,
             pending: None,

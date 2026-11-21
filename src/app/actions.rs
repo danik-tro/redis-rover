@@ -90,6 +90,11 @@ impl App {
             | Action::MonitorTogglePause
             | Action::MonitorClear
             | Action::MonitorEnter => self.handle_monitor_action(action),
+            Action::SlowlogRefresh
+            | Action::SlowlogSort
+            | Action::SlowlogEnter
+            | Action::SlowlogReset
+            | Action::SlowlogLoaded => self.handle_slowlog_action(action),
             Action::NextChart => self.dashboard.next_chart(),
             Action::PrevChart => self.dashboard.prev_chart(),
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
@@ -187,6 +192,13 @@ impl App {
             match action {
                 Action::ToggleWrap => self.monitor.toggle_detail_wrap(),
                 _ => self.monitor.pan_detail(*action == Action::ScrollRight),
+            }
+            return;
+        }
+        if self.mode == Mode::Slowlog {
+            match action {
+                Action::ToggleWrap => self.slowlog.toggle_detail_wrap(),
+                _ => self.slowlog.pan_detail(*action == Action::ScrollRight),
             }
             return;
         }
@@ -294,6 +306,7 @@ impl App {
             | Action::DbSwitched
             | Action::OpenKeyChanged { .. }
             | Action::LiveStatus(_)
+            | Action::SlowlogLoaded
             | Action::ValueLoadFailed
             | Action::FilterMatchCount { .. }
             | Action::YankReady

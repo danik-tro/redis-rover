@@ -1031,6 +1031,7 @@ async fn read_only_rejects_every_write() {
                 items: vec!["x".into()],
             },
         },
+        RedisEvent::SlowlogReset,
     ];
     for event in writes {
         assert!(event.is_write(), "{event:?} must count as a write");
@@ -3361,5 +3362,123 @@ async fn monitor_under_load_stays_responsive_and_bounded() {
         assert!(p99 < Duration::from_millis(16), "frame p99 {p99:?}");
     }
     h.monitor(MonitorCmd::Stop);
+    h.shutdown().await;
+}
+
+// ---- Slowlog ---------------------------------------------------------------
+
+async fn config_set(admin: &mut redis::aio::ConnectionManager, name: &str, value: &str) {
+    let () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg(name)
+        .arg(value)
+        .query_async(admin)
+        .await
+        .expect("CONFIG SET");
+}
+
+async fn slowlog_len(admin: &mut redis::aio::ConnectionManager) -> i64 {
+    redis::cmd("SLOWLOG")
+        .arg("LEN")
+        .query_async(admin)
+        .await
+        .expect("SLOWLOG LEN")
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn slowlog_lists_with_durations_and_resets() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    config_set(&mut admin, "slowlog-log-slower-than", "0").await;
+    let () = admin.set("slow:key", "value").await.expect("SET");
+
+    let mut h = Harness::new(server.client(0), false).await;
+    h.send(RedisEvent::FetchSlowlog);
+    h.expect("loaded", |a| *a == Action::SlowlogLoaded).await;
+    let data = h.state.slowlog.lock().take().expect("data");
+    assert_eq!(data.error, None);
+    assert_eq!(data.slower_than, Some(0));
+    assert_eq!(data.max_len, Some(128));
+    let set = data
+        .entries
+        .iter()
+        .find(|e| e.args.len() == 3 && e.args[1] == "slow:key")
+        .expect("the SET is listed");
+    assert!(set.args[0].eq_ignore_ascii_case("SET"));
+    assert_eq!(set.args[2], "value");
+    assert!(!set.client.is_empty());
+
+    config_set(&mut admin, "slowlog-log-slower-than", "-1").await;
+    h.send(RedisEvent::SlowlogReset);
+    h.expect("reloaded", |a| *a == Action::SlowlogLoaded).await;
+    assert_eq!(slowlog_len(&mut admin).await, 0);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn slowlog_reset_is_refused_under_read_only() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    config_set(&mut admin, "slowlog-log-slower-than", "0").await;
+    let () = admin.set("a", "1").await.expect("SET");
+    config_set(&mut admin, "slowlog-log-slower-than", "-1").await;
+    let before = slowlog_len(&mut admin).await;
+    assert!(before > 0);
+
+    let mut h = Harness::new(server.client(0), true).await;
+    h.send(RedisEvent::SlowlogReset);
+    h.expect(
+        "refused",
+        |a| matches!(a, Action::Error(m) if m.contains("Read-only")),
+    )
+    .await;
+    assert_eq!(slowlog_len(&mut admin).await, before);
+    h.shutdown().await;
+}
+
+/// A server that refuses `CONFIG` still lists; one that refuses `SLOWLOG`
+/// reports it in the data, with no error popup.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn slowlog_refusals_stay_inline() {
+    let server = support::start_redis().await;
+    let mut admin = server.admin(0).await;
+    for (user, denied) in [("nocfg", "-config"), ("noslow", "-slowlog")] {
+        let () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(user)
+            .arg("on")
+            .arg(">pw")
+            .arg("~*")
+            .arg("+@all")
+            .arg(denied)
+            .query_async(&mut admin)
+            .await
+            .expect("ACL SETUSER");
+    }
+    let client = |user: &str| {
+        let url = format!("redis://{user}:pw@{}:{}/0", server.host, server.port);
+        redis::Client::open(url).expect("url")
+    };
+
+    let mut h = Harness::new(client("nocfg"), false).await;
+    h.send(RedisEvent::FetchSlowlog);
+    h.expect("loaded", |a| *a == Action::SlowlogLoaded).await;
+    let data = h.state.slowlog.lock().take().expect("data");
+    assert_eq!(
+        (data.slower_than, data.max_len, data.error),
+        (None, None, None)
+    );
+    h.shutdown().await;
+
+    let mut h = Harness::new(client("noslow"), false).await;
+    h.send(RedisEvent::FetchSlowlog);
+    let seen = h.expect("loaded", |a| *a == Action::SlowlogLoaded).await;
+    assert_eq!(seen, Action::SlowlogLoaded);
+    let data = h.state.slowlog.lock().take().expect("data");
+    let error = data.error.expect("refused");
+    assert!(error.to_lowercase().contains("permission"), "{error}");
     h.shutdown().await;
 }

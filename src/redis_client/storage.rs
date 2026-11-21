@@ -14,6 +14,7 @@ use super::{
     bytes::{strings, Raw, Text},
     client,
     pubsub_store::ServerChannels,
+    slowlog::{parse_config_int, parse_entries, SlowlogData, SLOWLOG_FETCH},
     types::{
         ItemDelete, ItemEdit, KeyItem, KeyMeta, KeyValue, LoadedValue, NewKeySpec, RedisType,
         SweepRequest, SweepResult, Ttl, TypeScan, ValueState,
@@ -507,6 +508,46 @@ impl Storage {
     /// # Errors
     ///
     /// Returns an error if the command fails.
+    pub async fn slowlog_reset(&self) -> redis::RedisResult<()> {
+        let mut manager = self.manager.clone();
+        for cmd in super::write_cmd::slowlog_reset() {
+            let _: redis::Value = cmd.query_async(&mut manager).await?;
+        }
+        Ok(())
+    }
+
+    /// The slowlog and its settings. Never fails: managed services often
+    /// refuse `CONFIG` or `SLOWLOG`, and the screen says so inline.
+    pub async fn slowlog(&self) -> SlowlogData {
+        let mut manager = self.manager.clone();
+        let reply = redis::cmd("SLOWLOG")
+            .arg("GET")
+            .arg(SLOWLOG_FETCH)
+            .query_async::<redis::Value>(&mut manager)
+            .await;
+        let (entries, error) = match reply {
+            Ok(reply) => (parse_entries(reply), None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
+        let mut setting = async |name: &str| {
+            redis::cmd("CONFIG")
+                .arg("GET")
+                .arg(name)
+                .query_async::<redis::Value>(&mut manager)
+                .await
+                .ok()
+                .and_then(parse_config_int)
+        };
+        let slower_than = setting("slowlog-log-slower-than").await;
+        let max_len = setting("slowlog-max-len").await;
+        SlowlogData {
+            entries,
+            slower_than,
+            max_len,
+            error,
+        }
+    }
+
     pub async fn publish(
         &self,
         channel: &str,
