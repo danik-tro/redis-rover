@@ -93,6 +93,28 @@ impl SentinelFixture {
         assert!(out.status.success(), "redis-cli {args:?} failed");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
+
+    /// `SENTINEL FAILOVER mymaster`, repeated while the Sentinels aren't
+    /// ready for one yet.
+    pub fn failover(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let reply = self.cli(SENTINELS[0], &["SENTINEL", "FAILOVER", "mymaster"]);
+            if reply.trim() == "OK" {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no failover: {reply}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Kill the process of a Redis node; the container stays up.
+    pub fn kill(&self, port: u16) {
+        let pidfile = format!("/data/{port}/redis.pid");
+        let script = format!("kill -9 \"$(cat {pidfile})\"");
+        let out = docker(&["exec", &self.name, "sh", "-c", &script]);
+        assert!(out.status.success(), "kill {port} failed");
+    }
 }
 
 impl Drop for SentinelFixture {

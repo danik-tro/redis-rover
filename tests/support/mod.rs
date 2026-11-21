@@ -19,8 +19,8 @@ use std::{
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 use redis_rover::internals::{
-    connect_cluster, Action, ClusterClients, Conn, Connector, Link, LiveCmd, MonitorCmd, PubSubCmd,
-    RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
+    connect_cluster, Action, ClusterClients, Conn, Connector, FollowConn, Link, LiveCmd,
+    MasterRoute, MonitorCmd, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -335,6 +335,16 @@ impl Harness {
         Self::wired(seed, conn, connector, false)
     }
 
+    /// The runner behind Sentinel, as `redis_rover::run` opens it.
+    pub async fn sentinel(client: redis::Client, route: MasterRoute) -> Self {
+        init();
+        let conn = FollowConn::open(route.clone(), 0, Link::Interactive)
+            .await
+            .expect("connect to the master");
+        let connector = Connector::sentinel(client.clone(), route);
+        Self::wired(client, Conn::Follow(conn), connector, false)
+    }
+
     fn wired(client: redis::Client, conn: Conn, connector: Connector, read_only: bool) -> Self {
         let state = SharedState::default();
         *state.db.lock() = client.get_connection_info().redis_settings().db();
@@ -381,6 +391,15 @@ impl Harness {
 
     pub fn monitor(&self, cmd: MonitorCmd) {
         self.monitor.send(cmd).expect("MONITOR task is listening");
+    }
+
+    /// The actions that arrived so far, without waiting.
+    pub fn drain_actions(&mut self) -> Vec<Action> {
+        let mut drained = Vec::new();
+        while let Ok(action) = self.actions.try_recv() {
+            drained.push(action);
+        }
+        drained
     }
 
     /// Wait for the first action that `matches`, skipping (and remembering)
