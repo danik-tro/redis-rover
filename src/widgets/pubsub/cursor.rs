@@ -3,6 +3,44 @@ use crate::{
     widgets::text_view::{TextCache, TextView},
 };
 
+/// A log a [`LogCursor`] moves over: entries in order, numbered by a `seq`
+/// that only grows and keeps counting past evictions.
+pub trait LogBuffer {
+    fn len(&self) -> usize;
+    fn first_seq(&self) -> Option<u64>;
+    fn last_seq(&self) -> Option<u64>;
+    /// `seq` of the entry at `index`.
+    fn seq_at(&self, index: usize) -> Option<u64>;
+    /// Index of the entry with `seq`, or where it would go.
+    fn index_of(&self, seq: u64) -> Result<usize, usize>;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl LogBuffer for MessageBuffer {
+    fn len(&self) -> usize {
+        MessageBuffer::len(self)
+    }
+
+    fn first_seq(&self) -> Option<u64> {
+        MessageBuffer::first_seq(self)
+    }
+
+    fn last_seq(&self) -> Option<u64> {
+        MessageBuffer::last_seq(self)
+    }
+
+    fn seq_at(&self, index: usize) -> Option<u64> {
+        self.get(index).map(|m| m.seq)
+    }
+
+    fn index_of(&self, seq: u64) -> Result<usize, usize> {
+        MessageBuffer::index_of(self, seq)
+    }
+}
+
 /// A paused log: what the user looks at, by sequence number so evictions
 /// don't shift it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,13 +75,13 @@ impl LogCursor {
 
     /// Freeze the view as it is (the newest `height` rows), selecting the
     /// newest entry. Nothing to pause on an empty buffer.
-    fn pause(&mut self, buf: &MessageBuffer) -> bool {
+    fn pause(&mut self, buf: &impl LogBuffer) -> bool {
         let Some(last) = buf.last_seq() else {
             return false;
         };
         let top = buf
-            .get(buf.len().saturating_sub(self.height.max(1)))
-            .map_or(last, |m| m.seq);
+            .seq_at(buf.len().saturating_sub(self.height.max(1)))
+            .unwrap_or(last);
         self.paused = Some(Paused {
             selected: last,
             top,
@@ -54,7 +92,7 @@ impl LogCursor {
     }
 
     /// Space: pause, or resume following.
-    pub fn toggle_pause(&mut self, buf: &MessageBuffer) {
+    pub fn toggle_pause(&mut self, buf: &impl LogBuffer) {
         if self.is_paused() {
             self.follow();
         } else {
@@ -63,14 +101,14 @@ impl LogCursor {
     }
 
     /// Index of the selected entry (the oldest kept one if it was evicted).
-    fn selected_index(paused: &Paused, buf: &MessageBuffer) -> usize {
+    fn selected_index(paused: &Paused, buf: &impl LogBuffer) -> usize {
         buf.index_of(paused.selected)
             .unwrap_or_else(|i| i)
             .min(buf.len().saturating_sub(1))
     }
 
     /// `k`: select the previous entry. Pauses a following log first.
-    pub fn up(&mut self, buf: &MessageBuffer) {
+    pub fn up(&mut self, buf: &impl LogBuffer) {
         if !self.is_paused() && !self.pause(buf) {
             return;
         }
@@ -78,21 +116,21 @@ impl LogCursor {
             return;
         };
         let i = Self::selected_index(paused, buf);
-        if let Some(prev) = i.checked_sub(1).and_then(|i| buf.get(i)) {
-            paused.selected = prev.seq;
+        if let Some(prev) = i.checked_sub(1).and_then(|i| buf.seq_at(i)) {
+            paused.selected = prev;
             paused.evicted = false;
         }
     }
 
     /// `j`: select the next entry; past the newest one, follow again.
-    pub fn down(&mut self, buf: &MessageBuffer) {
+    pub fn down(&mut self, buf: &impl LogBuffer) {
         let Some(paused) = self.paused.as_mut() else {
             return;
         };
         let i = Self::selected_index(paused, buf);
-        match buf.get(i + 1) {
+        match buf.seq_at(i + 1) {
             Some(next) => {
-                paused.selected = next.seq;
+                paused.selected = next;
                 paused.evicted = false;
             }
             None => self.follow(),
@@ -103,7 +141,7 @@ impl LogCursor {
     /// first row shown and of the selected one (`None` when empty). A
     /// paused view whose rows were evicted moves to the oldest entry still
     /// kept; an empty buffer (cleared) follows again.
-    pub fn sync(&mut self, buf: &MessageBuffer, height: usize) -> (usize, Option<usize>) {
+    pub fn sync(&mut self, buf: &impl LogBuffer, height: usize) -> (usize, Option<usize>) {
         self.height = height;
         let height = height.max(1);
         let (Some(first), len) = (buf.first_seq(), buf.len()) else {
@@ -124,12 +162,12 @@ impl LogCursor {
         } else if selected >= top + height {
             top = selected + 1 - height;
         }
-        paused.top = buf.get(top).map_or(first, |m| m.seq);
+        paused.top = buf.seq_at(top).unwrap_or(first);
         (top, Some(selected))
     }
 
     /// Sequence number of the selected entry: the newest one while following.
-    pub fn selected_seq(&self, buf: &MessageBuffer) -> Option<u64> {
+    pub fn selected_seq(&self, buf: &impl LogBuffer) -> Option<u64> {
         match self.paused {
             Some(paused) => buf
                 .first_seq()
@@ -140,10 +178,23 @@ impl LogCursor {
     }
 
     /// Entries that arrived since the log was paused, counted by `seq`.
-    pub fn new_count(&self, buf: &MessageBuffer) -> u64 {
+    pub fn new_count(&self, buf: &impl LogBuffer) -> u64 {
         match (self.paused, buf.last_seq()) {
             (Some(paused), Some(last)) => last.saturating_sub(paused.newest_at_pause),
             _ => 0,
+        }
+    }
+
+    /// Index just past the last entry a frozen view shows: the newest one
+    /// at the pause, or the selection if it moved further.
+    pub fn visible_end(&self, buf: &impl LogBuffer) -> usize {
+        let Some(paused) = self.paused else {
+            return buf.len();
+        };
+        let last = paused.newest_at_pause.max(paused.selected);
+        match buf.index_of(last) {
+            Ok(index) => index + 1,
+            Err(index) => index,
         }
     }
 

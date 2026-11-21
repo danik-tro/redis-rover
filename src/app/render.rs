@@ -26,7 +26,7 @@ use crate::{
         db_picker::DbPickerWidget,
         info::{build_hint, InfoWidget},
         keyspace::KeySpaceWidget,
-        monitor::{MonitorView, MonitorWidget},
+        monitor::MonitorWidget,
         pubsub::PubSubWidget,
         slowlog::{SlowlogView, SlowlogWidget},
         toast::ToastWidget,
@@ -101,9 +101,11 @@ const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
 /// Footer hint entries for the MONITOR screen, in display order.
 const MONITOR_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::LeaveScreen, "back"),
-    (Command::GoToSlowlog, "slowlog"),
-    (Command::GoToPubSub, "pubsub"),
-    (Command::GoToDashboard, "metrics"),
+    (Command::MonitorToggle, "start/stop"),
+    (Command::MonitorFilter, "filter"),
+    (Command::MonitorTogglePause, "pause"),
+    (Command::MonitorClear, "clear"),
+    (Command::MonitorEnter, "detail"),
     (Command::ToggleHelp, "help"),
 ];
 
@@ -126,7 +128,17 @@ const GO_TO_HELP_ENTRIES: &[(Command, &str)] = &[
 
 /// `?` help rows for the MONITOR screen, in display order.
 const MONITOR_HELP_ENTRIES: &[(Command, &str)] = &[
-    (Command::LeaveScreen, "Back to keyspace"),
+    (Command::LeaveScreen, "Back (Esc closes the detail first)"),
+    (Command::MonitorToggle, "Start / stop MONITOR"),
+    (Command::MonitorFilter, "Filter by command or key glob"),
+    (Command::MonitorTogglePause, "Pause / follow the log"),
+    (Command::MonitorClear, "Clear the log"),
+    (Command::MonitorEnter, "Open the selected line"),
+    (Command::ScrollDown, "Down (log or detail)"),
+    (Command::ScrollUp, "Up (log or detail; pauses the log)"),
+    (Command::ToggleWrap, "Wrap the detail on / off"),
+    (Command::ScrollLeft, "Pan detail left (wrap off)"),
+    (Command::ScrollRight, "Pan detail right (wrap off)"),
     (Command::ToggleReadOnly, "Toggle read-only"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
@@ -320,7 +332,12 @@ impl App {
             self.redraw.wall_sec = wall_sec(wall);
             self.pubsub.build_view(main, now, wall)
         });
-        self.frame.monitor = (mode == Mode::Monitor).then(MonitorView::default);
+        self.frame.monitor = (mode == Mode::Monitor).then(|| {
+            // Read before the view, like the Pub/Sub tab.
+            self.redraw.monitor = self.state.monitor.lock().version();
+            self.redraw.wall_sec = wall_sec(wall);
+            self.monitor.build_view(main, wall)
+        });
         self.frame.slowlog = (mode == Mode::Slowlog).then(SlowlogView::default);
     }
 
@@ -358,6 +375,11 @@ impl App {
             return self.state.pubsub.lock().version() != self.redraw.pubsub
                 || wall_sec(self.clock.wall()) != self.redraw.wall_sec;
         }
+        if mode == Mode::Monitor {
+            // The rate in the title moves each second while it runs.
+            return self.state.monitor.lock().version() != self.redraw.monitor
+                || (self.monitor_active() && wall_sec(self.clock.wall()) != self.redraw.wall_sec);
+        }
         false
     }
 
@@ -379,7 +401,7 @@ impl App {
     }
 
     /// The mode drawn under a popup: the one it was opened from.
-    fn view_mode(&self) -> Mode {
+    pub(super) fn view_mode(&self) -> Mode {
         match self.mode {
             Mode::Popup(_) => self.previous_mode.unwrap_or(Mode::KeySpace),
             m => m,
@@ -460,8 +482,8 @@ impl App {
                 }
             }
             Mode::Monitor => {
-                if let Some(view) = &self.frame.monitor {
-                    MonitorWidget { view }.render(area, buf);
+                if let Some(view) = self.frame.monitor.take() {
+                    StatefulWidget::render(MonitorWidget { view }, area, buf, &mut *self.monitor);
                 }
             }
             Mode::Slowlog => {
@@ -574,7 +596,7 @@ impl App {
             .collect();
         // Fixed by ratatui-textarea, so not in the keybindings: listed for
         // the screens that have text inputs.
-        if !matches!(mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog) {
+        if !matches!(mode, Mode::Dashboard | Mode::Slowlog) {
             rows.extend(
                 TEXT_INPUT_HELP
                     .iter()

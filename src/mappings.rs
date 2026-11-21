@@ -59,6 +59,11 @@ impl From<Command> for Action {
             Command::GoToPubSub => Self::GoToPubSub,
             Command::GoToDashboard => Self::GoToDashboard,
             Command::LeaveScreen => Self::LeaveScreen,
+            Command::MonitorToggle => Self::MonitorToggle,
+            Command::MonitorFilter => Self::MonitorFilter,
+            Command::MonitorTogglePause => Self::MonitorTogglePause,
+            Command::MonitorClear => Self::MonitorClear,
+            Command::MonitorEnter => Self::MonitorEnter,
         }
     }
 }

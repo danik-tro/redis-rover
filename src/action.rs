@@ -159,6 +159,16 @@ pub enum Action {
     GoToDashboard,
     /// Esc on a server screen: back to the key list.
     LeaveScreen,
+    /// `t` on the MONITOR screen: start (asks first) or stop.
+    MonitorToggle,
+    /// `/` on the MONITOR screen: open the filter.
+    MonitorFilter,
+    /// Space on the MONITOR screen: pause / follow.
+    MonitorTogglePause,
+    /// `c` on the MONITOR screen: drop the lines.
+    MonitorClear,
+    /// Enter on the MONITOR screen: open the selected line.
+    MonitorEnter,
 }
 
 impl Action {

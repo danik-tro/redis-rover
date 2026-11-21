@@ -7,10 +7,12 @@ mod popups;
 mod render;
 mod view;
 
-use cursor::{Detail, LogCursor};
+use cursor::Detail;
+pub use cursor::{LogBuffer, LogCursor};
 use popups::{render_add_popup, render_publish_popup, AddPopup, Popup, PublishPopup};
 pub use render::PubSubWidget;
 use view::clock;
+pub(crate) use view::log_state;
 pub use view::PubSubView;
 
 use std::sync::Arc;

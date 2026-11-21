@@ -312,6 +312,11 @@ impl MonitorStore {
     }
 
     #[must_use]
+    pub fn limits(&self) -> MonitorLimits {
+        self.limits
+    }
+
+    #[must_use]
     pub fn seen(&self) -> u64 {
         self.seen
     }
@@ -334,6 +339,33 @@ impl MonitorStore {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    #[must_use]
+    pub fn first_seq(&self) -> Option<u64> {
+        self.items.front().map(|l| l.seq)
+    }
+
+    #[must_use]
+    pub fn last_seq(&self) -> Option<u64> {
+        self.items.back().map(|l| l.seq)
+    }
+
+    /// The line with `seq`. Sequence numbers have no gaps.
+    #[must_use]
+    pub fn get(&self, seq: u64) -> Option<&MonitorLine> {
+        let index = seq.checked_sub(self.first_seq()?)?;
+        self.items.get(usize::try_from(index).ok()?)
+    }
+
+    /// The lines after `seq`, oldest first.
+    pub fn since(&self, seq: u64) -> impl Iterator<Item = &MonitorLine> {
+        let skip = self
+            .first_seq()
+            .map_or(0, |first| (seq + 1).saturating_sub(first));
+        self.items
+            .iter()
+            .skip(usize::try_from(skip).unwrap_or(usize::MAX))
     }
 
     #[must_use = "iterators do nothing unless used"]

@@ -690,6 +690,10 @@ impl App {
             self.pubsub_move(true);
             return;
         }
+        if self.mode == Mode::Monitor {
+            self.monitor.move_selection(true);
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -713,6 +717,10 @@ impl App {
     pub(super) fn scroll_up(&mut self, now: Instant) {
         if self.mode == Mode::PubSub {
             self.pubsub_move(false);
+            return;
+        }
+        if self.mode == Mode::Monitor {
+            self.monitor.move_selection(false);
             return;
         }
         if self.mode != Mode::KeySpace {

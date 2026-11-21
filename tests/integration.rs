@@ -25,8 +25,8 @@ use redis_rover::{
     internals::{
         diff, text_from_bytes, Action, ConnStatus, Diff, EntryKind, ItemDelete, ItemEdit,
         JsonPreview, JsonPreviewKind, KeyChange, KeyItem, KeyValue, LiveCmd, Liveness, MemberKind,
-        MonitorCmd, MonitorStatus, NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType, Sort,
-        SortKey, Target, Ttl, TypeFilter, ValueEdit,
+        Monitor, MonitorCmd, MonitorStatus, NewKeySpec, PageRow, PubSubCmd, RedisEvent, RedisType,
+        Sort, SortKey, Target, Ttl, TypeFilter, ValueEdit,
     },
     Cli,
 };
@@ -3250,5 +3250,116 @@ async fn monitor_refused_by_an_acl_is_final() {
         "no retry"
     );
     assert!(monitor_clients(&mut admin).await.is_empty());
+    h.shutdown().await;
+}
+
+/// `total_commands_processed` from `INFO stats`.
+async fn commands_processed(admin: &mut redis::aio::ConnectionManager) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("stats")
+        .query_async(admin)
+        .await
+        .expect("INFO");
+    info.lines()
+        .find_map(|l| l.strip_prefix("total_commands_processed:"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("total_commands_processed")
+}
+
+/// At 50k commands a second the UI still answers within a frame, the screen
+/// shows it is sampling, and the heap stays within the buffer limit + 20 MiB.
+/// Timings mean something in a release build:
+/// `cargo test --release --test integration -- --ignored --nocapture monitor_under_load`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Docker"]
+async fn monitor_under_load_stays_responsive_and_bounded() {
+    const LOAD: Duration = Duration::from_secs(6);
+    let server = support::start_redis().await;
+    let h = Harness::new(server.client(0), false).await;
+    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(before, Ordering::Relaxed);
+
+    h.monitor(MonitorCmd::Start);
+    let store = h.state.monitor.clone();
+    wait_until("running", || {
+        *store.lock().status() == MonitorStatus::Running
+    })
+    .await;
+    let limit = store.lock().limits().bytes;
+    let seen_before = store.lock().seen();
+    let mut admin = server.admin(0).await;
+    let commands_before = commands_processed(&mut admin).await;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4 {
+        let client = server.client(0);
+        let stop = stop.clone();
+        writers.push(tokio::spawn(async move {
+            let mut con = client
+                .get_multiplexed_async_connection()
+                .await
+                .expect("load connection");
+            while !stop.load(Ordering::Relaxed) {
+                let mut pipe = redis::pipe();
+                for i in 0..500 {
+                    pipe.set(format!("load:{w}:{i}"), "value").ignore();
+                }
+                let () = pipe.query_async(&mut con).await.expect("load pipeline");
+            }
+        }));
+    }
+
+    let mut monitor = Monitor::new(store.clone());
+    let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+    let started = Instant::now();
+    let mut frames = Vec::new();
+    let mut sampled = false;
+    let mut down = false;
+    while started.elapsed() < LOAD {
+        let at = Instant::now();
+        monitor.move_selection(down);
+        down = !down;
+        let view = monitor.build_view(area, std::time::SystemTime::now());
+        std::hint::black_box(view);
+        frames.push(at.elapsed());
+        sampled |= store.lock().sample_every() > 1;
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        writer.await.expect("load task");
+    }
+
+    let commands = commands_processed(&mut admin).await - commands_before;
+    // The stream may still be draining: wait for it, then compare.
+    let deadline = Instant::now() + WAIT;
+    while store.lock().seen() - seen_before < commands * 9 / 10 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = store.lock().seen() - seen_before;
+    assert!(
+        seen <= commands + 16,
+        "counted {seen} lines for {commands} commands"
+    );
+    let rate = commands / elapsed.as_secs().max(1);
+    frames.sort();
+    let p99 = frames[frames.len() * 99 / 100];
+    let max = frames[frames.len() - 1];
+    let grown = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    eprintln!(
+        "load: {rate} commands/s by the server, {seen} of {commands} lines read, sampling 1/{}, frame p99 {p99:?} max {max:?}, heap +{} MiB",
+        store.lock().sample_every(),
+        grown >> 20
+    );
+    assert!(rate >= 50_000, "the load only reached {rate} lines/s");
+    assert!(sampled, "never sampled");
+    assert!(store.lock().bytes() <= limit);
+    assert!(grown <= limit + (20 << 20), "heap grew {grown} bytes");
+    if !cfg!(debug_assertions) {
+        assert!(p99 < Duration::from_millis(16), "frame p99 {p99:?}");
+    }
+    h.monitor(MonitorCmd::Stop);
     h.shutdown().await;
 }

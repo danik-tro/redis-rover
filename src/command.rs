@@ -69,4 +69,14 @@ pub enum Command {
     GoToDashboard,
     /// Leave a server screen for the key list.
     LeaveScreen,
+    /// Start / stop MONITOR.
+    MonitorToggle,
+    /// Filter the MONITOR log.
+    MonitorFilter,
+    /// Pause / follow the MONITOR log.
+    MonitorTogglePause,
+    /// Clear the MONITOR log.
+    MonitorClear,
+    /// Open the selected MONITOR line.
+    MonitorEnter,
 }

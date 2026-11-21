@@ -1,9 +1,21 @@
 //! Jumping between the top-level screens with the `g` chords.
 
 use super::App;
-use crate::mode::Mode;
+use crate::{action::Action, mode::Mode};
 
 impl App {
+    /// The `g` jumps and Esc on a server screen.
+    pub(super) fn navigate(&mut self, action: &Action) {
+        match action {
+            Action::GoToMonitor => self.go_to(Mode::Monitor),
+            Action::GoToSlowlog => self.go_to(Mode::Slowlog),
+            Action::GoToPubSub => self.go_to(Mode::PubSub),
+            Action::GoToDashboard => self.go_to(Mode::Dashboard),
+            Action::LeaveScreen => self.leave_screen(),
+            _ => {}
+        }
+    }
+
     /// Show `target`. A jump always goes back to the key list: remembering
     /// the screen it came from would let two screens point at each other.
     pub(super) fn go_to(&mut self, target: Mode) {
@@ -21,6 +33,9 @@ impl App {
         } else {
             self.mode = target;
             self.sync_hint();
+        }
+        if target == Mode::Monitor {
+            self.offer_monitor();
         }
     }
 
@@ -53,6 +68,8 @@ mod tests {
     fn chord(app: &mut App, second: char) {
         press(app, KeyCode::Char('g'));
         press(app, KeyCode::Char(second));
+        // Opening MONITOR asks first; these tests are about the jump.
+        app.pending = None;
     }
 
     #[test]
@@ -67,6 +84,7 @@ mod tests {
             for (letter, to) in screens {
                 let mut app = app();
                 app.go_to(from);
+                app.pending = None;
                 assert_eq!(app.mode, from);
                 chord(&mut app, letter);
                 assert_eq!(app.mode, to, "{from:?} -> g {letter}");

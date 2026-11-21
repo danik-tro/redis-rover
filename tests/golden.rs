@@ -24,12 +24,13 @@ use ratatui::{
     widgets::{StatefulWidget, Widget},
 };
 use redis_rover::internals::{
-    render_help, render_help_page, render_typed_confirm, render_typed_count, Clock, ConfirmPopup,
-    ConnStatus, Dashboard, DashboardWidget, Environment, FixedClock, FrameData, Info, InfoSnapshot,
-    InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
-    KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, PageInfo,
-    PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Sort, SortKey,
-    Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    parse_line, render_help, render_help_page, render_monitor_confirm, render_typed_confirm,
+    render_typed_count, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget, Environment,
+    FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview,
+    JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress,
+    LoadedValue, MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore,
+    MonitorWidget, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
+    SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -794,6 +795,72 @@ fn pubsub_log_paused() {
     let view = pubsub.build_view(area, clock.now(), clock.wall());
     PubSubWidget { view }.render(buf.area, &mut buf, &mut pubsub);
     check("pubsub_log_paused", &buf);
+}
+
+// ---- MONITOR ---------------------------------------------------------------
+
+const MONITOR_SEC: u64 = 1_700_000_010;
+
+/// A store with a few commands, the last seconds busy enough to sample.
+fn monitor_store() -> Arc<Mutex<MonitorStore>> {
+    let store = Arc::new(Mutex::new(MonitorStore::new(MonitorLimits {
+        lines: 100,
+        bytes: 1 << 20,
+    })));
+    let raw = [
+        r#"1700000005.100000 [0 10.0.0.7:51012] "GET" "session:7f3a9c""#,
+        r#"1700000006.250000 [0 10.0.0.7:51012] "SET" "a" "1""#,
+        r#"1700000007.003000 [2 unix:/run/redis.sock] "HSET" "user:1" "name" "Ada""#,
+        r#"1700000008.420000 [0 lua] "INCR" "counter""#,
+        r#"1700000009.999000 [0 [::1]:6380] "DEL" "tmp:1" "tmp:2""#,
+    ];
+    for (i, line) in raw.iter().enumerate() {
+        let parsed = parse_line(line).expect("a MONITOR line");
+        let sec = MONITOR_SEC - 5 + i as u64;
+        store
+            .lock()
+            .push_batch(vec![parsed], 7000 + 500 * i as u64, 2, sec);
+    }
+    store.lock().set_status(MonitorStatus::Running);
+    store
+}
+
+#[test]
+fn monitor_following() {
+    init();
+    let mut monitor = Monitor::new(monitor_store());
+    let mut buf = buffer(100, 12);
+    let wall = UNIX_EPOCH + Duration::from_secs(MONITOR_SEC);
+    let view = monitor.build_view(buf.area, wall);
+    MonitorWidget { view }.render(buf.area, &mut buf, &mut monitor);
+    check("monitor_following", &buf);
+}
+
+#[test]
+fn monitor_paused() {
+    init();
+    let store = monitor_store();
+    let mut monitor = Monitor::new(store.clone());
+    let area = Rect::new(0, 0, 80, 12);
+    let wall = UNIX_EPOCH + Duration::from_secs(MONITOR_SEC);
+    monitor.build_view(area, wall);
+    monitor.toggle_pause();
+    monitor.move_selection(false);
+    let parsed = parse_line(r#"1700000010.000000 [0 lua] "PING""#).expect("a MONITOR line");
+    store.lock().push_batch(vec![parsed], 1, 1, MONITOR_SEC);
+
+    let mut buf = Buffer::empty(area);
+    let view = monitor.build_view(area, wall);
+    MonitorWidget { view }.render(area, &mut buf, &mut monitor);
+    check("monitor_paused", &buf);
+}
+
+#[test]
+fn monitor_confirm_prod() {
+    init();
+    let mut buf = buffer(80, 24);
+    render_monitor_confirm(buf.area, &mut buf, Environment::Prod, "mon");
+    check("monitor_confirm_prod", &buf);
 }
 
 // ---- Help -----------------------------------------------------------------

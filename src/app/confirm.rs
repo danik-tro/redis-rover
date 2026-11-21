@@ -31,6 +31,40 @@ pub(super) enum PendingConfirm {
     LoadAll { db: i64, keys: u64, bytes: u64 },
     /// `g o`: the filter hides the open key; clear it and go there.
     ClearFilterFor(String),
+    /// Start MONITOR, which costs the server CPU. Typed on Prod.
+    StartMonitor(Option<Box<TypedConfirm>>),
+}
+
+impl PendingConfirm {
+    /// The question before MONITOR starts on `env`.
+    pub(super) fn start_monitor(env: Environment) -> Self {
+        Self::StartMonitor((env == Environment::Prod).then(|| {
+            Box::new(TypedConfirm {
+                input: typed_input_titled("Type monitor", "monitor"),
+                expected: "monitor".to_owned(),
+                action: "start",
+                object: "MONITOR",
+                what: "monitor",
+            })
+        }))
+    }
+
+    /// The typed confirm of this question, if it has one.
+    fn typed(&self) -> Option<&TypedConfirm> {
+        match self {
+            Self::Write(write) => write.typed.as_ref(),
+            Self::StartMonitor(typed) => typed.as_deref(),
+            Self::LiftReadOnly | Self::LoadAll { .. } | Self::ClearFilterFor(_) => None,
+        }
+    }
+
+    fn typed_mut(&mut self) -> Option<&mut TypedConfirm> {
+        match self {
+            Self::Write(write) => write.typed.as_mut(),
+            Self::StartMonitor(typed) => typed.as_deref_mut(),
+            Self::LiftReadOnly | Self::LoadAll { .. } | Self::ClearFilterFor(_) => None,
+        }
+    }
 }
 
 /// A write waiting for `y`, with what to do once it is sent.
@@ -301,15 +335,17 @@ impl App {
     /// The typed confirm's text (tests).
     #[cfg(test)]
     pub(super) fn typed_text(&self) -> Option<String> {
-        match &self.pending {
-            Some(PendingConfirm::Write(w)) => w.typed.as_ref().map(|t| input_text(&t.input)),
-            _ => None,
-        }
+        self.pending
+            .as_ref()
+            .and_then(PendingConfirm::typed)
+            .map(|t| input_text(&t.input))
     }
 
     /// The open question is the typed confirm (it has a text input).
     pub(super) fn typed_confirm_open(&self) -> bool {
-        matches!(&self.pending, Some(PendingConfirm::Write(w)) if w.typed.is_some())
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.typed().is_some())
     }
 
     /// Keys while a question is open. Popup-local like Enter / Esc in the
@@ -347,12 +383,7 @@ impl App {
         if Self::is_quit_key(key) {
             return Some(Action::Quit);
         }
-        let Some(PendingConfirm::Write(write)) = &mut self.pending else {
-            return None;
-        };
-        let Some(typed) = &mut write.typed else {
-            return None;
-        };
+        let typed = self.pending.as_mut().and_then(PendingConfirm::typed_mut)?;
         if key.code == KeyCode::Enter {
             if typed.matches() {
                 self.accept_confirm();
@@ -369,6 +400,7 @@ impl App {
             Some(PendingConfirm::LiftReadOnly) => self.lift_read_only(now),
             Some(PendingConfirm::LoadAll { .. }) => self.start_load(None),
             Some(PendingConfirm::ClearFilterFor(key)) => self.clear_filter_for(key),
+            Some(PendingConfirm::StartMonitor(_)) => self.start_monitor(),
             Some(PendingConfirm::Write(write)) => {
                 let PendingWrite { event, after, .. } = *write;
                 self.send_write(event, after);
@@ -400,6 +432,15 @@ impl App {
             }
             Some(PendingConfirm::ClearFilterFor(key)) => {
                 ConfirmPopup::clear_filter_for(key, env).render(area, buf);
+            }
+            Some(PendingConfirm::StartMonitor(typed)) => {
+                let popup = ConfirmPopup::start_monitor(env);
+                match typed {
+                    Some(typed) => popup
+                        .typed_confirm(&typed.text(), &typed.input, typed.matches())
+                        .render(area, buf),
+                    None => popup.render(area, buf),
+                }
             }
             None => {}
         }

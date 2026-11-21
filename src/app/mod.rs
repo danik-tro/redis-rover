@@ -8,6 +8,7 @@ mod input;
 mod keyspace;
 mod live;
 mod load;
+mod monitor;
 mod navigation;
 mod power;
 mod pubsub;
@@ -27,6 +28,7 @@ use crate::{
     redis_client::{
         event::RedisEvent,
         live::{LiveCmd, Liveness},
+        monitor::MonitorCmd,
         pubsub::PubSubCmd,
         types::RedisType,
     },
@@ -46,8 +48,8 @@ use crate::{
     mode::Mode,
     tui,
     widgets::{
-        dashboard::Dashboard, db_picker::DbPicker, info::Info, keyspace::KeySpace, pubsub::PubSub,
-        toast::Toast,
+        dashboard::Dashboard, db_picker::DbPicker, info::Info, keyspace::KeySpace,
+        monitor::Monitor, pubsub::PubSub, toast::Toast,
     },
 };
 
@@ -121,6 +123,9 @@ pub struct App {
     /// Where `b` / Esc in the Pub/Sub tab goes back to. Kept apart from
     /// `previous_mode`, which an error popup inside the tab overwrites.
     pubsub_return: Mode,
+    /// Boxed: its text input would make the `run` future too large.
+    monitor: Box<Monitor>,
+    monitor_link: MonitorLink,
     /// Read-only: refuse writes before any input is asked for. The same
     /// flag the runner checks (`Runner::read_only_flag`).
     read_only: Arc<AtomicBool>,
@@ -178,11 +183,22 @@ struct Redraw {
     info_seq: u64,
     /// `PubSubStore::version` the Pub/Sub tab showed.
     pubsub: u64,
+    /// `MonitorStore::version` the MONITOR screen showed.
+    monitor: u64,
     /// Wall-clock second of that frame (the tab shows rates and ages).
     wall_sec: u64,
     /// Frames drawn since `since`, logged at debug once a minute.
     frames: u64,
     since: Option<Instant>,
+}
+
+/// The App's side of the MONITOR task.
+#[derive(Default)]
+struct MonitorLink {
+    /// Control channel; `None` in tests without one.
+    tx: Option<UnboundedSender<MonitorCmd>>,
+    /// MONITOR was started and not stopped.
+    on: bool,
 }
 
 /// Shown when a write is attempted in `--read-only` mode.
@@ -208,6 +224,7 @@ impl App {
         let keyspace = KeySpace::new(Vec::new());
         let dashboard = Dashboard::new(state.metrics.clone());
         let pubsub = PubSub::new(state.pubsub.clone());
+        let monitor = Box::new(Monitor::new(state.monitor.clone()));
 
         let mut app = Self {
             state,
@@ -243,6 +260,8 @@ impl App {
             pubsub,
             pubsub_tx,
             pubsub_return: Mode::KeySpace,
+            monitor,
+            monitor_link: MonitorLink::default(),
             read_only: Arc::new(AtomicBool::new(false)),
             environment: Environment::Local,
             pending: None,
@@ -277,6 +296,13 @@ impl App {
     pub fn environment(mut self, environment: Environment) -> Self {
         self.environment = environment;
         self.summary.environment = environment;
+        self
+    }
+
+    /// The MONITOR task's control channel (`Runner::monitor_tx`).
+    #[must_use]
+    pub fn monitor_tx(mut self, tx: UnboundedSender<MonitorCmd>) -> Self {
+        self.monitor_link.tx = Some(tx);
         self
     }
 
