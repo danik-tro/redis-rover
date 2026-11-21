@@ -752,18 +752,36 @@ fn footer_environments() {
     }
 }
 
+/// The footer of a session behind Sentinel names the master it is on.
+#[test]
+fn footer_sentinel() {
+    for (name, width) in [("footer_sentinel_80", 80), ("footer_sentinel_120", 120)] {
+        let buf = footer_at(
+            "sentinel mymaster → 10.0.1.7:6379",
+            Environment::Staging,
+            false,
+            width,
+        );
+        check(name, &buf);
+    }
+}
+
 fn footer(env: Environment, read_only: bool) -> Buffer {
+    footer_at("redis://localhost:6379", env, read_only, 100)
+}
+
+fn footer_at(target: &str, env: Environment, read_only: bool, width: u16) -> Buffer {
     init();
     let shared = SharedState::default();
     *shared.info.lock() = Some(sample_info());
-    let mut info = Info::new("redis://localhost:6379");
+    let mut info = Info::new(target);
     info.environment = env;
     info.read_only = read_only;
     info.hint = "o open  y yank  / filter  d db  ? help".into();
     let mut frame = FrameData::default();
     frame.refresh_footer(&shared);
 
-    let mut buf = buffer(100, 5);
+    let mut buf = buffer(width, 5);
     InfoWidget { frame: &frame }.render(buf.area, &mut buf, &mut info);
     buf
 }
