@@ -167,7 +167,7 @@ impl Storage {
     /// This session browses a whole cluster.
     #[must_use]
     pub fn is_cluster(&self) -> bool {
-        !matches!(self.manager, Conn::Single(_))
+        self.manager.is_cluster()
     }
 
     /// [`Self::masters`], read once. No lock is held across the query.

@@ -28,6 +28,7 @@ use super::{
     cluster::{is_topology_error, MasterNode},
     conn::client_at,
     pubsub_store::{ConnStatus, PubSubStore, Target},
+    sentinel::ServerClient,
 };
 
 /// How long opening the Pub/Sub connection may take.
@@ -60,7 +61,7 @@ pub fn backoff(attempt: u32) -> Duration {
 /// [`backoff`] and subscribes every target in the store again; buffers and
 /// stats are kept.
 pub async fn run(
-    client: redis::Client,
+    client: impl Into<ServerClient>,
     cluster: Option<ClusterClient>,
     masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
     store: Arc<Mutex<PubSubStore>>,
@@ -70,7 +71,7 @@ pub async fn run(
 ) {
     let shard_masters = Arc::clone(&masters.lock());
     let mut task = PubSubTask {
-        client,
+        client: client.into(),
         cluster,
         shard_masters,
         masters,
@@ -92,6 +93,7 @@ pub async fn run(
                 None => break,
             },
             _ = topology.tick(), if on_cluster => task.follow_topology().await,
+            () = task.client.changed() => task.lost("the master changed"),
             msg = next_msg(task.conn.as_mut()) => match msg {
                 Some(msg) => task.store.lock().push_msg(&msg, SystemTime::now()),
                 None => task.lost("the server closed the connection"),
@@ -169,7 +171,8 @@ impl ShardLink {
 }
 
 struct PubSubTask {
-    client: redis::Client,
+    /// The server, or behind Sentinel whichever is the master now.
+    client: ServerClient,
     /// RESP3 cluster client: routes each `SSUBSCRIBE` to the slot's owner.
     cluster: Option<ClusterClient>,
     /// The cluster's masters, kept current by the info task.
@@ -297,7 +300,8 @@ impl PubSubTask {
             }
             return open_cluster_shard(cluster).await;
         }
-        let info = self.client.get_connection_info().clone();
+        let current = self.client.current();
+        let info = current.get_connection_info().clone();
         let settings = info
             .redis_settings()
             .clone()
@@ -320,9 +324,10 @@ impl PubSubTask {
     /// A RESP3 cluster client seeded with the current masters.
     fn current_masters_client(&self) -> Option<ClusterClient> {
         let masters = Arc::clone(&self.masters.lock());
+        let base = self.client.current();
         let nodes: Vec<ConnectionInfo> = masters
             .iter()
-            .filter_map(|node| client_at(&self.client, &node.host, node.port).ok())
+            .filter_map(|node| client_at(&base, &node.host, node.port).ok())
             .map(|client| {
                 let info = client.get_connection_info().clone();
                 let settings = info
@@ -343,11 +348,12 @@ impl PubSubTask {
     /// down, last. One server has no masters list and uses its own address.
     async fn open_pubsub(&self) -> Result<redis::aio::PubSub, String> {
         let masters = Arc::clone(&self.masters.lock());
+        let base = self.client.current();
         let mut clients: Vec<redis::Client> = masters
             .iter()
-            .filter_map(|node| client_at(&self.client, &node.host, node.port).ok())
+            .filter_map(|node| client_at(&base, &node.host, node.port).ok())
             .collect();
-        clients.push(self.client.clone());
+        clients.push(base);
         let mut reason = String::new();
         for client in clients {
             match tokio::time::timeout(CONNECT_TIMEOUT, client.get_async_pubsub()).await {

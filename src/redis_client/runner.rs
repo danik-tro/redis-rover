@@ -30,6 +30,7 @@ use super::{
     live::{self, LiveCmd},
     monitor::{self, MonitorCmd},
     pubsub::{self, PubSubCmd},
+    sentinel::MasterRoute,
     slowlog::SlowlogData,
     storage::{Storage, TypeScanRejected},
     types::{RedisType, SweepApply, ValueState},
@@ -53,6 +54,10 @@ const LOAD_NOTIFY: Duration = Duration::from_millis(250);
 /// Failed `INFO` samples in a row before a cluster counts as down: a
 /// failover takes a few seconds and heals by itself.
 const CLUSTER_INFO_PATIENCE: u32 = 15;
+/// How often a Sentinel session asks who the master is.
+const SENTINEL_CHECK: Duration = Duration::from_secs(1);
+/// Shortest gap between two questions after failed commands.
+const SENTINEL_RETRY_GAP: Duration = Duration::from_millis(200);
 
 /// The toast of a topology change.
 const TOPOLOGY_CHANGED: &str = "cluster topology changed · rescanning";
@@ -77,9 +82,6 @@ pub static VALUE_FETCH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 pub struct Runner {
     cancellation_token: CancellationToken,
-    /// The client the app started with. A DB switch builds a new connection
-    /// from it, so TLS settings and credentials carry over.
-    client: redis::Client,
     /// Opens the state task's connections (one server, or the cluster).
     connector: Connector,
     manager: Conn,
@@ -139,8 +141,7 @@ impl Runner {
 
         Self {
             cancellation_token,
-            connector: Connector::single(client.clone()),
-            client,
+            connector: Connector::single(client),
             manager: manager.into(),
             read_only: Arc::new(AtomicBool::new(false)),
             state,
@@ -217,6 +218,20 @@ impl Runner {
         self.launch_pubsub_task();
         self.launch_monitor_task();
         self.launch_live_task();
+        self.launch_sentinel_task();
+    }
+
+    /// On a Sentinel target, follow the master. Ends with the cancel token.
+    fn launch_sentinel_task(&mut self) {
+        let Some(route) = self.connector.route().cloned() else {
+            return;
+        };
+        tokio::spawn(follow_master(
+            route,
+            self.state.clone(),
+            self.action_tx.clone(),
+            self.cancellation_token.clone(),
+        ));
     }
 
     /// Spawn the MONITOR task. It idles until `MonitorCmd::Start`, so the
@@ -226,7 +241,7 @@ impl Runner {
             return;
         };
         self.monitor_task = tokio::spawn(monitor::run(
-            self.client.clone(),
+            self.connector.server_client(),
             self.state.monitor.clone(),
             self.state.ops_node.clone(),
             config::get().monitor.max_rate(),
@@ -246,7 +261,7 @@ impl Runner {
             return;
         }
         self.live_task = tokio::spawn(live::run(
-            self.client.clone(),
+            self.connector.server_client(),
             config,
             self.state.value_state.clone(),
             self.state.masters.clone(),
@@ -263,7 +278,7 @@ impl Runner {
             return;
         };
         self.pubsub_task = tokio::spawn(pubsub::run(
-            self.client.clone(),
+            self.connector.server_client(),
             self.connector.shard_client(),
             self.state.masters.clone(),
             self.state.pubsub.clone(),
@@ -514,6 +529,38 @@ async fn watch_topology(storage: &Storage, state: &SharedState, tx: &ActionSende
     }
     crate::action::try_send_action(tx, Action::Notice(TOPOLOGY_CHANGED.to_owned()));
     crate::action::try_send_action(tx, Action::KeysChanged);
+}
+
+/// Ask the Sentinels every [`SENTINEL_CHECK`], and at once when a connection
+/// fails, so the app reconnects to the new master rather than the old one.
+/// A move restarts the sweep: a `SCAN` cursor means nothing on another node.
+async fn follow_master(
+    route: MasterRoute,
+    state: SharedState,
+    tx: ActionSender<Action>,
+    cancel: CancellationToken,
+) {
+    let mut check = tokio::time::interval(SENTINEL_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = check.tick() => {}
+            () = route.lost() => {
+                // Failing commands report in bursts.
+                tokio::time::sleep(SENTINEL_RETRY_GAP).await;
+            }
+            () = cancel.cancelled() => break,
+        }
+        let moved = tokio::select! {
+            moved = route.refresh() => moved,
+            () = cancel.cancelled() => break,
+        };
+        if let Some(label) = moved {
+            state.keyspace_state.lock().rescan();
+            crate::action::try_send_action(&tx, Action::MasterChanged(label));
+            crate::action::try_send_action(&tx, Action::KeysChanged);
+        }
+    }
 }
 
 /// One `INFO` per master into `SharedState::cluster_metrics`, for the
@@ -1322,6 +1369,18 @@ async fn sweep_to_end(
 /// The server can't be reached, refuses the connection settings, or the
 /// attempts time out.
 pub async fn connect(client: redis::Client, link: Link) -> Result<Conn, FetchError> {
+    Ok(connect_manager(client, link).await?.into())
+}
+
+/// [`connect`], as the manager itself.
+///
+/// # Errors
+///
+/// See [`connect`].
+pub async fn connect_manager(
+    client: redis::Client,
+    link: Link,
+) -> Result<ConnectionManager, FetchError> {
     let overall = config::get().connection.connect_timeout();
     connect_within(client, link, overall).await
 }
@@ -1366,14 +1425,16 @@ const STARTUP_RETRY_ALLOWANCE: Duration = Duration::from_secs(15);
 /// As [`connect`].
 pub async fn connect_at_startup(client: redis::Client) -> Result<Conn, FetchError> {
     let overall = config::get().connection.connect_timeout() + STARTUP_RETRY_ALLOWANCE;
-    connect_within(client, Link::Interactive, overall).await
+    Ok(connect_within(client, Link::Interactive, overall)
+        .await?
+        .into())
 }
 
 async fn connect_within(
     client: redis::Client,
     link: Link,
     overall: Duration,
-) -> Result<Conn, FetchError> {
+) -> Result<ConnectionManager, FetchError> {
     let timeouts = config::get().connection;
     let response = match link {
         Link::Interactive => timeouts.response_timeout(),
@@ -1388,7 +1449,7 @@ async fn connect_within(
     )
     .await
     .map_err(|_| format!("connecting timed out after {overall:?}"))??;
-    Ok(manager.into())
+    Ok(manager)
 }
 
 /// Fetch the value page `snapshot` describes. Unless the user moved on

@@ -141,6 +141,11 @@ impl Info {
             pubsub_unread: 0,
         }
     }
+
+    /// The connection target moved (a Sentinel failover).
+    pub fn set_target(&mut self, target: &str) {
+        self.title = format!(" Info · {target} ");
+    }
 }
 
 /// Draws the footer from the frame's [`FooterText`].

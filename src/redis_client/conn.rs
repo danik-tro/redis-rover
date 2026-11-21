@@ -10,7 +10,10 @@ use redis::{
     Arg, Cmd, ConnectionAddr, Pipeline, RedisFuture, Value,
 };
 
-use super::runner::{self, Link};
+use super::{
+    runner::{self, Link},
+    sentinel::{FollowConn, MasterRoute, ServerClient},
+};
 
 type ConnectError = Box<dyn std::error::Error + Sync + Send>;
 
@@ -27,9 +30,17 @@ pub enum Conn {
     /// A node runs a pipeline over several of its slots, which the slot
     /// routing of [`Conn::Cluster`] refuses as `CROSSSLOT`.
     Node(ClusterConnection, SingleNodeRoutingInfo),
+    /// One server behind Sentinel: follows the master through a failover.
+    Follow(FollowConn),
 }
 
 impl Conn {
+    /// Whether commands are routed over a cluster's nodes.
+    #[must_use]
+    pub fn is_cluster(&self) -> bool {
+        matches!(self, Self::Cluster(_) | Self::Node(..))
+    }
+
     /// This connection, with everything sent to the home node (see
     /// [`home_route`]). One server is its own home.
     #[must_use]
@@ -54,7 +65,7 @@ impl Conn {
                     port,
                 },
             ),
-            single @ Self::Single(_) => single.clone(),
+            single @ (Self::Single(_) | Self::Follow(_)) => single.clone(),
         }
     }
 
@@ -67,7 +78,7 @@ impl Conn {
                 conn.clone(),
                 SingleNodeRoutingInfo::SpecificNode(Route::new(slot, SlotAddr::Master)),
             ),
-            single @ Self::Single(_) => single.clone(),
+            single @ (Self::Single(_) | Self::Follow(_)) => single.clone(),
         }
     }
 }
@@ -124,6 +135,7 @@ impl ConnectionLike for Conn {
             Self::Node(conn, node) => {
                 Box::pin(conn.route_command(cmd.clone(), RoutingInfo::SingleNode(node.clone())))
             }
+            Self::Follow(conn) => Box::pin(conn.command(cmd)),
         }
     }
 
@@ -139,6 +151,7 @@ impl ConnectionLike for Conn {
             Self::Node(conn, node) => {
                 Box::pin(conn.route_pipeline(cmd.clone(), offset, count, node.clone()))
             }
+            Self::Follow(conn) => Box::pin(conn.pipeline(cmd, offset, count)),
         }
     }
 
@@ -146,6 +159,7 @@ impl ConnectionLike for Conn {
         match self {
             Self::Single(conn) => conn.get_db(),
             Self::Cluster(conn) | Self::Node(conn, _) => conn.get_db(),
+            Self::Follow(conn) => conn.db(),
         }
     }
 }
@@ -164,6 +178,7 @@ pub struct ClusterClients {
 pub struct Connector {
     client: redis::Client,
     cluster: Option<ClusterClients>,
+    route: Option<MasterRoute>,
 }
 
 impl Connector {
@@ -172,6 +187,7 @@ impl Connector {
         Self {
             client,
             cluster: None,
+            route: None,
         }
     }
 
@@ -180,6 +196,32 @@ impl Connector {
         Self {
             client,
             cluster: Some(cluster),
+            route: None,
+        }
+    }
+
+    /// One server behind Sentinel: every connection follows `route`.
+    #[must_use]
+    pub fn sentinel(client: redis::Client, route: MasterRoute) -> Self {
+        Self {
+            client,
+            cluster: None,
+            route: Some(route),
+        }
+    }
+
+    /// The master route of a Sentinel session.
+    #[must_use]
+    pub fn route(&self) -> Option<&MasterRoute> {
+        self.route.as_ref()
+    }
+
+    /// What a long-lived task connects with.
+    #[must_use]
+    pub fn server_client(&self) -> ServerClient {
+        match &self.route {
+            Some(route) => route.into(),
+            None => self.client.clone().into(),
         }
     }
 
@@ -195,6 +237,11 @@ impl Connector {
     ///
     /// The server can't be reached or the attempts time out.
     pub async fn open(&self, db: i64, link: Link) -> Result<Conn, ConnectError> {
+        if let Some(route) = &self.route {
+            return Ok(Conn::Follow(
+                FollowConn::open(route.clone(), db, link).await?,
+            ));
+        }
         if let Some(cluster) = &self.cluster {
             return runner::connect_cluster(&cluster.plain, link).await;
         }

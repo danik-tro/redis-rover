@@ -19,8 +19,7 @@ use crate::{
     cli::{apply_tls_flags, Cli, TlsArgs},
     redis_client::{
         conn::{client_at, ClusterClients},
-        escape::printable,
-        sentinel::{SentinelTarget, DEFAULT_PORT},
+        sentinel::{MasterRoute, SentinelTarget, DEFAULT_PORT},
     },
 };
 
@@ -853,6 +852,15 @@ impl Target {
         Ok(master)
     }
 
+    /// The shared route to the master of a Sentinel target; `client` is on
+    /// the master [`Target::resolve_master`] found.
+    #[must_use]
+    pub fn master_route(&self, client: &redis::Client) -> Option<MasterRoute> {
+        self.sentinel
+            .clone()
+            .map(|sentinel| MasterRoute::new(sentinel, client.clone()))
+    }
+
     /// Apply what `addr` implies to an environment inferred from elsewhere.
     fn tighten_for(&mut self, addr: &redis::ConnectionAddr) {
         let at_master = Environment::infer(addr);
@@ -901,12 +909,7 @@ impl Target {
     #[must_use]
     pub fn label(&self, info: &ConnectionInfo) -> String {
         if let Some(sentinel) = &self.sentinel {
-            // The address comes from a server's reply.
-            return format!(
-                "sentinel {} → {}",
-                printable(&sentinel.master),
-                printable(&info.addr().to_string())
-            );
+            return sentinel.label(info.addr());
         }
         if self.seeds.is_empty() {
             return crate::cli::connection_label(info);

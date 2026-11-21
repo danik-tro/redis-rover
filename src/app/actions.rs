@@ -147,6 +147,11 @@ impl App {
                 self.toast.show(msg.clone(), false, now);
             }
             Action::Notice(ref msg) => self.toast.show(msg.clone(), false, now),
+            Action::MasterChanged(ref target) => {
+                self.summary.set_target(target);
+                self.toast
+                    .show(format!("new master · {target}"), false, now);
+            }
             Action::LoadNextPage => self.load_next_page(),
             Action::LoadPreviousPage => self.load_previous_page(),
             Action::SetKeyspaceFilter => self.enter_filter_popup(),

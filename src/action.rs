@@ -152,6 +152,8 @@ pub enum Action {
     KeysDeleted(u64),
     /// Something the user should know that is not an error (a toast).
     Notice(String),
+    /// Sentinel named another master; carries the new footer target.
+    MasterChanged(String),
     /// `g m`: jump to the MONITOR screen.
     GoToMonitor,
     /// `g s`: jump to the Slowlog screen.
