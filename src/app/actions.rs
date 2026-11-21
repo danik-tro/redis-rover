@@ -66,6 +66,7 @@ impl App {
         changed |= self.toast.expire(now);
         changed |= self.keyspace.expire_changed(now);
         changed |= self.pubsub_tick(now, self.clock.wall());
+        changed |= self.sync_ops_node();
         self.redraw.dirty |= changed;
     }
 
@@ -100,8 +101,14 @@ impl App {
             | Action::SlowlogLoaded => self.handle_slowlog_action(action),
             Action::NextChart => self.dashboard.next_chart(),
             Action::PrevChart => self.dashboard.prev_chart(),
-            Action::NextNode => self.dashboard.next_node(),
-            Action::PrevNode => self.dashboard.prev_node(),
+            Action::NextNode | Action::PrevNode => {
+                let forward = *action == Action::NextNode;
+                match (self.view_mode(), forward) {
+                    (Mode::Slowlog | Mode::Monitor, _) => self.step_ops_node(forward),
+                    (_, true) => self.dashboard.next_node(),
+                    (_, false) => self.dashboard.prev_node(),
+                }
+            }
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
             Action::ToggleMetricsPause => self.dashboard.toggle_pause(),
             Action::ResetMetrics => self.reset_metrics(),

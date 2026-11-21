@@ -30,6 +30,7 @@ use super::{
     live::{self, LiveCmd},
     monitor::{self, MonitorCmd},
     pubsub::{self, PubSubCmd},
+    slowlog::SlowlogData,
     storage::{Storage, TypeScanRejected},
     types::{RedisType, SweepApply, ValueState},
 };
@@ -227,6 +228,7 @@ impl Runner {
         self.monitor_task = tokio::spawn(monitor::run(
             self.client.clone(),
             self.state.monitor.clone(),
+            self.state.ops_node.clone(),
             config::get().monitor.max_rate(),
             cmd_rx,
             self.cancellation_token.clone(),
@@ -812,13 +814,19 @@ impl EventHandler {
                 self.action_hook(Action::StreamGroupLoaded);
             }
             RedisEvent::FetchSlowlog => self.load_slowlog().await,
-            RedisEvent::SlowlogReset => match self.storage.slowlog_reset().await {
-                Ok(()) => self.load_slowlog().await,
-                Err(err) => {
-                    log::error!("SLOWLOG RESET failed: {err:?}");
-                    self.action_hook(Action::Error(format!("SLOWLOG RESET failed: {err}")));
+            RedisEvent::SlowlogReset => {
+                let result = match self.picked_storage().await {
+                    Ok(storage) => storage.slowlog_reset().await.map_err(|err| err.to_string()),
+                    Err(err) => Err(err),
+                };
+                match result {
+                    Ok(()) => self.load_slowlog().await,
+                    Err(err) => {
+                        log::error!("SLOWLOG RESET failed: {err}");
+                        self.action_hook(Action::Error(format!("SLOWLOG RESET failed: {err}")));
+                    }
                 }
-            },
+            }
             RedisEvent::FetchKeys => self.fetch_keys().await,
             RedisEvent::BackfillMeta => self.backfill_meta().await,
             RedisEvent::LoadAll { until } => self.load_all(until).await,
@@ -826,8 +834,41 @@ impl EventHandler {
         }
     }
 
+    /// The node the Slowlog screen looks at: the picked master, the first
+    /// one until a node is picked, this connection on one server. A picked
+    /// node that is no longer a master is an error, so a reset the preview
+    /// announced for it never lands on another node.
+    async fn picked_storage(&self) -> Result<Storage, String> {
+        if !self.storage.is_cluster() {
+            return Ok(self.storage.clone());
+        }
+        let masters = self
+            .storage
+            .cached_masters()
+            .await
+            .map_err(|err| err.to_string())?;
+        let picked = self.state.ops_node.lock().clone();
+        match picked {
+            Some((host, port)) => masters
+                .iter()
+                .find(|master| master.host == host && master.port == port)
+                .map(|master| self.storage.at(&master.host, master.port))
+                .ok_or_else(|| format!("{host}:{port} is no longer a master")),
+            None => masters
+                .first()
+                .map(|master| self.storage.at(&master.host, master.port))
+                .ok_or_else(|| "the cluster reports no masters".to_owned()),
+        }
+    }
+
     async fn load_slowlog(&mut self) {
-        let data = self.storage.slowlog().await;
+        let data = match self.picked_storage().await {
+            Ok(storage) => storage.slowlog().await,
+            Err(error) => SlowlogData {
+                error: Some(error),
+                ..SlowlogData::default()
+            },
+        };
         *self.state.slowlog.lock() = Some(data);
         self.action_hook(Action::SlowlogLoaded);
     }

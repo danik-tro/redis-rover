@@ -136,6 +136,8 @@ const MONITOR_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::MonitorTogglePause, "Pause / follow the log"),
     (Command::MonitorClear, "Clear the log"),
     (Command::MonitorEnter, "Open the selected line"),
+    (Command::NextNode, "Next cluster node"),
+    (Command::PrevNode, "Previous cluster node"),
     (Command::ScrollDown, "Down (log or detail)"),
     (Command::ScrollUp, "Up (log or detail; pauses the log)"),
     (Command::ToggleWrap, "Wrap the detail on / off"),
@@ -153,6 +155,8 @@ const SLOWLOG_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::SlowlogSort, "Sort: newest / slowest first"),
     (Command::SlowlogRefresh, "Load it again"),
     (Command::SlowlogReset, "SLOWLOG RESET (shows a preview)"),
+    (Command::NextNode, "Next cluster node"),
+    (Command::PrevNode, "Previous cluster node"),
     (Command::ScrollDown, "Down (table or detail)"),
     (Command::ScrollUp, "Up (table or detail)"),
     (Command::ToggleWrap, "Wrap the detail on / off"),
@@ -359,11 +363,22 @@ impl App {
             self.redraw.wall_sec = wall_sec(wall);
             self.pubsub.build_view(main, now, wall)
         });
+        self.frame.node_strip = self.node_strip(mode);
+        // The node row takes the screen's first line.
+        let body = if self.frame.node_strip.is_some() {
+            Rect {
+                y: main.y + 1,
+                height: main.height.saturating_sub(1),
+                ..main
+            }
+        } else {
+            main
+        };
         self.frame.monitor = (mode == Mode::Monitor).then(|| {
             // Read before the view, like the Pub/Sub tab.
             self.redraw.monitor = self.state.monitor.lock().version();
             self.redraw.wall_sec = wall_sec(wall);
-            self.monitor.build_view(main, wall)
+            self.monitor.build_view(body, wall)
         });
     }
 
@@ -508,18 +523,28 @@ impl App {
                 }
             }
             Mode::Monitor => {
+                let body = self.render_node_strip(area, buf);
                 if let Some(view) = self.frame.monitor.take() {
-                    StatefulWidget::render(MonitorWidget { view }, area, buf, &mut *self.monitor);
+                    StatefulWidget::render(MonitorWidget { view }, body, buf, &mut *self.monitor);
                 }
             }
             Mode::Slowlog => {
+                let body = self.render_node_strip(area, buf);
                 let wall = self.clock.wall();
-                StatefulWidget::render(SlowlogWidget { wall }, area, buf, &mut self.slowlog);
+                StatefulWidget::render(SlowlogWidget { wall }, body, buf, &mut self.slowlog);
             }
             Mode::Common | Mode::Popup(_) => {}
         }
         if self.mode == Mode::Popup(PopupMode::Error) {
             self.render_error_popup(area, buf);
+        }
+    }
+
+    /// The cluster's node row, if any; returns the area left for the screen.
+    fn render_node_strip(&self, area: Rect, buf: &mut Buffer) -> Rect {
+        match &self.frame.node_strip {
+            Some(strip) => strip.render_above(area, buf),
+            None => area,
         }
     }
 

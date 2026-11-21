@@ -2,11 +2,43 @@
 //! dashboard, Slowlog and MONITOR share it.
 
 use ratatui::{
+    buffer::Buffer,
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
+    widgets::Widget,
 };
 
 use crate::config;
+
+/// MONITOR sees the commands of one server only.
+pub const MONITOR_NODE_WARNING: &str = "⚠ covers this node only";
+
+/// The row above the Slowlog and MONITOR screens of a cluster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStrip {
+    pub labels: Vec<String>,
+    pub selected: usize,
+    pub warning: Option<&'static str>,
+}
+
+impl NodeStrip {
+    /// Draw the strip on the first row of `area`; returns the rest.
+    pub fn render_above(&self, area: Rect, buf: &mut Buffer) -> Rect {
+        let [row, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        let warning = self.warning.unwrap_or_default();
+        let width = u16::try_from(warning.chars().count()).unwrap_or(0);
+        let [picker, note] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(width)]).areas(row);
+        picker_line(&self.labels, self.selected, picker.width).render(picker, buf);
+        if !warning.is_empty() {
+            let style = Style::default().fg(config::get().colors.base0a);
+            Line::styled(warning, style).render(note, buf);
+        }
+        rest
+    }
+}
 
 /// The picker for `labels` in `width` columns. Labels that don't fit are
 /// left out from the start, so the selected one always shows; `‹` marks it.

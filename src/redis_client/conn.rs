@@ -7,7 +7,7 @@ use redis::{
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
     cluster_routing::{Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr},
-    Arg, Cmd, Pipeline, RedisFuture, Value,
+    Arg, Cmd, ConnectionAddr, Pipeline, RedisFuture, Value,
 };
 
 use super::runner::{self, Link};
@@ -189,6 +189,34 @@ impl Connector {
         let client = redis::Client::open(info.set_redis_settings(settings))?;
         runner::connect(client, link).await
     }
+}
+
+/// A client for the node at `host:port`, with `client`'s credentials and
+/// TLS settings.
+///
+/// # Errors
+///
+/// The settings don't make a valid client.
+pub fn client_at(
+    client: &redis::Client,
+    host: &str,
+    port: u16,
+) -> redis::RedisResult<redis::Client> {
+    let info = client.get_connection_info().clone();
+    let addr = match info.addr().clone() {
+        ConnectionAddr::TcpTls {
+            insecure,
+            tls_params,
+            ..
+        } => ConnectionAddr::TcpTls {
+            host: host.to_owned(),
+            port,
+            insecure,
+            tls_params,
+        },
+        _ => ConnectionAddr::Tcp(host.to_owned(), port),
+    };
+    redis::Client::open(info.set_addr(addr))
 }
 
 /// `cluster_enabled:1` in an `INFO cluster` reply.

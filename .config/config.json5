@@ -100,6 +100,8 @@
       "<Space>": "MonitorTogglePause",
       "c": "MonitorClear",
       "<Enter>": "MonitorEnter",
+      "<Tab>": "NextNode",
+      "<BackTab>": "PrevNode",
       "j": "ScrollDown",
       "k": "ScrollUp",
       "<Down>": "ScrollDown",
@@ -119,6 +121,8 @@
       "r": "SlowlogRefresh",
       "o": "SlowlogSort",
       "<Enter>": "SlowlogEnter",
+      "<Tab>": "NextNode",
+      "<BackTab>": "PrevNode",
       // Here R resets the slowlog (after a preview), not read-only.
       "<Shift-r>": "SlowlogReset",
       "j": "ScrollDown",
