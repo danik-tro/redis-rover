@@ -11,10 +11,16 @@ use super::types::{
     LoadedValue, MemberKind, NewKeySpec, RedisInfo, RedisType, ScanSweep, Ttl, ValuePageInfo,
     ValueState, JSON_PREVIEW_ITEMS, STRING_PREVIEW_BYTES,
 };
+use super::types::{
+    parse_consumers, parse_groups, parse_last_id, parse_pending, parse_stream_entries, prev_id,
+    GroupDetail, StreamEntry, StreamValue,
+};
 use super::write_cmd;
 
 /// Elements per command when fetching a whole collection for copying.
 const FULL_FETCH_CHUNK: usize = 1000;
+/// Pending entries listed for a consumer group.
+const STREAM_PENDING_ROWS: usize = 100;
 
 /// Parse the text of an `INFO` reply into a `field -> value` map. Section
 /// headers (`# Server`) and lines without a `:` are skipped; values are trimmed.
@@ -157,13 +163,15 @@ pub async fn fetch_value_page(
                 KeyValue::Set(names.to_vec())
             }
         }
-        RedisType::Stream | RedisType::Unknown(_) => KeyValue::Unknown,
+        RedisType::Stream => KeyValue::Stream(fetch_stream(manager, &key, &mut state).await?),
+        RedisType::Unknown(_) => KeyValue::Unknown,
     };
 
     let len = match &value {
         KeyValue::List(items) | KeyValue::Set(items) => items.len(),
         KeyValue::Hash(entries) => entries.len(),
         KeyValue::Zset(entries) => entries.len(),
+        KeyValue::Stream(stream) => stream.entries.len(),
         KeyValue::String { .. }
         | KeyValue::Json(_)
         | KeyValue::JsonPreview(_)
@@ -469,11 +477,157 @@ pub async fn fetch_full_value(
                 KeyValue::Set(sweep.names)
             }
         }
-        RedisType::Stream | RedisType::Unknown(_) => {
+        RedisType::Stream => KeyValue::Stream(StreamValue {
+            entries: fetch_all_stream_entries(manager, key).await?,
+            ..StreamValue::default()
+        }),
+        RedisType::Unknown(_) => {
             return Err(format!("copying {} values isn't supported yet", r_type.name()).into());
         }
     };
     Ok(value)
+}
+
+/// `XREVRANGE key start - COUNT count`.
+async fn xrevrange(
+    manager: &mut ConnectionManager,
+    key: &str,
+    start: &str,
+    count: usize,
+) -> Result<Vec<StreamEntry>, BoxError> {
+    let reply: redis::Value = redis::cmd("XREVRANGE")
+        .arg(Raw(key))
+        .arg(start)
+        .arg("-")
+        .arg("COUNT")
+        .arg(count)
+        .query_async(manager)
+        .await?;
+    Ok(parse_stream_entries(reply))
+}
+
+/// The page `state` points at, newest first. Pages are walked by ID from
+/// the nearest start already known, and a page past the end falls back to
+/// the last one that has entries.
+async fn fetch_stream(
+    manager: &mut ConnectionManager,
+    key: &str,
+    state: &mut ValueState,
+) -> Result<StreamValue, BoxError> {
+    let length: usize = redis::cmd("XLEN")
+        .arg(Raw(key))
+        .query_async(&mut *manager)
+        .await?;
+    state.total = Some(length);
+    state.clamp_page();
+    let size = state.page_size.max(1);
+    if state.stream_starts.is_empty() {
+        state.stream_starts.push("+".to_owned());
+    }
+    while state.stream_starts.len() <= state.page {
+        let from = state.stream_starts[state.stream_starts.len() - 1].clone();
+        let walked = xrevrange(manager, key, &from, size).await?;
+        let next = (walked.len() == size)
+            .then(|| walked.last().and_then(|e| prev_id(&e.id)))
+            .flatten();
+        let Some(next) = next else {
+            state.page = state.stream_starts.len() - 1;
+            break;
+        };
+        state.stream_starts.push(next);
+    }
+    let mut entries = xrevrange(manager, key, &state.stream_starts[state.page], size).await?;
+    if entries.is_empty() && state.page > 0 {
+        // Everything from here down was deleted: start over from the top.
+        state.page = 0;
+        state.stream_starts.truncate(1);
+        entries = xrevrange(manager, key, "+", size).await?;
+    }
+    state.stream_starts.truncate(state.page + 1);
+    if entries.len() == size {
+        state
+            .stream_starts
+            .extend(entries.last().and_then(|e| prev_id(&e.id)));
+    }
+
+    let last_id = redis::cmd("XINFO")
+        .arg("STREAM")
+        .arg(Raw(key))
+        .query_async::<redis::Value>(&mut *manager)
+        .await
+        .ok()
+        .and_then(parse_last_id)
+        .unwrap_or_default();
+    // Refused on some managed services; the entries still show.
+    let groups = redis::cmd("XINFO")
+        .arg("GROUPS")
+        .arg(Raw(key))
+        .query_async::<redis::Value>(&mut *manager)
+        .await
+        .ok()
+        .map(parse_groups);
+    Ok(StreamValue {
+        entries,
+        length,
+        last_id,
+        groups,
+    })
+}
+
+/// Every entry of a stream, newest first, in [`FULL_FETCH_CHUNK`] steps.
+async fn fetch_all_stream_entries(
+    manager: &mut ConnectionManager,
+    key: &str,
+) -> Result<Vec<StreamEntry>, BoxError> {
+    let mut all = Vec::new();
+    let mut start = "+".to_owned();
+    loop {
+        let chunk = xrevrange(manager, key, &start, FULL_FETCH_CHUNK).await?;
+        let done = chunk.len() < FULL_FETCH_CHUNK;
+        let next = chunk.last().and_then(|e| prev_id(&e.id));
+        all.extend(chunk);
+        match next {
+            Some(next) if !done => start = next,
+            _ => return Ok(all),
+        }
+    }
+}
+
+/// Consumers and the first pending entries of `group`. A refusal is kept
+/// in the result, for the screen to show.
+pub async fn fetch_stream_group(
+    mut manager: ConnectionManager,
+    key: &str,
+    group: &str,
+) -> GroupDetail {
+    let mut detail = GroupDetail {
+        key: key.to_owned(),
+        group: group.to_owned(),
+        ..GroupDetail::default()
+    };
+    match redis::cmd("XINFO")
+        .arg("CONSUMERS")
+        .arg(Raw(key))
+        .arg(Raw(group))
+        .query_async::<redis::Value>(&mut manager)
+        .await
+    {
+        Ok(reply) => detail.consumers = parse_consumers(reply),
+        Err(err) => detail.error = Some(err.to_string()),
+    }
+    match redis::cmd("XPENDING")
+        .arg(Raw(key))
+        .arg(Raw(group))
+        .arg("-")
+        .arg("+")
+        .arg(STREAM_PENDING_ROWS)
+        .query_async::<redis::Value>(&mut manager)
+        .await
+    {
+        Ok(reply) => detail.pending = parse_pending(reply),
+        Err(err) => detail.error = detail.error.or(Some(err.to_string())),
+    }
+    detail
 }
 
 /// `start` / `stop` (inclusive) of the next [`FULL_FETCH_CHUNK`] elements.

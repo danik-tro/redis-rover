@@ -179,6 +179,8 @@ pub enum Action {
     SlowlogReset,
     /// A slowlog load is waiting in `SharedState::slowlog`.
     SlowlogLoaded,
+    /// A consumer group is waiting in `SharedState::stream_group`.
+    StreamGroupLoaded,
 }
 
 impl Action {

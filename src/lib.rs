@@ -144,9 +144,10 @@ pub mod internals {
     pub use crate::redis_client::runner::{connect, Link, Runner, VALUE_FETCH_DELAY_MS};
     pub use crate::redis_client::slowlog::{SlowlogData, SlowlogEntry};
     pub use crate::redis_client::types::{
-        ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyMeta, KeyValue,
-        KeyspaceState, LoadedValue, MemberKind, NewKeySpec, PageRow, RedisInfo, RedisType, Sort,
-        SortKey, SweepApply, SweepResult, Ttl, TypeFilter, TypeScan, ValuePageInfo,
+        ConsumerInfo, GroupDetail, GroupInfo, ItemDelete, ItemEdit, JsonField, JsonPreview,
+        JsonPreviewKind, KeyItem, KeyMeta, KeyValue, KeyspaceState, LoadedValue, MemberKind,
+        NewKeySpec, PageRow, PendingEntry, RedisInfo, RedisType, Sort, SortKey, StreamEntry,
+        StreamValue, SweepApply, SweepResult, Ttl, TypeFilter, TypeScan, ValuePageInfo,
     };
     pub use crate::redis_client::value_edit::{diff, Diff, ValueEdit};
     pub use crate::state::{FrameData, SharedState};

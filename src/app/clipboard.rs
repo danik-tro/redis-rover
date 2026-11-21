@@ -51,7 +51,7 @@ impl App {
             self.copy_text(&text, &format!("value of {key}"));
             return;
         }
-        if matches!(r_type, RedisType::Stream | RedisType::Unknown(_)) {
+        if matches!(r_type, RedisType::Unknown(_)) {
             self.toast.show(
                 format!("Copying {} values isn't supported yet", r_type.name()),
                 false,

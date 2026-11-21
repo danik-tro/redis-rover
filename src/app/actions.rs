@@ -77,7 +77,7 @@ impl App {
             Action::Tick => self.tick(now, help_open),
             Action::Quit => self.should_quit = true,
             // `Resize` / `Render` are terminal work, done by `handle_action`.
-            Action::Resize(..) | Action::Render | Action::Refresh => {}
+            Action::Resize(..) | Action::Render | Action::Refresh | Action::StreamGroupLoaded => {}
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
             Action::GoToMonitor
@@ -313,6 +313,7 @@ impl App {
             | Action::OpenKeyChanged { .. }
             | Action::LiveStatus(_)
             | Action::SlowlogLoaded
+            | Action::StreamGroupLoaded
             | Action::ValueLoadFailed
             | Action::FilterMatchCount { .. }
             | Action::YankReady

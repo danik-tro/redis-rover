@@ -340,6 +340,11 @@ impl Storage {
         client::fetch_value_page(self.manager.clone(), state).await
     }
 
+    /// A consumer group's consumers and pending entries.
+    pub async fn stream_group(&self, key: &str, group: &str) -> super::types::GroupDetail {
+        client::fetch_stream_group(self.manager.clone(), key, group).await
+    }
+
     /// Fetch a key's whole value for copying. Delegates to
     /// [`client::fetch_full_value`].
     ///

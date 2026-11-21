@@ -56,6 +56,7 @@ pub(super) fn value_footer(
         KeyValue::List(_) => "Items",
         KeyValue::Hash(_) => "Fields",
         KeyValue::Set(_) | KeyValue::Zset(_) => "Members",
+        KeyValue::Stream(_) => "Entries",
         KeyValue::Json(_) => {
             return (!json_path.is_empty())
                 .then(|| format!("{} · Esc back", display_json_path(json_path)));

@@ -260,9 +260,11 @@ impl KeySpace {
         let whole = match &loaded.value {
             KeyValue::String { .. } => !loaded.value.is_truncated(),
             KeyValue::Json(_) => true,
-            KeyValue::List(_) | KeyValue::Set(_) | KeyValue::Hash(_) | KeyValue::Zset(_) => {
-                !loaded.page.is_paged()
-            }
+            KeyValue::List(_)
+            | KeyValue::Set(_)
+            | KeyValue::Hash(_)
+            | KeyValue::Zset(_)
+            | KeyValue::Stream(_) => !loaded.page.is_paged(),
             KeyValue::JsonPreview(_) | KeyValue::Unknown => false,
         };
         if !whole {

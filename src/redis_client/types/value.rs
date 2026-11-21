@@ -42,6 +42,9 @@ impl KeyValue {
                     })
                     .collect(),
             ),
+            Self::Stream(stream) => {
+                Value::Array(stream.entries.iter().map(super::StreamEntry::to_json).collect())
+            }
             // Only a part of the document is loaded.
             Self::JsonPreview(_) | Self::Unknown => return None,
         };
@@ -200,6 +203,9 @@ pub struct ValueState {
     /// Top-level fields opened from a JSON preview, outermost first. Empty
     /// shows the document itself.
     pub json_path: Vec<String>,
+    /// A stream's `XREVRANGE` start of each page visited, `+` first. By ID,
+    /// so entries added meanwhile don't shift a page.
+    pub stream_starts: Vec<String>,
 }
 
 impl Default for ValueState {
@@ -216,6 +222,7 @@ impl Default for ValueState {
             size: None,
             json_cap: DEFAULT_JSON_PREVIEW_BYTES,
             json_path: Vec::new(),
+            stream_starts: Vec::new(),
         }
     }
 }
@@ -234,6 +241,7 @@ impl ValueState {
         self.page = 0;
         self.total = None;
         self.json_path.clear();
+        self.stream_starts.clear();
         self.rescan();
     }
 
@@ -265,6 +273,7 @@ impl ValueState {
         self.total = None;
         self.size = None;
         self.json_path.clear();
+        self.stream_starts.clear();
         self.rescan();
     }
 
@@ -360,6 +369,7 @@ impl ValueState {
         self.page = other.page;
         self.total = other.total;
         self.sweep = other.sweep;
+        self.stream_starts = other.stream_starts;
     }
 
     /// Paging summary for a page of `len` rows.
