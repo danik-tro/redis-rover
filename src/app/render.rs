@@ -28,7 +28,7 @@ use crate::{
         keyspace::KeySpaceWidget,
         monitor::MonitorWidget,
         pubsub::PubSubWidget,
-        slowlog::{SlowlogView, SlowlogWidget},
+        slowlog::SlowlogWidget,
         toast::ToastWidget,
     },
 };
@@ -56,6 +56,7 @@ const WRITE_COMMANDS: &[Command] = &[
     Command::CopyKey,
     Command::EditExternal,
     Command::PubSubPublish,
+    Command::SlowlogReset,
 ];
 
 /// Footer hint entries for the keyspace view, in display order.
@@ -112,9 +113,10 @@ const MONITOR_HINT_ENTRIES: &[(Command, &str)] = &[
 /// Footer hint entries for the Slowlog screen, in display order.
 const SLOWLOG_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::LeaveScreen, "back"),
-    (Command::GoToMonitor, "monitor"),
-    (Command::GoToPubSub, "pubsub"),
-    (Command::GoToDashboard, "metrics"),
+    (Command::SlowlogEnter, "detail"),
+    (Command::SlowlogSort, "sort"),
+    (Command::SlowlogRefresh, "refresh"),
+    (Command::SlowlogReset, "reset"),
     (Command::ToggleHelp, "help"),
 ];
 
@@ -146,8 +148,16 @@ const MONITOR_HELP_ENTRIES: &[(Command, &str)] = &[
 
 /// `?` help rows for the Slowlog screen, in display order.
 const SLOWLOG_HELP_ENTRIES: &[(Command, &str)] = &[
-    (Command::LeaveScreen, "Back to keyspace"),
-    (Command::ToggleReadOnly, "Toggle read-only"),
+    (Command::LeaveScreen, "Back (Esc closes the detail first)"),
+    (Command::SlowlogEnter, "Open the entry's full arguments"),
+    (Command::SlowlogSort, "Sort: newest / slowest first"),
+    (Command::SlowlogRefresh, "Load it again"),
+    (Command::SlowlogReset, "SLOWLOG RESET (shows a preview)"),
+    (Command::ScrollDown, "Down (table or detail)"),
+    (Command::ScrollUp, "Up (table or detail)"),
+    (Command::ToggleWrap, "Wrap the detail on / off"),
+    (Command::ScrollLeft, "Pan detail left (wrap off)"),
+    (Command::ScrollRight, "Pan detail right (wrap off)"),
     (Command::ToggleHelp, "Toggle this help"),
     (Command::Quit, "Quit"),
 ];
@@ -338,7 +348,6 @@ impl App {
             self.redraw.wall_sec = wall_sec(wall);
             self.monitor.build_view(main, wall)
         });
-        self.frame.slowlog = (mode == Mode::Slowlog).then(SlowlogView::default);
     }
 
     /// Whether `Render` at `now` should draw (#50): something changed
@@ -487,9 +496,8 @@ impl App {
                 }
             }
             Mode::Slowlog => {
-                if let Some(view) = &self.frame.slowlog {
-                    SlowlogWidget { view }.render(area, buf);
-                }
+                let wall = self.clock.wall();
+                StatefulWidget::render(SlowlogWidget { wall }, area, buf, &mut self.slowlog);
             }
             Mode::Common | Mode::Popup(_) => {}
         }

@@ -169,6 +169,16 @@ pub enum Action {
     MonitorClear,
     /// Enter on the MONITOR screen: open the selected line.
     MonitorEnter,
+    /// `r` on the Slowlog screen: load it again.
+    SlowlogRefresh,
+    /// `o` on the Slowlog screen: newest first / slowest first.
+    SlowlogSort,
+    /// Enter on the Slowlog screen: open the selected entry.
+    SlowlogEnter,
+    /// `R` on the Slowlog screen: `SLOWLOG RESET`, after its preview.
+    SlowlogReset,
+    /// A slowlog load is waiting in `SharedState::slowlog`.
+    SlowlogLoaded,
 }
 
 impl Action {

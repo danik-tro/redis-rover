@@ -79,4 +79,12 @@ pub enum Command {
     MonitorClear,
     /// Open the selected MONITOR line.
     MonitorEnter,
+    /// Load the slowlog again.
+    SlowlogRefresh,
+    /// Sort the slowlog by time / duration.
+    SlowlogSort,
+    /// Open the selected slowlog entry.
+    SlowlogEnter,
+    /// `SLOWLOG RESET`, after its preview.
+    SlowlogReset,
 }

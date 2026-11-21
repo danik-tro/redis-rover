@@ -414,6 +414,13 @@ pub fn list_delete_unscripted(key: &str, index: usize) -> Vec<Cmd> {
 
 /// `PUBLISH channel payload`.
 #[must_use]
+/// `SLOWLOG RESET`.
+pub fn slowlog_reset() -> Vec<Cmd> {
+    let mut cmd = redis::cmd("SLOWLOG");
+    cmd.arg("RESET");
+    vec![cmd]
+}
+
 pub fn publish(channel: &str, payload: &str) -> Vec<Cmd> {
     vec![Cmd::publish(Raw(channel), payload)]
 }

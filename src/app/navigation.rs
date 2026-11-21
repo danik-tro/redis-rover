@@ -34,8 +34,10 @@ impl App {
             self.mode = target;
             self.sync_hint();
         }
-        if target == Mode::Monitor {
-            self.offer_monitor();
+        match target {
+            Mode::Monitor => self.offer_monitor(),
+            Mode::Slowlog => self.fetch_slowlog(),
+            _ => {}
         }
     }
 

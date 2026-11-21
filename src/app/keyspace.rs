@@ -694,6 +694,10 @@ impl App {
             self.monitor.move_selection(true);
             return;
         }
+        if self.mode == Mode::Slowlog {
+            self.slowlog.move_selection(true);
+            return;
+        }
         if self.mode != Mode::KeySpace {
             return;
         }
@@ -721,6 +725,10 @@ impl App {
         }
         if self.mode == Mode::Monitor {
             self.monitor.move_selection(false);
+            return;
+        }
+        if self.mode == Mode::Slowlog {
+            self.slowlog.move_selection(false);
             return;
         }
         if self.mode != Mode::KeySpace {

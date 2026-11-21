@@ -687,11 +687,25 @@ impl EventHandler {
                     }
                 }
             }
+            RedisEvent::FetchSlowlog => self.load_slowlog().await,
+            RedisEvent::SlowlogReset => match self.storage.slowlog_reset().await {
+                Ok(()) => self.load_slowlog().await,
+                Err(err) => {
+                    log::error!("SLOWLOG RESET failed: {err:?}");
+                    self.action_hook(Action::Error(format!("SLOWLOG RESET failed: {err}")));
+                }
+            },
             RedisEvent::FetchKeys => self.fetch_keys().await,
             RedisEvent::BackfillMeta => self.backfill_meta().await,
             RedisEvent::LoadAll { until } => self.load_all(until).await,
             RedisEvent::StopLoadAll => self.stop_load_all(),
         }
+    }
+
+    async fn load_slowlog(&mut self) {
+        let data = self.storage.slowlog().await;
+        *self.state.slowlog.lock() = Some(data);
+        self.action_hook(Action::SlowlogLoaded);
     }
 
     /// Switch to DB `db` by opening a new connection for it.

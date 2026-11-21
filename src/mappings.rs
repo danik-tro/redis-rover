@@ -64,6 +64,10 @@ impl From<Command> for Action {
             Command::MonitorTogglePause => Self::MonitorTogglePause,
             Command::MonitorClear => Self::MonitorClear,
             Command::MonitorEnter => Self::MonitorEnter,
+            Command::SlowlogRefresh => Self::SlowlogRefresh,
+            Command::SlowlogSort => Self::SlowlogSort,
+            Command::SlowlogEnter => Self::SlowlogEnter,
+            Command::SlowlogReset => Self::SlowlogReset,
         }
     }
 }

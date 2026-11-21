@@ -142,6 +142,7 @@ pub mod internals {
     pub use crate::redis_client::pubsub::PubSubCmd;
     pub use crate::redis_client::pubsub_store::{ConnStatus, EntryKind, PubSubStore, Target};
     pub use crate::redis_client::runner::{connect, Link, Runner, VALUE_FETCH_DELAY_MS};
+    pub use crate::redis_client::slowlog::{SlowlogData, SlowlogEntry};
     pub use crate::redis_client::types::{
         ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyMeta, KeyValue,
         KeyspaceState, LoadedValue, MemberKind, NewKeySpec, PageRow, RedisInfo, RedisType, Sort,
@@ -156,6 +157,7 @@ pub mod internals {
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, LoadProgress, PageInfo};
     pub use crate::widgets::monitor::{Monitor, MonitorWidget};
     pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
+    pub use crate::widgets::slowlog::{Slowlog, SlowlogWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};
 

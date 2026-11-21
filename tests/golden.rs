@@ -30,7 +30,8 @@ use redis_rover::internals::{
     JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress,
     LoadedValue, MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore,
     MonitorWidget, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Sort, SortKey, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
+    SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey, Target, Toast,
+    ToastWidget, TypeFilter, ValuePageInfo,
 };
 
 static SETUP: Once = Once::new();
@@ -861,6 +862,48 @@ fn monitor_confirm_prod() {
     let mut buf = buffer(80, 24);
     render_monitor_confirm(buf.area, &mut buf, Environment::Prod, "mon");
     check("monitor_confirm_prod", &buf);
+}
+
+// ---- Slowlog ---------------------------------------------------------------
+
+#[test]
+fn slowlog_table() {
+    init();
+    let entry = |id, ts_secs, micros, args: &[&str], client: &str| SlowlogEntry {
+        id,
+        ts_secs,
+        micros,
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        client: client.to_owned(),
+        name: String::new(),
+    };
+    let mut slowlog = Slowlog::default();
+    slowlog.load(SlowlogData {
+        entries: vec![
+            entry(
+                12,
+                1_700_000_100,
+                1_250_000,
+                &["KEYS", "*"],
+                "10.0.0.7:51012",
+            ),
+            entry(
+                11,
+                1_700_000_050,
+                12_400,
+                &["HGETALL", "user:1"],
+                "10.0.0.8:40110",
+            ),
+            entry(10, 1_699_000_000, 850, &["GET", "a"], "[::1]:6380"),
+        ],
+        slower_than: Some(10_000),
+        max_len: None,
+        error: None,
+    });
+    let mut buf = buffer(100, 10);
+    let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_200);
+    SlowlogWidget { wall }.render(buf.area, &mut buf, &mut slowlog);
+    check("slowlog_table", &buf);
 }
 
 // ---- Help -----------------------------------------------------------------

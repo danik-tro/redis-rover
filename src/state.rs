@@ -11,9 +11,10 @@ use crate::{
         metrics::MetricsHistory,
         monitor_store::MonitorStore,
         pubsub_store::PubSubStore,
+        slowlog::SlowlogData,
         types::{KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
-    widgets::{info::FooterText, monitor::MonitorView, pubsub::PubSubView, slowlog::SlowlogView},
+    widgets::{info::FooterText, monitor::MonitorView, pubsub::PubSubView},
 };
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,8 @@ pub struct SharedState {
     pub pubsub: Arc<Mutex<PubSubStore>>,
     /// MONITOR lines. Written by the MONITOR task.
     pub monitor: Arc<Mutex<MonitorStore>>,
+    /// The last slowlog load, until the App takes it (`SlowlogLoaded`).
+    pub slowlog: Arc<Mutex<Option<SlowlogData>>>,
 }
 
 /// Redis's default `databases` setting.
@@ -70,6 +73,7 @@ impl Default for SharedState {
             monitor: Arc::new(Mutex::new(MonitorStore::new(
                 config::get().monitor.limits(),
             ))),
+            slowlog: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -92,8 +96,6 @@ pub struct FrameData {
     pub pubsub: Option<PubSubView>,
     /// The MONITOR screen; `None` outside it.
     pub monitor: Option<MonitorView>,
-    /// The Slowlog screen; `None` outside it.
-    pub slowlog: Option<SlowlogView>,
 }
 
 impl FrameData {
