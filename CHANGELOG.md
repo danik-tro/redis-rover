@@ -17,7 +17,8 @@ First public release. Requires Rust 1.97 or newer.
 - Add, edit and delete keys and collection items, and set TTLs. Deletes ask for
   confirmation.
 - Real type names: RedisJSON keys show as `json`, streams as `stream`, and other module
-  types (e.g. `MBbloom--`) by their own name. Their values show "viewer not supported yet".
+  types (e.g. `MBbloom--`) by their own name. Values of those other types show "viewer
+  not supported yet".
 - DB switching: `s` opens a DB picker, and the footer shows `db N · K keys`.
 - `--read-only` flag: every write is refused, and the footer shows an `RO` badge.
 - Cluster warning: in cluster mode a banner says SCAN only sees the connected node, and
@@ -27,6 +28,18 @@ First public release. Requires Rust 1.97 or newer.
 - `--token` prompts for the password, so it stays out of shell history.
 - Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients
   charts, pause / reset, cluster summary.
+- MONITOR screen (`g m`): a live command log with a glob filter, pause (`+N new`), clear,
+  full-line detail and a rate sparkline. It asks before starting because it costs server
+  CPU (typed `monitor` on Prod), stops when you leave the screen unless
+  `monitor.keep_running` is set, and samples above `monitor.max_rate` (`sampling 1/N`).
+- Slowlog screen (`g s`): `SLOWLOG GET 128` with time / duration sort, full arguments, the
+  two settings (or `unknown`), and `SLOWLOG RESET` through the write preview.
+- Sharded Pub/Sub (Redis 7+): shard subscriptions and `SPUBLISH` in the Pub/Sub tab, with
+  badges, notifications, stats and resubscribe after a lost connection. On older servers
+  the option is dimmed with `needs Redis 7`.
+- Read-only Streams view: entries newest first with paging on every server with streams,
+  entry detail, consumer groups, consumers and pending entries. `y` copies as JSON.
+- `g m`, `g s`, `g p` and `g d` jump between the server screens from any of them.
 - Pub/Sub tab (`b`): subscribe to channels and glob patterns on a dedicated connection,
   list the server's channels (`PUBSUB CHANNELS` / `NUMSUB` / `NUMPAT`) and subscribe
   with `Enter`, and publish to any channel (`delivered to N subscribers`; disabled with
