@@ -19,8 +19,8 @@ use std::{
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 use redis_rover::internals::{
-    connect_cluster, Action, Conn, Connector, Link, LiveCmd, MonitorCmd, PubSubCmd, RedisEvent,
-    Runner, SharedState, VALUE_FETCH_DELAY_MS,
+    connect_cluster, Action, ClusterClients, Conn, Connector, Link, LiveCmd, MonitorCmd, PubSubCmd,
+    RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -326,9 +326,9 @@ impl Harness {
 
     /// The runner on a whole cluster, as `redis_rover::run` opens it.
     /// `seed` is the single-node client of the tasks that stay on one node.
-    pub async fn cluster(seed: redis::Client, cluster: redis::cluster::ClusterClient) -> Self {
+    pub async fn cluster(seed: redis::Client, cluster: ClusterClients) -> Self {
         init();
-        let conn = connect_cluster(&cluster, Link::Interactive)
+        let conn = connect_cluster(&cluster.plain, Link::Interactive)
             .await
             .expect("connect to the cluster");
         let connector = Connector::cluster(seed.clone(), cluster);

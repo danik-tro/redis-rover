@@ -12,8 +12,9 @@ mod support;
 use cluster_support::ClusterFixture;
 use redis::AsyncCommands;
 use redis_rover::internals::{
-    connect_cluster, Action, KeyspaceState, Link, MasterNode, MemberKind, MonitorCmd,
-    MonitorStatus, NewKeySpec, RedisEvent, Storage, SweepApply, Ttl, ValueEdit,
+    connect_cluster, Action, KeyChange, KeyspaceState, Link, LiveCmd, Liveness, MasterNode,
+    MemberKind, MonitorCmd, MonitorStatus, NewKeySpec, RedisEvent, RedisType, Storage, SweepApply,
+    Ttl, ValueEdit,
 };
 use support::Harness;
 
@@ -95,7 +96,7 @@ async fn writes_reach_every_master() {
     let fixture = ClusterFixture::start();
     let client = fixture.client();
     let mut con = client.get_async_connection().await.unwrap();
-    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    let mut harness = Harness::cluster(fixture.seed(), fixture.clients()).await;
     harness.fetch_page().await;
 
     for key in ["foo", "bar", "c"] {
@@ -246,7 +247,7 @@ async fn cross_slot_moves_are_refused() {
     let client = fixture.client();
     let mut con = client.get_async_connection().await.unwrap();
     let () = con.set("foo", "v").await.unwrap();
-    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    let mut harness = Harness::cluster(fixture.seed(), fixture.clients()).await;
 
     for event in [
         RedisEvent::RenameKey {
@@ -300,7 +301,7 @@ async fn a_failover_restarts_the_sweep() {
         .unwrap_or_default();
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    let mut harness = Harness::cluster(fixture.seed(), fixture.clients()).await;
     assert_eq!(
         sorted(harness.fetch_all_pages().await),
         sorted(keys.clone())
@@ -371,7 +372,7 @@ async fn slowlog_and_monitor_follow_the_picked_node() {
         .unwrap();
     let () = direct.set("foo", "marker-on-7102").await.unwrap();
 
-    let mut harness = Harness::cluster(fixture.seed(), fixture.client()).await;
+    let mut harness = Harness::cluster(fixture.seed(), fixture.clients()).await;
     harness.fetch_page().await;
     *harness.state.ops_node.lock() = Some(("127.0.0.1".to_owned(), 7102));
 
@@ -412,5 +413,83 @@ async fn slowlog_and_monitor_follow_the_picked_node() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     harness.monitor(MonitorCmd::Stop);
+    harness.shutdown().await;
+}
+
+/// Open `key` in the value pane and track it, as the App does. A status
+/// that stays `Live` isn't sent again, so `Liveness` can't say when this key
+/// is armed: [`change_until_seen`] writes until the change is reported.
+fn track(harness: &Harness, key: &str) {
+    harness
+        .state
+        .value_state
+        .lock()
+        .select(key, RedisType::String);
+    harness.live(LiveCmd::Track {
+        key: key.to_owned(),
+        db: 0,
+    });
+}
+
+/// Change `key` from another client until the live task reports it.
+async fn change_until_seen(
+    harness: &mut Harness,
+    con: &mut redis::cluster_async::ClusterConnection,
+    key: &str,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    for round in 0u32.. {
+        let () = con.set(key, format!("v{round}")).await.unwrap();
+        let seen = harness.drain(std::time::Duration::from_millis(300)).await;
+        if seen.iter().any(|action| {
+            matches!(action, Action::OpenKeyChanged { key: name, change: KeyChange::Changed { .. } } if name == key)
+        }) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{key}: no change");
+    }
+}
+
+/// AC5: the open key updates live wherever it lives, so tracking is on its
+/// slot's owner, and it follows the key after a `MOVED`.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn live_tracking_follows_the_slot_owner() {
+    let fixture = ClusterFixture::start();
+    let client = fixture.client();
+    let mut con = client.get_async_connection().await.unwrap();
+    for key in ["foo", "bar", "c"] {
+        let () = con.set(key, "v0").await.unwrap();
+    }
+    let mut harness = Harness::cluster(fixture.seed(), fixture.clients()).await;
+    harness.fetch_page().await;
+
+    // On 7102, 7100 and 7101: every master.
+    for (key, port) in [("foo", 7102), ("bar", 7100), ("c", 7101)] {
+        track(&harness, key);
+        change_until_seen(&mut harness, &mut con, key).await;
+        let list = fixture.cli(port, &["client", "list"]);
+        assert!(list.contains("name=rrover-live"), "{key}: {list}");
+    }
+
+    // Move `c` (slot 7365) from 7101 to 7102 while it is open.
+    let from = fixture.cli(7101, &["cluster", "myid"]);
+    let to = fixture.cli(7102, &["cluster", "myid"]);
+    fixture.cli(7102, &["cluster", "setslot", "7365", "importing", &from]);
+    fixture.cli(7101, &["cluster", "setslot", "7365", "migrating", &to]);
+    fixture.cli(
+        7101,
+        &["migrate", "127.0.0.1", "7102", "", "0", "5000", "keys", "c"],
+    );
+    for port in [7102, 7101, 7100] {
+        fixture.cli(port, &["cluster", "setslot", "7365", "node", &to]);
+    }
+    // The migration deleted it from 7101: tracking re-arms on 7102.
+    harness
+        .expect("live again", |a| *a == Action::LiveStatus(Liveness::Live))
+        .await;
+    change_until_seen(&mut harness, &mut con, "c").await;
+    let list = fixture.cli(7102, &["client", "list"]);
+    assert!(list.contains("name=rrover-live"), "{list}");
     harness.shutdown().await;
 }

@@ -38,7 +38,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{bytes::Raw, client, conn::Conn, pubsub::backoff, runner::Link, types::ValueState};
+use super::{
+    bytes::Raw,
+    client,
+    cluster::{key_slot, redirect_target, MasterNode},
+    conn::{client_at, Conn},
+    pubsub::backoff,
+    runner::Link,
+    types::ValueState,
+};
 use crate::{
     action::{try_send_action, Action},
     config::{LiveConfig, LiveMode},
@@ -156,11 +164,12 @@ pub async fn run(
     client: redis::Client,
     config: LiveConfig,
     value_state: Arc<Mutex<ValueState>>,
+    masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
     mut cmd_rx: UnboundedReceiver<LiveCmd>,
     action_tx: Sender<Action>,
     cancel: CancellationToken,
 ) {
-    let mut task = LiveTask::new(client, config, value_state, action_tx);
+    let mut task = LiveTask::new(client, config, value_state, masters, action_tx);
     loop {
         let retry_at = task.retry.map(|(_, at)| at);
         let poll_at = task.poll.as_ref().and_then(|poll| poll.next_at);
@@ -209,6 +218,13 @@ struct LiveTask {
     config: LiveConfig,
     /// The App's value state: what polling fingerprints.
     value_state: Arc<Mutex<ValueState>>,
+    /// A cluster's masters (empty on one server): the open key is tracked
+    /// on the master of its slot.
+    masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
+    /// Where a `MOVED` said the open key went, ahead of `masters`.
+    moved_to: Option<(String, u16)>,
+    /// The node the tracking connection is on.
+    conn_node: Option<(String, u16)>,
     action_tx: Sender<Action>,
     conn: Option<Tracked>,
     /// DB the connection is (or will be) opened on.
@@ -238,6 +254,8 @@ struct LiveTask {
 /// Poll mode state.
 #[derive(Default)]
 struct Poll {
+    /// The cluster node `conn` is on.
+    node: Option<(String, u16)>,
     /// Its connection, on `db`. The manager reconnects by itself; a
     /// fingerprint taken after a gap still shows what changed in it.
     conn: Option<(i64, Conn)>,
@@ -264,6 +282,7 @@ impl LiveTask {
         client: redis::Client,
         config: LiveConfig,
         value_state: Arc<Mutex<ValueState>>,
+        masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
         action_tx: Sender<Action>,
     ) -> Self {
         let db = client.get_connection_info().redis_settings().db();
@@ -271,6 +290,9 @@ impl LiveTask {
             client,
             config,
             value_state,
+            masters,
+            moved_to: None,
+            conn_node: None,
             action_tx,
             conn: None,
             db,
@@ -291,6 +313,9 @@ impl LiveTask {
             LiveCmd::Track { key, db } => {
                 let same_db = db == self.db;
                 self.db = db;
+                if self.key.as_deref() != Some(key.as_str()) {
+                    self.moved_to = None;
+                }
                 self.key = Some(key);
                 self.expires_at = None;
                 if self.poll.is_some() {
@@ -301,8 +326,9 @@ impl LiveTask {
                     // Down: armed on reconnect.
                     return;
                 }
-                if self.conn.is_some() && !same_db {
-                    // Tracking needs the arming read on the key's DB.
+                if self.conn.is_some() && (!same_db || self.conn_node != self.owner()) {
+                    // Tracking needs the arming read on the key's DB and,
+                    // on a cluster, on the master of its slot.
                     self.conn = None;
                 }
                 if self.conn.is_none() {
@@ -343,6 +369,7 @@ impl LiveTask {
         match opened {
             Ok((Capability::Tracking, Some(conn))) => {
                 self.conn = Some(Tracked { conn, pushes });
+                self.conn_node = self.owner();
                 // `arm` reports `Live` once the key is armed.
                 if refetch {
                     self.key_changed().await;
@@ -373,10 +400,40 @@ impl LiveTask {
         }
     }
 
+    /// The master of the open key's slot; `None` on one server.
+    fn owner(&self) -> Option<(String, u16)> {
+        if let Some(node) = &self.moved_to {
+            return Some(node.clone());
+        }
+        let slot = key_slot(self.key.as_deref()?);
+        let masters = self.masters.lock();
+        masters
+            .iter()
+            .find(|master| master.owns(slot))
+            .map(|master| (master.host.clone(), master.port))
+    }
+
+    /// A client on `self.db` and, on a cluster, on the open key's master.
     fn db_client(&self) -> redis::RedisResult<redis::Client> {
         let info = self.client.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(self.db);
-        redis::Client::open(info.set_redis_settings(settings))
+        let client = redis::Client::open(info.set_redis_settings(settings))?;
+        match self.owner() {
+            Some((host, port)) => client_at(&client, &host, port),
+            None => Ok(client),
+        }
+    }
+
+    /// The key's slot moved to `node`: reconnect there at once and refetch.
+    fn follow_redirect(&mut self, node: (String, u16)) {
+        log::info!("Live: the open key moved to {}:{}", node.0, node.1);
+        self.moved_to = Some(node);
+        self.conn = None;
+        if let Some(poll) = &mut self.poll {
+            poll.conn = None;
+        }
+        self.retry = Some((1, Instant::now()));
+        self.set_status(Liveness::NotLive("reconnecting".to_owned()));
     }
 
     /// Make the server track the open key: `CLIENT CACHING YES` applies to
@@ -404,6 +461,12 @@ impl LiveTask {
                 // Only now: a change before this point would be missed.
                 self.set_status(Liveness::Live);
                 Some(r_type)
+            }
+            Err(err) if redirect_target(&err).is_some() => {
+                if let Some(node) = redirect_target(&err) {
+                    self.follow_redirect(node);
+                }
+                None
             }
             Err(err) if is_connection_error(&err) => {
                 self.lost(&err.to_string());
@@ -481,13 +544,15 @@ impl LiveTask {
     /// Open the polling connection on `self.db` (again after a DB switch)
     /// and check the open key at once, which sets the baseline.
     async fn start_polling(&mut self) {
+        let owner = self.owner();
         let Some(poll) = &mut self.poll else {
             return;
         };
         poll.last = None;
         poll.next_at = None;
-        if poll.conn.as_ref().is_none_or(|(db, _)| *db != self.db) {
+        if poll.node != owner || poll.conn.as_ref().is_none_or(|(db, _)| *db != self.db) {
             poll.conn = None;
+            poll.node.clone_from(&owner);
             // The configured timeouts, not the redis crate's 500 ms reply
             // default: a fingerprint (`DUMP`, a value page) can be slow.
             let opened = match self.db_client() {
@@ -547,6 +612,10 @@ impl LiveTask {
         };
         let print = match taken {
             Ok(print) => print,
+            Err(Failure::Moved(node)) => {
+                self.follow_redirect(node);
+                return;
+            }
             Err(Failure::DumpRefused(err)) => {
                 log::info!("DUMP refused, polling by page: {err}");
                 poll.no_dump = true;
@@ -609,6 +678,8 @@ impl LiveTask {
 
     /// The connection is gone: say so, then reconnect.
     fn lost(&mut self, reason: &str) {
+        // The node may be gone: ask the current topology again.
+        self.moved_to = None;
         if self.conn.take().is_none() {
             return;
         }
@@ -652,6 +723,8 @@ struct Print {
 enum Failure {
     DumpRefused(String),
     Connection(String),
+    /// The key's slot is on this node now.
+    Moved((String, u16)),
     Other(String),
 }
 
@@ -677,7 +750,9 @@ async fn fingerprint(mut conn: Conn, snapshot: ValueState, whole: bool) -> Resul
             .map(|(r_type, pttl)| (r_type, pttl, None))
     };
     let (r_type, pttl, dump) = reply.map_err(|err| {
-        if is_connection_error(&err) {
+        if let Some(node) = redirect_target(&err) {
+            Failure::Moved(node)
+        } else if is_connection_error(&err) {
             Failure::Connection(err.to_string())
         } else if whole {
             Failure::DumpRefused(err.to_string())
@@ -866,7 +941,7 @@ mod tests {
     fn task(config: LiveConfig) -> (LiveTask, mpsc::Receiver<Action>) {
         let (tx, rx) = mpsc::channel(16);
         let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
-        let task = LiveTask::new(client, config, Arc::default(), tx);
+        let task = LiveTask::new(client, config, Arc::default(), Arc::default(), tx);
         (task, rx)
     }
 

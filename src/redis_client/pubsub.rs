@@ -11,7 +11,9 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use redis::{
     aio::{MultiplexedConnection, PubSubSink, PubSubStream},
-    AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
+    cluster::{ClusterClient, ClusterConfig},
+    cluster_async::ClusterConnection,
+    AsyncConnectionConfig, ConnectionInfo, ProtocolVersion, PushInfo, PushKind, Value,
 };
 use tokio::{
     sync::mpsc::{self, Sender, UnboundedReceiver},
@@ -23,11 +25,15 @@ use crate::action::{try_send_action, Action};
 
 use super::{
     bytes::{text_from_bytes, Raw},
+    cluster::{is_topology_error, MasterNode},
+    conn::client_at,
     pubsub_store::{ConnStatus, PubSubStore, Target},
 };
 
 /// How long opening the Pub/Sub connection may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a cluster's shard subscriptions are checked against its masters.
+const TOPOLOGY_CHECK: Duration = Duration::from_secs(1);
 /// Longest wait between two reconnect attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -55,13 +61,19 @@ pub fn backoff(attempt: u32) -> Duration {
 /// stats are kept.
 pub async fn run(
     client: redis::Client,
+    cluster: Option<ClusterClient>,
+    masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
     store: Arc<Mutex<PubSubStore>>,
     mut cmd_rx: UnboundedReceiver<PubSubCmd>,
     action_tx: Sender<Action>,
     cancel: CancellationToken,
 ) {
+    let shard_masters = Arc::clone(&masters.lock());
     let mut task = PubSubTask {
         client,
+        cluster,
+        shard_masters,
+        masters,
         store,
         action_tx,
         conn: None,
@@ -69,6 +81,9 @@ pub async fn run(
         retry: None,
         lost_targets: Vec::new(),
     };
+    let mut topology = tokio::time::interval(TOPOLOGY_CHECK);
+    topology.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let on_cluster = task.cluster.is_some();
     loop {
         let retry_at = task.retry.map(|(_, at)| at);
         tokio::select! {
@@ -76,6 +91,7 @@ pub async fn run(
                 Some(cmd) => task.apply(cmd).await,
                 None => break,
             },
+            _ = topology.tick(), if on_cluster => task.follow_topology().await,
             msg = next_msg(task.conn.as_mut()) => match msg {
                 Some(msg) => task.store.lock().push_msg(&msg, SystemTime::now()),
                 None => task.lost("the server closed the connection"),
@@ -117,12 +133,49 @@ async fn sleep_until(at: Option<Instant>) {
 /// The RESP3 connection for shard channels: `aio::PubSub` has no
 /// `SSUBSCRIBE`, so messages arrive as pushes on a multiplexed connection.
 struct ShardConn {
-    conn: MultiplexedConnection,
+    conn: ShardLink,
     pushes: UnboundedReceiver<PushInfo>,
+}
+
+/// One server, or a cluster connection that sends each shard channel to the
+/// master of its slot and subscribes it again after a failover.
+enum ShardLink {
+    Single(MultiplexedConnection),
+    Cluster(ClusterConnection),
+}
+
+impl ShardLink {
+    async fn subscribe(&mut self, channel: &str) -> redis::RedisResult<()> {
+        match self {
+            Self::Single(conn) => redis::cmd("SSUBSCRIBE")
+                .arg(Raw(channel))
+                .query_async::<Value>(conn)
+                .await
+                .map(|_| ()),
+            Self::Cluster(conn) => conn.ssubscribe(Raw(channel)).await,
+        }
+    }
+
+    async fn unsubscribe(&mut self, channel: &str) -> redis::RedisResult<()> {
+        match self {
+            Self::Single(conn) => redis::cmd("SUNSUBSCRIBE")
+                .arg(Raw(channel))
+                .query_async::<Value>(conn)
+                .await
+                .map(|_| ()),
+            Self::Cluster(conn) => conn.sunsubscribe(Raw(channel)).await,
+        }
+    }
 }
 
 struct PubSubTask {
     client: redis::Client,
+    /// RESP3 cluster client: routes each `SSUBSCRIBE` to the slot's owner.
+    cluster: Option<ClusterClient>,
+    /// The cluster's masters, kept current by the info task.
+    masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
+    /// The list the shard connection was last checked against.
+    shard_masters: Arc<Vec<MasterNode>>,
     store: Arc<Mutex<PubSubStore>>,
     action_tx: Sender<Action>,
     conn: Option<(PubSubSink, PubSubStream)>,
@@ -154,7 +207,7 @@ impl PubSubTask {
                     return;
                 }
                 if let Err(err) = self.subscribe(&target).await {
-                    if is_connection_error(&err) {
+                    if is_retryable(&err) {
                         // Kept in the store: resubscribed on reconnect.
                         self.lost(&err.to_string());
                     } else {
@@ -167,16 +220,12 @@ impl PubSubTask {
                 let res = match (&target, self.conn.as_mut(), self.shard.as_mut()) {
                     (Target::Channel(name), Some((sink, _)), _) => sink.unsubscribe(name).await,
                     (Target::Pattern(name), Some((sink, _)), _) => sink.punsubscribe(name).await,
-                    (Target::Shard(name), _, Some(shard)) => redis::cmd("SUNSUBSCRIBE")
-                        .arg(Raw(name))
-                        .query_async::<Value>(&mut shard.conn)
-                        .await
-                        .map(|_| ()),
+                    (Target::Shard(name), _, Some(shard)) => shard.conn.unsubscribe(name).await,
                     _ => return,
                 };
                 if let Err(err) = res {
                     log::warn!("Unsubscribe from {target} failed: {err}");
-                    if is_connection_error(&err) {
+                    if is_retryable(&err) {
                         self.lost(&err.to_string());
                     }
                 }
@@ -186,19 +235,13 @@ impl PubSubTask {
 
     async fn subscribe(&mut self, target: &Target) -> redis::RedisResult<()> {
         if let Target::Shard(name) = target {
-            // TODO(cluster): connect to the node that owns the channel's
-            // slot. On a cluster this node answers MOVED for the others.
             if self.shard.is_none() {
                 self.shard = Some(self.open_shard().await?);
             }
             let Some(shard) = self.shard.as_mut() else {
                 return Ok(());
             };
-            return redis::cmd("SSUBSCRIBE")
-                .arg(Raw(name))
-                .query_async::<Value>(&mut shard.conn)
-                .await
-                .map(|_| ());
+            return shard.conn.subscribe(name).await;
         }
         let Some((sink, _)) = self.conn.as_mut() else {
             return Ok(());
@@ -210,8 +253,50 @@ impl PubSubTask {
         }
     }
 
+    /// The cluster's masters changed. The client only resubscribes on a node
+    /// it reconnects to, and a promoted replica isn't one, so shard channels
+    /// go on a new connection, which subscribes them on the current owners.
+    async fn follow_topology(&mut self) {
+        let current = Arc::clone(&self.masters.lock());
+        if Arc::ptr_eq(&current, &self.shard_masters) {
+            return;
+        }
+        self.shard_masters = current;
+        if self.shard.is_none() {
+            return;
+        }
+        self.shard = None;
+        let shards: Vec<Target> = self
+            .store
+            .lock()
+            .targets()
+            .into_iter()
+            .filter(|target| matches!(target, Target::Shard(_)))
+            .collect();
+        for target in &shards {
+            if let Err(err) = self.subscribe(target).await {
+                log::warn!("Resubscribing {target} after a topology change failed: {err}");
+                self.lost(&err.to_string());
+                return;
+            }
+        }
+        self.store
+            .lock()
+            .mark_reconnected(&shards, SystemTime::now());
+    }
+
     /// A RESP3 connection whose pushes come to this task.
     async fn open_shard(&self) -> redis::RedisResult<ShardConn> {
+        if let Some(cluster) = &self.cluster {
+            // The seeds may be the node that just died: start from the
+            // masters known now, then fall back on the seeds.
+            if let Some(current) = self.current_masters_client() {
+                if let Ok(shard) = open_cluster_shard(&current).await {
+                    return Ok(shard);
+                }
+            }
+            return open_cluster_shard(cluster).await;
+        }
         let info = self.client.get_connection_info().clone();
         let settings = info
             .redis_settings()
@@ -226,7 +311,52 @@ impl PubSubTask {
         let conn = client
             .get_multiplexed_async_connection_with_config(&config)
             .await?;
-        Ok(ShardConn { conn, pushes })
+        Ok(ShardConn {
+            conn: ShardLink::Single(conn),
+            pushes,
+        })
+    }
+
+    /// A RESP3 cluster client seeded with the current masters.
+    fn current_masters_client(&self) -> Option<ClusterClient> {
+        let masters = Arc::clone(&self.masters.lock());
+        let nodes: Vec<ConnectionInfo> = masters
+            .iter()
+            .filter_map(|node| client_at(&self.client, &node.host, node.port).ok())
+            .map(|client| {
+                let info = client.get_connection_info().clone();
+                let settings = info
+                    .redis_settings()
+                    .clone()
+                    .set_protocol(ProtocolVersion::RESP3);
+                info.set_redis_settings(settings)
+            })
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        ClusterClient::new(nodes).ok()
+    }
+
+    /// The plain Pub/Sub connection. Any cluster node carries plain channels,
+    /// so the current masters are tried first and the seed, which may be
+    /// down, last. One server has no masters list and uses its own address.
+    async fn open_pubsub(&self) -> Result<redis::aio::PubSub, String> {
+        let masters = Arc::clone(&self.masters.lock());
+        let mut clients: Vec<redis::Client> = masters
+            .iter()
+            .filter_map(|node| client_at(&self.client, &node.host, node.port).ok())
+            .collect();
+        clients.push(self.client.clone());
+        let mut reason = String::new();
+        for client in clients {
+            match tokio::time::timeout(CONNECT_TIMEOUT, client.get_async_pubsub()).await {
+                Ok(Ok(pubsub)) => return Ok(pubsub),
+                Ok(Err(err)) => reason = err.to_string(),
+                Err(_) => reason = format!("timed out after {CONNECT_TIMEOUT:?}"),
+            }
+        }
+        Err(reason)
     }
 
     /// A push from the shard connection.
@@ -242,7 +372,11 @@ impl PubSubTask {
                         .push_shard(&channel, payload, SystemTime::now());
                 }
             }
-            PushKind::Disconnection => self.lost("the shard connection closed"),
+            // One node of a cluster dropping isn't the end of the link: the
+            // client reconnects to it, `follow_topology` handles a failover.
+            PushKind::Disconnection if self.cluster.is_none() => {
+                self.lost("the shard connection closed");
+            }
             _ => {}
         }
     }
@@ -253,19 +387,14 @@ impl PubSubTask {
     /// while subscribing.
     async fn connect(&mut self) -> Result<(), String> {
         self.store.lock().status = ConnStatus::Connecting;
-        let opened = tokio::time::timeout(CONNECT_TIMEOUT, self.client.get_async_pubsub()).await;
-        let pubsub = match opened {
-            Ok(Ok(pubsub)) => pubsub,
-            Ok(Err(err)) => return Err(err.to_string()),
-            Err(_) => return Err(format!("timed out after {CONNECT_TIMEOUT:?}")),
-        };
+        let pubsub = self.open_pubsub().await?;
         self.conn = Some(pubsub.split());
 
         let targets = self.store.lock().targets();
         let mut failed = Vec::new();
         for target in targets {
             if let Err(err) = self.subscribe(&target).await {
-                if is_connection_error(&err) {
+                if is_retryable(&err) {
                     self.conn = None;
                     self.shard = None;
                     return Err(err.to_string());
@@ -336,6 +465,26 @@ pub(super) fn is_connection_error(err: &redis::RedisError) -> bool {
     err.is_connection_dropped() || err.is_io_error() || err.is_connection_refusal()
 }
 
+/// Worth another attempt, with the target kept: the link is down, or a
+/// cluster is between masters (`CLUSTERDOWN`, `MOVED`, a timed-out node).
+fn is_retryable(err: &redis::RedisError) -> bool {
+    is_connection_error(err) || err.is_timeout() || is_topology_error(err)
+}
+
+/// A shard connection on `cluster`, its pushes going to the returned receiver.
+async fn open_cluster_shard(cluster: &ClusterClient) -> redis::RedisResult<ShardConn> {
+    let (tx, pushes) = mpsc::unbounded_channel();
+    let config = ClusterConfig::new()
+        .set_connection_timeout(CONNECT_TIMEOUT)
+        .set_response_timeout(CONNECT_TIMEOUT)
+        .set_push_sender(tx);
+    let conn = cluster.get_async_connection_with_config(config).await?;
+    Ok(ShardConn {
+        conn: ShardLink::Cluster(conn),
+        pushes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use redis::AsyncCommands;
@@ -399,6 +548,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run(
             client.clone(),
+            None,
+            Arc::default(),
             store.clone(),
             cmd_rx,
             action_tx,
@@ -471,6 +622,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run(
             client.clone(),
+            None,
+            Arc::default(),
             store.clone(),
             cmd_rx,
             action_tx,

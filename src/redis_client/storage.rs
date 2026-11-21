@@ -187,18 +187,10 @@ impl Storage {
 
     /// A connection to the master that owns `slot`, by its address.
     fn master_conn(&self, masters: &[MasterNode], slot: u16) -> Conn {
-        masters
-            .iter()
-            .find(|master| {
-                master
-                    .slots
-                    .iter()
-                    .any(|&(start, end)| (start..=end).contains(&slot))
-            })
-            .map_or_else(
-                || self.manager.on_slot(slot),
-                |master| self.manager.on_address(&master.host, master.port),
-            )
+        masters.iter().find(|master| master.owns(slot)).map_or_else(
+            || self.manager.on_slot(slot),
+            |master| self.manager.on_address(&master.host, master.port),
+        )
     }
 
     /// One connection per master, or this connection on one server.

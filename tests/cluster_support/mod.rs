@@ -9,7 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use redis::cluster::ClusterClient;
+use redis::cluster::{ClusterClient, ClusterClientBuilder};
+use redis_rover::internals::ClusterClients;
 
 const IMAGE: &str = "rrover-test-cluster";
 pub const PORTS: [u16; 6] = [7100, 7101, 7102, 7103, 7104, 7105];
@@ -94,6 +95,27 @@ impl ClusterFixture {
             assert!(Instant::now() < deadline, "the cluster never became ready");
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// The clients `redis_rover::run` builds for this cluster.
+    pub fn clients(&self) -> ClusterClients {
+        ClusterClients {
+            plain: self.client(),
+            resp3: ClusterClientBuilder::new(self.nodes.clone())
+                .use_protocol(redis::ProtocolVersion::RESP3)
+                .build()
+                .expect("valid seeds"),
+        }
+    }
+
+    /// `redis-cli -p port args…` inside the container; its output.
+    pub fn cli(&self, port: u16, args: &[&str]) -> String {
+        let port = port.to_string();
+        let mut full = vec!["exec", &self.name, "redis-cli", "-p", &port];
+        full.extend_from_slice(args);
+        let out = docker(&full);
+        assert!(out.status.success(), "redis-cli {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     /// Kill one node; the container and the other nodes keep running.
