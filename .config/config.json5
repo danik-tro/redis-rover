@@ -157,5 +157,14 @@
     "mode": "auto",
     // How often polling checks the open key, in milliseconds (250 or more).
     "poll_interval_ms": 2000,
+  },
+  "monitor": {
+    // Lines and bytes kept on the MONITOR screen; the oldest go first.
+    "buffer_lines": 10000,
+    "buffer_bytes": 16777216,
+    // Above this many lines per second, keep one line in N.
+    "max_rate": 5000,
+    // MONITOR costs the server CPU, so it stops when you leave the screen.
+    "keep_running": false,
   }
 }

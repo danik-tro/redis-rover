@@ -62,6 +62,9 @@ pub struct Config {
     pub connection: ConnectionConfig,
     #[serde(default)]
     pub pubsub: PubSubConfig,
+    /// The MONITOR screen.
+    #[serde(default)]
+    pub monitor: MonitorConfig,
     /// Write safety: when the command preview shows.
     #[serde(default)]
     pub safety: SafetyConfig,
@@ -211,6 +214,56 @@ impl PubSubConfig {
             messages: self.buffer_messages(),
             bytes: self.buffer_bytes(),
             payload: self.max_payload(),
+        }
+    }
+}
+
+/// `monitor`: limits of the MONITOR screen.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// Lines kept; see [`MonitorConfig::buffer_lines`].
+    pub buffer_lines: usize,
+    /// Bytes kept; see [`MonitorConfig::buffer_bytes`].
+    pub buffer_bytes: usize,
+    /// Above this many lines per second, keep one in `n`; see
+    /// [`MonitorConfig::max_rate`].
+    pub max_rate: u64,
+    /// Keep MONITOR running after leaving the screen.
+    pub keep_running: bool,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            buffer_lines: 10_000,
+            buffer_bytes: 16 * 1024 * 1024,
+            max_rate: 5_000,
+            keep_running: false,
+        }
+    }
+}
+
+impl MonitorConfig {
+    /// Lines kept, clamped to 100..=1,000,000.
+    pub fn buffer_lines(&self) -> usize {
+        self.buffer_lines.clamp(100, 1_000_000)
+    }
+
+    /// Bytes kept, clamped to 1 MiB..=1 GiB.
+    pub fn buffer_bytes(&self) -> usize {
+        self.buffer_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024)
+    }
+
+    /// Lines per second before sampling starts, clamped to 100..=1,000,000.
+    pub fn max_rate(&self) -> u64 {
+        self.max_rate.clamp(100, 1_000_000)
+    }
+
+    pub fn limits(&self) -> crate::redis_client::monitor_store::MonitorLimits {
+        crate::redis_client::monitor_store::MonitorLimits {
+            lines: self.buffer_lines(),
+            bytes: self.buffer_bytes(),
         }
     }
 }
@@ -943,6 +996,32 @@ mod tests {
             json5::from_str("{ keybindings: {}, pubsub: { buffer_messages: 50 } }").unwrap();
         assert_eq!(cfg.pubsub.buffer_messages(), 50);
         assert_eq!(cfg.pubsub.max_payload(), 64 * 1024);
+    }
+
+    #[test]
+    fn monitor_config_defaults_and_clamps() {
+        let d = MonitorConfig::default();
+        assert_eq!(d.buffer_lines(), 10_000);
+        assert_eq!(d.buffer_bytes(), 16 * 1024 * 1024);
+        assert_eq!(d.max_rate(), 5_000);
+        assert!(!d.keep_running);
+
+        let low = MonitorConfig {
+            buffer_lines: 0,
+            buffer_bytes: 0,
+            max_rate: 0,
+            keep_running: false,
+        };
+        assert_eq!(low.buffer_lines(), 100);
+        assert_eq!(low.buffer_bytes(), 1024 * 1024);
+        assert_eq!(low.max_rate(), 100);
+
+        let cfg: Config =
+            json5::from_str("{ keybindings: {}, monitor: { max_rate: 700, keep_running: true } }")
+                .unwrap();
+        assert_eq!(cfg.monitor.max_rate(), 700);
+        assert!(cfg.monitor.keep_running);
+        assert_eq!(cfg.monitor.buffer_lines(), 10_000);
     }
 
     #[test]

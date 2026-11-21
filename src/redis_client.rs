@@ -4,6 +4,8 @@ pub mod escape;
 pub mod event;
 pub mod live;
 pub mod metrics;
+pub mod monitor;
+pub mod monitor_store;
 pub mod pubsub;
 pub mod pubsub_store;
 pub mod runner;

@@ -9,6 +9,7 @@ use crate::{
     config,
     redis_client::{
         metrics::MetricsHistory,
+        monitor_store::MonitorStore,
         pubsub_store::PubSubStore,
         types::{KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
@@ -42,6 +43,8 @@ pub struct SharedState {
     pub yank: Arc<Mutex<Option<(String, String)>>>,
     /// Pub/Sub subscriptions and their messages. Written by the Pub/Sub task.
     pub pubsub: Arc<Mutex<PubSubStore>>,
+    /// MONITOR lines. Written by the MONITOR task.
+    pub monitor: Arc<Mutex<MonitorStore>>,
 }
 
 /// Redis's default `databases` setting.
@@ -64,6 +67,9 @@ impl Default for SharedState {
             db_count: Arc::new(Mutex::new(DEFAULT_DB_COUNT)),
             yank: Arc::new(Mutex::new(None)),
             pubsub: Arc::new(Mutex::new(PubSubStore::new(config::get().pubsub.limits()))),
+            monitor: Arc::new(Mutex::new(MonitorStore::new(
+                config::get().monitor.limits(),
+            ))),
         }
     }
 }
