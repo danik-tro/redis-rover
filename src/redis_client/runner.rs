@@ -21,6 +21,7 @@ mod power;
 
 use super::{
     client,
+    conn::Conn,
     event::RedisEvent,
     live::{self, LiveCmd},
     monitor::{self, MonitorCmd},
@@ -67,7 +68,7 @@ pub struct Runner {
     /// The client the app started with. A DB switch builds a new connection
     /// from it, so TLS settings and credentials carry over.
     client: redis::Client,
-    manager: ConnectionManager,
+    manager: Conn,
     /// Refuse every write. Shared with `App`, so toggling it in the session
     /// moves the guarantee too.
     read_only: Arc<AtomicBool>,
@@ -106,7 +107,7 @@ impl Runner {
     #[must_use]
     pub fn new(
         client: redis::Client,
-        manager: ConnectionManager,
+        manager: impl Into<Conn>,
         state: SharedState,
         action_tx: ActionSender<Action>,
     ) -> Self {
@@ -125,7 +126,7 @@ impl Runner {
         Self {
             cancellation_token,
             client,
-            manager,
+            manager: manager.into(),
             read_only: Arc::new(AtomicBool::new(false)),
             state,
             info_task,
@@ -952,7 +953,7 @@ impl EventHandler {
         }
     }
 
-    async fn connect_db(&self, db: i64, link: Link) -> Result<ConnectionManager, FetchError> {
+    async fn connect_db(&self, db: i64, link: Link) -> Result<Conn, FetchError> {
         let info = self.client.get_connection_info().clone();
         let settings = info.redis_settings().clone().set_db(db);
         let client = redis::Client::open(info.set_redis_settings(settings))?;
@@ -1158,7 +1159,7 @@ async fn sweep_to_end(
 ///
 /// The server can't be reached, refuses the connection settings, or the
 /// attempts time out.
-pub async fn connect(client: redis::Client, link: Link) -> Result<ConnectionManager, FetchError> {
+pub async fn connect(client: redis::Client, link: Link) -> Result<Conn, FetchError> {
     let overall = config::get().connection.connect_timeout();
     connect_within(client, link, overall).await
 }
@@ -1176,7 +1177,7 @@ const STARTUP_RETRY_ALLOWANCE: Duration = Duration::from_secs(15);
 /// # Errors
 ///
 /// As [`connect`].
-pub async fn connect_at_startup(client: redis::Client) -> Result<ConnectionManager, FetchError> {
+pub async fn connect_at_startup(client: redis::Client) -> Result<Conn, FetchError> {
     let overall = config::get().connection.connect_timeout() + STARTUP_RETRY_ALLOWANCE;
     connect_within(client, Link::Interactive, overall).await
 }
@@ -1185,7 +1186,7 @@ async fn connect_within(
     client: redis::Client,
     link: Link,
     overall: Duration,
-) -> Result<ConnectionManager, FetchError> {
+) -> Result<Conn, FetchError> {
     let timeouts = config::get().connection;
     let response = match link {
         Link::Interactive => timeouts.response_timeout(),
@@ -1200,7 +1201,7 @@ async fn connect_within(
     )
     .await
     .map_err(|_| format!("connecting timed out after {overall:?}"))??;
-    Ok(manager)
+    Ok(manager.into())
 }
 
 /// Fetch the value page `snapshot` describes. Unless the user moved on

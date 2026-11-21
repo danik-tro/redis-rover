@@ -29,8 +29,7 @@ use std::{
 use parking_lot::Mutex;
 
 use redis::{
-    aio::{ConnectionManager, MultiplexedConnection},
-    AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
+    aio::MultiplexedConnection, AsyncConnectionConfig, ProtocolVersion, PushInfo, PushKind, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -39,7 +38,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{bytes::Raw, client, pubsub::backoff, runner::Link, types::ValueState};
+use super::{bytes::Raw, client, conn::Conn, pubsub::backoff, runner::Link, types::ValueState};
 use crate::{
     action::{try_send_action, Action},
     config::{LiveConfig, LiveMode},
@@ -241,7 +240,7 @@ struct LiveTask {
 struct Poll {
     /// Its connection, on `db`. The manager reconnects by itself; a
     /// fingerprint taken after a gap still shows what changed in it.
-    conn: Option<(i64, ConnectionManager)>,
+    conn: Option<(i64, Conn)>,
     /// When the next check runs (`None`: no key, or paused).
     next_at: Option<Instant>,
     /// The last fingerprint and what it was taken of.
@@ -661,11 +660,7 @@ enum Failure {
 /// the page on screen, fetched as the value task does (bounded: one page,
 /// at most 64 KiB of a string). `OBJECT IDLETIME` isn't used: our own reads
 /// reset it, and it errors under an LFU policy.
-async fn fingerprint(
-    mut conn: ConnectionManager,
-    snapshot: ValueState,
-    whole: bool,
-) -> Result<Print, Failure> {
+async fn fingerprint(mut conn: Conn, snapshot: ValueState, whole: bool) -> Result<Print, Failure> {
     let Some(key) = snapshot.key.clone() else {
         return Err(Failure::Other("no key".to_owned()));
     };

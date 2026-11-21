@@ -7,12 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use redis::aio::ConnectionManager;
 use redis::{FromRedisValue, ScanOptions};
 
 use super::{
     bytes::{strings, Raw, Text},
     client,
+    conn::Conn,
     pubsub_store::ServerChannels,
     slowlog::{parse_config_int, parse_entries, SlowlogData, SLOWLOG_FETCH},
     types::{
@@ -67,7 +67,7 @@ const PUBSUB_CHANNELS_MAX: usize = 1000;
 
 #[derive(Clone)]
 pub struct Storage {
-    manager: ConnectionManager,
+    manager: Conn,
     /// The server refused `MEMORY USAGE` (an ACL without it, a managed
     /// service or a fork that lacks it): stop asking on this connection and
     /// show sizes as unknown. Shared by the clones of this `Storage`.
@@ -75,9 +75,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(manager: ConnectionManager) -> Self {
+    pub fn new(manager: impl Into<Conn>) -> Self {
         Self {
-            manager,
+            manager: manager.into(),
             memory_usage_refused: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -399,7 +399,7 @@ impl Storage {
 
     /// The connection, for the `client` helpers of the power edits.
     #[must_use]
-    pub fn manager(&self) -> ConnectionManager {
+    pub fn manager(&self) -> Conn {
         self.manager.clone()
     }
 
