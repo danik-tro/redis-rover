@@ -405,7 +405,17 @@ impl Harness {
     /// Wait for the first action that `matches`, skipping (and remembering)
     /// the others. Panics with every action seen if none comes within `WAIT`.
     pub async fn expect(&mut self, what: &str, matches: impl Fn(&Action) -> bool) -> Action {
-        let deadline = tokio::time::Instant::now() + WAIT;
+        self.expect_within(what, WAIT, matches).await
+    }
+
+    /// [`Self::expect`] with its own patience, for a long sweep.
+    pub async fn expect_within(
+        &mut self,
+        what: &str,
+        wait: Duration,
+        matches: impl Fn(&Action) -> bool,
+    ) -> Action {
+        let deadline = tokio::time::Instant::now() + wait;
         let mut seen = Vec::new();
         loop {
             match tokio::time::timeout_at(deadline, self.actions.recv()).await {

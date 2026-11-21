@@ -10,6 +10,7 @@ mod cluster_support;
 mod support;
 
 use cluster_support::ClusterFixture;
+use futures::StreamExt;
 use redis::AsyncCommands;
 use redis_rover::internals::{
     connect_cluster, Action, KeyChange, KeyspaceState, Link, LiveCmd, Liveness, MasterNode,
@@ -41,6 +42,59 @@ async fn sweep_covers_every_master() {
         assert_eq!(state.apply_result(&request, result), SweepApply::Applied);
     }
     assert_eq!(state.scanned.len(), 3000);
+}
+
+/// AC1: 30,000 keys spread over the masters all load, and the footer's count
+/// covers the whole cluster, so no "this node" warning applies.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn thirty_thousand_keys_load_as_one_keyspace() {
+    const KEYS: usize = 30_000;
+    let fixture = ClusterFixture::start();
+    let seed = fixture.client().get_async_connection().await.unwrap();
+    futures::stream::iter(0..KEYS)
+        .map(|i| {
+            let mut seed = seed.clone();
+            async move {
+                let () = seed.set(format!("ac1:{i}"), i).await.unwrap();
+            }
+        })
+        .buffer_unordered(200)
+        .collect::<Vec<()>>()
+        .await;
+
+    let mut h = Harness::cluster(fixture.seed(), fixture.clients()).await;
+    h.fetch_page().await;
+    h.send(RedisEvent::LoadAll { until: None });
+    let done = h
+        .expect_within("the whole sweep", std::time::Duration::from_mins(1), |a| {
+            matches!(a, Action::LoadAllDone { .. })
+        })
+        .await;
+    assert!(
+        matches!(done, Action::LoadAllDone { complete: true, .. }),
+        "{done:?}"
+    );
+    assert_eq!(h.state.keyspace_state.lock().scanned.len(), KEYS);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let counted = h
+            .state
+            .info
+            .lock()
+            .as_ref()
+            .is_some_and(|info| info.whole_cluster && info.db_keys(0) == KEYS as u64);
+        if counted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the footer never counted the whole cluster"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    h.shutdown().await;
 }
 
 /// `fetch_meta` answers for keys on all masters, in page order, and the
