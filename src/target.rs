@@ -17,7 +17,11 @@ use serde::Deserialize;
 
 use crate::{
     cli::{apply_tls_flags, Cli, TlsArgs},
-    redis_client::conn::ClusterClients,
+    redis_client::{
+        conn::{client_at, ClusterClients},
+        escape::printable,
+        sentinel::{SentinelTarget, DEFAULT_PORT},
+    },
 };
 
 /// Used when neither `--url`, a profile nor `REDIS_URL` names a server.
@@ -41,6 +45,31 @@ pub struct Profile {
     /// `true`: connect as a cluster client. `false`: stay on the one node
     /// even if it is in a cluster. Unset: detect it from `INFO cluster`.
     pub cluster: Option<bool>,
+    /// Connect through Sentinel instead of `url`.
+    pub sentinel: Option<SentinelProfile>,
+}
+
+/// `sentinel: { hosts, master, password }` of a profile. Its `Debug` never
+/// shows the password.
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SentinelProfile {
+    /// `host:port`; the port defaults to 26379.
+    pub hosts: Vec<String>,
+    pub master: String,
+    /// `AUTH` for the Sentinels. The master's password is the profile's
+    /// `password_command` or `--token`.
+    pub password: Option<String>,
+}
+
+impl fmt::Debug for SentinelProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SentinelProfile")
+            .field("hosts", &self.hosts)
+            .field("master", &self.master)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Whether the session uses the cluster client.
@@ -255,6 +284,10 @@ pub struct Target {
     /// Every seed of a `redis-cluster://` URL, the first one included.
     /// Empty for any other URL.
     seeds: Vec<redis::ConnectionAddr>,
+    /// Set when the master is found through Sentinel; `info` then holds the
+    /// credentials and DB, and its address is only a placeholder until
+    /// [`Target::resolve_master`].
+    sentinel: Option<SentinelTarget>,
     pub cluster: ClusterMode,
     pub cluster_source: Source,
     pub url_source: Source,
@@ -300,8 +333,15 @@ pub fn resolve(
     };
     let profile_source = || Source::Profile(name.unwrap_or_default().to_owned());
 
+    // `--url` replaces a profile's Sentinels as it replaces its `url`.
+    let profile_sentinel = checked_sentinel(profile)?.filter(|_| cli.url.is_none());
+    let sentinel_url =
+        profile_sentinel.map(|s| format!("redis+sentinel://{}/{}", s.hosts.join(","), s.master));
+
     let (url, url_source) = if let Some(url) = cli.url.as_deref() {
         (url, Source::Flag("--url"))
+    } else if let Some(url) = sentinel_url.as_deref() {
+        (url, profile_source())
     } else if let Some(url) = profile.and_then(|p| p.url.as_deref()) {
         (url, profile_source())
     } else if let Some(url) = redis_url_env.filter(|u| !u.trim().is_empty()) {
@@ -309,7 +349,12 @@ pub fn resolve(
     } else {
         (DEFAULT_URL, Source::Default)
     };
-    let (mut info, seeds) = parse_url(url, &url_source)?;
+    let ParsedUrl {
+        mut info,
+        seeds,
+        names_db,
+        sentinel,
+    } = parse_target_url(url, &url_source, profile_sentinel)?;
 
     let db_source = if let Some(db) = cli.db {
         info = with_db(info, db);
@@ -317,7 +362,7 @@ pub fn resolve(
     } else if let Some(db) = profile.and_then(|p| p.db) {
         info = with_db(info, db);
         profile_source()
-    } else if url_names_db(url) {
+    } else if names_db {
         Source::Url
     } else {
         Source::Default
@@ -333,18 +378,21 @@ pub fn resolve(
     // server, so its `environment` and `read_only: false` can only add
     // protection here, never take it away (`rrover local --url prod-db`
     // must not come up as LOCAL and writable).
-    let url_replaced = cli.url.is_some() && profile.is_some_and(|p| p.url.is_some());
+    let url_replaced =
+        cli.url.is_some() && profile.is_some_and(|p| p.url.is_some() || p.sentinel.is_some());
     let override_source = || Source::UrlOverridesProfile(name.unwrap_or_default().to_owned());
-    let inferred = if seeds.is_empty() {
-        Environment::infer(info.addr())
-    } else {
-        Environment::infer_all(&seeds)
-    };
+    let inferred = infer_environment(&info, &seeds, sentinel.as_ref());
 
     // A replaced URL is another server: the profile's `cluster` says nothing
     // about it.
     let profile_cluster = profile.and_then(|p| p.cluster).filter(|_| !url_replaced);
     let (cluster, cluster_source) = match (seeds.is_empty(), profile_cluster) {
+        (_, Some(true)) if sentinel.is_some() => {
+            return Err(TargetError::Config(
+                "a Sentinel target can't also be a cluster".to_owned(),
+            ));
+        }
+        _ if sentinel.is_some() => (ClusterMode::Off, Source::Url),
         (false, _) => (ClusterMode::On, Source::Url),
         (true, Some(true)) => (ClusterMode::On, profile_source()),
         (true, Some(false)) => (ClusterMode::Off, profile_source()),
@@ -376,6 +424,7 @@ pub fn resolve(
         read_only_source,
         info,
         seeds,
+        sentinel,
         cluster,
         cluster_source,
         url_source,
@@ -384,6 +433,67 @@ pub fn resolve(
         tls_source,
         password,
     })
+}
+
+/// The profile's `sentinel`, refused next to a `url`.
+fn checked_sentinel(profile: Option<&Profile>) -> Result<Option<&SentinelProfile>, TargetError> {
+    let sentinel = profile.and_then(|p| p.sentinel.as_ref());
+    if sentinel.is_some() && profile.is_some_and(|p| p.url.is_some()) {
+        return Err(TargetError::Config(
+            "a profile takes `url` or `sentinel`, not both".to_owned(),
+        ));
+    }
+    Ok(sentinel)
+}
+
+/// What the resolved URL says about the connection.
+struct ParsedUrl {
+    info: ConnectionInfo,
+    seeds: Vec<redis::ConnectionAddr>,
+    names_db: bool,
+    sentinel: Option<SentinelTarget>,
+}
+
+/// Parse `url` of any supported scheme. `profile` gives a Sentinel URL the
+/// password for the Sentinels, which a URL doesn't carry.
+fn parse_target_url(
+    url: &str,
+    source: &Source,
+    profile: Option<&SentinelProfile>,
+) -> Result<ParsedUrl, TargetError> {
+    let parts = parse_sentinel_url(url).map_err(|detail| TargetError::InvalidUrl {
+        source: source.clone(),
+        detail,
+    })?;
+    if let Some(parts) = parts {
+        let password = profile.and_then(|s| s.password.clone());
+        return Ok(ParsedUrl {
+            info: parts.info,
+            seeds: Vec::new(),
+            names_db: parts.names_db,
+            sentinel: Some(SentinelTarget::new(parts.hosts, parts.master, password)),
+        });
+    }
+    let (info, seeds) = parse_url(url, source)?;
+    Ok(ParsedUrl {
+        info,
+        seeds,
+        names_db: url_names_db(url),
+        sentinel: None,
+    })
+}
+
+/// The environment the addresses of a target imply.
+fn infer_environment(
+    info: &ConnectionInfo,
+    seeds: &[redis::ConnectionAddr],
+    sentinel: Option<&SentinelTarget>,
+) -> Environment {
+    match sentinel {
+        Some(sentinel) => Environment::infer_all(&sentinel.hosts),
+        None if seeds.is_empty() => Environment::infer(info.addr()),
+        None => Environment::infer_all(seeds),
+    }
 }
 
 /// Where the TLS settings came from.
@@ -470,6 +580,83 @@ fn with_db(info: ConnectionInfo, db: i64) -> ConnectionInfo {
     info.set_redis_settings(settings)
 }
 
+/// What a `redis+sentinel://` URL says.
+struct SentinelUrl {
+    /// Credentials and DB, with the first Sentinel as a placeholder address.
+    info: ConnectionInfo,
+    hosts: Vec<redis::ConnectionAddr>,
+    master: String,
+    names_db: bool,
+}
+
+/// `host:port`, with the Sentinel port added when `host` has none.
+fn with_sentinel_port(host: &str) -> String {
+    if host
+        .rsplit_once(':')
+        .is_some_and(|(_, p)| !p.ends_with(']'))
+    {
+        host.to_owned()
+    } else {
+        format!("{host}:{DEFAULT_PORT}")
+    }
+}
+
+/// `redis+sentinel://[user:pw@]h1:26379,h2/mymaster[/db]`; `None` for any
+/// other scheme. The credentials are the master's. Errors never quote the
+/// URL, which may hold a password.
+fn parse_sentinel_url(url: &str) -> Result<Option<SentinelUrl>, String> {
+    const SHAPE: &str = "a redis+sentinel:// URL looks like \
+                         redis+sentinel://host:26379,host:26379/master/0";
+    let Some(rest) = url.strip_prefix("redis+sentinel://") else {
+        return Ok(None);
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_once('/').ok_or(SHAPE)?;
+    let (credentials, hosts) = match authority.rsplit_once('@') {
+        Some((credentials, hosts)) => (format!("{credentials}@"), hosts),
+        None => (String::new(), authority),
+    };
+    let mut parts = path.trim_end_matches('/').split('/');
+    let master = parts.next().filter(|m| !m.is_empty()).ok_or(SHAPE)?;
+    let db = match parts.next() {
+        Some(db) => Some(
+            db.parse::<i64>()
+                .map_err(|_| "the DB of a redis+sentinel:// URL must be a number".to_owned())?,
+        ),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return Err(SHAPE.to_owned());
+    }
+    let hosts: Vec<String> = hosts
+        .split(',')
+        .map(|host| match host.trim() {
+            "" => Err(SHAPE.to_owned()),
+            host => Ok(with_sentinel_port(host)),
+        })
+        .collect::<Result<_, _>>()?;
+    let addrs = hosts
+        .iter()
+        .map(|host| {
+            format!("redis://{host}")
+                .as_str()
+                .into_connection_info()
+                .map(|info| info.addr().clone())
+                .map_err(|_| "a Sentinel host in the URL is not valid".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let info = format!("redis://{credentials}{}/{}", hosts[0], db.unwrap_or(0))
+        .as_str()
+        .into_connection_info()
+        .map_err(|_| "the credentials of the redis+sentinel:// URL are not valid".to_owned())?;
+    Ok(Some(SentinelUrl {
+        info,
+        hosts: addrs,
+        master: master.to_owned(),
+        names_db: db.is_some(),
+    }))
+}
+
 /// `redis-cluster://[user:pw@]h1:7000,h2:7001[/0]` as one `redis://` URL per
 /// seed; `None` for any other scheme. Errors never quote the URL, which may
 /// hold a password.
@@ -499,6 +686,9 @@ fn cluster_seed_urls(url: &str) -> Result<Option<Vec<String>>, String> {
 ///
 /// The reason it doesn't, without the URL itself.
 pub fn validate_url(url: &str) -> Result<(), String> {
+    if parse_sentinel_url(url)?.is_some() {
+        return Ok(());
+    }
     match cluster_seed_urls(url)? {
         Some(seeds) => seeds.iter().try_for_each(|seed| {
             seed.as_str()
@@ -639,6 +829,44 @@ impl Target {
         }
     }
 
+    /// The client for the master Sentinel names now, or `client` itself on
+    /// a target without Sentinel. A master that isn't on loopback tightens an
+    /// inferred environment: Sentinels reached through a local tunnel say
+    /// nothing about where the data is.
+    ///
+    /// # Errors
+    ///
+    /// Sentinel can't name a reachable master.
+    pub async fn resolve_master(&mut self, client: redis::Client) -> Result<redis::Client> {
+        let Some(sentinel) = &self.sentinel else {
+            return Ok(client);
+        };
+        let within = crate::config::get().connection.connect_timeout();
+        let (host, port) = sentinel.resolve(&client, within).await.map_err(|e| {
+            eyre!(
+                "Sentinel could not name the master `{}`: {e}",
+                sentinel.master
+            )
+        })?;
+        let master = client_at(&client, &host, port).map_err(|e| eyre!(e))?;
+        self.tighten_for(master.get_connection_info().addr());
+        Ok(master)
+    }
+
+    /// Apply what `addr` implies to an environment inferred from elsewhere.
+    fn tighten_for(&mut self, addr: &redis::ConnectionAddr) {
+        let at_master = Environment::infer(addr);
+        if self.env_source != Source::Inferred
+            || at_master.strictness() <= self.environment.strictness()
+        {
+            return;
+        }
+        self.environment = at_master;
+        if self.read_only_source == Source::Environment {
+            self.read_only = at_master.default_read_only();
+        }
+    }
+
     fn cluster_clients(&self, info: &ConnectionInfo) -> Result<ClusterClients> {
         if info.redis_settings().db() != 0 || matches!(info.addr(), redis::ConnectionAddr::Unix(_))
         {
@@ -672,6 +900,14 @@ impl Target {
     /// What the footer and `--probe` call this target (no credentials).
     #[must_use]
     pub fn label(&self, info: &ConnectionInfo) -> String {
+        if let Some(sentinel) = &self.sentinel {
+            // The address comes from a server's reply.
+            return format!(
+                "sentinel {} → {}",
+                printable(&sentinel.master),
+                printable(&info.addr().to_string())
+            );
+        }
         if self.seeds.is_empty() {
             return crate::cli::connection_label(info);
         }
@@ -697,12 +933,15 @@ impl Target {
         }
         rows.push((
             "target",
-            self.label(&info),
+            self.sentinel
+                .as_ref()
+                .map_or_else(|| self.label(&info), SentinelTarget::url),
             Some(self.url_source.to_string()),
         ));
         // `Auto` is only known after connecting; see `--probe`.
         match self.cluster {
             ClusterMode::Auto => {}
+            ClusterMode::Off if self.sentinel.is_some() => {}
             ClusterMode::On => rows.push((
                 "cluster",
                 "yes".to_owned(),
@@ -739,6 +978,13 @@ impl Target {
             ),
         };
         rows.push(("password", password.0, password.1));
+        if self
+            .sentinel
+            .as_ref()
+            .is_some_and(SentinelTarget::has_password)
+        {
+            rows.push(("sentinel pw", "********".to_owned(), None));
+        }
         rows.push((
             "environment",
             self.environment.to_string(),
@@ -858,6 +1104,93 @@ mod tests {
 
     use super::{resolve, run_password_command, PasswordSource, Profile, Source, TargetError};
     use crate::cli::Cli;
+
+    #[test]
+    fn sentinel_urls_name_the_hosts_master_and_db() {
+        let cli = Cli::parse_from([
+            "rrover",
+            "--url",
+            "redis+sentinel://user:s3cret@10.0.0.1:26380,10.0.0.2/mymaster/3",
+        ]);
+        let target = resolve(&cli, &HashMap::new(), None).unwrap();
+        assert_eq!(target.info().redis_settings().db(), 3);
+        assert_eq!(target.db_source, Source::Url);
+        assert_eq!(target.cluster, super::ClusterMode::Off);
+        let report = target.report().unwrap();
+        assert!(report.contains("redis+sentinel://10.0.0.1:26380,10.0.0.2:26379/mymaster"));
+        assert!(!report.contains("s3cret"), "{report}");
+        assert!(report.contains("********"));
+    }
+
+    #[test]
+    fn malformed_sentinel_urls_are_refused_without_quoting_them() {
+        for url in [
+            "redis+sentinel://h1:26379",
+            "redis+sentinel://h1:26379/",
+            "redis+sentinel://:pw-secret@h1/m/notadb",
+            "redis+sentinel://h1,,h2/m",
+            "redis+sentinel://h1/m/0/extra",
+        ] {
+            let Err(err) = super::parse_sentinel_url(url) else {
+                panic!("accepted a malformed URL");
+            };
+            assert!(!err.contains("pw-secret"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_sentinel_profile_masks_its_password() {
+        let profiles = HashMap::from([(
+            "ha".to_owned(),
+            Profile {
+                sentinel: Some(super::SentinelProfile {
+                    hosts: vec!["127.0.0.1:26379".into(), "127.0.0.2".into()],
+                    master: "mymaster".into(),
+                    password: Some("sentinel-secret".into()),
+                }),
+                ..Profile::default()
+            },
+        )]);
+        let cli = Cli::parse_from(["rrover", "ha"]);
+        let target = resolve(&cli, &profiles, None).unwrap();
+        let report = target.report().unwrap();
+        assert!(!report.contains("sentinel-secret"), "{report}");
+        assert!(report.contains("sentinel pw"), "{report}");
+        assert!(!format!("{target:?}").contains("sentinel-secret"));
+        assert!(!format!("{profiles:?}").contains("sentinel-secret"));
+    }
+
+    #[test]
+    fn a_profile_takes_url_or_sentinel() {
+        let profiles = HashMap::from([(
+            "both".to_owned(),
+            Profile {
+                url: Some("redis://h".into()),
+                sentinel: Some(super::SentinelProfile {
+                    hosts: vec!["h".into()],
+                    master: "m".into(),
+                    password: None,
+                }),
+                ..Profile::default()
+            },
+        )]);
+        let cli = Cli::parse_from(["rrover", "both"]);
+        assert!(matches!(
+            resolve(&cli, &profiles, None),
+            Err(TargetError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn a_remote_master_tightens_loopback_sentinels() {
+        let cli = Cli::parse_from(["rrover", "--url", "redis+sentinel://127.0.0.1/m"]);
+        let mut target = resolve(&cli, &HashMap::new(), None).unwrap();
+        assert_eq!(target.environment, super::Environment::Local);
+        assert!(!target.read_only);
+        target.tighten_for(&ConnectionAddr::Tcp("10.0.1.7".into(), 6379));
+        assert_eq!(target.environment, super::Environment::Unknown);
+        assert!(target.read_only);
+    }
 
     fn profiles() -> HashMap<String, Profile> {
         HashMap::from([

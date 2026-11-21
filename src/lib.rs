@@ -69,8 +69,9 @@ pub async fn run(args: Cli) -> Result<()> {
     // already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
     if args.probe {
-        let target = resolve_target(&args)?;
+        let mut target = resolve_target(&args)?;
         let client = target.client()?;
+        let client = target.resolve_master(client).await?;
         let label = target.label(client.get_connection_info());
         print!("{}", probe::report(&client, &label).await?);
         return Ok(());
@@ -84,8 +85,9 @@ pub async fn run(args: Cli) -> Result<()> {
 
     let state = SharedState::default();
 
-    let target = resolve_target(&args)?;
+    let mut target = resolve_target(&args)?;
     let (client, cluster) = target.clients()?;
+    let client = target.resolve_master(client).await?;
     let label = target.label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
     let session = open_session(&target, &client, cluster)
