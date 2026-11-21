@@ -19,7 +19,8 @@ use std::{
 
 use redis::{aio::ConnectionManager, AsyncCommands};
 use redis_rover::internals::{
-    Action, LiveCmd, MonitorCmd, PubSubCmd, RedisEvent, Runner, SharedState, VALUE_FETCH_DELAY_MS,
+    connect_cluster, Action, Conn, Connector, Link, LiveCmd, MonitorCmd, PubSubCmd, RedisEvent,
+    Runner, SharedState, VALUE_FETCH_DELAY_MS,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -319,11 +320,28 @@ impl Harness {
     pub async fn try_new(client: redis::Client, read_only: bool) -> redis::RedisResult<Self> {
         init();
         let manager = ConnectionManager::new(client.clone()).await?;
+        let connector = Connector::single(client.clone());
+        Ok(Self::wired(client, manager.into(), connector, read_only))
+    }
+
+    /// The runner on a whole cluster, as `redis_rover::run` opens it.
+    /// `seed` is the single-node client of the tasks that stay on one node.
+    pub async fn cluster(seed: redis::Client, cluster: redis::cluster::ClusterClient) -> Self {
+        init();
+        let conn = connect_cluster(&cluster, Link::Interactive)
+            .await
+            .expect("connect to the cluster");
+        let connector = Connector::cluster(seed.clone(), cluster);
+        Self::wired(seed, conn, connector, false)
+    }
+
+    fn wired(client: redis::Client, conn: Conn, connector: Connector, read_only: bool) -> Self {
         let state = SharedState::default();
         *state.db.lock() = client.get_connection_info().redis_settings().db();
         let (tx, actions) = mpsc::channel(ACTION_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
-        let mut runner = Runner::new(client, manager, state.clone(), tx)
+        let mut runner = Runner::new(client, conn, state.clone(), tx)
+            .connector(connector)
             .cancellation_token(cancel.clone())
             .read_only(read_only);
         let events = runner.tx();
@@ -331,7 +349,7 @@ impl Harness {
         let live = runner.live_tx();
         let monitor = runner.monitor_tx();
         runner.start();
-        Ok(Self {
+        Self {
             state,
             events,
             pubsub,
@@ -340,7 +358,7 @@ impl Harness {
             actions,
             runner,
             cancel,
-        })
+        }
     }
 
     /// Send a `RedisEvent`, as `App` does through its sender.
