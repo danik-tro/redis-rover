@@ -2,9 +2,10 @@ use std::{collections::HashMap, time::Instant};
 
 use color_eyre::eyre::Result;
 
-use redis::{aio::ConnectionManager, AsyncCommands};
+use redis::AsyncCommands;
 
 use super::bytes::{strings, Raw, Text};
+use super::conn::Conn;
 use super::metrics::{parse_cluster_info, ClusterSummary, InfoSnapshot};
 use super::types::{
     json_path, ItemDelete, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyItem, KeyValue,
@@ -47,9 +48,7 @@ pub fn parse_info(raw: &str) -> HashMap<&str, &str> {
 /// # Errors
 ///
 /// Returns an error if the command fails.
-pub async fn redis_info_with_snapshot(
-    manager: &mut ConnectionManager,
-) -> Result<(RedisInfo, InfoSnapshot)> {
+pub async fn redis_info_with_snapshot(manager: &mut Conn) -> Result<(RedisInfo, InfoSnapshot)> {
     let raw: String = redis::cmd("INFO").query_async(manager).await?;
     let taken_at = Instant::now();
     let map = parse_info(&raw);
@@ -63,7 +62,7 @@ pub async fn redis_info_with_snapshot(
 /// # Errors
 ///
 /// Returns an error if the command fails (e.g. cluster mode is disabled).
-pub async fn cluster_info(manager: &mut ConnectionManager) -> Result<ClusterSummary> {
+pub async fn cluster_info(manager: &mut Conn) -> Result<ClusterSummary> {
     let raw: String = redis::cmd("CLUSTER")
         .arg("INFO")
         .query_async(manager)
@@ -86,7 +85,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// Returns an error if no key is selected or any Redis command fails.
 pub async fn fetch_value_page(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     mut state: ValueState,
 ) -> Result<(ValueState, LoadedValue), BoxError> {
     let key = state.key.clone().ok_or("no key selected")?;
@@ -194,7 +193,7 @@ pub async fn fetch_value_page(
 /// document under the cap loads on `RedisJSON` 1.x too; above the cap, a server
 /// that rejects `$` paths gets [`JsonPreviewKind::TooLarge`].
 async fn fetch_json(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     state: &mut ValueState,
 ) -> Result<KeyValue, BoxError> {
@@ -298,7 +297,7 @@ fn json_preview(bytes: u64, kind: JsonPreviewKind) -> KeyValue {
 /// Type and size of the fields `names` of the object at `parent`, in one
 /// pipeline.
 async fn fetch_json_fields(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     parent: &[String],
     names: &[String],
@@ -391,7 +390,7 @@ fn first_match(json: serde_json::Value) -> Option<serde_json::Value> {
 ///
 /// Returns an error for STREAM / unknown types or if a Redis command fails.
 pub async fn fetch_full_value(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     key: &str,
     r_type: &RedisType,
 ) -> Result<KeyValue, BoxError> {
@@ -490,7 +489,7 @@ pub async fn fetch_full_value(
 
 /// `XREVRANGE key start - COUNT count`.
 async fn xrevrange(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     start: &str,
     count: usize,
@@ -510,7 +509,7 @@ async fn xrevrange(
 /// the nearest start already known, and a page past the end falls back to
 /// the last one that has entries.
 async fn fetch_stream(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     state: &mut ValueState,
 ) -> Result<StreamValue, BoxError> {
@@ -576,7 +575,7 @@ async fn fetch_stream(
 
 /// Every entry of a stream, newest first, in [`FULL_FETCH_CHUNK`] steps.
 async fn fetch_all_stream_entries(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
 ) -> Result<Vec<StreamEntry>, BoxError> {
     let mut all = Vec::new();
@@ -595,11 +594,7 @@ async fn fetch_all_stream_entries(
 
 /// Consumers and the first pending entries of `group`. A refusal is kept
 /// in the result, for the screen to show.
-pub async fn fetch_stream_group(
-    mut manager: ConnectionManager,
-    key: &str,
-    group: &str,
-) -> GroupDetail {
+pub async fn fetch_stream_group(mut manager: Conn, key: &str, group: &str) -> GroupDetail {
     let mut detail = GroupDetail {
         key: key.to_owned(),
         group: group.to_owned(),
@@ -655,7 +650,7 @@ fn window_bounds(state: &ValueState) -> Result<(isize, isize), BoxError> {
 /// `LLEN` + `LRANGE` for the current page, in one pipeline. Stores the length
 /// in `state.total`.
 async fn fetch_list_window(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     state: &mut ValueState,
 ) -> Result<Vec<String>, BoxError> {
@@ -676,7 +671,7 @@ async fn fetch_list_window(
 /// `ZCARD` + `ZRANGE … WITHSCORES` for the current page, in one pipeline.
 /// Stores the length in `state.total`.
 async fn fetch_zset_window(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     state: &mut ValueState,
 ) -> Result<Vec<(String, f64)>, BoxError> {
@@ -701,7 +696,7 @@ async fn fetch_zset_window(
 /// One `HSCAN` / `SSCAN key cursor COUNT n` step. HSCAN replies with a flat
 /// `field, value, …` list; pair it up with [`pair_up`].
 async fn scan_step(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     is_hash: bool,
     state: &ValueState,
@@ -730,7 +725,7 @@ fn pair_up(flat: Vec<String>) -> Vec<(String, String)> {
 /// `STRLEN` + `GETRANGE 0 max-1` in one pipeline. Returns the decoded preview,
 /// the full length in bytes, and whether decoding replaced invalid bytes.
 async fn fetch_string_preview(
-    manager: &mut ConnectionManager,
+    manager: &mut Conn,
     key: &str,
     max: usize,
 ) -> Result<(String, usize, bool), BoxError> {
@@ -773,7 +768,7 @@ type WriteResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 /// one `MULTI` / `EXEC`, so a lost connection or a timeout between them
 /// can't leave half a write behind (a tombstone in a list, a SET member
 /// removed and never added back).
-async fn run_writes(mut manager: ConnectionManager, cmds: Vec<redis::Cmd>) -> WriteResult {
+async fn run_writes(mut manager: Conn, cmds: Vec<redis::Cmd>) -> WriteResult {
     match cmds.as_slice() {
         [] => {}
         [cmd] => {
@@ -814,7 +809,7 @@ fn unknown_command(err: &redis::RedisError) -> bool {
 /// The LIST write without a script: check the element, then run `cmds` in
 /// one `MULTI`. Only for servers where [`scripting_refused`].
 async fn list_write_unscripted(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     key: &str,
     index: usize,
     expected: &str,
@@ -836,7 +831,7 @@ async fn list_write_unscripted(
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn set_string(mut manager: ConnectionManager, key: &str, value: &str) -> WriteResult {
+pub async fn set_string(mut manager: Conn, key: &str, value: &str) -> WriteResult {
     match run_writes(manager.clone(), write_cmd::set_string(key, value)).await {
         Err(err) if is_syntax_error(err.as_ref()) => {
             let ttl_ms: i64 = redis::cmd("PTTL")
@@ -860,7 +855,7 @@ fn is_syntax_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> boo
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn delete_key(manager: ConnectionManager, key: &str) -> WriteResult {
+pub async fn delete_key(manager: Conn, key: &str) -> WriteResult {
     run_writes(manager, write_cmd::delete_key(key)).await
 }
 
@@ -870,7 +865,7 @@ pub async fn delete_key(manager: ConnectionManager, key: &str) -> WriteResult {
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn set_ttl(manager: ConnectionManager, key: &str, ttl: Ttl) -> WriteResult {
+pub async fn set_ttl(manager: Conn, key: &str, ttl: Ttl) -> WriteResult {
     run_writes(manager, write_cmd::set_ttl(key, ttl)).await
 }
 
@@ -888,7 +883,7 @@ pub enum Moved {
 ///
 /// Returns an error if the command fails (`from` is gone, cross-slot).
 pub async fn rename_key(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     from: &str,
     to: &str,
     overwrite: bool,
@@ -925,7 +920,7 @@ impl std::error::Error for CopyUnsupported {}
 /// [`CopyUnsupported`] before Redis 6.2 (copy with [`copy_key_dump`]
 /// instead), or the command's error.
 pub async fn copy_key(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     from: &str,
     to: &str,
     db: Option<i64>,
@@ -958,8 +953,8 @@ pub async fn copy_key(
 ///
 /// Returns an error if `from` is gone or a command fails.
 pub async fn copy_key_dump(
-    mut source: ConnectionManager,
-    mut target: ConnectionManager,
+    mut source: Conn,
+    mut target: Conn,
     from: &str,
     to: &str,
     overwrite: bool,
@@ -991,7 +986,7 @@ pub async fn copy_key_dump(
 /// Returns an error if a command fails (the transaction then wrote
 /// nothing).
 pub async fn apply_value_edit(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     key: &str,
     edit: &super::value_edit::ValueEdit,
 ) -> WriteResult {
@@ -1019,11 +1014,7 @@ pub async fn apply_value_edit(
 /// # Errors
 ///
 /// Returns an error if the command fails.
-pub async fn key_slots(
-    mut manager: ConnectionManager,
-    a: &str,
-    b: &str,
-) -> Result<(i64, i64), BoxError> {
+pub async fn key_slots(mut manager: Conn, a: &str, b: &str) -> Result<(i64, i64), BoxError> {
     let mut pipe = redis::pipe();
     pipe.cmd("CLUSTER")
         .arg("KEYSLOT")
@@ -1047,11 +1038,7 @@ const SHIFT_TTL_ATTEMPTS: usize = 3;
 ///
 /// The key is gone or has no TTL, the result would not be positive, the key
 /// kept changing, or a command failed.
-pub async fn shift_ttl(
-    mut manager: ConnectionManager,
-    key: &str,
-    delta_secs: i64,
-) -> Result<i64, BoxError> {
+pub async fn shift_ttl(mut manager: Conn, key: &str, delta_secs: i64) -> Result<i64, BoxError> {
     let name = super::bytes::shown(key);
     for _ in 0..SHIFT_TTL_ATTEMPTS {
         let () = redis::cmd("WATCH")
@@ -1102,7 +1089,7 @@ pub enum Renamed {
 ///
 /// `to` exists, `from` is gone, or a command fails.
 pub async fn rename_item(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     key: &str,
     kind: Option<MemberKind>,
     from: &str,
@@ -1166,7 +1153,7 @@ pub async fn rename_item(
 /// # Errors
 ///
 /// Returns the first failing chunk's error; earlier chunks stay deleted.
-pub async fn delete_keys(mut manager: ConnectionManager, keys: &[String]) -> Result<u64, BoxError> {
+pub async fn delete_keys(mut manager: Conn, keys: &[String]) -> Result<u64, BoxError> {
     let mut removed = 0;
     let mut cmds = write_cmd::delete_keys(keys).into_iter().peekable();
     // Only the first chunk can find `UNLINK` missing; then all go as `DEL`.
@@ -1192,7 +1179,7 @@ pub async fn delete_keys(mut manager: ConnectionManager, keys: &[String]) -> Res
 ///
 /// Returns an error if the underlying Redis command fails.
 pub async fn key_exists(
-    mut manager: ConnectionManager,
+    mut manager: Conn,
     key: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let exists: bool = manager.exists(Raw(key)).await?;
@@ -1206,11 +1193,7 @@ pub async fn key_exists(
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn create_key(
-    mut manager: ConnectionManager,
-    key: &str,
-    spec: &NewKeySpec,
-) -> WriteResult {
+pub async fn create_key(mut manager: Conn, key: &str, spec: &NewKeySpec) -> WriteResult {
     if let NewKeySpec::String(_) = spec {
         // `SET … NX` answers nil when the key appeared after the `EXISTS`
         // guard: nothing was overwritten.
@@ -1231,7 +1214,7 @@ pub async fn create_key(
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn add_item(manager: ConnectionManager, key: &str, item: &KeyItem) -> WriteResult {
+pub async fn add_item(manager: Conn, key: &str, item: &KeyItem) -> WriteResult {
     run_writes(manager, write_cmd::add_item(key, item)).await
 }
 
@@ -1243,7 +1226,7 @@ pub async fn add_item(manager: ConnectionManager, key: &str, item: &KeyItem) -> 
 ///
 /// Returns an error if the new SET member already exists, or if the underlying
 /// Redis command fails.
-pub async fn edit_item(mut manager: ConnectionManager, key: &str, edit: &ItemEdit) -> WriteResult {
+pub async fn edit_item(mut manager: Conn, key: &str, edit: &ItemEdit) -> WriteResult {
     if let ItemEdit::SetReplace { old, new } = edit {
         if old != new {
             let exists: bool = manager.sismember(Raw(key), Raw(new)).await?;
@@ -1274,11 +1257,7 @@ pub async fn edit_item(mut manager: ConnectionManager, key: &str, edit: &ItemEdi
 /// # Errors
 ///
 /// Returns an error if the underlying Redis command fails.
-pub async fn delete_item(
-    manager: ConnectionManager,
-    key: &str,
-    delete: &ItemDelete,
-) -> WriteResult {
+pub async fn delete_item(manager: Conn, key: &str, delete: &ItemDelete) -> WriteResult {
     match run_writes(manager.clone(), write_cmd::delete_item(key, delete)).await {
         Err(err) if scripting_refused(err.as_ref()) => match delete {
             ItemDelete::ListIndex { index, expected } => {
@@ -1347,13 +1326,14 @@ mod tests {
         skip
     }
 
-    async fn manager() -> redis::aio::ConnectionManager {
+    async fn manager() -> super::Conn {
         let url = std::env::var("RROVER_TEST_URL").expect("RROVER_TEST_URL not set");
         redis::Client::open(url)
             .unwrap()
             .get_connection_manager()
             .await
             .unwrap()
+            .into()
     }
 
     fn state(key: &str, r_type: RedisType) -> ValueState {

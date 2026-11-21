@@ -29,7 +29,6 @@ pub use redis_client::escape::printable_lines;
 pub use target::TargetError;
 
 use color_eyre::eyre::Result;
-use redis::aio::ConnectionManager;
 use redis_client::runner::{connect_at_startup, Runner};
 use state::SharedState;
 use tokio::sync::mpsc;
@@ -84,7 +83,7 @@ pub async fn run(args: Cli) -> Result<()> {
     let client = target.client()?;
     let label = cli::connection_label(client.get_connection_info());
     *state.db.lock() = client.get_connection_info().redis_settings().db();
-    let manager: ConnectionManager = connect_at_startup(client.clone())
+    let manager = connect_at_startup(client.clone())
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
@@ -132,6 +131,7 @@ pub mod internals {
     pub use crate::mode::Mode;
     pub use crate::probe::report as probe_report;
     pub use crate::redis_client::bytes::text_from_bytes;
+    pub use crate::redis_client::conn::Conn;
     pub use crate::redis_client::event::RedisEvent;
     pub use crate::redis_client::live::{KeyChange, LiveCmd, Liveness};
     pub use crate::redis_client::metrics::{InfoSnapshot, MetricsHistory};

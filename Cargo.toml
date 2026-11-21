@@ -59,6 +59,8 @@ redis = { version = "1.6", default-features = false, features = [
     "aio",
     "tokio-comp",
     "connection-manager",
+    "cluster-async",
+    "sentinel",
     "tokio-rustls-comp",
     "tls-rustls",
     "tls-rustls-webpki-roots",
