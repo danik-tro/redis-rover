@@ -11,6 +11,7 @@ pub mod monitor_store;
 pub mod pubsub;
 pub mod pubsub_store;
 pub mod runner;
+pub mod sentinel;
 pub mod slowlog;
 pub mod storage;
 pub mod types;
