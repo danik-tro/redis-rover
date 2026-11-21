@@ -141,6 +141,54 @@ pub fn by_slot(keys: &[String]) -> Vec<Vec<String>> {
     slots.into_values().collect()
 }
 
+/// What a fresh list of masters says about the one in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyUpdate {
+    Same,
+    /// Other masters or slots: the sweep restarts.
+    Changed,
+    /// Fewer slots covered: a master failed and no replica took over yet.
+    /// Wait for the promotion rather than sweep part of the keyspace.
+    Partial,
+}
+
+fn slots_covered(masters: &[MasterNode]) -> u32 {
+    masters
+        .iter()
+        .flat_map(|master| &master.slots)
+        .map(|&(start, end)| u32::from(end) - u32::from(start) + 1)
+        .sum()
+}
+
+#[must_use]
+pub fn topology_update(old: &[MasterNode], new: &[MasterNode]) -> TopologyUpdate {
+    if old == new {
+        TopologyUpdate::Same
+    } else if slots_covered(new) < slots_covered(old) {
+        TopologyUpdate::Partial
+    } else {
+        TopologyUpdate::Changed
+    }
+}
+
+/// An error a topology change explains: a redirect, a cluster that is
+/// electing a new master, or a node that went away.
+#[must_use]
+pub fn is_topology_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(err) = err.downcast_ref::<redis::RedisError>() {
+        if err.is_io_error() || err.is_connection_dropped() || err.is_timeout() {
+            return true;
+        }
+    }
+    let text = err.to_string();
+    ["MOVED", "ASK", "CLUSTERDOWN", "TRYAGAIN"]
+        .iter()
+        .any(|word| {
+            text.split(|c: char| !c.is_ascii_alphabetic())
+                .any(|w| w == *word)
+        })
+}
+
 /// Put each group's replies back at their keys' positions. `None` if a group
 /// answered with the wrong number of replies.
 #[must_use]
@@ -321,8 +369,9 @@ mod tests {
     use redis::Value;
 
     use super::{
-        by_slot, cross_slot_refusal, group_by_node, key_slot, merge_groups, parse_shards,
-        parse_slots, target_note, MasterNode, NodeGroup,
+        by_slot, cross_slot_refusal, group_by_node, is_topology_error, key_slot, merge_groups,
+        parse_shards, parse_slots, target_note, topology_update, MasterNode, NodeGroup,
+        TopologyUpdate,
     };
 
     fn bulk(text: &str) -> Value {
@@ -467,6 +516,44 @@ mod tests {
             assert!(group.iter().all(|key| key_slot(key) == slot), "{group:?}");
         }
         assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), keys.len());
+    }
+
+    #[test]
+    fn a_failover_is_a_change_once_a_replica_took_over() {
+        let old = three_masters();
+        assert_eq!(topology_update(&old, &old), TopologyUpdate::Same);
+
+        // The master of 0-5460 failed, nobody serves its slots yet.
+        let waiting = old[1..].to_vec();
+        assert_eq!(topology_update(&old, &waiting), TopologyUpdate::Partial);
+
+        let mut promoted = old.clone();
+        promoted[0].id = "a-replica".into();
+        promoted[0].port = 7003;
+        assert_eq!(topology_update(&old, &promoted), TopologyUpdate::Changed);
+
+        // A reshard moves slots between the same masters.
+        let mut resharded = old.clone();
+        resharded[0].slots = vec![(0, 5000)];
+        resharded[1].slots = vec![(5001, 8000), (9000, 10922)];
+        assert_eq!(topology_update(&old, &resharded), TopologyUpdate::Changed);
+    }
+
+    #[test]
+    fn redirects_and_lost_nodes_are_topology_errors() {
+        let err = |text: &str| -> Box<dyn std::error::Error + Send + Sync> { text.into() };
+        for text in [
+            "MOVED 3999 127.0.0.1:7001",
+            "CLUSTERDOWN The cluster is down",
+            "TRYAGAIN",
+        ] {
+            assert!(is_topology_error(err(text).as_ref()), "{text}");
+        }
+        for text in ["WRONGTYPE Operation", "a key named BASKET failed"] {
+            assert!(!is_topology_error(err(text).as_ref()), "{text}");
+        }
+        let io = redis::RedisError::from((redis::ErrorKind::Io, "gone"));
+        assert!(is_topology_error(&io));
     }
 
     #[test]
