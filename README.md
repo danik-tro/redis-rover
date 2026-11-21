@@ -15,13 +15,16 @@ A Redis terminal-ui client written in rust 🦀
 - Browse and filter Redis keys with type-colored badges; module types (`json`, `stream`, `MBbloom--`, ...) show their real name
 - Paginate through large keyspaces via SCAN, and through large values page by page (no `HGETALL` freezes). A page turn costs the same on page 1 and page 10,000, even with 10M keys swept
 - Sort the key list by name, type, TTL or size, show only some types, or browse it as a prefix tree (`user:` → `user:1:`); load the whole keyspace in the background (`Shift-a`) and jump back to the open key (`g o`)
-- View strings, lists, sets, hashes and sorted sets; add, edit and delete keys and items, with a confirm step on delete
+- View strings, lists, sets, hashes, sorted sets and streams; add, edit and delete keys and items, with a confirm step on delete
 - RedisJSON documents pretty-printed; a document above 1 MiB opens as a preview (its top-level fields with type and size, or the first 100 items) instead of freezing the pane
 - Switch between logical databases (`s`) and see the key count of the current one
 - `--read-only` mode for browsing production safely
 - TLS (`rediss://`), including private CAs and mutual TLS
 - Live metrics dashboard (`m`): ops/sec, memory, CPU, network, hit rate and clients charts, pause/reset, cluster summary
 - Pub/Sub tab (`b`): subscribe to channels and patterns, a live log you can pause, message detail with pretty JSON, publish, per-subscription stats and notifications that don't spam
+- MONITOR tail (`g m`): filter, pause, rate sparkline and sampling under load, with a confirm because it costs server CPU
+- Slowlog (`g s`): sort by time or duration, full arguments, reset with a preview
+- Sharded Pub/Sub (Redis 7+) in the Pub/Sub tab, and a read-only Streams view with consumer groups and pending entries
 - Fully configurable key bindings, colors, and styles via a config file (JSON5, JSON, YAML, TOML, INI)
 
 ---
@@ -202,7 +205,7 @@ The open key follows changes made by other clients. When `HSET user:1 name Bob` 
 The value pane's title says how the key is followed:
 
 - `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN NOLOOP` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
-- `◌ polling 2s`: servers without RESP3 (Redis 5 and older), or that refuse `CLIENT TRACKING` (some proxies and managed services), are polled every `live.poll_interval_ms` instead. Each check is one pipeline: `TYPE` + `PTTL` + `DUMP` for keys up to 64 KiB, otherwise the visible page. The value is fetched again only when that changed. Polling pauses on the dashboard and Pub/Sub tabs.
+- `◌ polling 2s`: servers without RESP3 (Redis 5 and older), or that refuse `CLIENT TRACKING` (some proxies and managed services), are polled every `live.poll_interval_ms` instead. Each check is one pipeline: `TYPE` + `PTTL` + `DUMP` for keys up to 64 KiB, otherwise the visible page. The value is fetched again only when that changed. Polling pauses on the server screens (dashboard, Pub/Sub, MONITOR, Slowlog).
 - `✕ not live (reason)`: the connection was lost (`reconnecting`, retried with backoff up to 30 s), or `live.mode = "tracking"` on a server that can't track. After a reconnect the key is fetched again, so a change made in the gap still shows.
 
 If another client deletes the key, or its TTL runs out, the last value stays on screen, dimmed, with `key deleted · 14:22:07` (or `key expired · …`) below it. The cursor doesn't move. If the key is created again, it is shown again.
@@ -244,15 +247,43 @@ In cluster mode `rrover` connects to a single node. SCAN only sees that node's k
 
 Press `b` (from the keyspace or the dashboard) to open the Pub/Sub tab. `b` or `Esc` goes back.
 
-- **Subscribe**: `a` opens a one-field popup. Text with `*`, `?` or `[` subscribes to a pattern (`PSUBSCRIBE`), anything else to a channel; `Tab` flips the kind. The left list also shows the server's other channels (`PUBSUB CHANNELS` with subscriber counts, `r` refreshes them); `Enter` on one subscribes to it. `d` unsubscribes, `c` clears the messages and stats.
+- **Subscribe**: `a` opens a one-field popup. Text with `*`, `?` or `[` subscribes to a pattern (`PSUBSCRIBE`), anything else to a channel; `Tab` cycles channel → pattern → shard (`SSUBSCRIBE`, Redis 7+; on older servers shard is dimmed with `needs Redis 7`). The left list also shows the server's other channels (`PUBSUB CHANNELS` with subscriber counts, `r` refreshes them); `Enter` on one subscribes to it. `d` unsubscribes, `c` clears the messages and stats.
 - **Log**: the right pane shows the selected subscription's messages (time, concrete channel, one-line preview; binary payloads as `[binary N B]` plus hex). `Tab` moves the focus between the list and the log. The log follows the newest message; `Space` or `k` pauses it, and the title counts what arrived since (`paused · +128 new`). `Space` again, or `j` past the last row, follows again. Each subscription keeps the last 1,000 messages (8 MiB): if the paused rows are evicted, the view moves to the oldest message still kept.
 - **Detail**: `Enter` in the log opens the message: channel, pattern, time, size (and `truncated (original …)` when it was cut at 64 KiB), and the payload in the same viewer as string values: JSON pretty-printed, `w` wrap, arrows pan, binary as a hex dump. `Esc` closes it.
 - **Copy**: `y` copies the selected message's payload (binary as hex; the toast says `truncated` when the stored payload was cut), `Shift-y` its channel.
 - **Stats** under the log: message count, bytes, average and largest size, rate over the last second and minute, time of the last message, and for patterns the five busiest channels.
-- **Publish**: `Shift-p` opens a popup with a channel (prefilled from the selection) and a multi-line payload; `Ctrl-s` sends, and a toast says how many subscribers got it. Disabled with `--read-only`.
+- **Publish**: `Shift-p` opens a popup with a channel (prefilled from the selection) and a multi-line payload; `Ctrl-t` switches between `PUBLISH` and `SPUBLISH` (it starts on `SPUBLISH` from a shard subscription), `Ctrl-s` sends, and a toast says how many subscribers got it. Disabled with `--read-only`.
 - **Notifications**: off by default, `Shift-n` toggles them per subscription. The first message toasts, later ones only bump the unread badge (per subscription, and `PubSub N` in the footer outside the tab) until the subscription has been quiet for 30 s. A subscription above 10 msg/s for 10 s is muted (`🔕`) until you press `Shift-n` again.
 
-Subscriptions use their own connection, keep collecting while you're in other views, and resubscribe after a lost connection (the log marks the gap). They last for the session only. In cluster mode `PUBSUB CHANNELS` lists the connected node's channels only. Buffer sizes and notification thresholds are set in the `pubsub` section of the config.
+Subscriptions use their own connection, keep collecting while you're in other views, and resubscribe after a lost connection (the log marks the gap). They last for the session only. In cluster mode `PUBSUB CHANNELS` lists the connected node's channels only, and a shard subscription only works for channels this node owns. Buffer sizes and notification thresholds are set in the `pubsub` section of the config.
+
+### MONITOR
+
+> **MONITOR costs the server CPU**, and more the busier the server is: it sends every command to this client. Avoid it on a loaded production server.
+
+`g m` opens the screen and asks before starting (on `prod` you type `monitor`). It stops when you leave the screen, and `CLIENT LIST` then shows no monitor client. Set `monitor.keep_running` to keep it running.
+
+- **Log**: time, DB, client and the command with its arguments, shortened. `Enter` shows the line in full (each argument is kept up to 1 KiB).
+- **Filter**: `/` takes a glob that matches the command (any case) or any argument, such as `SET` or `user:*`.
+- **Pause**: `Space` freezes the view and the title counts `+N new`. `c` clears the log, `t` starts or stops MONITOR.
+- **Under load**: above `monitor.max_rate` lines per second (5,000) rrover keeps one line in N and the title shows `sampling 1/N`. The buffer is bounded by `monitor.buffer_lines` (10,000) and `monitor.buffer_bytes` (16 MiB).
+
+A server that refuses MONITOR (an ACL, a managed service) is reported on the screen. A lost connection reconnects with backoff.
+
+### Slowlog
+
+`g s` lists `SLOWLOG GET 128`: ID, time, duration, client and command. The title shows `slowlog-log-slower-than` and `slowlog-max-len`, or `unknown` where `CONFIG` is disabled.
+
+`o` sorts by time or duration, `Enter` shows the full arguments, and `r` reloads. `Shift-r` runs `SLOWLOG RESET` after showing it in the write preview; on this screen it doesn't toggle read-only, and read-only mode refuses the reset.
+
+### Streams
+
+Open a stream key like any other value. Entries are listed newest first, with a readable time from the ID, and page with `n` / `p`. Paging works on every server with streams (Redis 5+).
+
+- **Entry**: `Enter` shows its fields in two columns, with JSON values pretty-printed. `y` copies the entry as JSON.
+- **Groups**: `Tab` switches between entries and consumer groups (consumers, pending, lag on Redis 7+, last delivered ID). `Enter` on a group shows its consumers and first 100 pending entries (ID, consumer, idle time, deliveries).
+
+The view is read-only: there is no `XADD`, `XDEL`, `XACK` or `XCLAIM`.
 
 ### TLS
 
@@ -309,6 +340,8 @@ Press `?` in the app for the full list. Defaults:
 | `v` | Tree view (`←` / `→` fold and unfold) |
 | `Shift-a` | Load all keys (`Esc` stops) |
 | `g o` | Go to the open key |
+| `g m` / `g s` / `g p` / `g d` | Go to MONITOR / Slowlog / Pub/Sub / dashboard (every screen; `Esc` returns to the keyspace) |
+| `Tab` | In a stream: entries / consumer groups |
 | `r` | Refresh keyspace |
 | `a` | Add a new key |
 | `i` | Add an item to the open collection |
@@ -360,6 +393,32 @@ Press `?` in the app for the full list. Defaults:
 | `Shift-n` | Toggle notifications |
 | `r` | Refresh server channels |
 | `Shift-r` | Toggle read-only |
+
+**MONITOR**
+
+| Key | Action |
+|---|---|
+| `Esc` | Back (closes the filter or detail first) |
+| `t` | Start / stop MONITOR |
+| `/` | Filter by command or key glob |
+| `Space` | Pause / follow |
+| `c` | Clear the log |
+| `Enter` | Open the selected line |
+| `j` / `k` | Move (`k` pauses the log) |
+| `w`, `←` / `→` | Wrap / pan the detail |
+| `Shift-r` | Toggle read-only |
+
+**Slowlog**
+
+| Key | Action |
+|---|---|
+| `Esc` | Back (closes the detail first) |
+| `j` / `k` | Move |
+| `Enter` | Show the full arguments |
+| `o` | Sort by time / duration |
+| `r` | Reload |
+| `Shift-r` | `SLOWLOG RESET` (shows a preview) |
+| `w`, `←` / `→` | Wrap / pan the detail |
 
 In the write preview, `y` runs the write and `n` / `Esc` cancels. In the typed confirm on `prod`, `Enter` deletes once the key name matches.
 
@@ -422,7 +481,7 @@ cargo clippy --all-targets --all-features -- -D warnings -W clippy::all -W clipp
 cargo fmt --check
 ```
 
-The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging (including paging to page 1,000 over 1M keys, each page under 100 ms), DB switching, `--read-only`, value edits, Pub/Sub reconnects and TLS, and run in CI on every push, PR and nightly.
+The integration tests (`tests/integration.rs`) start `redis:7-alpine` with [testcontainers](https://crates.io/crates/testcontainers), one container per test, so they don't touch your own Redis. They cover SCAN paging (including paging to page 1,000 over 1M keys, each page under 100 ms), DB switching, `--read-only`, value edits, Pub/Sub reconnects, MONITOR, Slowlog, sharded Pub/Sub, streams and TLS, and run in CI on every push, PR and nightly.
 
 If a change touches the keyspace or rendering, run the benches before and after and compare with `benches/baseline.md` (the sol 01 baseline plus an "After sol 02" section). `scripts/bench.sh` without `--quick` also runs the 10M-key case, which takes a few minutes and about 2 GB of RAM.
 
