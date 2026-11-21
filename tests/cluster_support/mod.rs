@@ -49,6 +49,8 @@ fn build_image() {
 pub struct ClusterFixture {
     name: String,
     seeds: Vec<String>,
+    /// Every node, so a client can start after one was killed.
+    nodes: Vec<String>,
 }
 
 impl ClusterFixture {
@@ -74,7 +76,11 @@ impl ClusterFixture {
             .iter()
             .map(|port| format!("redis://127.0.0.1:{port}"))
             .collect();
-        let fixture = Self { name, seeds };
+        let nodes = PORTS
+            .iter()
+            .map(|port| format!("redis://127.0.0.1:{port}"))
+            .collect();
+        let fixture = Self { name, seeds, nodes };
         fixture.wait_ready();
         fixture
     }
@@ -90,13 +96,28 @@ impl ClusterFixture {
         }
     }
 
+    /// Kill one node; the container and the other nodes keep running.
+    pub fn kill_node(&self, port: u16) {
+        let port = port.to_string();
+        // SHUTDOWN closes the connection, so its exit status says nothing.
+        let _ = docker(&[
+            "exec",
+            &self.name,
+            "redis-cli",
+            "-p",
+            &port,
+            "shutdown",
+            "nosave",
+        ]);
+    }
+
     /// A plain client on the first seed.
     pub fn seed(&self) -> redis::Client {
         redis::Client::open(self.seeds[0].as_str()).expect("valid seed")
     }
 
     pub fn client(&self) -> ClusterClient {
-        ClusterClient::new(self.seeds.clone()).expect("valid seeds")
+        ClusterClient::new(self.nodes.clone()).expect("valid seeds")
     }
 }
 
