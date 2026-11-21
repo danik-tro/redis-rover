@@ -81,7 +81,7 @@ impl App {
         }
 
         // Keep a half-open keyspace overlay from swallowing dashboard keys.
-        if self.mode == Mode::Dashboard {
+        if matches!(self.mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog) {
             // Esc backs out of the help overlay first; any other key (`m`)
             // goes through as a real command.
             if is_cancel && self.help_is_open() {
@@ -212,7 +212,7 @@ impl App {
                 multiline: self.pubsub.is_payload_focused(),
             });
         }
-        if self.mode == Mode::Dashboard
+        if matches!(self.mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog)
             || self.keyspace.is_sort_menu_open()
             || self.keyspace.is_type_menu_open()
         {

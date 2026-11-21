@@ -149,6 +149,16 @@ pub enum Action {
     KeysDeleted(u64),
     /// Something the user should know that is not an error (a toast).
     Notice(String),
+    /// `g m`: jump to the MONITOR screen.
+    GoToMonitor,
+    /// `g s`: jump to the Slowlog screen.
+    GoToSlowlog,
+    /// `g p`: jump to the Pub/Sub tab.
+    GoToPubSub,
+    /// `g d`: jump to the metrics dashboard.
+    GoToDashboard,
+    /// Esc on a server screen: back to the key list.
+    LeaveScreen,
 }
 
 impl Action {

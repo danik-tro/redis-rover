@@ -13,11 +13,11 @@
             │ Toggle read-only                      Shift-R         │
             │ Toggle this help                      ?               │
             │ Quit                                  Ctrl-c          │
+            │ Go to MONITOR                         g m             │
+            │ Go to Slowlog                         g s             │
+            │ Go to Pub/Sub                         g p             │
+            │ Go to metrics dashboard               g d             │
             │ Undo / redo in a text input           Ctrl-U / Ctrl-R │
-            │                                                       │
-            │                                                       │
-            │                                                       │
-            │                                                       │
             │                                                       │
             │                                                       │
             │                                                       │

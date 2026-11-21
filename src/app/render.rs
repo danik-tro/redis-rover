@@ -26,7 +26,9 @@ use crate::{
         db_picker::DbPickerWidget,
         info::{build_hint, InfoWidget},
         keyspace::KeySpaceWidget,
+        monitor::{MonitorView, MonitorWidget},
         pubsub::PubSubWidget,
+        slowlog::{SlowlogView, SlowlogWidget},
         toast::ToastWidget,
     },
 };
@@ -94,6 +96,48 @@ const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::YankValue, "yank"),
     (Command::YankKey, "channel"),
     (Command::ToggleHelp, "help"),
+];
+
+/// Footer hint entries for the MONITOR screen, in display order.
+const MONITOR_HINT_ENTRIES: &[(Command, &str)] = &[
+    (Command::LeaveScreen, "back"),
+    (Command::GoToSlowlog, "slowlog"),
+    (Command::GoToPubSub, "pubsub"),
+    (Command::GoToDashboard, "metrics"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// Footer hint entries for the Slowlog screen, in display order.
+const SLOWLOG_HINT_ENTRIES: &[(Command, &str)] = &[
+    (Command::LeaveScreen, "back"),
+    (Command::GoToMonitor, "monitor"),
+    (Command::GoToPubSub, "pubsub"),
+    (Command::GoToDashboard, "metrics"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// `?` help rows for the `g` jumps, shown on every top-level screen.
+const GO_TO_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::GoToMonitor, "Go to MONITOR"),
+    (Command::GoToSlowlog, "Go to Slowlog"),
+    (Command::GoToPubSub, "Go to Pub/Sub"),
+    (Command::GoToDashboard, "Go to metrics dashboard"),
+];
+
+/// `?` help rows for the MONITOR screen, in display order.
+const MONITOR_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::LeaveScreen, "Back to keyspace"),
+    (Command::ToggleReadOnly, "Toggle read-only"),
+    (Command::ToggleHelp, "Toggle this help"),
+    (Command::Quit, "Quit"),
+];
+
+/// `?` help rows for the Slowlog screen, in display order.
+const SLOWLOG_HELP_ENTRIES: &[(Command, &str)] = &[
+    (Command::LeaveScreen, "Back to keyspace"),
+    (Command::ToggleReadOnly, "Toggle read-only"),
+    (Command::ToggleHelp, "Toggle this help"),
+    (Command::Quit, "Quit"),
 ];
 
 /// `?` help rows for the Pub/Sub tab, in display order.
@@ -276,6 +320,8 @@ impl App {
             self.redraw.wall_sec = wall_sec(wall);
             self.pubsub.build_view(main, now, wall)
         });
+        self.frame.monitor = (mode == Mode::Monitor).then(MonitorView::default);
+        self.frame.slowlog = (mode == Mode::Slowlog).then(SlowlogView::default);
     }
 
     /// Whether `Render` at `now` should draw (#50): something changed
@@ -345,6 +391,8 @@ impl App {
         let (mode, entries) = match self.mode {
             Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HINT_ENTRIES),
             Mode::PubSub => (Mode::PubSub, PUBSUB_HINT_ENTRIES),
+            Mode::Monitor => (Mode::Monitor, MONITOR_HINT_ENTRIES),
+            Mode::Slowlog => (Mode::Slowlog, SLOWLOG_HINT_ENTRIES),
             _ => (Mode::KeySpace, KEYSPACE_HINT_ENTRIES),
         };
         let read_only = self.is_read_only();
@@ -409,6 +457,16 @@ impl App {
                 self.pubsub.cluster_mode = self.frame.cluster;
                 if let Some(view) = self.frame.pubsub.take() {
                     StatefulWidget::render(PubSubWidget { view }, area, buf, &mut self.pubsub);
+                }
+            }
+            Mode::Monitor => {
+                if let Some(view) = &self.frame.monitor {
+                    MonitorWidget { view }.render(area, buf);
+                }
+            }
+            Mode::Slowlog => {
+                if let Some(view) = &self.frame.slowlog {
+                    SlowlogWidget { view }.render(area, buf);
                 }
             }
             Mode::Common | Mode::Popup(_) => {}
@@ -495,11 +553,14 @@ impl App {
         let (lookup_mode, entries) = match mode {
             Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HELP_ENTRIES),
             Mode::PubSub => (Mode::PubSub, PUBSUB_HELP_ENTRIES),
+            Mode::Monitor => (Mode::Monitor, MONITOR_HELP_ENTRIES),
+            Mode::Slowlog => (Mode::Slowlog, SLOWLOG_HELP_ENTRIES),
             _ => (Mode::KeySpace, KEYSPACE_HELP_ENTRIES),
         };
 
         let mut rows: Vec<(String, String)> = entries
             .iter()
+            .chain(GO_TO_HELP_ENTRIES)
             .map(|(command, label)| {
                 let mut binds = keybindings.get_config_for_command(lookup_mode, *command);
                 binds.extend(keybindings.get_config_for_command(Mode::Common, *command));
@@ -513,7 +574,7 @@ impl App {
             .collect();
         // Fixed by ratatui-textarea, so not in the keybindings: listed for
         // the screens that have text inputs.
-        if mode != Mode::Dashboard {
+        if !matches!(mode, Mode::Dashboard | Mode::Monitor | Mode::Slowlog) {
             rows.extend(
                 TEXT_INPUT_HELP
                     .iter()

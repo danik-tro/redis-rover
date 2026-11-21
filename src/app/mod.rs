@@ -8,6 +8,7 @@ mod input;
 mod keyspace;
 mod live;
 mod load;
+mod navigation;
 mod power;
 mod pubsub;
 mod render;

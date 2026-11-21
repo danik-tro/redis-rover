@@ -23,16 +23,19 @@ impl App {
                 self.mode = self.pubsub_return;
                 self.sync_hint();
             }
-            Mode::KeySpace | Mode::Dashboard => {
-                self.pubsub_return = self.mode;
-                self.mode = Mode::PubSub;
-                self.sync_hint();
-                self.mark_selected_read();
-                self.summary.pubsub_unread = 0;
-                self.fetch_pubsub_channels();
-            }
-            Mode::Common | Mode::Popup(_) => {}
+            Mode::KeySpace | Mode::Dashboard => self.open_pubsub(self.mode),
+            Mode::Monitor | Mode::Slowlog | Mode::Common | Mode::Popup(_) => {}
         }
+    }
+
+    /// Show the Pub/Sub tab; `b` / Esc in it goes back to `back_to`.
+    pub(super) fn open_pubsub(&mut self, back_to: Mode) {
+        self.pubsub_return = back_to;
+        self.mode = Mode::PubSub;
+        self.sync_hint();
+        self.mark_selected_read();
+        self.summary.pubsub_unread = 0;
+        self.fetch_pubsub_channels();
     }
 
     /// Enter in the add popup: subscribe to the target typed.

@@ -12,7 +12,7 @@ use crate::{
         pubsub_store::PubSubStore,
         types::{KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
-    widgets::{info::FooterText, pubsub::PubSubView},
+    widgets::{info::FooterText, monitor::MonitorView, pubsub::PubSubView, slowlog::SlowlogView},
 };
 
 #[derive(Clone, Debug)]
@@ -84,6 +84,10 @@ pub struct FrameData {
     /// The Pub/Sub tab's rows; `None` outside the tab. Taken by the widget
     /// when it draws.
     pub pubsub: Option<PubSubView>,
+    /// The MONITOR screen; `None` outside it.
+    pub monitor: Option<MonitorView>,
+    /// The Slowlog screen; `None` outside it.
+    pub slowlog: Option<SlowlogView>,
 }
 
 impl FrameData {

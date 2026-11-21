@@ -76,6 +76,11 @@ impl App {
             Action::Resize(..) | Action::Render | Action::Refresh => {}
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
+            Action::GoToMonitor => self.go_to(Mode::Monitor),
+            Action::GoToSlowlog => self.go_to(Mode::Slowlog),
+            Action::GoToPubSub => self.go_to(Mode::PubSub),
+            Action::GoToDashboard => self.go_to(Mode::Dashboard),
+            Action::LeaveScreen => self.leave_screen(),
             Action::NextChart => self.dashboard.next_chart(),
             Action::PrevChart => self.dashboard.prev_chart(),
             Action::ToggleAllCharts => self.dashboard.toggle_all(),
