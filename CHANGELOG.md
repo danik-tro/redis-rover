@@ -21,8 +21,13 @@ First public release. Requires Rust 1.97 or newer.
   not supported yet".
 - DB switching: `s` opens a DB picker, and the footer shows `db N · K keys`.
 - `--read-only` flag: every write is refused, and the footer shows an `RO` badge.
-- Cluster warning: in cluster mode a banner says SCAN only sees the connected node, and
-  the footer key count is marked `(this node)`.
+- Redis Cluster: `redis-cluster://` URLs and auto-detection, one keyspace swept over every
+  master, reads and writes routed by slot, cross-slot renames refused with the slot numbers,
+  a rescan after a failover or resharding, a per-node dashboard, Slowlog and MONITOR, and
+  sharded Pub/Sub and live updates on the slot owner. If the nodes can't be reached, the
+  session stays on one node, with a banner and a `(this node)` key count.
+- Redis Sentinel: `redis+sentinel://` URLs and `sentinel` profile fields. Every connection
+  follows the master through a failover, with the master named in the footer and a toast.
 - TLS for `rediss://` URLs: bundled Mozilla roots, `--tls-ca`, `--tls-cert`/`--tls-key`
   for mutual TLS, and `--insecure`.
 - `--token` prompts for the password, so it stays out of shell history.
