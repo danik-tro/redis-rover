@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::{
+    aio::{ConnectionManager, ConnectionManagerConfig},
+    cluster::{ClusterClient, ClusterConfig},
+};
 use tokio::{
     sync::mpsc::{self, Sender as ActionSender, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
@@ -21,7 +24,7 @@ mod power;
 
 use super::{
     client,
-    conn::Conn,
+    conn::{Conn, Connector},
     event::RedisEvent,
     live::{self, LiveCmd},
     monitor::{self, MonitorCmd},
@@ -68,6 +71,8 @@ pub struct Runner {
     /// The client the app started with. A DB switch builds a new connection
     /// from it, so TLS settings and credentials carry over.
     client: redis::Client,
+    /// Opens the state task's connections (one server, or the cluster).
+    connector: Connector,
     manager: Conn,
     /// Refuse every write. Shared with `App`, so toggling it in the session
     /// moves the guarantee too.
@@ -125,6 +130,7 @@ impl Runner {
 
         Self {
             cancellation_token,
+            connector: Connector::single(client.clone()),
             client,
             manager: manager.into(),
             read_only: Arc::new(AtomicBool::new(false)),
@@ -149,6 +155,13 @@ impl Runner {
     #[must_use]
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Open the state task's connections with `connector` (a cluster).
+    #[must_use]
+    pub fn connector(mut self, connector: Connector) -> Self {
+        self.connector = connector;
         self
     }
 
@@ -292,21 +305,28 @@ impl Runner {
         let action_tx = self.action_tx.clone();
         let state = self.state.clone();
         let storage = Storage::new(manager);
-        let client = self.client.clone();
+        let connector = self.connector.clone();
         let read_only = Arc::clone(&self.read_only);
 
         self.state_task = tokio::spawn(async move {
             // Values load over their own connection, so a large value reply
             // never holds back a keys page queued behind it on the socket.
-            let value_storage = match connect(client.clone(), Link::Interactive).await {
+            let db = *state.db.lock();
+            let value_storage = match connector.open(db, Link::Interactive).await {
                 Ok(manager) => Storage::new(manager),
                 Err(err) => {
                     log::warn!("Opening the value connection failed, sharing the main one: {err}");
                     storage.clone()
                 }
             };
-            let mut event_handler =
-                EventHandler::new(state, action_tx, storage, value_storage, client, read_only);
+            let mut event_handler = EventHandler::new(
+                state,
+                action_tx,
+                storage,
+                value_storage,
+                connector,
+                read_only,
+            );
             event_handler.load_db_count().await;
 
             // Events already waiting when one arrives; see `superseded`.
@@ -451,8 +471,8 @@ pub struct EventHandler {
     storage: Storage,
     /// Connection the value fetches use (see [`EventHandler::fetch_value`]).
     value_storage: Storage,
-    /// Base client used to open a connection to another DB.
-    client: redis::Client,
+    /// Opens a connection to another DB (or, on a cluster, another handle).
+    connector: Connector,
     read_only: Arc<AtomicBool>,
     /// `ValueState::generation` of the last value fetch started.
     last_value_generation: Option<u64>,
@@ -507,7 +527,7 @@ impl EventHandler {
         tx: ActionSender<Action>,
         storage: Storage,
         value_storage: Storage,
-        client: redis::Client,
+        connector: Connector,
         read_only: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -515,7 +535,7 @@ impl EventHandler {
             tx,
             storage,
             value_storage,
-            client,
+            connector,
             read_only,
             last_value_generation: None,
             keys_unfinished: false,
@@ -954,10 +974,7 @@ impl EventHandler {
     }
 
     async fn connect_db(&self, db: i64, link: Link) -> Result<Conn, FetchError> {
-        let info = self.client.get_connection_info().clone();
-        let settings = info.redis_settings().clone().set_db(db);
-        let client = redis::Client::open(info.set_redis_settings(settings))?;
-        connect(client, link).await
+        self.connector.open(db, link).await
     }
 
     /// Fetch the selected value's current page in a separate task on the value
@@ -1162,6 +1179,31 @@ async fn sweep_to_end(
 pub async fn connect(client: redis::Client, link: Link) -> Result<Conn, FetchError> {
     let overall = config::get().connection.connect_timeout();
     connect_within(client, link, overall).await
+}
+
+/// Open a cluster connection with the same timeouts as [`connect`].
+///
+/// # Errors
+///
+/// No seed can be reached, the cluster's topology can't be read, or the
+/// attempts time out.
+pub async fn connect_cluster(client: &ClusterClient, link: Link) -> Result<Conn, FetchError> {
+    let timeouts = config::get().connection;
+    let response = match link {
+        Link::Interactive => timeouts.response_timeout(),
+        Link::Bulk => timeouts.bulk_response_timeout(),
+    };
+    let cluster_config = ClusterConfig::new()
+        .set_response_timeout(response)
+        .set_connection_timeout(timeouts.connect_timeout());
+    let overall = timeouts.connect_timeout();
+    let connection = tokio::time::timeout(
+        overall,
+        client.get_async_connection_with_config(cluster_config),
+    )
+    .await
+    .map_err(|_| format!("connecting to the cluster timed out after {overall:?}"))??;
+    Ok(connection.into())
 }
 
 /// How long the manager's retries may go on at startup, on top of the
