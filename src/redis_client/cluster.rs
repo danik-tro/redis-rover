@@ -81,6 +81,66 @@ pub fn group_by_node<K: AsRef<str>>(keys: &[K], masters: &[MasterNode]) -> Vec<N
     groups
 }
 
+/// `from` and `to` can't be renamed / copied into each other: the refusal,
+/// with both slot numbers and how to fix it. `None` when they share a slot.
+#[must_use]
+pub fn cross_slot_refusal(from: &str, to: &str) -> Option<String> {
+    let (a, b) = (key_slot(from), key_slot(to));
+    (a != b).then(|| {
+        format!(
+            "keys are in different slots ({a} vs {b}): a hash tag puts them in one, \
+             like {{tag}}:a and {{tag}}:b"
+        )
+    })
+}
+
+/// The preview's line naming where a write goes: `node host:port · slot n`
+/// for one key, or one `host:port (n keys)` per node for several. `None`
+/// without keys or before the masters are known.
+#[must_use]
+pub fn target_note(keys: &[&str], masters: &[MasterNode]) -> Option<String> {
+    if keys.is_empty() || masters.is_empty() {
+        return None;
+    }
+    let addr = |group: &NodeGroup| {
+        masters
+            .iter()
+            .find(|master| master.route_slot() == Some(group.slot))
+            .map_or_else(
+                || "unassigned slot".to_owned(),
+                |master| format!("{}:{}", master.host, master.port),
+            )
+    };
+    let groups = group_by_node(keys, masters);
+    match groups.as_slice() {
+        [group] if keys.len() == 1 => {
+            Some(format!("node {} · slot {}", addr(group), key_slot(keys[0])))
+        }
+        [group] => Some(format!("node {}", addr(group))),
+        groups => {
+            let nodes: Vec<String> = groups
+                .iter()
+                .map(|group| {
+                    let count = group.indices.len();
+                    let noun = if count == 1 { "key" } else { "keys" };
+                    format!("{} ({count} {noun})", addr(group))
+                })
+                .collect();
+            Some(format!("nodes {}", nodes.join(", ")))
+        }
+    }
+}
+
+/// `keys` by slot: what one multi-key command may carry on a cluster.
+#[must_use]
+pub fn by_slot(keys: &[String]) -> Vec<Vec<String>> {
+    let mut slots = std::collections::BTreeMap::<u16, Vec<String>>::new();
+    for key in keys {
+        slots.entry(key_slot(key)).or_default().push(key.clone());
+    }
+    slots.into_values().collect()
+}
+
 /// Put each group's replies back at their keys' positions. `None` if a group
 /// answered with the wrong number of replies.
 #[must_use]
@@ -261,7 +321,8 @@ mod tests {
     use redis::Value;
 
     use super::{
-        group_by_node, key_slot, merge_groups, parse_shards, parse_slots, MasterNode, NodeGroup,
+        by_slot, cross_slot_refusal, group_by_node, key_slot, merge_groups, parse_shards,
+        parse_slots, target_note, MasterNode, NodeGroup,
     };
 
     fn bulk(text: &str) -> Value {
@@ -365,6 +426,47 @@ mod tests {
         let masters = vec![master("a", 7000, vec![(0, 100)])];
         let groups = group_by_node(&["foo"], &masters);
         assert_eq!(groups[0].slot, 12182);
+    }
+
+    #[test]
+    fn a_cross_slot_move_is_refused_with_both_slots_and_a_hint() {
+        let refusal = cross_slot_refusal("foo", "bar").unwrap();
+        assert!(refusal.contains("12182 vs 5061"), "{refusal}");
+        assert!(refusal.contains("{tag}"), "{refusal}");
+        assert_eq!(cross_slot_refusal("{u1}:a", "{u1}:b"), None);
+    }
+
+    #[test]
+    fn the_preview_names_the_target_node() {
+        let masters = three_masters();
+        assert_eq!(
+            target_note(&["foo"], &masters).unwrap(),
+            "node db.example:7002 · slot 12182"
+        );
+        assert_eq!(
+            target_note(&["{user1000}:a", "{user1000}:b"], &masters).unwrap(),
+            "node db.example:7000"
+        );
+        assert_eq!(
+            target_note(&["foo", "bar", "a"], &masters).unwrap(),
+            "nodes db.example:7002 (2 keys), db.example:7000 (1 key)"
+        );
+        assert_eq!(target_note(&[], &masters), None);
+        assert_eq!(target_note(&["foo"], &[]), None, "one server");
+    }
+
+    #[test]
+    fn multi_key_commands_are_split_by_slot() {
+        let keys: Vec<String> = ["foo", "{foo}:1", "bar", "{bar}:1", "c"]
+            .map(str::to_owned)
+            .to_vec();
+        let groups = by_slot(&keys);
+        assert_eq!(groups.len(), 3);
+        for group in &groups {
+            let slot = key_slot(&group[0]);
+            assert!(group.iter().all(|key| key_slot(key) == slot), "{group:?}");
+        }
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), keys.len());
     }
 
     #[test]

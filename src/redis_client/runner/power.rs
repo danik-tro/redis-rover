@@ -8,6 +8,7 @@ use crate::{
     redis_client::{
         bytes::shown,
         client::{self, CopyUnsupported, Moved, Renamed},
+        cluster,
         types::MemberKind,
         value_edit::ValueEdit,
     },
@@ -19,7 +20,7 @@ impl EventHandler {
     /// `RENAMENX` / `RENAME`. A taken name answers `TargetExists`, so the
     /// App can ask before replacing it.
     pub(super) async fn rename_key(&mut self, from: String, to: String, overwrite: bool) {
-        if !self.same_slot(&from, &to).await {
+        if !self.same_slot(&from, &to) {
             return;
         }
         match client::rename_key(self.storage.manager(), &from, &to, overwrite).await {
@@ -55,7 +56,7 @@ impl EventHandler {
     ) {
         let current = *self.state.db.lock();
         let db = db.filter(|&db| db != current);
-        if db.is_none() && !self.same_slot(&from, &to).await {
+        if db.is_none() && !self.same_slot(&from, &to) {
             return;
         }
         let result = if self.copy_unsupported {
@@ -200,27 +201,22 @@ impl EventHandler {
     }
 
     /// In cluster mode both names must hash to one slot, or `RENAME` /
-    /// `COPY` fail with `CROSSSLOT`; say so up front. `true` outside a
-    /// cluster.
-    async fn same_slot(&self, from: &str, to: &str) -> bool {
-        if !self.cluster_enabled() {
+    /// `COPY` fail with `CROSSSLOT`; say so up front, with both slots and a
+    /// hash-tag hint. `true` outside a cluster.
+    fn same_slot(&self, from: &str, to: &str) -> bool {
+        if !self.storage.is_cluster() && !self.cluster_enabled() {
             return true;
         }
-        match client::key_slots(self.storage.manager(), from, to).await {
-            Ok((a, b)) if a == b => true,
-            Ok((a, b)) => {
+        match cluster::cross_slot_refusal(from, to) {
+            Some(refusal) => {
                 self.action_hook(Action::Error(format!(
-                    "{} (slot {a}) and {} (slot {b}) are in different cluster slots: \
-                     rename / copy can't move a key between slots",
+                    "Can't move {} to {}: {refusal}",
                     shown(from),
                     shown(to)
                 )));
                 false
             }
-            Err(err) => {
-                log::warn!("CLUSTER KEYSLOT failed, trying anyway: {err}");
-                true
-            }
+            None => true,
         }
     }
 

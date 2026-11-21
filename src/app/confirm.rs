@@ -261,6 +261,11 @@ impl App {
         }
         let typed = TypedConfirm::for_event(&event, self.environment);
         let mut all_notes = event.preview_notes();
+        let masters = std::sync::Arc::clone(&self.state.masters.lock());
+        all_notes.extend(crate::redis_client::cluster::target_note(
+            &event.target_keys(),
+            &masters,
+        ));
         all_notes.extend(notes);
         self.pending = Some(PendingConfirm::Write(Box::new(PendingWrite {
             notes: all_notes,

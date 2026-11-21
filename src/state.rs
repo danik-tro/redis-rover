@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use crate::{
     config,
     redis_client::{
+        cluster::MasterNode,
         metrics::MetricsHistory,
         monitor_store::MonitorStore,
         pubsub_store::PubSubStore,
@@ -50,6 +51,9 @@ pub struct SharedState {
     pub slowlog: Arc<Mutex<Option<SlowlogData>>>,
     /// The stream group asked for last, until the App takes it.
     pub stream_group: Arc<Mutex<Option<GroupDetail>>>,
+    /// A cluster's masters, as the sweep last read them (empty on one
+    /// server). The command preview names the target node from it.
+    pub masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
 }
 
 /// Redis's default `databases` setting.
@@ -58,6 +62,7 @@ pub const DEFAULT_DB_COUNT: usize = 16;
 impl Default for SharedState {
     fn default() -> Self {
         Self {
+            masters: Arc::default(),
             info: Arc::new(Mutex::new(None)),
             info_seq: Arc::new(AtomicU64::new(0)),
             keys: Arc::new(Mutex::new(None)),

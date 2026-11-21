@@ -1063,6 +1063,7 @@ impl EventHandler {
         if self.storage.is_cluster() {
             let masters = self.storage.cached_masters().await?;
             let slots: Vec<u16> = masters.iter().filter_map(MasterNode::route_slot).collect();
+            *self.state.masters.lock() = masters;
             self.state.keyspace_state.lock().set_sweep_nodes(&slots);
         }
         let mut scanned = false;
