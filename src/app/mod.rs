@@ -10,6 +10,7 @@ mod live;
 mod load;
 mod monitor;
 mod navigation;
+mod nodes;
 mod power;
 mod pubsub;
 mod render;

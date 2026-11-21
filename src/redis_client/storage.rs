@@ -156,6 +156,14 @@ impl Storage {
         self
     }
 
+    /// This storage with everything sent to the node at `host:port`.
+    #[must_use]
+    pub fn at(&self, host: &str, port: u16) -> Self {
+        let mut storage = self.clone();
+        storage.manager = self.manager.on_address(host, port);
+        storage
+    }
+
     /// This session browses a whole cluster.
     #[must_use]
     pub fn is_cluster(&self) -> bool {

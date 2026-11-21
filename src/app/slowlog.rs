@@ -34,7 +34,14 @@ impl App {
             self.toast.show(READ_ONLY_NOTICE, false, self.clock.now());
             return;
         }
-        self.submit_write(RedisEvent::SlowlogReset, AfterWrite::default());
+        // On a cluster the reset covers one node: say which.
+        self.pin_picked_node();
+        let notes = self
+            .picked_node_label()
+            .map(|node| format!("node {node}"))
+            .into_iter()
+            .collect();
+        self.submit_write_noted(RedisEvent::SlowlogReset, AfterWrite::default(), None, notes);
     }
 
     /// Esc backs out one layer: help, detail, then the screen.

@@ -239,6 +239,7 @@ pub mod internals {
     pub use crate::widgets::info::{Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, LoadProgress, PageInfo};
     pub use crate::widgets::monitor::{Monitor, MonitorWidget};
+    pub use crate::widgets::node_picker::{NodeStrip, MONITOR_NODE_WARNING};
     pub use crate::widgets::pubsub::{PubSub, PubSubWidget};
     pub use crate::widgets::slowlog::{Slowlog, SlowlogWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};

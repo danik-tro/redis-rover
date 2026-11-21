@@ -26,6 +26,7 @@ impl App {
 
     pub(super) fn start_monitor(&mut self) {
         self.monitor_link.on = true;
+        self.pin_picked_node();
         self.send_monitor(MonitorCmd::Start);
     }
 
@@ -34,7 +35,7 @@ impl App {
         self.send_monitor(MonitorCmd::Stop);
     }
 
-    fn send_monitor(&self, cmd: MonitorCmd) {
+    pub(super) fn send_monitor(&self, cmd: MonitorCmd) {
         if let Some(tx) = &self.monitor_link.tx {
             // Closed only while the app shuts down.
             let _ = tx.send(cmd);

@@ -18,6 +18,7 @@ use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    conn::client_at,
     monitor_store::{parse_line, MonitorStatus, MonitorStore, ParsedLine},
     pubsub::{backoff, is_connection_error},
 };
@@ -103,6 +104,7 @@ type Lines = Pin<Box<dyn Stream<Item = Value> + Send>>;
 pub async fn run(
     client: redis::Client,
     store: Arc<Mutex<MonitorStore>>,
+    node: Arc<Mutex<Option<(String, u16)>>>,
     max_rate: u64,
     mut cmd_rx: UnboundedReceiver<MonitorCmd>,
     cancel: CancellationToken,
@@ -110,6 +112,7 @@ pub async fn run(
     let mut task = MonitorTask {
         client,
         store,
+        node,
         sampler: Sampler::new(max_rate),
         conn: None,
         retry: None,
@@ -148,6 +151,8 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 struct MonitorTask {
+    /// The cluster node to watch (`SharedState::ops_node`).
+    node: Arc<Mutex<Option<(String, u16)>>>,
     client: redis::Client,
     store: Arc<Mutex<MonitorStore>>,
     sampler: Sampler,
@@ -177,13 +182,27 @@ impl MonitorTask {
     /// Open the connection. A refusal is final; a network failure retries.
     async fn connect(&mut self, attempt: u32) {
         self.store.lock().set_status(MonitorStatus::Connecting);
-        let opened = tokio::time::timeout(CONNECT_TIMEOUT, self.client.get_async_monitor()).await;
+        // On a cluster, the node picked on the screen.
+        let picked = self.node.lock().clone();
+        let client = match picked {
+            Some((host, port)) => match client_at(&self.client, &host, port) {
+                Ok(client) => client,
+                Err(err) => {
+                    self.store
+                        .lock()
+                        .set_status(MonitorStatus::Failed(err.to_string()));
+                    return;
+                }
+            },
+            None => self.client.clone(),
+        };
+        let opened = tokio::time::timeout(CONNECT_TIMEOUT, client.get_async_monitor()).await;
         match opened {
             Ok(Ok(monitor)) => {
                 // `Value` always converts: another target type would end
                 // the stream on the first line it can't read.
                 let mut lines: Lines = Box::pin(monitor.into_on_message::<Value>());
-                match confirm_started(&self.client, &mut lines).await {
+                match confirm_started(&client, &mut lines).await {
                     Confirmed::Yes => {
                         self.conn = Some(lines);
                         self.store.lock().set_status(MonitorStatus::Running);

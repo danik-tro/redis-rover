@@ -15,7 +15,10 @@ use crate::{
         slowlog::SlowlogData,
         types::{GroupDetail, KeyMeta, KeyspaceState, LoadedValue, PageRow, RedisInfo, ValueState},
     },
-    widgets::{dashboard::ClusterView, info::FooterText, monitor::MonitorView, pubsub::PubSubView},
+    widgets::{
+        dashboard::ClusterView, info::FooterText, monitor::MonitorView, node_picker::NodeStrip,
+        pubsub::PubSubView,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,9 @@ pub struct SharedState {
     /// A cluster's masters, as the sweep last read them (empty on one
     /// server). The command preview names the target node from it.
     pub masters: Arc<Mutex<Arc<Vec<MasterNode>>>>,
+    /// The node the Slowlog and MONITOR screens look at (`host`, `port`);
+    /// `None` until one is picked, and always on one server.
+    pub ops_node: Arc<Mutex<Option<(String, u16)>>>,
     /// A metrics history per master, for the cluster dashboard.
     pub cluster_metrics: Arc<Mutex<ClusterMetrics>>,
 }
@@ -65,6 +71,7 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             masters: Arc::default(),
+            ops_node: Arc::default(),
             cluster_metrics: Arc::new(Mutex::new(ClusterMetrics::new(
                 config::get().dashboard.history(),
             ))),
@@ -112,6 +119,8 @@ pub struct FrameData {
     /// The Pub/Sub tab's rows; `None` outside the tab. Taken by the widget
     /// when it draws.
     pub pubsub: Option<PubSubView>,
+    /// The node row of the Slowlog / MONITOR screen on a cluster.
+    pub node_strip: Option<NodeStrip>,
     /// The MONITOR screen; `None` outside it.
     pub monitor: Option<MonitorView>,
 }
