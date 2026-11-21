@@ -328,6 +328,12 @@ impl App {
         let [main, _] = layout(area);
         let (now, wall) = (self.clock.now(), self.clock.wall());
         self.frame.cluster = self.cluster_enabled();
+        self.frame.whole_cluster = self
+            .state
+            .info
+            .lock()
+            .as_ref()
+            .is_some_and(|info| info.whole_cluster);
         self.frame.refresh_footer(&self.state);
         self.redraw.info_seq = self.frame.footer.key().map_or(0, |(seq, _)| seq);
         let mode = self.view_mode();
@@ -560,7 +566,8 @@ impl App {
     }
 
     fn render_key_space(&mut self, area: Rect, buf: &mut Buffer) {
-        self.keyspace.cluster_mode = self.frame.cluster;
+        // Only a session stuck on one node of a cluster has a partial list.
+        self.keyspace.cluster_mode = self.frame.cluster && !self.frame.whole_cluster;
         StatefulWidget::render(KeySpaceWidget, area, buf, &mut self.keyspace);
     }
 

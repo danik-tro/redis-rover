@@ -91,6 +91,8 @@ pub struct FrameData {
     pub footer: FooterText,
     /// The server runs in cluster mode.
     pub cluster: bool,
+    /// The session browses the whole cluster (not one node of it).
+    pub whole_cluster: bool,
     /// Metrics window for the dashboard's width; `None` outside the
     /// dashboard and while it is paused (it draws its frozen copy then).
     pub metrics: Option<MetricsHistory>,

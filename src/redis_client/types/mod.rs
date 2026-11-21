@@ -63,6 +63,9 @@ pub struct RedisInfo {
     /// Key count per DB, from the `# Keyspace` section (`db3:keys=120,...`).
     /// Empty DBs are not listed by Redis.
     pub keyspace: BTreeMap<i64, u64>,
+    /// `keyspace` counts every master of a cluster, not the node that
+    /// answered `INFO`.
+    pub whole_cluster: bool,
 }
 
 impl From<HashMap<&str, &str>> for RedisInfo {
@@ -74,6 +77,7 @@ impl From<HashMap<&str, &str>> for RedisInfo {
         Self {
             common: CommonInfo::from(map),
             keyspace,
+            whole_cluster: false,
         }
     }
 }
