@@ -12,6 +12,7 @@ use redis::{FromRedisValue, ScanOptions};
 use super::{
     bytes::{strings, Raw, Text},
     client,
+    cluster::{parse_shards, parse_slots, MasterNode},
     conn::Conn,
     pubsub_store::ServerChannels,
     slowlog::{parse_config_int, parse_entries, SlowlogData, SLOWLOG_FETCH},
@@ -49,6 +50,33 @@ fn scan_cmd(
     let mut cmd = redis::cmd("SCAN");
     cmd.arg(cursor).arg(options);
     cmd
+}
+
+/// One `SCAN` step on `conn`.
+async fn scan_step(
+    conn: &mut Conn,
+    cursor: u64,
+    pattern: Option<&str>,
+    count: usize,
+    scan_type: Option<&str>,
+) -> redis::RedisResult<(u64, Vec<String>)> {
+    // Key names are bytes: one that isn't UTF-8 must not fail the page.
+    let (cursor, keys): (u64, Vec<Text>) = scan_cmd(cursor, pattern, count, scan_type)
+        .query_async(conn)
+        .await?;
+    Ok((cursor, strings(keys)))
+}
+
+/// `TYPE` of every key on `conn`, in one pipeline.
+async fn types_on(conn: &mut Conn, keys: &[String]) -> redis::RedisResult<Vec<String>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = redis::pipe();
+    for key in keys {
+        pipe.cmd("TYPE").arg(Raw(key));
+    }
+    pipe.query_async(conn).await
 }
 
 /// Most `SCAN` steps one [`Storage::scan_until`] call runs.
@@ -101,11 +129,7 @@ impl Storage {
         scan_type: Option<&str>,
     ) -> redis::RedisResult<(u64, Vec<String>)> {
         let mut manager = self.manager.clone();
-        // Key names are bytes: one that isn't UTF-8 must not fail the page.
-        let (cursor, keys): (u64, Vec<Text>) = scan_cmd(cursor, pattern, count, scan_type)
-            .query_async(&mut manager)
-            .await?;
-        Ok((cursor, strings(keys)))
+        scan_step(&mut manager, cursor, pattern, count, scan_type).await
     }
 
     /// Answer a [`SweepRequest`]: run `SCAN` steps from its cursor until they
@@ -131,6 +155,11 @@ impl Storage {
             batch: Vec::new(),
             checked: 0,
         };
+        // On a cluster the cursor only means something on its own master.
+        let mut conn = match request.node {
+            Some(slot) => self.manager.on_slot(slot),
+            None => self.manager.clone(),
+        };
         let started = Instant::now();
         let mut count = request.scan_count;
         let mut steps = 0;
@@ -139,9 +168,14 @@ impl Storage {
             TypeScan::All | TypeScan::Client(_) => None,
         };
         loop {
-            let step = self
-                .scan_batch(result.cursor, request.pattern.as_deref(), count, scan_type)
-                .await;
+            let step = scan_step(
+                &mut conn,
+                result.cursor,
+                request.pattern.as_deref(),
+                count,
+                scan_type,
+            )
+            .await;
             let (cursor, keys) = match step {
                 Ok(step) => step,
                 // A server reply error (not I/O): the server can't do TYPE.
@@ -157,7 +191,7 @@ impl Storage {
             let found_before = result.batch.len();
             match &request.types {
                 TypeScan::Client(filter) => {
-                    let types = self.fetch_types(&keys).await?;
+                    let types = types_on(&mut conn, &keys).await?;
                     result.batch.extend(
                         keys.into_iter()
                             .zip(types)
@@ -186,15 +220,42 @@ impl Storage {
     ///
     /// Returns an error if the pipeline fails.
     pub async fn fetch_types(&self, keys: &[String]) -> redis::RedisResult<Vec<String>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
+        types_on(&mut self.manager.home(), keys).await
+    }
+
+    /// The cluster's masters, in slot order: `CLUSTER SHARDS`, or
+    /// `CLUSTER SLOTS` on a server before Redis 7.
+    ///
+    /// # Errors
+    ///
+    /// Both commands fail, or the reply names no master.
+    pub async fn masters(&self) -> redis::RedisResult<Vec<MasterNode>> {
+        let mut conn = self.manager.home();
+        let shards = redis::cmd("CLUSTER")
+            .arg("SHARDS")
+            .query_async::<redis::Value>(&mut conn)
+            .await;
+        let masters = match shards {
+            Ok(reply) => parse_shards(&reply),
+            // An older server, or an ACL without it.
+            Err(err) if err.code().is_some() => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if !masters.is_empty() {
+            return Ok(masters);
         }
-        let mut pipe = redis::pipe();
-        for key in keys {
-            pipe.cmd("TYPE").arg(Raw(key));
+        let reply = redis::cmd("CLUSTER")
+            .arg("SLOTS")
+            .query_async::<redis::Value>(&mut conn)
+            .await?;
+        let masters = parse_slots(&reply);
+        if masters.is_empty() {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "the cluster reports no masters",
+            )));
         }
-        let mut manager = self.manager.home();
-        pipe.query_async(&mut manager).await
+        Ok(masters)
     }
 
     /// Count the keys matching `pattern` with a full `SCAN` sweep, stopping
@@ -508,7 +569,7 @@ impl Storage {
         })
     }
 
-    /// `PUBLISH channel payload`; returns how many subscribers got it.
+    /// `SLOWLOG RESET`.
     ///
     /// # Errors
     ///
@@ -553,6 +614,11 @@ impl Storage {
         }
     }
 
+    /// `SPUBLISH channel payload`; returns how many subscribers got it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails.
     pub async fn spublish(&self, channel: &str, payload: &str) -> redis::RedisResult<i64> {
         let mut manager = self.manager.clone();
         let mut receivers = 0;
@@ -562,6 +628,11 @@ impl Storage {
         Ok(receivers)
     }
 
+    /// `PUBLISH channel payload`; returns how many subscribers got it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails.
     pub async fn publish(
         &self,
         channel: &str,

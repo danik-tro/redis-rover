@@ -53,8 +53,13 @@ pub struct KeyspaceState {
     /// Keys the sweep's SCAN steps were asked to check so far (the sum of
     /// their `COUNT` hints, so an estimate).
     pub sweep_checked: u64,
-    /// The sweep reached the end (SCAN returned cursor 0).
+    /// The sweep reached the end (SCAN returned cursor 0, on the last master
+    /// of a cluster).
     pub sweep_done: bool,
+    /// A cluster's masters, scanned in turn. Empty on one server.
+    sweep_nodes: Vec<NodeCursor>,
+    /// Index in `sweep_nodes` of the master being scanned.
+    sweep_node: usize,
     /// Bumped on every page / pattern / rescan change, so the background
     /// fetcher can drop results computed for a state the user already left.
     pub generation: u64,
@@ -84,6 +89,15 @@ pub struct KeyspaceState {
     /// A key to bring on screen once the order is built
     /// ([`Self::reveal`]).
     reveal: Option<String>,
+}
+
+/// Where the sweep stands on one master of a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeCursor {
+    /// A slot the master owns, which routes its `SCAN` steps.
+    pub slot: u16,
+    pub cursor: u64,
+    pub done: bool,
 }
 
 /// Keys whose metadata the backfill fetches next, copied out under the lock.
@@ -124,6 +138,8 @@ pub struct SweepRequest {
     pub pattern: Option<String>,
     /// Cursor to continue the sweep from.
     pub cursor: u64,
+    /// On a cluster, a slot of the master this cursor belongs to.
+    pub node: Option<u16>,
     /// `COUNT` hint for every `SCAN` step.
     pub scan_count: usize,
     /// New keys the current page still needs. The runner can't dedup against
@@ -160,7 +176,8 @@ pub enum SweepApply {
 }
 
 impl SweepResult {
-    /// SCAN returned cursor 0: the sweep is over.
+    /// SCAN returned cursor 0: the sweep is over (on a cluster, on this
+    /// master).
     #[must_use]
     pub fn done(&self) -> bool {
         self.cursor == 0
@@ -272,6 +289,11 @@ impl KeyspaceState {
         self.sweep_cursor = 0;
         self.sweep_checked = 0;
         self.sweep_done = false;
+        self.sweep_node = 0;
+        for node in &mut self.sweep_nodes {
+            node.cursor = 0;
+            node.done = false;
+        }
         self.generation += 1;
         self.sweep_epoch += 1;
         self.index_epoch += 1;
@@ -281,6 +303,49 @@ impl KeyspaceState {
             meta.clear();
         }
         self.tree_target = self.tree_target.max(self.page_size);
+    }
+
+    /// Sweep these masters (a slot of each), in turn. A different list
+    /// restarts the sweep, keeping the page; returns whether it did.
+    pub fn set_sweep_nodes(&mut self, slots: &[u16]) -> bool {
+        if self
+            .sweep_nodes
+            .iter()
+            .map(|node| node.slot)
+            .eq(slots.iter().copied())
+        {
+            return false;
+        }
+        self.sweep_nodes = slots
+            .iter()
+            .map(|&slot| NodeCursor {
+                slot,
+                cursor: 0,
+                done: false,
+            })
+            .collect();
+        self.rescan();
+        true
+    }
+
+    /// The slot routing the current master's `SCAN`; `None` on one server.
+    fn current_node(&self) -> Option<u16> {
+        self.sweep_nodes.get(self.sweep_node).map(|node| node.slot)
+    }
+
+    /// Record `cursor` for the current master, moving to the next one when
+    /// it finished. Returns `true` when the whole sweep has ended.
+    fn advance_cursor(&mut self, cursor: u64) -> bool {
+        let Some(node) = self.sweep_nodes.get_mut(self.sweep_node) else {
+            return cursor == 0;
+        };
+        node.cursor = cursor;
+        if cursor != 0 {
+            return false;
+        }
+        node.done = true;
+        self.sweep_node += 1;
+        self.sweep_node >= self.sweep_nodes.len()
     }
 
     /// Back to page 1 of a new sweep (pattern, type filter, DB).
@@ -338,11 +403,13 @@ impl KeyspaceState {
     }
 
     /// Merge one `SCAN` step into the sweep, skipping keys already seen (SCAN
-    /// may return a key more than once). A returned cursor of 0 ends the sweep.
+    /// may return a key more than once). A returned cursor of 0 ends the
+    /// sweep, or on a cluster moves it to the next master.
     pub fn merge_batch(&mut self, cursor: u64, keys: Vec<String>) {
         let full = self.merge_names(keys);
         self.sweep_cursor = cursor;
-        self.sweep_done = cursor == 0 || full;
+        let ended = self.advance_cursor(cursor);
+        self.sweep_done = ended || full;
         self.refresh_tree();
     }
 
@@ -489,6 +556,7 @@ impl KeyspaceState {
         Some(SweepRequest {
             pattern: self.pattern.clone(),
             cursor: self.sweep_cursor,
+            node: self.current_node(),
             scan_count: self.scan_count,
             need: self.keys_needed() - self.loaded(),
             types: self.type_scan(),
@@ -506,7 +574,10 @@ impl KeyspaceState {
         if request.epoch != self.sweep_epoch {
             return SweepApply::Stale;
         }
-        if self.sweep_done || request.cursor != self.sweep_cursor {
+        if self.sweep_done
+            || request.cursor != self.sweep_cursor
+            || request.node != self.current_node()
+        {
             return SweepApply::Raced;
         }
         self.sweep_checked += result.checked;
@@ -524,6 +595,7 @@ impl KeyspaceState {
         Some(SweepRequest {
             pattern: self.pattern.clone(),
             cursor: self.sweep_cursor,
+            node: self.current_node(),
             scan_count: self.scan_count.max(LOAD_ALL_COUNT),
             need: 1,
             types: self.type_scan(),
@@ -929,6 +1001,8 @@ impl Default for KeyspaceState {
             sweep_cursor: 0,
             sweep_checked: 0,
             sweep_done: false,
+            sweep_nodes: Vec::new(),
+            sweep_node: 0,
             generation: 0,
             sweep_epoch: 0,
             index_epoch: 0,
@@ -948,6 +1022,82 @@ mod tests {
     use super::*;
 
     use crate::redis_client::types::{tests::keys, SortKey};
+
+    #[test]
+    fn a_cluster_sweep_walks_each_master_in_turn() {
+        let mut state = state_with(100);
+        assert!(state.set_sweep_nodes(&[0, 5461, 10923]));
+        assert!(!state.set_sweep_nodes(&[0, 5461, 10923]), "same masters");
+
+        // (node asked, cursor asked, cursor answered, sweep over)
+        let steps = [
+            (0, 0, 7, false),
+            (0, 7, 0, false),
+            (5461, 0, 0, false),
+            (10923, 0, 9, false),
+            (10923, 9, 0, true),
+        ];
+        for (i, (node, cursor, next, done)) in steps.into_iter().enumerate() {
+            let request = state.load_request().unwrap();
+            assert_eq!((request.node, request.cursor), (Some(node), cursor), "{i}");
+            let batch = keys(i * 10..i * 10 + 5);
+            assert_eq!(
+                state.apply_result(&request, result(next, batch)),
+                SweepApply::Applied
+            );
+            assert_eq!(state.sweep_done, done, "{i}");
+        }
+        assert_eq!(state.scanned.len(), 25);
+        assert!(state.load_request().is_none());
+    }
+
+    #[test]
+    fn an_answer_from_the_previous_master_is_raced() {
+        let mut state = state_with(100);
+        state.set_sweep_nodes(&[0, 5461]);
+        let first = state.load_request().unwrap();
+        let racing = first.clone();
+        assert_eq!(
+            state.apply_result(&first, result(0, keys(0..3))),
+            SweepApply::Applied
+        );
+        // Node 2 is also at cursor 0: only the node tells them apart.
+        assert_eq!(state.sweep_cursor, 0);
+        assert_eq!(
+            state.apply_result(&racing, result(0, keys(3..6))),
+            SweepApply::Raced
+        );
+        assert_eq!(state.scanned.len(), 3);
+    }
+
+    #[test]
+    fn a_rescan_restarts_every_master() {
+        let mut state = state_with(100);
+        state.set_sweep_nodes(&[0, 5461]);
+        let request = state.load_request().unwrap();
+        state.apply_result(&request, result(0, keys(0..3)));
+        state.rescan();
+        let request = state.load_request().unwrap();
+        assert_eq!((request.node, request.cursor), (Some(0), 0));
+        assert!(!state.sweep_done);
+    }
+
+    #[test]
+    fn new_masters_restart_the_sweep() {
+        let mut state = state_with(100);
+        state.set_sweep_nodes(&[0, 5461]);
+        let request = state.load_request().unwrap();
+        state.apply_result(&request, result(4, keys(0..3)));
+        let generation = state.generation;
+        assert!(state.set_sweep_nodes(&[0, 8000]));
+        assert!(state.scanned.is_empty());
+        assert!(state.generation > generation);
+        // The answer to the old sweep is dropped.
+        assert_eq!(
+            state.apply_result(&request, result(0, keys(3..6))),
+            SweepApply::Stale
+        );
+    }
 
     #[test]
     fn type_filter_restarts_the_sweep_and_picks_how_to_scan() {

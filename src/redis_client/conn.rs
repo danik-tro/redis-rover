@@ -39,6 +39,19 @@ impl Conn {
             other => other.clone(),
         }
     }
+
+    /// This connection, with everything sent to the master of `slot`. One
+    /// server serves every slot.
+    #[must_use]
+    pub fn on_slot(&self, slot: u16) -> Self {
+        match self {
+            Self::Cluster(conn) | Self::Node(conn, _) => Self::Node(
+                conn.clone(),
+                SingleNodeRoutingInfo::SpecificNode(Route::new(slot, SlotAddr::Master)),
+            ),
+            single @ Self::Single(_) => single.clone(),
+        }
+    }
 }
 
 impl From<ConnectionManager> for Conn {
