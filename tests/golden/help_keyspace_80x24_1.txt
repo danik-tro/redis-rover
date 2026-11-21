@@ -12,6 +12,7 @@
             │ Load all keys (Esc stops)             Shift-A         │
             │ Go to the open key                    g o             │
             │ Enter value / JSON field / confirm    Enter           │
+            │ Stream: entries / groups              Tab             │
             │ Add new key                           a               │
             │ Add item (in collection)              i               │
             │ Edit value / item (drill in first)    e               │
@@ -20,5 +21,4 @@
             │ Set TTL                               t               │
             │ Rename key / field / member           F2              │
             │ Copy key (Tab: target DB)             c               │
-            │ Mark / unmark key (d deletes marked)  Space           │
             ╰────────────────── 1/2 · n / p: page ──────────────────╯

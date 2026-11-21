@@ -25,12 +25,13 @@ use ratatui::{
 };
 use redis_rover::internals::{
     parse_line, render_help, render_help_page, render_monitor_confirm, render_typed_confirm,
-    render_typed_count, Clock, ConfirmPopup, ConnStatus, Dashboard, DashboardWidget, Environment,
-    FixedClock, FrameData, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview,
-    JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress,
-    LoadedValue, MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore,
-    MonitorWidget, PageInfo, PageRow, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType,
-    SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey, Target, Toast,
+    render_typed_count, Clock, ConfirmPopup, ConnStatus, ConsumerInfo, Dashboard, DashboardWidget,
+    Environment, FixedClock, FrameData, GroupDetail, GroupInfo, Info, InfoSnapshot, InfoWidget,
+    ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace, KeySpaceWidget, KeyValue,
+    Liveness, LoadProgress, LoadedValue, MetricsHistory, Mode, Monitor, MonitorLimits,
+    MonitorStatus, MonitorStore, MonitorWidget, PageInfo, PageRow, PendingEntry, PubSub,
+    PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState, Slowlog, SlowlogData,
+    SlowlogEntry, SlowlogWidget, Sort, SortKey, StreamEntry, StreamValue, Target, Toast,
     ToastWidget, TypeFilter, ValuePageInfo,
 };
 
@@ -491,6 +492,118 @@ fn value_hash() {
         ),
     );
     check("value_hash", &draw_keyspace(&mut keyspace, 120, 20));
+}
+
+// ---- Streams ---------------------------------------------------------------
+
+fn stream_value() -> KeyValue {
+    let entry = |id: &str, fields: &[(&str, &str)]| StreamEntry {
+        id: id.into(),
+        fields: fields
+            .iter()
+            .map(|(f, v)| ((*f).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    KeyValue::Stream(StreamValue {
+        entries: vec![
+            entry(
+                "1700000003000-0",
+                &[("event", "paid"), ("order", "1042"), ("total", "19.90")],
+            ),
+            entry(
+                "1700000002000-1",
+                &[("event", "created"), ("doc", r#"{"id":1041,"items":2}"#)],
+            ),
+            entry("1700000001000-0", &[("event", "created")]),
+        ],
+        length: 10_000,
+        last_id: "1700000003000-0".into(),
+        groups: Some(vec![
+            GroupInfo {
+                name: "billing".into(),
+                consumers: 2,
+                pending: 3,
+                last_delivered: "1700000002000-1".into(),
+                lag: Some(1),
+            },
+            GroupInfo {
+                name: "audit".into(),
+                consumers: 0,
+                pending: 0,
+                last_delivered: "0-0".into(),
+                lag: None,
+            },
+        ]),
+    })
+}
+
+#[test]
+fn stream_entries() {
+    init();
+    let mut keyspace = with_value("events:orders", stream_value());
+    keyspace.enter_value();
+    check("stream_entries", &draw_keyspace(&mut keyspace, 120, 20));
+}
+
+#[test]
+fn stream_entry_detail() {
+    init();
+    let mut keyspace = with_value("events:orders", stream_value());
+    keyspace.enter_value();
+    keyspace.scroll_next();
+    assert_eq!(keyspace.open_stream_row(), None);
+    check(
+        "stream_entry_detail",
+        &draw_keyspace(&mut keyspace, 120, 20),
+    );
+}
+
+#[test]
+fn stream_groups() {
+    init();
+    let mut keyspace = with_value("events:orders", stream_value());
+    assert!(keyspace.toggle_stream_tab());
+    check("stream_groups", &draw_keyspace(&mut keyspace, 120, 20));
+}
+
+#[test]
+fn stream_pending() {
+    init();
+    let mut keyspace = with_value("events:orders", stream_value());
+    assert!(keyspace.toggle_stream_tab());
+    let (key, group) = keyspace.open_stream_row().expect("a group");
+    keyspace.set_stream_group(&GroupDetail {
+        key,
+        group,
+        consumers: vec![
+            ConsumerInfo {
+                name: "worker-1".into(),
+                pending: 2,
+                idle_ms: 1_500,
+            },
+            ConsumerInfo {
+                name: "worker-2".into(),
+                pending: 1,
+                idle_ms: 90_000,
+            },
+        ],
+        pending: vec![
+            PendingEntry {
+                id: "1700000001000-0".into(),
+                consumer: "worker-1".into(),
+                idle_ms: 1_500,
+                deliveries: 1,
+            },
+            PendingEntry {
+                id: "1700000002000-1".into(),
+                consumer: "worker-2".into(),
+                idle_ms: 90_000,
+                deliveries: 4,
+            },
+        ],
+        error: None,
+    });
+    check("stream_pending", &draw_keyspace(&mut keyspace, 120, 24));
 }
 
 // ---- Live updates ---------------------------------------------------------

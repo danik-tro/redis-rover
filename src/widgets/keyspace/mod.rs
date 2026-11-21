@@ -6,6 +6,7 @@ mod marks;
 mod overlay;
 mod render;
 mod state;
+mod stream;
 mod type_menu;
 
 pub use format::format_bytes;
@@ -87,6 +88,7 @@ pub struct KeySpace {
     load_progress: Option<LoadProgress>,
     /// Liveness label, changed rows and a gone key (live updates).
     live: live::LiveView,
+    stream: stream::StreamPane,
     /// Keys marked for a bulk delete (`Space`), by name: they stay marked
     /// across pages and filters.
     marks: HashSet<String>,
@@ -172,6 +174,7 @@ impl KeySpace {
             tree_rows: None,
             load_progress: None,
             live: live::LiveView::default(),
+            stream: stream::StreamPane::default(),
             marks: HashSet::new(),
         }
     }
@@ -239,6 +242,9 @@ impl KeySpace {
     /// inside a collection: the LIST item / SET member, the HASH field's
     /// value, or a ZSET `{"rank","member","score"}` JSON object.
     pub fn selected_element_text(&self) -> Option<String> {
+        if self.is_stream_focused() {
+            return self.stream_row_text();
+        }
         let row = self.value_table.selected()?;
         let start = self.selected_value.as_ref()?.page.start;
         Some(match self.selected_element()? {

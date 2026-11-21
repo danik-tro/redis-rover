@@ -1,4 +1,5 @@
             ╭──────────────────────── Help ─────────────────────────╮
+            │ Mark / unmark key (d deletes marked)  Space           │
             │ Mark all keys on the page             Shift-M         │
             │ Clear marks                           Shift-U         │
             │ Copy value / item                     y               │
@@ -18,7 +19,6 @@
             │ Go to Pub/Sub                         g p             │
             │ Go to metrics dashboard               g d             │
             │ Undo / redo in a text input           Ctrl-U / Ctrl-R │
-            │                                                       │
             │                                                       │
             │                                                       │
             ╰────────────────── 2/2 · n / p: page ──────────────────╯

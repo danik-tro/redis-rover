@@ -73,11 +73,14 @@ impl App {
     // action has to be routed here.
     #[allow(clippy::too_many_lines)]
     fn apply(&mut self, action: &Action, now: Instant, help_open: bool) {
+        if self.refuse_stream_edit(action, now) {
+            return;
+        }
         match *action {
             Action::Tick => self.tick(now, help_open),
             Action::Quit => self.should_quit = true,
             // `Resize` / `Render` are terminal work, done by `handle_action`.
-            Action::Resize(..) | Action::Render | Action::Refresh | Action::StreamGroupLoaded => {}
+            Action::Resize(..) | Action::Render | Action::Refresh => {}
             Action::PreviousMode => self.switch_to_previous_mode(),
             Action::ToggleDashboard => self.toggle_dashboard(),
             Action::GoToMonitor
@@ -151,6 +154,15 @@ impl App {
                 ref change,
             } => self.open_key_changed(key, change, self.clock.wall()),
             Action::LiveStatus(ref status) => self.set_liveness(status),
+            Action::StreamTab => {
+                self.keyspace.toggle_stream_tab();
+            }
+            Action::StreamGroupLoaded => {
+                let detail = self.state.stream_group.lock().take();
+                if let Some(detail) = detail {
+                    self.keyspace.set_stream_group(&detail);
+                }
+            }
             Action::Help => self.toggle_help(now),
             Action::ToggleReadOnly => self.toggle_read_only(now),
             Action::Error(ref msg) => self.show_error_popup(msg),
@@ -182,6 +194,25 @@ impl App {
             | Action::PubSubToggleNotify
             | Action::Published { .. } => self.handle_pubsub_action(action),
         }
+    }
+
+    /// Inside a stream the element keys (`d`, `e`, `i`, `F2`, `Shift-e`) do
+    /// nothing but say why: streams are read-only here.
+    fn refuse_stream_edit(&mut self, action: &Action, now: Instant) -> bool {
+        let edit = matches!(
+            action,
+            Action::RequestDeleteKey
+                | Action::RequestEditValue
+                | Action::RequestAddItem
+                | Action::RequestRename
+                | Action::RequestEditExternal
+        );
+        let refused = edit && self.keyspace.is_stream_focused();
+        if refused {
+            self.toast
+                .show("Streams are read-only: Esc back to the key", false, now);
+        }
+        refused
     }
 
     /// `←` / `→` (fold a tree group, else pan text) and `w`, in the open
@@ -373,6 +404,10 @@ impl App {
 
         if self.keyspace.is_edit_item_active() {
             self.keyspace.close_edit_item();
+            return;
+        }
+
+        if self.keyspace.close_stream_open() {
             return;
         }
 

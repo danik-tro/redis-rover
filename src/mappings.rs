@@ -68,6 +68,7 @@ impl From<Command> for Action {
             Command::SlowlogSort => Self::SlowlogSort,
             Command::SlowlogEnter => Self::SlowlogEnter,
             Command::SlowlogReset => Self::SlowlogReset,
+            Command::StreamTab => Self::StreamTab,
         }
     }
 }

@@ -126,7 +126,7 @@ fn wrapped_rows(line: &Line<'_>, line_width: usize, width: u16) -> usize {
 }
 
 impl TextCache {
-    fn new(lines: Vec<Line<'static>>, json: bool) -> Self {
+    pub(crate) fn new(lines: Vec<Line<'static>>, json: bool) -> Self {
         Self {
             lines,
             json,

@@ -229,6 +229,7 @@ impl KeySpace {
         }
         self.selected_value = value;
         self.value_loading = false;
+        self.sync_stream_pane();
         // Changed rows belong to the page they were found on.
         self.live.clear_changed();
         // A reloaded page may be shorter; keep the cursor on a real row.
@@ -312,7 +313,7 @@ impl KeySpace {
             Some(KeyValue::List(items) | KeyValue::Set(items)) => items.len(),
             Some(KeyValue::Hash(entries)) => entries.len(),
             Some(KeyValue::Zset(entries)) => entries.len(),
-            Some(KeyValue::Stream(stream)) => stream.entries.len(),
+            Some(KeyValue::Stream(stream)) => self.stream_row_count(stream),
             Some(KeyValue::JsonPreview(JsonPreview {
                 kind: JsonPreviewKind::Object { fields, .. },
                 ..
