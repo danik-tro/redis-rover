@@ -7,12 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::future::try_join_all;
+use parking_lot::Mutex;
 use redis::{FromRedisValue, ScanOptions};
 
 use super::{
     bytes::{strings, Raw, Text},
     client,
-    cluster::{parse_shards, parse_slots, MasterNode},
+    cluster::{group_by_node, merge_groups, parse_shards, parse_slots, MasterNode},
     conn::Conn,
     pubsub_store::ServerChannels,
     slowlog::{parse_config_int, parse_entries, SlowlogData, SLOWLOG_FETCH},
@@ -67,7 +69,8 @@ async fn scan_step(
     Ok((cursor, strings(keys)))
 }
 
-/// `TYPE` of every key on `conn`, in one pipeline.
+/// `TYPE` of every key on `conn`, in one pipeline (`none` for a key gone
+/// meanwhile).
 async fn types_on(conn: &mut Conn, keys: &[String]) -> redis::RedisResult<Vec<String>> {
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -100,6 +103,8 @@ pub struct Storage {
     /// service or a fork that lacks it): stop asking on this connection and
     /// show sizes as unknown. Shared by the clones of this `Storage`.
     memory_usage_refused: Arc<AtomicBool>,
+    /// The cluster's masters, read once and shared by the clones.
+    masters: Arc<Mutex<Option<Arc<Vec<MasterNode>>>>>,
 }
 
 impl Storage {
@@ -107,7 +112,55 @@ impl Storage {
         Self {
             manager: manager.into(),
             memory_usage_refused: Arc::new(AtomicBool::new(false)),
+            masters: Arc::default(),
         }
+    }
+
+    /// This session browses a whole cluster.
+    #[must_use]
+    pub fn is_cluster(&self) -> bool {
+        !matches!(self.manager, Conn::Single(_))
+    }
+
+    /// [`Self::masters`], read once. No lock is held across the query.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::masters`].
+    pub async fn cached_masters(&self) -> redis::RedisResult<Arc<Vec<MasterNode>>> {
+        if let Some(masters) = self.masters.lock().clone() {
+            return Ok(masters);
+        }
+        let masters = Arc::new(self.masters().await?);
+        *self.masters.lock() = Some(Arc::clone(&masters));
+        Ok(masters)
+    }
+
+    /// One connection per master, or this connection on one server.
+    async fn node_conns(&self) -> redis::RedisResult<Vec<Conn>> {
+        if !self.is_cluster() {
+            return Ok(vec![self.manager.clone()]);
+        }
+        let masters = self.cached_masters().await?;
+        Ok(masters
+            .iter()
+            .filter_map(MasterNode::route_slot)
+            .map(|slot| self.manager.on_slot(slot))
+            .collect())
+    }
+
+    /// `DBSIZE`, summed over every master.
+    ///
+    /// # Errors
+    ///
+    /// A master can't be asked.
+    pub async fn total_keys(&self) -> redis::RedisResult<u64> {
+        let conns = self.node_conns().await?;
+        let sizes = try_join_all(conns.into_iter().map(|mut conn| async move {
+            redis::cmd("DBSIZE").query_async::<u64>(&mut conn).await
+        }))
+        .await?;
+        Ok(sizes.into_iter().sum())
     }
 
     /// Run a single `SCAN cursor MATCH pattern COUNT count [TYPE t]` step and
@@ -214,15 +267,6 @@ impl Storage {
         }
     }
 
-    /// `TYPE` of every key, in one pipeline (`none` for a key gone meanwhile).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the pipeline fails.
-    pub async fn fetch_types(&self, keys: &[String]) -> redis::RedisResult<Vec<String>> {
-        types_on(&mut self.manager.home(), keys).await
-    }
-
     /// The cluster's masters, in slot order: `CLUSTER SHARDS`, or
     /// `CLUSTER SLOTS` on a server before Redis 7.
     ///
@@ -273,27 +317,33 @@ impl Storage {
         budget: Duration,
     ) -> Result<(usize, bool), Box<dyn std::error::Error + Sync + Send>> {
         if pattern.is_empty() || pattern == "*" {
-            let mut manager = self.manager.clone();
-            let total: usize = redis::cmd("DBSIZE").query_async(&mut manager).await?;
-            return Ok((total, true));
+            let total = self.total_keys().await?;
+            return Ok((usize::try_from(total).unwrap_or(usize::MAX), true));
         }
         let started = Instant::now();
         let mut seen = HashSet::new();
-        let mut cursor = 0;
-        for _ in 0..max_steps {
-            let (next, batch) = self
-                .scan_batch(cursor, Some(pattern), COUNT_SCAN_HINT, None)
-                .await?;
-            seen.extend(batch);
-            if next == 0 {
-                return Ok((seen.len(), true));
-            }
-            cursor = next;
-            if started.elapsed() >= budget {
-                break;
+        let mut steps = 0;
+        // The step and time budgets cover all the masters together.
+        for mut conn in self.node_conns().await? {
+            let mut cursor = 0;
+            loop {
+                if steps >= max_steps {
+                    return Ok((seen.len(), false));
+                }
+                steps += 1;
+                let (next, batch) =
+                    scan_step(&mut conn, cursor, Some(pattern), COUNT_SCAN_HINT, None).await?;
+                seen.extend(batch);
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+                if started.elapsed() >= budget {
+                    return Ok((seen.len(), false));
+                }
             }
         }
-        Ok((seen.len(), false))
+        Ok((seen.len(), true))
     }
 
     /// Number of logical databases (`CONFIG GET databases`). `None` if the
@@ -317,7 +367,9 @@ impl Storage {
             .filter(|&n: &usize| n > 0))
     }
 
-    /// Fetch TYPE / MEMORY USAGE / TTL for every key in a single pipeline.
+    /// Fetch TYPE / MEMORY USAGE / TTL for every key: one pipeline, or on a
+    /// cluster one per master, run at the same time and merged in `keys`
+    /// order.
     ///
     /// A server that refuses `MEMORY USAGE` still lists its keys: the size
     /// is left unknown (0) and, after the first refusal, no longer asked
@@ -325,7 +377,7 @@ impl Storage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pipeline fails or any reply has an unexpected
+    /// Returns an error if a pipeline fails or any reply has an unexpected
     /// shape.
     pub async fn fetch_meta(
         &self,
@@ -334,20 +386,40 @@ impl Storage {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        if !self.is_cluster() {
+            return self.meta_on(self.manager.clone(), keys).await;
+        }
+        let masters = self.cached_masters().await?;
+        let groups = group_by_node(keys, &masters);
+        let replies = try_join_all(groups.iter().map(|group| {
+            let names: Vec<&String> = group.indices.iter().map(|&i| &keys[i]).collect();
+            let conn = self.manager.on_slot(group.slot);
+            async move { self.meta_on(conn, &names).await }
+        }))
+        .await?;
+        merge_groups(keys.len(), &groups, replies)
+            .ok_or_else(|| "pipeline response truncated".into())
+    }
 
+    /// The metadata of `keys`, all on the node `conn` reaches.
+    async fn meta_on<K: AsRef<str> + Sync>(
+        &self,
+        mut manager: Conn,
+        keys: &[K],
+    ) -> Result<Vec<KeyMeta>, Box<dyn std::error::Error + Sync + Send>> {
         let with_size = !self.memory_usage_refused.load(Ordering::Relaxed);
         let mut pipe = redis::pipe();
         // Each reply comes back on its own, a refused command as
         // `Value::ServerError`, instead of one error for the whole page.
         pipe.ignore_errors();
         for key in keys {
+            let key = key.as_ref();
             pipe.cmd("TYPE").arg(Raw(key));
             if with_size {
                 pipe.cmd("MEMORY").arg("USAGE").arg(Raw(key));
             }
             pipe.cmd("TTL").arg(Raw(key));
         }
-        let mut manager = self.manager.home();
         let raw: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
 
         let mut metas = Vec::with_capacity(keys.len());
@@ -377,7 +449,7 @@ impl Storage {
             let ttl = isize::from_redis_value(ttl_val)?;
 
             metas.push(KeyMeta {
-                key: key.clone(),
+                key: key.as_ref().to_owned(),
                 r_type: RedisType::from(r_type),
                 size: size.unwrap_or_default(),
                 ttl,
