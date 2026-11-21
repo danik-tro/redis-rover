@@ -362,11 +362,22 @@ impl App {
 
     async fn event_loop(&mut self, tui: &mut tui::Tui) -> Result<()> {
         loop {
-            // TODO: refactor with async_channel crate
-            // replace with select multiplex
-            if let Some(e) = tui.next().await {
-                if let Some(action) = self.handle_event(&e) {
-                    action::try_send_action(&self.tx, action);
+            // Wake for a background result too, or it waits for the next tick
+            // or frame. Biased: terminal input goes first under a flood of
+            // actions. Both `recv`s are cancel-safe.
+            tokio::select! {
+                biased;
+                event = tui.next() => {
+                    if let Some(action) = event.and_then(|e| self.handle_event(&e)) {
+                        action::try_send_action(&self.tx, action);
+                    }
+                }
+                action = self.rx.recv() => {
+                    if let Some(action) = action {
+                        if let Some(next) = self.handle_action(&action, tui)? {
+                            action::try_send_action(&self.tx, next);
+                        }
+                    }
                 }
             }
 

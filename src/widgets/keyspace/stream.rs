@@ -72,6 +72,12 @@ impl KeySpace {
         }
     }
 
+    /// The value on show is a stream.
+    #[must_use]
+    pub fn is_stream_shown(&self) -> bool {
+        self.stream_value().is_some()
+    }
+
     /// Rows of the table on show.
     pub(super) fn stream_row_count(&self, stream: &StreamValue) -> usize {
         match self.stream.tab {

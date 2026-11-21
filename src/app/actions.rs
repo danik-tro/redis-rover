@@ -122,7 +122,10 @@ impl App {
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::KeysScanning(checked) => self.keyspace.set_scanning(Some(checked)),
             Action::RequestSelectedValue => self.request_selected_value(),
-            Action::LoadSelectedValueIntoView => self.load_selected_value(now),
+            Action::LoadSelectedValueIntoView => {
+                self.load_selected_value(now);
+                self.draw_stream_now();
+            }
             Action::ValueLoadFailed => self.keyspace.clear_value_loading(),
             Action::ScrollDown => self.scroll_down(now),
             Action::ScrollUp => self.scroll_up(now),
@@ -193,6 +196,14 @@ impl App {
             | Action::PubSubChannelsLoaded
             | Action::PubSubToggleNotify
             | Action::Published { .. } => self.handle_pubsub_action(action),
+        }
+    }
+
+    /// A stream's page shows as soon as it lands, not on the next frame: at
+    /// the default 4 frames a second the wait would dwarf the fetch.
+    fn draw_stream_now(&self) {
+        if self.keyspace.is_stream_shown() {
+            crate::action::try_send_action(&self.tx, Action::Render);
         }
     }
 
@@ -593,6 +604,35 @@ mod tests {
         app.update(&Action::Tick);
         assert!(app.redraw.dirty, "the help went away");
         assert!(!app.help_is_open());
+    }
+
+    /// A loaded stream asks for a frame at once; other values wait for the
+    /// next one.
+    #[test]
+    fn a_loaded_stream_draws_at_once() {
+        use crate::redis_client::types::{
+            KeyValue, LoadedValue, RedisType, StreamValue, ValuePageInfo,
+        };
+        let queued_render = |r_type: RedisType, value: KeyValue| {
+            let mut app = app();
+            let mut key = crate::app::tests::meta("k");
+            key.r_type = r_type;
+            app.keyspace.set_keys(vec![key]);
+            assert!(app.keyspace.select_key_by_name("k"));
+            app.request_selected_value();
+            *app.state.selected_value.lock() = Some(LoadedValue {
+                value,
+                page: ValuePageInfo::default(),
+            });
+            while app.rx.try_recv().is_ok() {}
+            app.update(&Action::LoadSelectedValueIntoView);
+            std::iter::from_fn(|| app.rx.try_recv().ok()).any(|a| a == Action::Render)
+        };
+        assert!(queued_render(
+            RedisType::Stream,
+            KeyValue::Stream(StreamValue::default())
+        ));
+        assert!(!queued_render(RedisType::List, KeyValue::List(Vec::new())));
     }
 
     #[test]
