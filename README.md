@@ -241,7 +241,47 @@ The footer reads e.g. `14.21 MiB preview · fields 1–100 of 50,000 · n/p page
 
 ### Cluster
 
-In cluster mode `rrover` connects to a single node. SCAN only sees that node's keys, so the key list is partial. A warning banner above the key table says so, and the footer key count reads `(this node)`. Cluster mode has only DB 0, so the DB picker is disabled. Full cluster browsing is planned after 0.1.0.
+`rrover` browses a whole Redis Cluster as one keyspace. It detects a cluster from `INFO`, or you can name the seeds:
+
+```bash
+rrover --url redis-cluster://10.0.0.1:7000,10.0.0.2:7000
+```
+
+In a profile, `cluster: true` forces the cluster client and `cluster: false` stays on the one node.
+
+- The key list sweeps every master, and the footer counts the keys of all of them.
+- Reads and writes go to the master of each key's slot. The write preview names the node and slot.
+- A rename or copy across slots is refused with both slot numbers. A hash tag (`{tag}:a`, `{tag}:b`) puts keys in one slot.
+- After a failover or resharding a toast says `cluster topology changed · rescanning`, and the sweep restarts on the new masters.
+- The dashboard (`m`) shows every master's ops and memory. `Tab` / `Shift-Tab` opens one node's charts. Slowlog and MONITOR work per node with the same keys.
+- Sharded Pub/Sub and live updates follow the owner of the slot.
+
+A cluster only has DB 0, so the DB picker is disabled. If the nodes announce addresses this machine can't reach (a port forward, for example), `rrover` stays on the node you named and says so. Reading from replicas and managing the cluster are out of scope.
+
+### Sentinel
+
+```bash
+rrover --url 'redis+sentinel://host1:26379,host2:26379/mymaster/0'
+```
+
+The path is the master's name and an optional DB, and the port defaults to 26379. Credentials in the URL are the master's. A profile can also set the password of the Sentinels themselves:
+
+```json5
+{
+  profiles: {
+    ha: {
+      sentinel: {
+        hosts: ["host1:26379", "host2:26379"],
+        master: "mymaster",
+        password: "for-the-sentinels",
+      },
+      password_command: "pass show redis/ha", // the master's password
+    },
+  },
+}
+```
+
+The footer reads `sentinel mymaster → host:port`. On a failover every connection moves to the new master, a toast names it, and the key list reloads. TLS is not supported on Sentinel targets yet.
 
 ### Pub/Sub
 
@@ -255,7 +295,7 @@ Press `b` (from the keyspace or the dashboard) to open the Pub/Sub tab. `b` or `
 - **Publish**: `Shift-p` opens a popup with a channel (prefilled from the selection) and a multi-line payload; `Ctrl-t` switches between `PUBLISH` and `SPUBLISH` (it starts on `SPUBLISH` from a shard subscription), `Ctrl-s` sends, and a toast says how many subscribers got it. Disabled with `--read-only`.
 - **Notifications**: off by default, `Shift-n` toggles them per subscription. The first message toasts, later ones only bump the unread badge (per subscription, and `PubSub N` in the footer outside the tab) until the subscription has been quiet for 30 s. A subscription above 10 msg/s for 10 s is muted (`🔕`) until you press `Shift-n` again.
 
-Subscriptions use their own connection, keep collecting while you're in other views, and resubscribe after a lost connection (the log marks the gap). They last for the session only. In cluster mode `PUBSUB CHANNELS` lists the connected node's channels only, and a shard subscription only works for channels this node owns. Buffer sizes and notification thresholds are set in the `pubsub` section of the config.
+Subscriptions use their own connection, keep collecting while you're in other views, and resubscribe after a lost connection (the log marks the gap). They last for the session only. In cluster mode `PUBSUB CHANNELS` lists one node's channels only. Shard subscriptions go to the owner of the channel's slot and follow it through a failover. Buffer sizes and notification thresholds are set in the `pubsub` section of the config.
 
 ### MONITOR
 
