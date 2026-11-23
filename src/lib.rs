@@ -21,6 +21,7 @@ mod pubsub_notify;
 mod redis_client;
 mod state;
 mod target;
+mod theme;
 mod tui;
 mod utils;
 mod widgets;
@@ -119,9 +120,10 @@ pub async fn run(args: Cli) -> Result<()> {
     .live_tx(watcher.live_tx())
     .monitor_tx(watcher.monitor_tx())
     .environment(target.environment)
-    .color_depth(color_depth::ColorDepth::detect(|name| {
-        std::env::var(name).ok()
-    }));
+    .color_depth(color_depth::ColorDepth::for_theme(
+        &config::get().ui.theme,
+        |name| std::env::var(name).ok(),
+    ));
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;
@@ -261,6 +263,14 @@ pub mod internals {
     pub use crate::widgets::slowlog::{Slowlog, SlowlogWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};
+
+    /// Convert a drawn frame the way `App::draw` does, for the configured
+    /// theme and this process's environment.
+    pub fn finish_frame(buf: &mut ratatui::buffer::Buffer) {
+        let cfg = crate::config::get();
+        crate::color_depth::ColorDepth::for_theme(&cfg.ui.theme, |name| std::env::var(name).ok())
+            .apply(buf, cfg.colors.base00);
+    }
 
     /// The MONITOR start confirm on `env`, `typed` in its input on Prod.
     pub fn render_monitor_confirm(

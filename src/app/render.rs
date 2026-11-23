@@ -327,7 +327,8 @@ impl App {
         tui.draw(|frame| {
             self.build_frame(frame.area());
             frame.render_stateful_widget(AppWidget, frame.area(), self);
-            self.color_depth.apply(frame.buffer_mut());
+            self.color_depth
+                .apply(frame.buffer_mut(), config::get().colors.base00);
         })?;
         Ok(())
     }

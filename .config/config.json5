@@ -189,6 +189,10 @@
   "ui": {
     // Capture the mouse. Turn it off to leave selection to the terminal.
     "mouse": true,
+    // "dark", "light", "high-contrast", "monochrome", or a theme file (a path,
+    // absolute or under the config dir) with any of the `colors` and
+    // `keyspace` colour names; what it leaves out stays as in "dark".
+    "theme": "dark",
   },
   "monitor": {
     // Lines and bytes kept on the MONITOR screen; the oldest go first.

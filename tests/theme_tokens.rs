@@ -4,7 +4,7 @@
 use std::{fs, path::Path};
 
 /// The files that define or convert colours.
-const ALLOWED: &[&str] = &["src/config.rs", "src/color_depth.rs"];
+const ALLOWED: &[&str] = &["src/config.rs", "src/color_depth.rs", "src/theme.rs"];
 
 const COLOR_LITERALS: &[&str] = &[
     "Color::",
