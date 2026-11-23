@@ -1,7 +1,10 @@
 //! What the terminal can show, and the one place a finished frame's colours
 //! are converted to it.
 
-use ratatui::{buffer::Buffer, style::Color};
+use ratatui::{
+    buffer::Buffer,
+    style::{Color, Modifier},
+};
 
 /// How many colours the terminal shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,6 +105,16 @@ impl ColorDepth {
         Self::Ansi16
     }
 
+    /// The depth for `theme`: the `monochrome` theme turns colour off
+    /// wherever it runs.
+    pub fn for_theme(theme: &str, var: impl Fn(&str) -> Option<String>) -> Self {
+        if theme == crate::theme::MONOCHROME {
+            Self::Monochrome
+        } else {
+            Self::detect(var)
+        }
+    }
+
     /// `color` as this depth shows it.
     #[must_use]
     pub fn map(self, color: Color) -> Color {
@@ -116,11 +129,17 @@ impl ColorDepth {
     }
 
     /// Convert every cell of a finished frame. Costs nothing on truecolor.
-    pub fn apply(self, buf: &mut Buffer) {
+    /// In monochrome a cell whose background stood out from `background`
+    /// (a selection, a badge, a changed row) becomes reverse video, so what
+    /// the colour said stays visible.
+    pub fn apply(self, buf: &mut Buffer, background: Color) {
         if self == Self::TrueColor {
             return;
         }
         for cell in &mut buf.content {
+            if self == Self::Monochrome && cell.bg != Color::Reset && cell.bg != background {
+                cell.modifier.insert(Modifier::REVERSED);
+            }
             cell.fg = self.map(cell.fg);
             cell.bg = self.map(cell.bg);
             cell.underline_color = self.map(cell.underline_color);
@@ -240,11 +259,39 @@ mod tests {
         buf[(1, 0)].set_fg(Color::Rgb(0, 255, 0));
         buf[(2, 0)].set_fg(Color::Rgb(255, 0, 0));
 
-        ColorDepth::Ansi16.apply(&mut buf);
+        ColorDepth::Ansi16.apply(&mut buf, Color::Reset);
 
         assert_eq!(buf[(0, 0)].fg, Color::LightRed);
         assert_eq!(buf[(1, 0)].fg, Color::LightGreen);
         assert_eq!(buf[(2, 0)].fg, Color::LightRed);
+    }
+
+    #[test]
+    fn monochrome_turns_a_highlight_into_reverse_video() {
+        let background = Color::Rgb(0, 0, 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf[(0, 0)].set_bg(background);
+        buf[(1, 0)].set_bg(Color::Rgb(70, 70, 70));
+
+        ColorDepth::Monochrome.apply(&mut buf, background);
+
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(1, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_monochrome_theme_ignores_the_terminal() {
+        let truecolor = |name: &str| (name == "COLORTERM").then(|| "truecolor".to_owned());
+        assert_eq!(
+            ColorDepth::for_theme("monochrome", truecolor),
+            ColorDepth::Monochrome
+        );
+        assert_eq!(
+            ColorDepth::for_theme("dark", truecolor),
+            ColorDepth::TrueColor
+        );
     }
 
     /// AC3: on 256 colours the terminal gets no truecolor escape sequence.
@@ -261,7 +308,7 @@ mod tests {
                 .bg(Color::Rgb(40, 41, 54)),
         );
 
-        ColorDepth::Ansi256.apply(&mut buf);
+        ColorDepth::Ansi256.apply(&mut buf, Color::Reset);
         let mut output = Vec::new();
         let mut backend = CrosstermBackend::new(&mut output);
         let cells = buf

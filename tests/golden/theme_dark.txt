@@ -1,0 +1,41 @@
+╭ Keys · 1 marked ────────────────╮╭ Values ─────────────────────────────────────────────── ● live ╮
+│ filter *                        ││ Key   queue:jobs                                              │
+│ ─────────────────────────────── ││ Type  list                                                    │
+│   Type   Key     TTL       Size ││ TTL   No expiry                                               │
+│ ─────────────────────────────── ││ Size  128 B                                                   │
+│    hash  us…       ∞      128 B ││ ───────────────────────────────────────────────────────────── │
+│    str   se…      1h      128 B ││   Item                                                        │
+│ ▌ ●list  qu…       ∞      128 B ││ ───────────────────────────────────────────────────────────── │
+│    set   ta…       ∞      128 B ││   first                                                       │
+│    zset  bo…       ∞      128 B ││   second                                                      │
+│    strea ev…       ∞      128 B ││                                                               │
+│    json  do…       ∞      128 B ││                                                               │
+│                                 ││                                                               │
+╰ Page 1 · 1–7 10/page · cursor 0 ╯╰───────────────────────────────────────────────────────────────╯
+╭ Info · redis://localhost:6379  PROD · RO  ─────────────────────────────────────────────── ? Help ╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+--- attributes: R reversed, B bold, # both ---
+ BBBBBBBBBBBBBBBBB
+                                           BBBBBBBBBB
+                                           BBBB
+  BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+
+     BBBB
+     BBB                             BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+  BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+     BBB
+     BBBB
+     BBBBB
+     BBBB
+
+
+                                BBBBBBBBBBB
+
+
+
+
+--- colours ---
+#00f769 #282936 #4d4f68 #626483 #62d6e8 #8be9fd #b45bcf #e9e9f4 #ea51b2 #ebff87 #ff5555 #ffb86c

@@ -80,16 +80,21 @@ pub struct Config {
 }
 
 /// `ui`: terminal UI behaviour.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct UiConfig {
     /// Capture the mouse. Off leaves selection to the terminal.
     pub mouse: bool,
+    /// `dark`, `light`, `high-contrast`, `monochrome` or a theme file.
+    pub theme: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { mouse: true }
+        Self {
+            mouse: true,
+            theme: crate::theme::DARK.to_owned(),
+        }
     }
 }
 
@@ -464,6 +469,13 @@ impl Config {
         }
 
         cfg.colors = default_config.colors;
+        crate::theme::apply(
+            &cfg.ui.theme,
+            &config_dir,
+            &mut cfg.colors,
+            &mut cfg.keyspace,
+        )
+        .map_err(config::ConfigError::Message)?;
         env_colors.apply(&mut cfg.colors)?;
 
         Ok(cfg)
