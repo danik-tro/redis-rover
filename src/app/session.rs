@@ -127,6 +127,7 @@ impl App {
         let Some(saved) = self.session.as_ref().map(|link| link.saved.clone()) else {
             return;
         };
+        self.keyspace.set_split(saved.split);
         let separator = config::get().keyspace.separator.clone();
         let (changed, needs_meta) = {
             let mut keyspace = self.state.keyspace_state.lock();
@@ -261,7 +262,7 @@ impl App {
             expanded: keyspace.expanded_groups(),
             selected_key,
             db: Some(db),
-            split: previous.split,
+            split: self.keyspace.split(),
             subscriptions,
         }
     }
@@ -481,6 +482,22 @@ mod tests {
         assert!(!drain(&mut events)
             .iter()
             .any(|e| matches!(e, RedisEvent::SelectDb(_))));
+    }
+
+    #[test]
+    fn the_pane_split_is_saved_and_comes_back() {
+        let dir = TempDir::new("split");
+        let (mut app, _events) = app_at(&dir);
+        start(&mut app, &["a"], true);
+        app.update(&Action::GrowRight);
+        app.save_session();
+        let saved = session::load(&dir.file()).targets[KEY].split;
+        assert!(saved.is_some());
+
+        let (mut app, _events) = app_at(&dir);
+        start(&mut app, &["a"], true);
+
+        assert_eq!(app.keyspace.split(), saved);
     }
 
     #[test]

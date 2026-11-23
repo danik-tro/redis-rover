@@ -3,7 +3,13 @@
 
 use ratatui::layout::{Position, Rect};
 
-use super::{state::Focus, KeySpace};
+use super::{render::key_pane_percent, state::Focus, KeySpace};
+
+/// The narrowest and widest key pane, in percent.
+const SPLIT_MIN: u16 = 25;
+const SPLIT_MAX: u16 = 75;
+/// How far one key press moves the divider, in percent.
+const SPLIT_STEP: u16 = 5;
 
 /// Where the last frame drew the two panes and their table rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,6 +42,33 @@ impl KeySpace {
     #[must_use]
     pub fn pane_areas(&self) -> PaneAreas {
         self.panes
+    }
+
+    /// The key pane's width in percent, if the user chose one.
+    #[must_use]
+    pub fn split(&self) -> Option<u16> {
+        self.split
+    }
+
+    /// Set the key pane's width (from a saved session), kept in range.
+    pub fn set_split(&mut self, split: Option<u16>) {
+        self.split = split.map(|percent| percent.clamp(SPLIT_MIN, SPLIT_MAX));
+    }
+
+    /// Move the divider one step. Nothing to move with one pane.
+    pub fn move_split(&mut self, right: bool) {
+        if self.single_pane {
+            return;
+        }
+        let current = self
+            .split
+            .unwrap_or_else(|| key_pane_percent(self.drawn_width));
+        let next = if right {
+            current.saturating_add(SPLIT_STEP)
+        } else {
+            current.saturating_sub(SPLIT_STEP)
+        };
+        self.split = Some(next.clamp(SPLIT_MIN, SPLIT_MAX));
     }
 
     /// The last frame showed one pane at a time.
@@ -178,6 +211,48 @@ mod tests {
         assert_eq!(row_at(rows, 0, 3, 2, 9), None, "the header");
         assert_eq!(row_at(rows, 0, 3, 22, 10), None, "beside the table");
         assert_eq!(row_at(rows, 0, 3, 2, 13), None, "below the last row");
+    }
+
+    #[test]
+    fn the_divider_moves_in_steps_and_stays_in_range() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.drawn_width = 120;
+
+        keyspace.move_split(true);
+        assert_eq!(keyspace.split(), Some(40));
+        keyspace.move_split(false);
+        keyspace.move_split(false);
+        assert_eq!(keyspace.split(), Some(30));
+        for _ in 0..20 {
+            keyspace.move_split(false);
+        }
+        assert_eq!(keyspace.split(), Some(SPLIT_MIN));
+        for _ in 0..20 {
+            keyspace.move_split(true);
+        }
+        assert_eq!(keyspace.split(), Some(SPLIT_MAX));
+    }
+
+    #[test]
+    fn a_saved_split_out_of_range_is_clamped() {
+        let mut keyspace = KeySpace::new(Vec::new());
+
+        keyspace.set_split(Some(5));
+        assert_eq!(keyspace.split(), Some(SPLIT_MIN));
+        keyspace.set_split(Some(500));
+        assert_eq!(keyspace.split(), Some(SPLIT_MAX));
+        keyspace.set_split(None);
+        assert_eq!(keyspace.split(), None);
+    }
+
+    #[test]
+    fn with_one_pane_the_divider_does_not_move() {
+        let mut keyspace = KeySpace::new(Vec::new());
+        keyspace.single_pane = true;
+
+        keyspace.move_split(true);
+
+        assert_eq!(keyspace.split(), None);
     }
 
     #[test]

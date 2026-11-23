@@ -23,6 +23,8 @@
       "b": "TogglePubSub",
       "<Left>": "ScrollLeft",
       "<Right>": "ScrollRight",
+      "<Ctrl-Left>": "GrowLeft",
+      "<Ctrl-Right>": "GrowRight",
       "w": "ToggleWrap",
       "y": "YankValue",
       "<Shift-y>": "YankKey",

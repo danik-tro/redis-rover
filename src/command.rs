@@ -48,6 +48,10 @@ pub enum Command {
     OpenSortMenu,
     TypeFilter,
     ToggleTree,
+    /// Move the pane divider left: a narrower key list.
+    GrowLeft,
+    /// Move the pane divider right: a wider key list.
+    GrowRight,
     LoadAll,
     GoToOpenKey,
     /// Rename the selected key, or the field / member in a hash, set, zset.
