@@ -34,6 +34,16 @@ pub fn try_get() -> Result<&'static Config, config::ConfigError> {
     Ok(CONFIG.get_or_init(|| cfg))
 }
 
+/// The key bindings of the bundled config, before the user's are merged in.
+pub fn default_keybindings() -> &'static KeyBindings {
+    static DEFAULTS: OnceLock<KeyBindings> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        json5::from_str::<Config>(CONFIG_PATH)
+            .map(|config| config.keybindings)
+            .unwrap_or_default()
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
