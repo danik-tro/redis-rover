@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{config, mode::PopupMode};
+use crate::{config, hit_map::HitTarget, mode::PopupMode};
 use color_eyre::eyre::Result;
 use ratatui::prelude::Rect;
 use ratatui::{
@@ -476,6 +476,9 @@ impl StatefulWidget for AppWidget {
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
         let [main, footer] = layout(area);
+        state.frame.hits.clear();
+        state.frame.hits.push(main, HitTarget::Main);
+        state.frame.hits.push(footer, HitTarget::Footer);
         // The environment's colour as a line across the top margin row.
         Block::new()
             .borders(Borders::TOP)

@@ -133,8 +133,8 @@ impl Tui {
         self
     }
 
+    /// Capture the mouse while the TUI is on screen (`ui.mouse`).
     #[must_use]
-    #[allow(dead_code)]
     pub fn mouse(mut self, mouse: bool) -> Self {
         self.mouse = mouse;
         self

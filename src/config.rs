@@ -71,9 +71,26 @@ pub struct Config {
     /// Live updates of the open key.
     #[serde(default)]
     pub live: LiveConfig,
+    /// Terminal UI behaviour.
+    #[serde(default)]
+    pub ui: UiConfig,
     /// Connection profiles: `rrover <name>` or `--profile <name>`.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+}
+
+/// `ui`: terminal UI behaviour.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Capture the mouse. Off leaves selection to the terminal.
+    pub mouse: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { mouse: true }
+    }
 }
 
 /// Write safety settings.
@@ -835,6 +852,12 @@ mod tests {
 
     #[test]
     fn preview_policy_parses_and_prod_forces_writes() {
+        let cfg: Config = json5::from_str(r"{ ui: { mouse: false } }").unwrap();
+        assert!(!cfg.ui.mouse);
+        let bundled: Config = json5::from_str(CONFIG_PATH).unwrap();
+        assert_eq!(bundled.ui, UiConfig::default());
+        assert!(UiConfig::default().mouse);
+
         let cfg: Config = json5::from_str(r#"{ safety: { preview: "off" } }"#).unwrap();
         assert_eq!(cfg.safety.preview, PreviewPolicy::Off);
         let cfg: Config = json5::from_str("{}").unwrap();

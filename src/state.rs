@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use crate::{
     config,
+    hit_map::HitMap,
     redis_client::{
         cluster::MasterNode,
         metrics::{ClusterMetrics, MetricsHistory},
@@ -123,6 +124,8 @@ pub struct FrameData {
     pub node_strip: Option<NodeStrip>,
     /// The MONITOR screen; `None` outside it.
     pub monitor: Option<MonitorView>,
+    /// Where this frame drew what, for the mouse. Written during render.
+    pub hits: HitMap,
 }
 
 impl FrameData {
