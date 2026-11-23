@@ -60,6 +60,22 @@ First public release. Requires Rust 1.97 or newer.
   (the log marks the gap); opt-in toasts per subscription (`Shift-n`) with a cooldown
   and an auto-mute for noisy subscriptions; unread badges per subscription and in the
   footer.
+- Mouse (`ui.mouse`, on by default): click selects a key or value row, double-click opens
+  a key, the wheel scrolls the pane under the pointer, and a bottom tab strip and popup
+  buttons are clickable. Buttons press the popup's own key, and a typed confirm can't be
+  confirmed with a click. Hold `Shift` for the terminal's own selection.
+- Themes (`ui.theme`): `dark`, `light`, `high-contrast`, `monochrome` or a theme file whose
+  omitted colors stay as in `dark`. Colors map to the terminal's depth (truecolor, 256,
+  16), and `NO_COLOR` turns them off, with reverse video for selections and badges.
+- Session restore: the filter, type filter, sort, tree folds, selected key, DB, pane split
+  and subscription names come back per target, from a private `session.json` that never
+  holds a value or a credential. `--no-restore` or `ui.restore = false` turns it off.
+- Narrow terminals: compact key columns below 120 columns, one pane at a time below 70, a
+  minimal footer below 50, and a `?` help that stacks its rows and pages.
+- A hint bar (`ui.hints`) with the keys for the current focus, built from the help tables
+  and the live key bindings, shortened by whole hints.
+- Resizable panes: `Ctrl-←` / `Ctrl-→` (`GrowLeft` / `GrowRight`), 25 to 75 %.
+- `docs/keybindings.md`, generated from the default config. A test fails when it is stale.
 - Toasts now render above every mode and popup.
 - `?` help overlay and a key-hint footer that follow the configured key bindings.
 - Configurable key bindings, colors and styles (JSON5, JSON, YAML, TOML, INI).
@@ -190,6 +206,9 @@ First public release. Requires Rust 1.97 or newer.
 
 ### Fixed
 
+- The help lists a command's keys in a stable order, shortest first (#62).
+- At 80 columns the key table shows key names, and its bottom border no longer cuts the
+  page range (#59).
 - The key list, values and writes could stop responding for the rest of the session after
   a burst of key presses while a request was slow (holding `j` during a long SCAN). No
   request is dropped any more.

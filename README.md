@@ -25,6 +25,10 @@ A Redis terminal-ui client written in rust 🦀
 - MONITOR tail (`g m`): filter, pause, rate sparkline and sampling under load, with a confirm because it costs server CPU
 - Slowlog (`g s`): sort by time or duration, full arguments, reset with a preview
 - Sharded Pub/Sub (Redis 7+) in the Pub/Sub tab, and a read-only Streams view with consumer groups and pending entries
+- Mouse: click to select, double-click to open, wheel to scroll the pane under the pointer, clickable tabs and popup buttons
+- Themes (`dark`, `light`, `high-contrast`, `monochrome`, or your own file) that adapt to truecolor, 256-color, 16-color and `NO_COLOR` terminals
+- Comes back where you left off: filter, sort, tree, selected key, DB, pane split and subscriptions, per server
+- Works in a narrow SSH window: one pane under 70 columns, and a hint bar with the keys for the current focus
 - Fully configurable key bindings, colors, and styles via a config file (JSON5, JSON, YAML, TOML, INI)
 
 ---
@@ -64,6 +68,7 @@ With no flags, `rrover` connects to `$REDIS_URL` if it is set, else to `localhos
 | `--print-target` | Print where `rrover` would connect, and where each setting came from, then exit. Opens no connection. |
 | `--probe` | Connect, print a short report (PING, server version, role, cluster, RESP3, live updates), then exit. |
 | `--tls-ca`, `--tls-cert`, `--tls-key`, `--insecure` | TLS options. See [TLS](#tls). |
+| `--no-restore` | Don't restore the last session of this target, and don't save this one. |
 | `-t, --tick-rate <FLOAT>` / `-f, --frame-rate <FLOAT>` | Ticks and frames per second. Default 4. A frame is drawn only when something on screen changed, so an idle key list redraws a few times a minute. |
 
 Each setting is taken from the first place that sets it:
@@ -359,6 +364,47 @@ The TLS flags only work with `rediss://` URLs.
 | Redis Cloud | `rediss://default:<password>@<host>:<port>` | `--tls-ca redis_ca.pem`, and `--tls-cert`/`--tls-key` if mutual TLS is on |
 | GCP Memorystore | `rediss://<ip>:6378` | `--tls-ca server-ca.pem` |
 | Self-hosted with a self-signed certificate | `rediss://<host>:<port>` | `--tls-ca ca.pem` |
+
+### Mouse
+
+With `ui.mouse` on (the default):
+
+- Click a key or value row to select it. Double-click a key to open its value.
+- The wheel scrolls the pane under the pointer, wherever the focus is. On the key list it turns the page at the end of one.
+- Click a tab on the bottom row to change screen. The tab strip needs about 50 columns.
+- Click a popup's buttons. They press the popup's own key, so a write still shows its preview. A typed confirm on `prod` has no clickable confirm: you type the name and press `Enter`.
+
+On Pub/Sub a click focuses a pane. MONITOR and Slowlog take the wheel but not row clicks.
+
+**Selecting text:** hold `Shift` while dragging to use your terminal's own selection (`Option` in iTerm2 and Terminal.app on macOS). To leave the mouse to the terminal altogether, set `ui.mouse` to `false`.
+
+### Themes
+
+```json5
+{ "ui": { "theme": "light" } }
+```
+
+`ui.theme` is `dark` (the default), `light`, `high-contrast`, `monochrome`, or the path of a theme file (absolute, or relative to the config directory). A theme file sets any of the `colors` and `keyspace` color names from [`.config/config.json5`](.config/config.json5), and whatever it leaves out stays as in `dark`:
+
+```json5
+{ "base00": "#101018", "base0d": "#7aa2f7", "hash": "#7aa2f7" }
+```
+
+Colors adapt to the terminal: `COLORTERM=truecolor` (or `24bit`) gets 24-bit color, a `TERM` containing `256` the nearest of 256 colors, anything else the 16 ANSI colors. A non-empty `NO_COLOR` turns color off. Without color, selections and badges use reverse video, and the environment, liveness and marks keep their text and symbols.
+
+### Sessions
+
+`rrover` remembers the filter, type filter, sort, tree folds, selected key, DB, pane split and Pub/Sub subscription names for each target (a profile's name, or `host:port/db`). It restores them after the first page loads and saves on quit and every 30 s when something changed. Restoring only reads from the server. If the saved key is gone, the nearest name is selected and a toast says `last key user:9 is gone`. On a DB above 2M keys it doesn't sweep to find the key.
+
+The state is in `session.json` in your state directory (the data directory on macOS and Windows), readable only by you. It holds key names and patterns, never a value, a message or a credential. A DB named with `--db`, in the URL or in a profile wins over the saved one. `--no-restore` or `ui.restore = false` turns all this off.
+
+### Narrow terminals
+
+- **Below 120 columns** the key list gets more of the width and shorter TTL and Size columns. Size, then TTL, then Type give way so the key name stays readable.
+- **Below 70 columns** one pane shows at a time. `Enter` opens the value and `Esc` goes back. The Pub/Sub tab switches panes with `Tab`.
+- **Below 50 columns** the footer shows only the environment and DB.
+
+The `?` help pages with `n` / `p` when it doesn't fit. `Ctrl-←` / `Ctrl-→` move the pane divider between 25 % and 75 %. On macOS these are Mission Control shortcuts by default, so you may need to rebind them. `ui.hints = false` hides the hint bar.
 
 ---
 
