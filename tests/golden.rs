@@ -198,6 +198,53 @@ fn keys_120() {
     check("keys_120", &draw_keyspace(&mut keyspace, 120, 20));
 }
 
+/// Under 70 columns: the key list alone, names first.
+#[test]
+fn keys_60() {
+    init();
+    let mut keyspace = keyspace(key_rows(), page(10, 10, None));
+    check("keys_60", &draw_keyspace(&mut keyspace, 60, 20));
+}
+
+/// Under 70 columns, Enter shows the value alone.
+#[test]
+fn value_60() {
+    init();
+    let mut keyspace = with_value("user:1001", user_hash("Ann Example"));
+    let mut buf = buffer(60, 20);
+    KeySpaceWidget.render(buf.area, &mut buf, &mut keyspace);
+    keyspace.enter_value();
+    let mut buf = buffer(60, 20);
+    KeySpaceWidget.render(buf.area, &mut buf, &mut keyspace);
+    check("value_60", &buf);
+}
+
+/// The `?` help at 60 columns: label over keys, on pages.
+#[test]
+fn help_60() {
+    init();
+    let mut buf = buffer(60, 24);
+    let pages = render_help_page(buf.area, &mut buf, Mode::KeySpace, 0);
+    assert!(pages > 1, "the keyspace help doesn't fit on one page");
+    check("help_60", &buf);
+}
+
+#[test]
+fn footer_60() {
+    check(
+        "footer_60",
+        &footer_at("redis://localhost:6379", Environment::Prod, true, 60),
+    );
+}
+
+#[test]
+fn footer_44() {
+    check(
+        "footer_44",
+        &footer_at("redis://localhost:6379", Environment::Prod, true, 44),
+    );
+}
+
 #[test]
 fn keys_filtered() {
     init();

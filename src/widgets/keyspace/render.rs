@@ -1,7 +1,7 @@
 use super::{
-    format::format_count, format_bytes_u128, format_ttl, format_ttl_detail, live,
-    mouse::below_header, truncate_to_width, value_footer, Focus, KeySpace, PaneAreas,
-    CLUSTER_BANNER,
+    format::format_count, format_bytes_u128, format_size_short, format_ttl, format_ttl_detail,
+    format_ttl_short, live, mouse::below_header, truncate_to_width, value_footer, Focus, KeySpace,
+    PaneAreas, CLUSTER_BANNER,
 };
 
 use byte_unit::{Byte, UnitType};
@@ -339,14 +339,61 @@ enum Column {
 }
 
 impl Column {
-    fn width(self) -> Constraint {
-        match self {
-            Self::Type => Constraint::Length(TYPE_COLUMN_WIDTH),
-            Self::Key => Constraint::Fill(1),
-            Self::Ttl => Constraint::Length(7),
-            Self::Size => Constraint::Length(10),
+    fn width(self, compact: bool) -> Constraint {
+        match (self, compact) {
+            (Self::Type, _) => Constraint::Length(TYPE_COLUMN_WIDTH),
+            (Self::Key, _) => Constraint::Fill(1),
+            (Self::Ttl, false) => Constraint::Length(7),
+            (Self::Ttl, true) => Constraint::Length(COMPACT_TTL_WIDTH),
+            (Self::Size, false) => Constraint::Length(10),
+            (Self::Size, true) => Constraint::Length(COMPACT_SIZE_WIDTH),
         }
     }
+}
+
+/// Below this width the screen shows one pane at a time.
+const SINGLE_PANE_BELOW: u16 = 70;
+/// From this width the key table has its full TTL and Size columns.
+const FULL_COLUMNS_FROM: u16 = 120;
+const COMPACT_TTL_WIDTH: u16 = 5;
+const COMPACT_SIZE_WIDTH: u16 = 6;
+/// The fewest columns a key name gets before another column gives way.
+const MIN_KEY_WIDTH: u16 = 12;
+
+/// How much of the width the key pane takes, in percent.
+fn key_pane_percent(width: u16) -> u16 {
+    if width >= FULL_COLUMNS_FROM {
+        35
+    } else {
+        45
+    }
+}
+
+/// The columns of a narrow key table: the name always keeps
+/// [`MIN_KEY_WIDTH`], with Size, then TTL, then Type giving way to it.
+fn compact_columns(table_width: u16) -> &'static [Column] {
+    const CHOICES: [&[Column]; 3] = [
+        &[Column::Type, Column::Key, Column::Ttl, Column::Size],
+        &[Column::Type, Column::Key, Column::Ttl],
+        &[Column::Type, Column::Key],
+    ];
+    // The selection marker takes two columns.
+    let room = table_width.saturating_sub(2);
+    CHOICES
+        .into_iter()
+        .find(|columns| {
+            let others: u16 = columns
+                .iter()
+                .map(|column| match column {
+                    Column::Type => TYPE_COLUMN_WIDTH + 1,
+                    Column::Ttl => COMPACT_TTL_WIDTH + 1,
+                    Column::Size => COMPACT_SIZE_WIDTH + 1,
+                    Column::Key => 0,
+                })
+                .sum();
+            room >= others + MIN_KEY_WIDTH
+        })
+        .unwrap_or(&[Column::Key])
 }
 
 /// Selection marker shared by the key and value tables.
@@ -400,10 +447,21 @@ impl StatefulWidget for KeySpaceWidget {
     #[allow(clippy::too_many_lines)]
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        let [t_area, view_area] =
-            Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)])
-                .flex(ratatui::layout::Flex::Center)
-                .areas(area);
+        state.single_pane = area.width < SINGLE_PANE_BELOW;
+        let [t_area, view_area] = if state.single_pane {
+            if state.shows_detail() {
+                [Rect::default(), area]
+            } else {
+                [area, Rect::default()]
+            }
+        } else {
+            Layout::horizontal([
+                Constraint::Percentage(key_pane_percent(area.width)),
+                Constraint::Fill(1),
+            ])
+            .flex(ratatui::layout::Flex::Center)
+            .areas(area)
+        };
         state.panes = PaneAreas {
             keys: t_area,
             value: view_area,
@@ -442,22 +500,28 @@ impl StatefulWidget for KeySpaceWidget {
                 .left_aligned(),
         );
         let room = usize::from(t_area.width.saturating_sub(2));
-        let right = match state.load_progress {
-            Some(progress) => {
-                let used = summary.as_ref().map_or(0, Line::width) + 1;
-                let mut label = progress.label(room.saturating_sub(used));
-                if label.chars().count() + used > room {
-                    summary = None;
-                    label = progress.label(room);
-                }
-                Line::from(label).fg(cfg.colors.base0a).right_aligned()
+        let right = if let Some(progress) = state.load_progress {
+            let used = summary.as_ref().map_or(0, Line::width) + 1;
+            let mut label = progress.label(room.saturating_sub(used));
+            if label.chars().count() + used > room {
+                summary = None;
+                label = progress.label(room);
             }
-            None => Line::from(format!(
+            Line::from(label).fg(cfg.colors.base0a).right_aligned()
+        } else {
+            // A debug detail: it gives way whole to the page summary.
+            let used = summary.as_ref().map_or(0, Line::width);
+            let label = format!(
                 " {}/page · cursor {} ",
                 state.page.page_size, state.page.scan_cursor
-            ))
-            .fg(cfg.colors.base03)
-            .right_aligned(),
+            );
+            // The two labels' padding spaces may share a column.
+            let label = if label.width() + used > room + 1 {
+                String::new()
+            } else {
+                label
+            };
+            Line::from(label).fg(cfg.colors.base03).right_aligned()
         };
         let space_block = Block::new()
             .bg(cfg.colors.base00)
@@ -569,16 +633,21 @@ impl StatefulWidget for KeySpaceWidget {
         }
         render_rule(rule_area, buf);
         // Header + the rule row under it take two lines.
-        state.visible_rows = usize::from(table_area.height.saturating_sub(2)).max(1);
+        // A hidden key list keeps its page size.
+        if !t_area.is_empty() {
+            state.visible_rows = usize::from(table_area.height.saturating_sub(2)).max(1);
+        }
 
         // The flat list shows every column. The tree needs room for its
         // names, so a narrow pane drops the type, then TTL and size.
+        let compact = area.width < FULL_COLUMNS_FROM;
         let columns: &[Column] = match (&state.tree_rows, table_area.width) {
+            (None, width) if compact => compact_columns(width),
             (None, _) | (Some(_), 60..) => &[Column::Type, Column::Key, Column::Ttl, Column::Size],
             (Some(_), 36..) => &[Column::Key, Column::Size],
             (Some(_), _) => &[Column::Key],
         };
-        let widths: Vec<Constraint> = columns.iter().map(|c| c.width()).collect();
+        let widths: Vec<Constraint> = columns.iter().map(|c| c.width(compact)).collect();
         // The sorted column carries its direction: `Key ▲`, `Size ▼`.
         let title = |name: &'static str, key: SortKey| -> String {
             match state.page.sort {
@@ -684,12 +753,20 @@ impl StatefulWidget for KeySpaceWidget {
                     )
                     .fg(cfg.colors.base05),
                     Column::Ttl => {
-                        Cell::from(Line::from(format_ttl(meta.ttl)).right_aligned()).fg(ttl_color)
+                        let ttl = if compact {
+                            format_ttl_short(meta.ttl)
+                        } else {
+                            format_ttl(meta.ttl)
+                        };
+                        Cell::from(Line::from(ttl).right_aligned()).fg(ttl_color)
                     }
                     // 0 is "unknown" (`MEMORY USAGE` refused, or the key
                     // went away): no stored key takes 0 bytes.
                     Column::Size if meta.size == 0 => {
                         Cell::from(Line::from("—").right_aligned()).fg(dim)
+                    }
+                    Column::Size if compact => {
+                        Cell::from(Line::from(format_size_short(meta.size)).right_aligned()).fg(dim)
                     }
                     Column::Size => Cell::from(
                         Line::from(format!(
@@ -763,6 +840,39 @@ mod tests {
 
     use crate::widgets::keyspace::tests::{render_text, with_value};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+
+    #[test]
+    fn a_narrow_table_gives_up_size_then_ttl_then_type() {
+        let columns = |width| compact_columns(width).to_vec();
+        assert_eq!(
+            columns(40),
+            [Column::Type, Column::Key, Column::Ttl, Column::Size]
+        );
+        assert_eq!(columns(28), [Column::Type, Column::Key, Column::Ttl]);
+        assert_eq!(columns(22), [Column::Type, Column::Key]);
+        assert_eq!(columns(14), [Column::Key]);
+    }
+
+    #[test]
+    fn a_hidden_key_list_keeps_its_page_size() {
+        let mut keyspace = with_value(
+            RedisType::List,
+            LoadedValue {
+                value: KeyValue::List(vec!["a".into()]),
+                page: ValuePageInfo::default(),
+            },
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 20));
+        KeySpaceWidget.render(buf.area, &mut buf, &mut keyspace);
+        let rows = keyspace.visible_rows();
+
+        keyspace.enter_value();
+        KeySpaceWidget.render(buf.area, &mut buf, &mut keyspace);
+
+        assert_eq!(keyspace.visible_rows(), rows);
+        assert!(keyspace.pane_areas().keys.is_empty());
+        assert_eq!(keyspace.pane_areas().value, buf.area);
+    }
 
     #[test]
     fn redis_json_value_renders_pretty() {

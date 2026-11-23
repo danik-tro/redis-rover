@@ -24,8 +24,8 @@ use crate::{
     widgets::{
         dashboard::DashboardWidget,
         db_picker::DbPickerWidget,
-        info::{build_hint, InfoWidget},
-        keyspace::KeySpaceWidget,
+        info::{self, build_hint, InfoWidget},
+        keyspace::{truncate_to_width, KeySpaceWidget},
         monitor::MonitorWidget,
         pubsub::{PubSubView, PubSubWidget},
         slowlog::SlowlogWidget,
@@ -266,9 +266,10 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
 /// Keys every text input takes (ratatui-textarea's own, not rebindable).
 const TEXT_INPUT_HELP: &[(&str, &str)] = &[("Undo / redo in a text input", "Ctrl-U / Ctrl-R")];
 
-/// The main area and, below it, the five-row footer.
+/// The main area and, below it, the footer (shorter on a narrow screen).
 fn layout(area: Rect) -> [Rect; 2] {
-    Layout::vertical([Constraint::Percentage(100), Constraint::Length(5)])
+    let footer = info::footer_height(area.width.saturating_sub(2));
+    Layout::vertical([Constraint::Percentage(100), Constraint::Length(footer)])
         .flex(Flex::Center)
         .margin(1)
         .areas(area)
@@ -671,11 +672,9 @@ impl App {
         Self::render_help_page(area, buf, mode, 0);
     }
 
-    /// The `?` help, page `page` of what fits in `area`. Returns how many
-    /// pages there are (1 when everything fits).
-    pub(crate) fn render_help_page(area: Rect, buf: &mut Buffer, mode: Mode, page: usize) -> usize {
-        let cfg = config::get();
-        let keybindings = &cfg.keybindings;
+    /// The `?` help's rows for `mode`: each command's label and its keys.
+    fn help_rows(mode: Mode) -> Vec<(String, String)> {
+        let keybindings = &config::get().keybindings;
 
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
@@ -711,9 +710,37 @@ impl App {
                     .map(|(label, keys)| ((*label).to_owned(), (*keys).to_owned())),
             );
         }
+        rows
+    }
 
+    /// The `?` help, page `page` of what fits in `area`. Returns how many
+    /// pages there are (1 when everything fits).
+    pub(crate) fn render_help_page(area: Rect, buf: &mut Buffer, mode: Mode, page: usize) -> usize {
+        let cfg = config::get();
+        let mut rows = Self::help_rows(mode);
+        // Too narrow for label and keys side by side: the keys go under it.
+        let stacked = help_columns(&rows).1 + 4 > usize::from(area.width);
+        if stacked {
+            let room = usize::from(area.width.saturating_sub(4));
+            rows = rows
+                .into_iter()
+                .flat_map(|(label, keys)| {
+                    [
+                        (truncate_to_width(&label, room).into_owned(), String::new()),
+                        (
+                            truncate_to_width(&format!("  {keys}"), room).into_owned(),
+                            String::new(),
+                        ),
+                    ]
+                })
+                .collect();
+        }
         let (label_width, row_width) = help_columns(&rows);
-        let grid = HelpGrid::fit(rows.len(), row_width, area);
+        let mut grid = HelpGrid::fit(rows.len(), row_width, area);
+        if stacked {
+            // A label and its keys stay on the same page.
+            grid.rows = (grid.rows - grid.rows % 2).max(2);
+        }
         let per_page = (grid.columns * grid.rows).max(1);
         let pages = rows.len().div_ceil(per_page).max(1);
         let page = page.min(pages - 1);

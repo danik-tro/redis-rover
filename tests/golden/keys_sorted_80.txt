@@ -1,20 +1,20 @@
-╭ Keys ────────────────────╮╭ Values ──────────────────────────────────────────╮
-│ filter *                 ││                                                  │
-│ ──────────────────────── ││                                                  │
-│   Ty    TTL ▲       Size ││                                                  │
-│ ──────────────────────── ││                                                  │
-│   st       2m  14.65 KiB ││                                                  │
-│   st       1h       96 B ││                                                  │
-│   zs       1d   1.17 KiB ││                                                  │
-│   MB        ∞   1.00 KiB ││                                                  │
-│   js        ∞      420 B ││                                                  │
-│   st        ∞   8.00 KiB ││           Select a key · Enter to open           │
-│   li        ∞   2.00 KiB ││                                                  │
-│   se        ∞      540 B ││                                                  │
-│   ha        ∞      312 B ││                                                  │
-│   ha        ∞      296 B ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
+╭ Keys ────────────────────────────╮╭ Values ──────────────────────────────────╮
+│ filter *                         ││                                          │
+│ ──────────────────────────────── ││                                          │
+│   Type   Key               TTL ▲ ││                                          │
+│ ──────────────────────────────── ││                                          │
+│   str    cache:page:/home     2m ││                                          │
+│   str    session:7f3a9c       1h ││                                          │
+│   zset   leaderboard:2024     1d ││                                          │
+│   MBblo… bloom:emails          ∞ ││                                          │
+│   json   doc:settings          ∞ ││                                          │
+│   stream events:orders         ∞ ││       Select a key · Enter to open       │
+│   list   queue:jobs            ∞ ││                                          │
+│   set    tags:popular          ∞ ││                                          │
+│   hash   user:1001             ∞ ││                                          │
+│   hash   user:1002             ∞ ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+╰ Page 1 · 1–10 of 10 ─────────────╯╰──────────────────────────────────────────╯

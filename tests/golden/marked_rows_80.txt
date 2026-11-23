@@ -1,20 +1,20 @@
-╭ Keys · 3 marked ─────────╮╭ Values ──────────────────────────────────────────╮
-│ filter *                 ││ Key   queue:jobs                                 │
-│ ──────────────────────── ││ Type  list                                       │
-│   Ty      TTL       Size ││ TTL   No expiry                                  │
-│ ──────────────────────── ││ Size  2.00 KiB                                   │
-│   ●h        ∞      312 B ││ ──────────────────────────────────────────────── │
-│    h        ∞      296 B ││                                                  │
-│   ●s       1h       96 B ││                                                  │
-│ ▌  l        ∞   2.00 KiB ││                                                  │
-│    s        ∞      540 B ││                                                  │
-│    z       1d   1.17 KiB ││                                                  │
-│    s        ∞   8.00 KiB ││                                                  │
-│    j        ∞      420 B ││                     Loading…                     │
-│   ●s       2m  14.65 KiB ││                                                  │
-│    M        ∞   1.00 KiB ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
+╭ Keys · 3 marked ─────────────────╮╭ Values ──────────────────────────────────╮
+│ filter *                         ││ Key   queue:jobs                         │
+│ ──────────────────────────────── ││ Type  list                               │
+│   Type   Key                 TTL ││ TTL   No expiry                          │
+│ ──────────────────────────────── ││ Size  2.00 KiB                           │
+│   hash   ● user:1001           ∞ ││ ──────────────────────────────────────── │
+│   hash     user:1002           ∞ ││                                          │
+│   str    ● session:7f3a9c     1h ││                                          │
+│ ▌ list     queue:jobs          ∞ ││                                          │
+│   set      tags:popular        ∞ ││                                          │
+│   zset     leaderboard:20…    1d ││                                          │
+│   stream   events:orders       ∞ ││                                          │
+│   json     doc:settings        ∞ ││                 Loading…                 │
+│   str    ● cache:page:/ho…    2m ││                                          │
+│   MBblo…   bloom:emails        ∞ ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+╰ Page 1 · 1–10 of 10 ─────────────╯╰──────────────────────────────────────────╯

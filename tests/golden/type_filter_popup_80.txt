@@ -1,20 +1,20 @@
-╭ Keys ────────────────────╮╭ Values ──────────────────────────────────────────╮
-│ filter *                 ││                                                  │
-│ ──────────────────────── ││                                                  │
-│   Ty      TTL       Size ││                                                  │
-│ ──────────────────────── ││                                                  │
-│   ha        ∞      312 B ╭ Show types ────────────╮                          │
-│   ha        ∞      296 B │   [ ] string           │                          │
-│   st       1h       96 B │   [ ] list             │                          │
-│   li        ∞   2.00 KiB │   [ ] set              │                          │
-│   se        ∞      540 B │   [x] zset             │                          │
-│   zs       1d   1.17 KiB │ › [x] hash             │· Enter to open           │
-│   st        ∞   8.00 KiB │   [ ] stream           │                          │
-│   js        ∞      420 B │   [ ] json             │                          │
-│   st       2m  14.65 KiB │   [ ] MBbloom--        │                          │
-│   MB        ∞   1.00 KiB ╰ Space · x none · Enter ╯                          │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
+╭ Keys ────────────────────────────╮╭ Values ──────────────────────────────────╮
+│ filter *                         ││                                          │
+│ ──────────────────────────────── ││                                          │
+│   Type   Key                 TTL ││                                          │
+│ ──────────────────────────────── ││                                          │
+│   hash   user:1001       ╭ Show types ────────────╮                          │
+│   hash   user:1002       │   [ ] string           │                          │
+│   str    session:7f3a9c  │   [ ] list             │                          │
+│   list   queue:jobs      │   [ ] set              │                          │
+│   set    tags:popular    │   [x] zset             │                          │
+│   zset   leaderboard:2024│ › [x] hash             │key · Enter to open       │
+│   stream events:orders   │   [ ] stream           │                          │
+│   json   doc:settings    │   [ ] json             │                          │
+│   str    cache:page:/home│   [ ] MBbloom--        │                          │
+│   MBblo… bloom:emails    ╰ Space · x none · Enter ╯                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+╰ Page 1 · 1–10 of 10 ─────────────╯╰──────────────────────────────────────────╯

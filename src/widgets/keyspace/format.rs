@@ -23,6 +23,33 @@ pub(super) fn format_ttl(ttl: isize) -> String {
     }
 }
 
+/// The TTL column on a narrow screen: only the largest unit (`1h`, `2d`).
+pub(super) fn format_ttl_short(ttl: isize) -> String {
+    let full = format_ttl(ttl);
+    full.split_whitespace().next().unwrap_or("").to_owned()
+}
+
+/// The size column on a narrow screen: at most 6 columns (`312B`, `1.2K`,
+/// `15K`, `3.4M`).
+pub(super) fn format_size_short(bytes: u128) -> String {
+    const UNITS: [&str; 6] = ["K", "M", "G", "T", "P", "E"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
 /// Detail-pane TTL: spelled-out sentinels, and the raw seconds alongside the
 /// humanized duration (`1h 30m (5400s)`).
 pub(super) fn format_ttl_detail(ttl: isize) -> String {
@@ -211,6 +238,34 @@ pub(crate) fn truncate_to_width(s: &str, max: usize) -> Cow<'_, str> {
     }
     out.push('…');
     Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn short_sizes_fit_their_column() {
+        for (bytes, text) in [
+            (0, "0B"),
+            (1023, "1023B"),
+            (1024, "1.0K"),
+            (15_360, "15K"),
+            (1_048_576, "1.0M"),
+            (1_023 * 1_048_576, "1023M"),
+            (5 * 1024u128.pow(6), "5.0E"),
+        ] {
+            assert_eq!(format_size_short(bytes), text);
+        }
+        assert!(format_size_short(1023 * 1024).chars().count() <= 6);
+    }
+
+    #[test]
+    fn a_short_ttl_is_its_largest_unit() {
+        assert_eq!(format_ttl_short(-1), "∞");
+        assert_eq!(format_ttl_short(5400), "1h");
+        assert_eq!(format_ttl_short(45), "45s");
+    }
 }
 
 #[cfg(test)]

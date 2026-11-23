@@ -271,6 +271,7 @@ impl KeySpace {
         // reset it (and drop value focus) so the new value starts fresh.
         self.value_table.select(None);
         self.focus = Focus::Keys;
+        self.detail_open = false;
     }
 
     pub fn refresh(&mut self) {

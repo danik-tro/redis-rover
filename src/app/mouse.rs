@@ -623,6 +623,31 @@ mod tests {
     }
 
     #[test]
+    fn in_one_pane_enter_shows_the_value_and_esc_goes_back() {
+        let (mut app, _) = app_with_keys();
+        assert!(app.keyspace.select_key_by_name("user:2"));
+        app.keyspace.set_selected_value(Some(LoadedValue {
+            value: KeyValue::Unknown,
+            page: ValuePageInfo::default(),
+        }));
+        let area = Rect::new(0, 0, 60, 24);
+        let mut buf = Buffer::empty(area);
+        app.build_frame(area);
+        AppWidget.render(area, &mut buf, &mut app);
+        assert!(app.keyspace.pane_areas().value.is_empty());
+
+        app.update(&Action::EnterValue);
+        app.build_frame(area);
+        AppWidget.render(area, &mut buf, &mut app);
+        assert!(app.keyspace.pane_areas().keys.is_empty(), "the value alone");
+
+        app.update(&Action::DiscardKeyspacePopup);
+        app.build_frame(area);
+        AppWidget.render(area, &mut buf, &mut app);
+        assert!(app.keyspace.pane_areas().value.is_empty(), "the list again");
+    }
+
+    #[test]
     fn nothing_under_a_modal_takes_the_mouse() {
         let (mut app, _) = app_with_keys();
         let buf = draw(&mut app);
