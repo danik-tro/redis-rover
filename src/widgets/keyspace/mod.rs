@@ -83,6 +83,10 @@ pub struct KeySpace {
     visible_rows: usize,
     /// Where the last frame drew the panes, for the mouse.
     panes: PaneAreas,
+    /// The key pane's width in percent, once the user moved the divider.
+    split: Option<u16>,
+    /// The width of the last frame.
+    drawn_width: u16,
     /// The last frame had room for one pane only.
     single_pane: bool,
     /// One pane: the selected key's details show even with focus on the
@@ -182,6 +186,8 @@ impl KeySpace {
             cluster_mode: false,
             visible_rows: 0,
             panes: PaneAreas::default(),
+            split: None,
+            drawn_width: 0,
             single_pane: false,
             detail_open: false,
             json_path: Vec::new(),

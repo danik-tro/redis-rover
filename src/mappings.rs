@@ -6,6 +6,8 @@ impl From<Command> for Action {
             Command::Quit => Self::Quit,
             Command::ScrollDown => Self::ScrollDown,
             Command::ScrollUp => Self::ScrollUp,
+            Command::GrowLeft => Self::GrowLeft,
+            Command::GrowRight => Self::GrowRight,
             Command::RefreshSpace => Self::RefreshSpace,
             Command::LoadNextPage => Self::LoadNextPage,
             Command::LoadPreviousPage => Self::LoadPreviousPage,

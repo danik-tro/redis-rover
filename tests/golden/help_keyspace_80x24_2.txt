@@ -7,6 +7,8 @@
             │ Wrap text value on / off              w               │
             │ Pan text left (wrap off)              Left            │
             │ Pan text right (wrap off)             Right           │
+            │ Narrow the key pane                   Ctrl-Left       │
+            │ Widen the key pane                    Ctrl-Right      │
             │ Switch database                       s               │
             │ Open metrics dashboard                m               │
             │ Open Pub/Sub                          b               │
@@ -19,6 +21,4 @@
             │ Go to Pub/Sub                         g p             │
             │ Go to metrics dashboard               g d             │
             │ Undo / redo in a text input           Ctrl-U / Ctrl-R │
-            │                                                       │
-            │                                                       │
             ╰────────────────── 2/2 · n / p: page ──────────────────╯

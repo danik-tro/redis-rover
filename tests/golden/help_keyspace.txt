@@ -6,27 +6,27 @@
 
 
 
-
     ╭──────────────────────────────────────────────────── Help ─────────────────────────────────────────────────────╮
-    │ Scroll down                           j                 Copy key (Tab: target DB)             c               │
-    │ Scroll up                             k                 Mark / unmark key (d deletes marked)  Space           │
-    │ Next page (keys or open value)        n                 Mark all keys on the page             Shift-M         │
-    │ Previous page (keys or open value)    p                 Clear marks                           Shift-U         │
-    │ Refresh keyspace                      r                 Copy value / item                     y               │
-    │ Set filter pattern                    f                 Copy key name                         Shift-Y         │
-    │ Delete filter pattern                 l                 Wrap text value on / off              w               │
-    │ Sort by key / type / TTL / size       o                 Pan text left (wrap off)              Left            │
-    │ Show only some types                  Shift-T           Pan text right (wrap off)             Right           │
-    │ Tree view (←/→ fold, Enter opens)     v                 Switch database                       s               │
-    │ Load all keys (Esc stops)             Shift-A           Open metrics dashboard                m               │
-    │ Go to the open key                    g o               Open Pub/Sub                          b               │
-    │ Enter value / JSON field / confirm    Enter             Close popup / overlay                 Esc             │
-    │ Stream: entries / groups              Tab               Toggle read-only                      Shift-R         │
-    │ Add new key                           a                 Toggle this help                      ?               │
-    │ Add item (in collection)              i                 Quit                                  Ctrl-c          │
-    │ Edit value / item (drill in first)    e                 Go to MONITOR                         g m             │
-    │ Edit value / item in $EDITOR          Shift-E           Go to Slowlog                         g s             │
-    │ Delete key / item (in value)          d                 Go to Pub/Sub                         g p             │
-    │ Set TTL                               t                 Go to metrics dashboard               g d             │
-    │ Rename key / field / member           F2                Undo / redo in a text input           Ctrl-U / Ctrl-R │
+    │ Scroll down                           j                 Mark / unmark key (d deletes marked)  Space           │
+    │ Scroll up                             k                 Mark all keys on the page             Shift-M         │
+    │ Next page (keys or open value)        n                 Clear marks                           Shift-U         │
+    │ Previous page (keys or open value)    p                 Copy value / item                     y               │
+    │ Refresh keyspace                      r                 Copy key name                         Shift-Y         │
+    │ Set filter pattern                    f                 Wrap text value on / off              w               │
+    │ Delete filter pattern                 l                 Pan text left (wrap off)              Left            │
+    │ Sort by key / type / TTL / size       o                 Pan text right (wrap off)             Right           │
+    │ Show only some types                  Shift-T           Narrow the key pane                   Ctrl-Left       │
+    │ Tree view (←/→ fold, Enter opens)     v                 Widen the key pane                    Ctrl-Right      │
+    │ Load all keys (Esc stops)             Shift-A           Switch database                       s               │
+    │ Go to the open key                    g o               Open metrics dashboard                m               │
+    │ Enter value / JSON field / confirm    Enter             Open Pub/Sub                          b               │
+    │ Stream: entries / groups              Tab               Close popup / overlay                 Esc             │
+    │ Add new key                           a                 Toggle read-only                      Shift-R         │
+    │ Add item (in collection)              i                 Toggle this help                      ?               │
+    │ Edit value / item (drill in first)    e                 Quit                                  Ctrl-c          │
+    │ Edit value / item in $EDITOR          Shift-E           Go to MONITOR                         g m             │
+    │ Delete key / item (in value)          d                 Go to Slowlog                         g s             │
+    │ Set TTL                               t                 Go to Pub/Sub                         g p             │
+    │ Rename key / field / member           F2                Go to metrics dashboard               g d             │
+    │ Copy key (Tab: target DB)             c                 Undo / redo in a text input           Ctrl-U / Ctrl-R │
     ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

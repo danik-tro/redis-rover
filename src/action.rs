@@ -62,6 +62,10 @@ pub enum Action {
     OpenTypeFilter,
     /// `v`: flat list ↔ prefix tree.
     ToggleTree,
+    /// Move the pane divider left.
+    GrowLeft,
+    /// Move the pane divider right.
+    GrowRight,
     RequestSelectedValue,
     LoadSelectedValueIntoView,
     /// A value fetch failed. Only clears the value's loading indicator.

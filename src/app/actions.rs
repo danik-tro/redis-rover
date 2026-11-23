@@ -130,6 +130,8 @@ impl App {
             Action::OpenSortMenu => self.keyspace.open_sort_menu(),
             Action::OpenTypeFilter => self.open_type_filter(),
             Action::ToggleTree => self.toggle_tree(),
+            Action::GrowLeft => self.keyspace.move_split(false),
+            Action::GrowRight => self.keyspace.move_split(true),
             Action::KeysLoadAborted => self.finish_keys_fetch(),
             Action::KeysScanning(checked) => self.keyspace.set_scanning(Some(checked)),
             Action::RequestSelectedValue => self.request_selected_value(),

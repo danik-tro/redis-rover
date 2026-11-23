@@ -382,6 +382,8 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleWrap, "Wrap text value on / off"),
     (Command::ScrollLeft, "Pan text left (wrap off)"),
     (Command::ScrollRight, "Pan text right (wrap off)"),
+    (Command::GrowLeft, "Narrow the key pane"),
+    (Command::GrowRight, "Widen the key pane"),
     (Command::SelectDb, "Switch database"),
     (Command::ToggleDashboard, "Open metrics dashboard"),
     (Command::TogglePubSub, "Open Pub/Sub"),

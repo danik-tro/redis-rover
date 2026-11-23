@@ -355,13 +355,15 @@ impl Column {
 const SINGLE_PANE_BELOW: u16 = 70;
 /// From this width the key table has its full TTL and Size columns.
 const FULL_COLUMNS_FROM: u16 = 120;
+/// The narrowest table that still gives a name room next to the full columns.
+const FULL_COLUMNS_TABLE: u16 = 38;
 const COMPACT_TTL_WIDTH: u16 = 5;
 const COMPACT_SIZE_WIDTH: u16 = 6;
 /// The fewest columns a key name gets before another column gives way.
 const MIN_KEY_WIDTH: u16 = 12;
 
 /// How much of the width the key pane takes, in percent.
-fn key_pane_percent(width: u16) -> u16 {
+pub(super) fn key_pane_percent(width: u16) -> u16 {
     if width >= FULL_COLUMNS_FROM {
         35
     } else {
@@ -447,6 +449,7 @@ impl StatefulWidget for KeySpaceWidget {
     #[allow(clippy::too_many_lines)]
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
+        state.drawn_width = area.width;
         state.single_pane = area.width < SINGLE_PANE_BELOW;
         let [t_area, view_area] = if state.single_pane {
             if state.shows_detail() {
@@ -456,7 +459,7 @@ impl StatefulWidget for KeySpaceWidget {
             }
         } else {
             Layout::horizontal([
-                Constraint::Percentage(key_pane_percent(area.width)),
+                Constraint::Percentage(state.split.unwrap_or_else(|| key_pane_percent(area.width))),
                 Constraint::Fill(1),
             ])
             .flex(ratatui::layout::Flex::Center)
@@ -640,7 +643,8 @@ impl StatefulWidget for KeySpaceWidget {
 
         // The flat list shows every column. The tree needs room for its
         // names, so a narrow pane drops the type, then TTL and size.
-        let compact = area.width < FULL_COLUMNS_FROM;
+        // A divider moved left narrows the table on a wide screen too.
+        let compact = area.width < FULL_COLUMNS_FROM || table_area.width < FULL_COLUMNS_TABLE;
         let columns: &[Column] = match (&state.tree_rows, table_area.width) {
             (None, width) if compact => compact_columns(width),
             (None, _) | (Some(_), 60..) => &[Column::Type, Column::Key, Column::Ttl, Column::Size],
