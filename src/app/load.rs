@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Above this many keys in the DB, `Shift-a` asks first.
-const LOAD_ALL_ASK_ABOVE: u64 = 2_000_000;
+pub(super) const LOAD_ALL_ASK_ABOVE: u64 = 2_000_000;
 
 /// Memory per loaded key besides its name: the sweep and its index (66 B,
 /// from the 10M-key `merge_batch` bench), the metadata columns a sort
@@ -83,6 +83,7 @@ impl App {
         if self.loading.take().is_none() {
             return false;
         }
+        self.end_restore_seek();
         self.send_redis_event(RedisEvent::StopLoadAll);
         self.keyspace.set_load_progress(None);
         self.refresh_page();
@@ -120,8 +121,13 @@ impl App {
                 self.refresh_page();
             }
             Loading::Seek(key) => {
+                let restoring = self.end_restore_seek();
                 if self.state.keyspace_state.lock().index_of(&key).is_some() {
                     self.reveal_key(key);
+                    return;
+                }
+                if restoring && complete {
+                    self.saved_key_gone(&key);
                     return;
                 }
                 if complete {
@@ -136,6 +142,7 @@ impl App {
     /// The DB changed: the runner dropped the load, and the open key
     /// belongs to the old DB.
     pub(super) fn forget_load_and_open_key(&mut self) {
+        self.end_restore_seek();
         self.loading = None;
         self.open_key = None;
         self.keyspace.set_load_progress(None);
@@ -149,7 +156,7 @@ impl App {
 
     /// Go to the page that shows `key` (opening its tree groups) and put
     /// the cursor on it.
-    fn reveal_key(&mut self, key: String) {
+    pub(super) fn reveal_key(&mut self, key: String) {
         self.state.keyspace_state.lock().reveal(key.clone());
         self.reselect_key = Some(key);
         self.fetch_keys();

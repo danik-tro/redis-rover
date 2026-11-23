@@ -136,7 +136,6 @@ pub fn get_config_dir() -> PathBuf {
 
 /// Where `session.json` lives: the platform's state directory, or the data
 /// directory where it has none (macOS, Windows). `REDIS_ROVER_DATA` moves it.
-#[allow(dead_code)] // Session restore, the next step, is the caller.
 pub fn get_state_dir() -> PathBuf {
     if let Some(dir) = DATA_FOLDER.clone() {
         return dir;

@@ -15,6 +15,7 @@ mod nodes;
 mod power;
 mod pubsub;
 mod render;
+mod session;
 mod slowlog;
 
 use std::{
@@ -161,6 +162,8 @@ pub struct App {
     live: LiveLink,
     /// What the terminal shows; every frame is converted to it.
     color_depth: ColorDepth,
+    /// The session file; `None` with `--no-restore` / `ui.restore = false`.
+    session: Option<session::SessionLink>,
 }
 
 /// The App's side of the live task.
@@ -284,6 +287,7 @@ impl App {
             open_key: None,
             live: LiveLink::default(),
             color_depth: ColorDepth::default(),
+            session: None,
             preview: config::get().safety.preview,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
@@ -376,6 +380,7 @@ impl App {
             Ok(()) => self.event_loop(&mut tui).await,
             Err(err) => Err(err),
         };
+        self.save_session();
         let shutdown = tui.shutdown().await;
         result.and(shutdown)
     }

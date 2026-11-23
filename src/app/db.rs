@@ -42,6 +42,11 @@ impl App {
         if db == *self.state.db.lock() {
             return;
         }
+        self.switch_db(db);
+    }
+
+    /// Ask the runner for DB `db`, dropping what belongs to the current one.
+    pub(super) fn switch_db(&mut self, db: i64) {
         self.reselect_key = None;
         self.restore_value_row = None;
         self.restore_value_pending = false;

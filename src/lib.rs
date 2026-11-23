@@ -126,6 +126,11 @@ pub async fn run(args: Cli) -> Result<()> {
         |name| std::env::var(name).ok(),
     ));
 
+    if config::get().ui.restore && !args.no_restore {
+        let path = session::path_in(&utils::get_state_dir());
+        app = app.session(path, target.session_key(), !target.names_db());
+    }
+
     watcher.start();
     let run_result = app.run(cancellation_token).await;
     watcher.shutdown().await;

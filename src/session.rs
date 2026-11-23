@@ -198,7 +198,6 @@ pub fn save(path: &Path, key: &str, state: &SessionState) -> io::Result<()> {
 }
 
 /// [`save`], logging a failure: a read-only disk must not disturb the app.
-#[allow(dead_code)] // Session restore, the next step, is the caller.
 pub fn save_logged(path: &Path, key: &str, state: &SessionState) {
     if let Err(err) = save(path, key, state) {
         log::warn!("could not save the session to {}: {err}", path.display());

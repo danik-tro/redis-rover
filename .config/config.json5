@@ -193,6 +193,9 @@
     // absolute or under the config dir) with any of the `colors` and
     // `keyspace` colour names; what it leaves out stays as in "dark".
     "theme": "dark",
+    // Come back to the last filter, sort, selection and DB of each target
+    // (`--no-restore` turns it off for one launch).
+    "restore": true,
   },
   "monitor": {
     // Lines and bytes kept on the MONITOR screen; the oldest go first.
