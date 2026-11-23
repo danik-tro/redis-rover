@@ -441,6 +441,13 @@ impl App {
                 self.keyspace.restore_value_focus(row);
             }
         }
+
+        if let Some(key) = self.open_when_loaded.take() {
+            if self.keyspace.selected_key().is_some_and(|(k, _)| k == key) {
+                self.enter_value();
+                self.remember_open_key();
+            }
+        }
     }
 
     /// Size keyspace pages to the rows the table can show (#45). Runs after
@@ -630,6 +637,7 @@ impl App {
     }
 
     pub(super) fn fetch_keys(&mut self) {
+        self.open_when_loaded = None;
         self.keyspace.refresh();
         if let Err(err) = self.redis_tx.send(RedisEvent::FetchKeys) {
             log::error!("Failed to send redis event: {err:?}");
@@ -648,7 +656,8 @@ impl App {
     /// The cursor moved to another key. The value is fetched at once when the
     /// cursor was at rest, else (a held `j` / `k`) once it has rested for
     /// [`VALUE_FETCH_REST`]: `Tick` or the next other action sends it.
-    fn cursor_moved(&mut self, now: Instant) {
+    pub(super) fn cursor_moved(&mut self, now: Instant) {
+        self.open_when_loaded = None;
         self.keyspace.clear_selected_value();
         let resting = self
             .last_cursor_move

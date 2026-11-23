@@ -97,6 +97,10 @@ pub struct App {
     last_cursor_move: Option<Instant>,
     /// A held `j` / `k` moved the cursor and its value isn't requested yet.
     value_pending: bool,
+    /// The last left click, for spotting a double-click.
+    last_click: Option<mouse::LastClick>,
+    /// A double-click on this key came before its value: open it on arrival.
+    open_when_loaded: Option<String>,
 
     should_quit: bool,
     /// Keys of a partially typed chord (a strict prefix of some binding).
@@ -253,6 +257,8 @@ impl App {
             json_focus_row: None,
             last_cursor_move: None,
             value_pending: false,
+            last_click: None,
+            open_when_loaded: None,
             pending_keys: Vec::new(),
             last_key_at: None,
             keys_in_flight: 0,

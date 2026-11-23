@@ -3,6 +3,7 @@ mod forms;
 mod input;
 mod live;
 mod marks;
+mod mouse;
 mod overlay;
 mod render;
 mod state;
@@ -14,6 +15,7 @@ pub(crate) use format::truncate_to_width;
 use format::{format_bytes_u128, format_ttl, format_ttl_detail, value_footer};
 pub(crate) use forms::{build_input_text_area, input_text, set_input_titles};
 pub use input::OverlayRequest;
+pub use mouse::PaneAreas;
 pub use render::KeySpaceWidget;
 pub use state::{ItemSlot, PageInfo, ScrollOutcome};
 pub use type_menu::{TypeMenu, TypeMenuOutcome};
@@ -76,6 +78,8 @@ pub struct KeySpace {
     /// Key rows that fit in the table on the last render (0 before the first
     /// render). The app sizes keyspace pages to it.
     visible_rows: usize,
+    /// Where the last frame drew the panes, for the mouse.
+    panes: PaneAreas,
     /// JSON field opened from a preview that the loaded value shows.
     json_path: Vec<String>,
     /// The `o` sort menu is open.
@@ -169,6 +173,7 @@ impl KeySpace {
             edit_item: None,
             cluster_mode: false,
             visible_rows: 0,
+            panes: PaneAreas::default(),
             json_path: Vec::new(),
             sort_menu: false,
             type_menu: None,

@@ -1,6 +1,7 @@
 use super::{
     format::format_count, format_bytes_u128, format_ttl, format_ttl_detail, live,
-    truncate_to_width, value_footer, Focus, KeySpace, CLUSTER_BANNER,
+    mouse::below_header, truncate_to_width, value_footer, Focus, KeySpace, PaneAreas,
+    CLUSTER_BANNER,
 };
 
 use byte_unit::{Byte, UnitType};
@@ -159,6 +160,7 @@ impl KeySpaceWidget {
             return;
         }
         let view_area = render_value_footer(footer, view_area, buf);
+        state.panes.value_rows = below_header(view_area);
 
         let mut rows = Rows {
             table: &mut state.value_table,
@@ -402,6 +404,11 @@ impl StatefulWidget for KeySpaceWidget {
             Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)])
                 .flex(ratatui::layout::Flex::Center)
                 .areas(area);
+        state.panes = PaneAreas {
+            keys: t_area,
+            value: view_area,
+            ..PaneAreas::default()
+        };
 
         // Highlight whichever pane currently has keyboard focus so it's obvious
         // where `j`/`k` will move after `EnterValue`.
@@ -707,6 +714,7 @@ impl StatefulWidget for KeySpaceWidget {
         if state.keys.is_empty() {
             Self::render_empty_keys(state, table_area, buf);
         } else {
+            state.panes.key_rows = below_header(table_area);
             StatefulWidget::render(table, table_area, buf, &mut state.table);
             render_header_rule(table_area, buf);
         }
