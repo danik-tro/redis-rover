@@ -67,6 +67,7 @@ impl App {
         changed |= self.keyspace.expire_changed(now);
         changed |= self.pubsub_tick(now, self.clock.wall());
         changed |= self.sync_ops_node();
+        self.session_tick(now);
         self.redraw.dirty |= changed;
     }
 
@@ -119,6 +120,7 @@ impl App {
                 self.finish_keys_fetch();
                 self.load_new_keys();
                 self.request_backfill();
+                self.advance_restore();
             }
             Action::KeyMetaBackfilled => self.meta_backfilled(),
             Action::LoadAll => self.request_load_all(),

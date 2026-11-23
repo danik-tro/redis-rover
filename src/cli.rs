@@ -87,6 +87,12 @@ pub struct Cli {
     )]
     pub probe: bool,
 
+    #[arg(
+        long,
+        help = "Don't restore the last session of this target, and don't save this one"
+    )]
+    pub no_restore: bool,
+
     #[command(flatten)]
     pub tls: TlsArgs,
 }

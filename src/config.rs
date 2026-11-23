@@ -87,12 +87,15 @@ pub struct UiConfig {
     pub mouse: bool,
     /// `dark`, `light`, `high-contrast`, `monochrome` or a theme file.
     pub theme: String,
+    /// Come back to the last filter, sort, selection and DB of each target.
+    pub restore: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             mouse: true,
+            restore: true,
             theme: crate::theme::DARK.to_owned(),
         }
     }

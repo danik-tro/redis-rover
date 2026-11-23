@@ -722,6 +722,26 @@ impl KeyspaceState {
         self.refresh_tree();
     }
 
+    /// The open tree groups by prefix, sorted (empty in the flat list).
+    #[must_use]
+    pub fn expanded_groups(&self) -> Vec<String> {
+        self.view.tree().map_or_else(Vec::new, Tree::expanded)
+    }
+
+    /// Turn the tree on with these groups open, for a restored session.
+    pub fn restore_tree(&mut self, separator: &str, expanded: &[String]) {
+        if !self.is_tree() {
+            self.toggle_tree(separator);
+        }
+        if let Some(tree) = self.view.tree_mut() {
+            for prefix in expanded {
+                tree.set_expanded(prefix, true);
+            }
+        }
+        self.refresh_tree();
+        self.generation += 1;
+    }
+
     /// The current page's rows in tree mode (`None` in the flat list):
     /// groups, and a `Leaf` per key of [`Self::page_keys`].
     #[must_use]

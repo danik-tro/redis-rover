@@ -88,6 +88,14 @@ impl Tree {
         self.expanded.contains(prefix)
     }
 
+    /// The open groups by prefix, sorted.
+    #[must_use]
+    pub fn expanded(&self) -> Vec<String> {
+        let mut prefixes: Vec<String> = self.expanded.iter().cloned().collect();
+        prefixes.sort_unstable();
+        prefixes
+    }
+
     /// Open or close the group `prefix`. Returns `true` if it changed.
     pub fn set_expanded(&mut self, prefix: &str, open: bool) -> bool {
         if open {

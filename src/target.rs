@@ -909,7 +909,6 @@ impl Target {
     /// its address and DB. Built from those fields alone, so no user name or
     /// password can reach the file. A `--url` that replaces a profile's
     /// server is that server, not the profile.
-    #[allow(dead_code)] // Session restore, the next step, is the caller.
     #[must_use]
     pub fn session_key(&self) -> String {
         if let (Some(name), Source::Profile(_)) = (&self.profile, &self.url_source) {
@@ -925,6 +924,12 @@ impl Target {
             return format!("cluster:{}", seeds.join(","));
         }
         format!("{}/{db}", session_addr(self.info.addr()))
+    }
+
+    /// The DB came from a flag, the URL or a profile, not the default.
+    #[must_use]
+    pub fn names_db(&self) -> bool {
+        self.db_source != Source::Default
     }
 
     /// What the footer and `--probe` call this target (no credentials).
