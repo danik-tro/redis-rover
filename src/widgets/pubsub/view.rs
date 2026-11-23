@@ -30,6 +30,16 @@ pub struct PubSubView {
     pub(super) list: Vec<Line<'static>>,
     pub(super) log: LogView,
     pub(super) stats: Option<Vec<Line<'static>>>,
+    /// The subscriptions pane and the pane right of it, for the mouse.
+    panes: (Rect, Rect),
+}
+
+impl PubSubView {
+    /// The subscriptions pane and the log / detail pane.
+    #[must_use]
+    pub fn pane_rects(&self) -> (Rect, Rect) {
+        self.panes
+    }
 }
 
 impl PubSub {
@@ -40,6 +50,8 @@ impl PubSub {
         self.clamp_selection();
         let has_sub = self.selected_sub().is_some();
         let PaneAreas {
+            list_area,
+            right_area,
             list_inner,
             log_inner,
             stats_inner,
@@ -76,6 +88,7 @@ impl PubSub {
             list,
             log,
             stats: stats_view,
+            panes: (list_area, right_area),
         }
     }
 }

@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     live,
+    mouse::below_header,
     render::{highlight_symbol, render_header_rule, render_value_footer, selected_row_style},
     state::Focus,
     KeySpace,
@@ -266,6 +267,7 @@ impl KeySpace {
         match self.stream.tab {
             StreamTab::Entries => {
                 let body = render_value_footer(footer, body, buf);
+                self.panes.value_rows = below_header(body);
                 render_entries(
                     &stream.entries,
                     &self.live.changed,
@@ -275,6 +277,7 @@ impl KeySpace {
                 );
             }
             StreamTab::Groups => {
+                self.panes.value_rows = below_header(body);
                 render_groups(stream.groups.as_deref(), body, buf, &mut self.value_table);
             }
         }

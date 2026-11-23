@@ -27,7 +27,7 @@ use crate::{
         info::{build_hint, InfoWidget},
         keyspace::KeySpaceWidget,
         monitor::MonitorWidget,
-        pubsub::PubSubWidget,
+        pubsub::{PubSubView, PubSubWidget},
         slowlog::SlowlogWidget,
         toast::ToastWidget,
     },
@@ -493,7 +493,20 @@ impl StatefulWidget for AppWidget {
             buf,
             &mut state.summary,
         );
+        let pubsub_panes = state.frame.pubsub.as_ref().map(PubSubView::pane_rects);
         state.render_main_block(main, buf);
+        match (state.view_mode(), pubsub_panes) {
+            (Mode::KeySpace, _) => {
+                let panes = state.keyspace.pane_areas();
+                state.frame.hits.push(panes.keys, HitTarget::KeysPane);
+                state.frame.hits.push(panes.value, HitTarget::ValuePane);
+            }
+            (Mode::PubSub, Some((list, log))) => {
+                state.frame.hits.push(list, HitTarget::PubSubList);
+                state.frame.hits.push(log, HitTarget::PubSubLog);
+            }
+            _ => {}
+        }
         StatefulWidget::render(DbPickerWidget, main, buf, &mut state.db_picker);
 
         if state.help_is_open() {

@@ -83,6 +83,7 @@ impl StatefulWidget for PubSubWidget {
             list,
             log,
             stats: stats_view,
+            ..
         } = self.view;
 
         let outer = outer_border();

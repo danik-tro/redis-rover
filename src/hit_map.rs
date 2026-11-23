@@ -9,6 +9,14 @@ pub enum HitTarget {
     Main,
     /// The footer.
     Footer,
+    /// The key list.
+    KeysPane,
+    /// The selected key's value.
+    ValuePane,
+    /// The Pub/Sub tab's subscriptions.
+    PubSubList,
+    /// The Pub/Sub tab's log or message detail.
+    PubSubLog,
 }
 
 /// The regions of the last frame, in drawing order. Rebuilt on every frame.
