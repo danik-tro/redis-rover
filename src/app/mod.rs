@@ -5,6 +5,8 @@ mod dashboard;
 mod db;
 mod editor;
 mod input;
+#[cfg(test)]
+mod keybindings_reference;
 mod keyspace;
 mod live;
 mod load;

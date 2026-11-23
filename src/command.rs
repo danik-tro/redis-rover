@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use strum::Display;
+use strum::{Display, EnumIter};
 
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Display, EnumIter, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     Quit,
     ScrollDown,

@@ -199,7 +199,7 @@ impl HintFocus {
 }
 
 /// The `?` help table of `mode`.
-fn help_entries(mode: Mode) -> &'static [(Command, &'static str)] {
+pub(super) fn help_entries(mode: Mode) -> &'static [(Command, &'static str)] {
     match mode {
         Mode::Dashboard => DASHBOARD_HELP_ENTRIES,
         Mode::PubSub => PUBSUB_HELP_ENTRIES,
@@ -250,7 +250,7 @@ pub fn fit_hint(hint: &str, width: usize) -> String {
 const HINT_SEPARATOR: &str = "  ";
 
 /// `?` help rows for the `g` jumps, shown on every top-level screen.
-const GO_TO_HELP_ENTRIES: &[(Command, &str)] = &[
+pub(super) const GO_TO_HELP_ENTRIES: &[(Command, &str)] = &[
     (Command::GoToMonitor, "Go to MONITOR"),
     (Command::GoToSlowlog, "Go to Slowlog"),
     (Command::GoToPubSub, "Go to Pub/Sub"),
@@ -394,7 +394,8 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
 ];
 
 /// Keys every text input takes (ratatui-textarea's own, not rebindable).
-const TEXT_INPUT_HELP: &[(&str, &str)] = &[("Undo / redo in a text input", "Ctrl-U / Ctrl-R")];
+pub(super) const TEXT_INPUT_HELP: &[(&str, &str)] =
+    &[("Undo / redo in a text input", "Ctrl-U / Ctrl-R")];
 
 /// The main area, the hint bar (empty with `ui.hints = false`) and the
 /// footer, which is shorter on a narrow screen.
