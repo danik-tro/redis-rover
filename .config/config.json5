@@ -186,6 +186,10 @@
     // How often polling checks the open key, in milliseconds (250 or more).
     "poll_interval_ms": 2000,
   },
+  "ui": {
+    // Capture the mouse. Turn it off to leave selection to the terminal.
+    "mouse": true,
+  },
   "monitor": {
     // Lines and bytes kept on the MONITOR screen; the oldest go first.
     "buffer_lines": 10000,

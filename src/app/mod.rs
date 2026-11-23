@@ -9,6 +9,7 @@ mod keyspace;
 mod live;
 mod load;
 mod monitor;
+mod mouse;
 mod navigation;
 mod nodes;
 mod power;
@@ -349,9 +350,9 @@ impl App {
         let mut tui = tui::Tui::new()?
             .tick_rate(self.tick_rate)
             .frame_rate(self.frame_rate)
-            .cancellation_token(cancellation_token.clone());
+            .cancellation_token(cancellation_token.clone())
+            .mouse(config::get().ui.mouse);
 
-        // tui.mouse(true);
         // `Tui` has no `Drop` teardown: always shut down explicitly, even when
         // entering or the loop fails, so the terminal is restored.
         let result = match tui.enter() {
@@ -402,8 +403,12 @@ impl App {
 
     fn handle_event(&mut self, e: &tui::Event) -> Option<Action> {
         // Keys often change the screen without an action (text typed into a
-        // popup, the DB picker), so every terminal event marks it dirty.
-        if !matches!(e, tui::Event::Tick | tui::Event::Render) {
+        // popup, the DB picker), so every terminal event marks it dirty. The
+        // mouse decides for itself: most of its events are pointer moves.
+        if !matches!(
+            e,
+            tui::Event::Tick | tui::Event::Render | tui::Event::Mouse(_)
+        ) {
             self.redraw.dirty = true;
         }
         match e {
@@ -415,6 +420,7 @@ impl App {
             tui::Event::Render => Some(Action::Render),
             tui::Event::Resize(x, y) => Some(Action::Resize(*x, *y)),
             tui::Event::Key(key) => self.handle_key_event(*key),
+            tui::Event::Mouse(mouse) => self.handle_mouse(*mouse),
             tui::Event::Paste(text) => {
                 self.handle_paste(text);
                 None

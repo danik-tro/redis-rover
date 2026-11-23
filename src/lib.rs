@@ -11,6 +11,7 @@ mod clock;
 mod command;
 mod config;
 mod external_editor;
+mod hit_map;
 mod keybindings;
 mod mappings;
 mod mode;
