@@ -27,6 +27,7 @@ use std::{
 
 use crate::{
     clock::{Clock, SystemClock},
+    color_depth::ColorDepth,
     config::{self, PreviewPolicy},
     redis_client::{
         event::RedisEvent,
@@ -158,6 +159,8 @@ pub struct App {
     open_key: Option<(String, RedisType)>,
     /// Live updates of the open key.
     live: LiveLink,
+    /// What the terminal shows; every frame is converted to it.
+    color_depth: ColorDepth,
 }
 
 /// The App's side of the live task.
@@ -280,6 +283,7 @@ impl App {
             loading: None,
             open_key: None,
             live: LiveLink::default(),
+            color_depth: ColorDepth::default(),
             preview: config::get().safety.preview,
             clipboard: Clipboard::default(),
             toast: Toast::default(),
@@ -308,6 +312,13 @@ impl App {
     pub fn environment(mut self, environment: Environment) -> Self {
         self.environment = environment;
         self.summary.environment = environment;
+        self
+    }
+
+    /// The terminal's colour depth.
+    #[must_use]
+    pub fn color_depth(mut self, depth: ColorDepth) -> Self {
+        self.color_depth = depth;
         self
     }
 

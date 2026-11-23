@@ -8,6 +8,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod clock;
+mod color_depth;
 mod command;
 mod config;
 mod external_editor;
@@ -117,7 +118,10 @@ pub async fn run(args: Cli) -> Result<()> {
     .read_only_flag(watcher.read_only_flag())
     .live_tx(watcher.live_tx())
     .monitor_tx(watcher.monitor_tx())
-    .environment(target.environment);
+    .environment(target.environment)
+    .color_depth(color_depth::ColorDepth::detect(|name| {
+        std::env::var(name).ok()
+    }));
 
     watcher.start();
     let run_result = app.run(cancellation_token).await;
