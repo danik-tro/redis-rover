@@ -1,5 +1,3 @@
 ╭ Info · redis://localhost:6379  PROD · RO  ─────── ? Help ╮
 │          db 0 · 1234 keys · Redis version: 7.2.4         │
-│          o open  y yank  / filter  d db  ? help          │
-│                                                          │
 ╰──────────────────────────────────────────────────────────╯

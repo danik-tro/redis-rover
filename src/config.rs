@@ -89,6 +89,8 @@ pub struct UiConfig {
     pub theme: String,
     /// Come back to the last filter, sort, selection and DB of each target.
     pub restore: bool,
+    /// Show a line of the most useful keys above the footer.
+    pub hints: bool,
 }
 
 impl Default for UiConfig {
@@ -96,6 +98,7 @@ impl Default for UiConfig {
         Self {
             mouse: true,
             restore: true,
+            hints: true,
             theme: crate::theme::DARK.to_owned(),
         }
     }

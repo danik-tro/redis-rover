@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{config, hit_map::HitTarget, mode::PopupMode};
+use crate::{config, hit_map::HitTarget, keybindings::KeyBindings, mode::PopupMode};
 use color_eyre::eyre::Result;
 use ratatui::prelude::Rect;
 use ratatui::{
@@ -27,7 +27,7 @@ use crate::{
         info::{self, build_hint, InfoWidget},
         keyspace::{truncate_to_width, KeySpaceWidget},
         monitor::MonitorWidget,
-        pubsub::{PubSubView, PubSubWidget},
+        pubsub::{Pane, PubSubView, PubSubWidget},
         slowlog::SlowlogWidget,
         tabs::{self, Tab},
         toast::ToastWidget,
@@ -60,22 +60,49 @@ const WRITE_COMMANDS: &[Command] = &[
     Command::SlowlogReset,
 ];
 
-/// Footer hint entries for the keyspace view, in display order.
-const KEYSPACE_HINT_ENTRIES: &[(Command, &str)] = &[
+/// Hint bar on the key list, most useful first.
+const KEY_LIST_HINTS: &[(Command, &str)] = &[
+    (Command::ScrollDown, "down"),
+    (Command::ScrollUp, "up"),
+    (Command::EnterValue, "open"),
+    (Command::SetPattern, "filter"),
+    (Command::OpenSortMenu, "sort"),
+    (Command::ToggleTree, "tree"),
     (Command::AddKey, "add"),
-    (Command::AddItem, "add-item"),
-    (Command::EditValue, "edit"),
     (Command::DeleteKey, "del"),
     (Command::SetTtl, "ttl"),
-    (Command::EnterValue, "open"),
     (Command::YankValue, "yank"),
-    (Command::SetPattern, "filter"),
     (Command::SelectDb, "db"),
     (Command::ToggleHelp, "help"),
 ];
 
-/// Footer hint entries for the dashboard view, in display order.
-const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
+/// Hint bar inside a collection.
+const VALUE_HINTS: &[(Command, &str)] = &[
+    (Command::ClosePopup, "back"),
+    (Command::ScrollDown, "down"),
+    (Command::ScrollUp, "up"),
+    (Command::LoadNextPage, "page"),
+    (Command::AddItem, "add-item"),
+    (Command::EditValue, "edit"),
+    (Command::DeleteKey, "del"),
+    (Command::YankValue, "yank"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// Hint bar on a STRING / JSON value.
+const TEXT_HINTS: &[(Command, &str)] = &[
+    (Command::ClosePopup, "back"),
+    (Command::ScrollDown, "down"),
+    (Command::ScrollUp, "up"),
+    (Command::ToggleWrap, "wrap"),
+    (Command::EditValue, "edit"),
+    (Command::EditExternal, "$EDITOR"),
+    (Command::YankValue, "yank"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// Hint bar on the dashboard.
+const DASHBOARD_HINTS: &[(Command, &str)] = &[
     (Command::ToggleDashboard, "back"),
     (Command::ToggleMetricsPause, "pause"),
     (Command::ResetMetrics, "reset"),
@@ -85,13 +112,24 @@ const DASHBOARD_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleHelp, "help"),
 ];
 
-/// Footer hint entries for the Pub/Sub tab, in display order. Kept short:
-/// remove, clear and refresh are in the `?` help.
-const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
+/// Hint bar on the Pub/Sub subscriptions.
+const PUBSUB_LIST_HINTS: &[(Command, &str)] = &[
     (Command::TogglePubSub, "back"),
+    (Command::ScrollDown, "down"),
+    (Command::ScrollUp, "up"),
     (Command::PubSubAdd, "add"),
     (Command::PubSubPublish, "publish"),
     (Command::PubSubToggleNotify, "notify"),
+    (Command::PubSubFocus, "focus"),
+    (Command::PubSubEnter, "open"),
+    (Command::ToggleHelp, "help"),
+];
+
+/// Hint bar on the Pub/Sub log.
+const PUBSUB_LOG_HINTS: &[(Command, &str)] = &[
+    (Command::TogglePubSub, "back"),
+    (Command::ScrollDown, "down"),
+    (Command::ScrollUp, "up"),
     (Command::PubSubFocus, "focus"),
     (Command::PubSubTogglePause, "pause"),
     (Command::PubSubEnter, "detail"),
@@ -100,8 +138,8 @@ const PUBSUB_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleHelp, "help"),
 ];
 
-/// Footer hint entries for the MONITOR screen, in display order.
-const MONITOR_HINT_ENTRIES: &[(Command, &str)] = &[
+/// Hint bar on the MONITOR screen.
+const MONITOR_HINTS: &[(Command, &str)] = &[
     (Command::LeaveScreen, "back"),
     (Command::MonitorToggle, "start/stop"),
     (Command::MonitorFilter, "filter"),
@@ -111,8 +149,8 @@ const MONITOR_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::ToggleHelp, "help"),
 ];
 
-/// Footer hint entries for the Slowlog screen, in display order.
-const SLOWLOG_HINT_ENTRIES: &[(Command, &str)] = &[
+/// Hint bar on the Slowlog screen.
+const SLOWLOG_HINTS: &[(Command, &str)] = &[
     (Command::LeaveScreen, "back"),
     (Command::SlowlogEnter, "detail"),
     (Command::SlowlogSort, "sort"),
@@ -120,6 +158,96 @@ const SLOWLOG_HINT_ENTRIES: &[(Command, &str)] = &[
     (Command::SlowlogReset, "reset"),
     (Command::ToggleHelp, "help"),
 ];
+
+/// What has the keyboard, for the hint bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintFocus {
+    KeyList,
+    Value,
+    Text,
+    Dashboard,
+    PubSubList,
+    PubSubLog,
+    Monitor,
+    Slowlog,
+}
+
+impl HintFocus {
+    /// The screen whose bindings and `?` help the hints come from.
+    fn mode(self) -> Mode {
+        match self {
+            Self::KeyList | Self::Value | Self::Text => Mode::KeySpace,
+            Self::Dashboard => Mode::Dashboard,
+            Self::PubSubList | Self::PubSubLog => Mode::PubSub,
+            Self::Monitor => Mode::Monitor,
+            Self::Slowlog => Mode::Slowlog,
+        }
+    }
+
+    fn entries(self) -> &'static [(Command, &'static str)] {
+        match self {
+            Self::KeyList => KEY_LIST_HINTS,
+            Self::Value => VALUE_HINTS,
+            Self::Text => TEXT_HINTS,
+            Self::Dashboard => DASHBOARD_HINTS,
+            Self::PubSubList => PUBSUB_LIST_HINTS,
+            Self::PubSubLog => PUBSUB_LOG_HINTS,
+            Self::Monitor => MONITOR_HINTS,
+            Self::Slowlog => SLOWLOG_HINTS,
+        }
+    }
+}
+
+/// The `?` help table of `mode`.
+fn help_entries(mode: Mode) -> &'static [(Command, &'static str)] {
+    match mode {
+        Mode::Dashboard => DASHBOARD_HELP_ENTRIES,
+        Mode::PubSub => PUBSUB_HELP_ENTRIES,
+        Mode::Monitor => MONITOR_HELP_ENTRIES,
+        Mode::Slowlog => SLOWLOG_HELP_ENTRIES,
+        _ => KEYSPACE_HELP_ENTRIES,
+    }
+}
+
+/// The hint bar's text: this focus's commands that the `?` help lists and
+/// that are allowed, each with the key it is bound to now.
+#[must_use]
+pub fn hint_text(keybindings: &KeyBindings, focus: HintFocus, read_only: bool) -> String {
+    let mode = focus.mode();
+    let help = help_entries(mode);
+    let entries: Vec<(Command, &str)> = focus
+        .entries()
+        .iter()
+        .filter(|(command, _)| help.iter().any(|(listed, _)| listed == command))
+        .filter(|(command, _)| !(read_only && WRITE_COMMANDS.contains(command)))
+        .copied()
+        .collect();
+    build_hint(keybindings, mode, &entries)
+}
+
+/// `hint` shortened from the right, by whole hints, to fit `width`.
+#[must_use]
+pub fn fit_hint(hint: &str, width: usize) -> String {
+    let mut fitted = String::new();
+    for part in hint.split(HINT_SEPARATOR) {
+        let extra = if fitted.is_empty() {
+            part.width()
+        } else {
+            HINT_SEPARATOR.width() + part.width()
+        };
+        if fitted.width() + extra > width {
+            break;
+        }
+        if !fitted.is_empty() {
+            fitted.push_str(HINT_SEPARATOR);
+        }
+        fitted.push_str(part);
+    }
+    fitted
+}
+
+/// Between two hints; a hint's key and label have one space.
+const HINT_SEPARATOR: &str = "  ";
 
 /// `?` help rows for the `g` jumps, shown on every top-level screen.
 const GO_TO_HELP_ENTRIES: &[(Command, &str)] = &[
@@ -266,13 +394,19 @@ const KEYSPACE_HELP_ENTRIES: &[(Command, &str)] = &[
 /// Keys every text input takes (ratatui-textarea's own, not rebindable).
 const TEXT_INPUT_HELP: &[(&str, &str)] = &[("Undo / redo in a text input", "Ctrl-U / Ctrl-R")];
 
-/// The main area and, below it, the footer (shorter on a narrow screen).
-fn layout(area: Rect) -> [Rect; 2] {
+/// The main area, the hint bar (empty with `ui.hints = false`) and the
+/// footer, which is shorter on a narrow screen.
+fn layout(area: Rect) -> [Rect; 3] {
     let footer = info::footer_height(area.width.saturating_sub(2));
-    Layout::vertical([Constraint::Percentage(100), Constraint::Length(footer)])
-        .flex(Flex::Center)
-        .margin(1)
-        .areas(area)
+    let hints = u16::from(config::get().ui.hints);
+    Layout::vertical([
+        Constraint::Percentage(100),
+        Constraint::Length(hints),
+        Constraint::Length(footer),
+    ])
+    .flex(Flex::Center)
+    .margin(1)
+    .areas(area)
 }
 
 /// Columns between a help label and its keys.
@@ -338,8 +472,9 @@ impl App {
     /// only for its copy. Widgets then render from `self.frame` alone.
     /// Records in `self.redraw` which data the frame shows.
     pub(super) fn build_frame(&mut self, area: Rect) {
-        let [main, _] = layout(area);
+        let [main, ..] = layout(area);
         let (now, wall) = (self.clock.now(), self.clock.wall());
+        self.sync_hint();
         self.frame.cluster = self.cluster_enabled();
         self.frame.whole_cluster = self
             .state
@@ -453,22 +588,28 @@ impl App {
         }
     }
 
-    /// Point the footer hint at the current mode.
+    /// What the keyboard drives now.
+    fn hint_focus(&self) -> HintFocus {
+        match self.view_mode() {
+            Mode::Dashboard => HintFocus::Dashboard,
+            Mode::PubSub if self.pubsub.focus() == Pane::Log => HintFocus::PubSubLog,
+            Mode::PubSub => HintFocus::PubSubList,
+            Mode::Monitor => HintFocus::Monitor,
+            Mode::Slowlog => HintFocus::Slowlog,
+            _ if self.keyspace.is_text_focused() => HintFocus::Text,
+            _ if self.keyspace.is_value_focused() => HintFocus::Value,
+            _ => HintFocus::KeyList,
+        }
+    }
+
+    /// Point the hint bar at the current focus, if that moved.
     pub(super) fn sync_hint(&mut self) {
-        let (mode, entries) = match self.mode {
-            Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HINT_ENTRIES),
-            Mode::PubSub => (Mode::PubSub, PUBSUB_HINT_ENTRIES),
-            Mode::Monitor => (Mode::Monitor, MONITOR_HINT_ENTRIES),
-            Mode::Slowlog => (Mode::Slowlog, SLOWLOG_HINT_ENTRIES),
-            _ => (Mode::KeySpace, KEYSPACE_HINT_ENTRIES),
-        };
-        let read_only = self.is_read_only();
-        let entries: Vec<(Command, &str)> = entries
-            .iter()
-            .filter(|(cmd, _)| !(read_only && WRITE_COMMANDS.contains(cmd)))
-            .copied()
-            .collect();
-        self.summary.hint = build_hint(&config::get().keybindings, mode, &entries);
+        let key = (self.hint_focus(), self.is_read_only());
+        if self.hint_key == Some(key) {
+            return;
+        }
+        self.hint_key = Some(key);
+        self.summary.hint = hint_text(&config::get().keybindings, key.0, key.1);
     }
 }
 
@@ -479,7 +620,7 @@ impl StatefulWidget for AppWidget {
         let cfg = config::get();
         Block::default().bg(cfg.colors.base00).render(area, buf);
 
-        let [main, footer] = layout(area);
+        let [main, hint_row, footer] = layout(area);
         state.frame.hits.clear();
         state.frame.hits.push(main, HitTarget::Main);
         state.frame.hits.push(footer, HitTarget::Footer);
@@ -509,6 +650,12 @@ impl StatefulWidget for AppWidget {
             buf,
             &mut state.summary,
         );
+        Paragraph::new(
+            Line::from(fit_hint(&state.summary.hint, usize::from(hint_row.width)))
+                .fg(cfg.colors.base04),
+        )
+        .alignment(Alignment::Center)
+        .render(hint_row, buf);
         let pubsub_panes = state.frame.pubsub.as_ref().map(PubSubView::pane_rects);
         state.render_main_block(main, buf);
         match (state.view_mode(), pubsub_panes) {
@@ -674,18 +821,18 @@ impl App {
 
     /// The `?` help's rows for `mode`: each command's label and its keys.
     fn help_rows(mode: Mode) -> Vec<(String, String)> {
-        let keybindings = &config::get().keybindings;
+        Self::help_rows_with(&config::get().keybindings, mode)
+    }
 
+    fn help_rows_with(keybindings: &KeyBindings, mode: Mode) -> Vec<(String, String)> {
         // Commands shown in the help, paired with a human-readable label. Each
         // is resolved to its configured key sequences via
         // `KeyBindings::get_config_for_command`.
-        let (lookup_mode, entries) = match mode {
-            Mode::Dashboard => (Mode::Dashboard, DASHBOARD_HELP_ENTRIES),
-            Mode::PubSub => (Mode::PubSub, PUBSUB_HELP_ENTRIES),
-            Mode::Monitor => (Mode::Monitor, MONITOR_HELP_ENTRIES),
-            Mode::Slowlog => (Mode::Slowlog, SLOWLOG_HELP_ENTRIES),
-            _ => (Mode::KeySpace, KEYSPACE_HELP_ENTRIES),
+        let lookup_mode = match mode {
+            Mode::Dashboard | Mode::PubSub | Mode::Monitor | Mode::Slowlog => mode,
+            _ => Mode::KeySpace,
         };
+        let entries = help_entries(lookup_mode);
 
         let mut rows: Vec<(String, String)> = entries
             .iter()
@@ -1074,5 +1221,105 @@ mod tests {
         app.switch_to_previous_mode();
         app.toggle_help(app.clock.now());
         check(&mut app, "help overlay");
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::keybindings::parse_key_sequence;
+
+    const FOCUSES: [HintFocus; 8] = [
+        HintFocus::KeyList,
+        HintFocus::Value,
+        HintFocus::Text,
+        HintFocus::Dashboard,
+        HintFocus::PubSubList,
+        HintFocus::PubSubLog,
+        HintFocus::Monitor,
+        HintFocus::Slowlog,
+    ];
+
+    #[test]
+    fn every_hint_is_in_the_help_of_its_screen() {
+        for focus in FOCUSES {
+            let help = help_entries(focus.mode());
+            for (command, label) in focus.entries() {
+                assert!(
+                    help.iter().any(|(listed, _)| listed == command),
+                    "{focus:?}: `{label}` is not in the help"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_hint_has_a_default_key() {
+        let keybindings = &config::get().keybindings;
+        for focus in FOCUSES {
+            let hint = hint_text(keybindings, focus, false);
+            assert_eq!(
+                hint.split(HINT_SEPARATOR).count(),
+                focus.entries().len(),
+                "{focus:?}: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_hides_every_write_key() {
+        let keybindings = &config::get().keybindings;
+        for focus in FOCUSES {
+            let hint = hint_text(keybindings, focus, true);
+            for (command, label) in focus.entries() {
+                if WRITE_COMMANDS.contains(command) {
+                    assert!(
+                        !hint
+                            .split(HINT_SEPARATOR)
+                            .any(|h| h.ends_with(&format!(" {label}"))),
+                        "{focus:?}: {hint}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC6: a rebound `ScrollDown` shows in the hint bar and in the help.
+    #[test]
+    fn a_rebound_key_shows_in_the_hints_and_the_help() {
+        let mut keybindings = config::get().keybindings.clone();
+        let bindings = keybindings.0.entry(Mode::KeySpace).or_default();
+        bindings.retain(|_, command| *command != Command::ScrollDown);
+        if let Some(common) = keybindings.0.get_mut(&Mode::Common) {
+            common.retain(|_, command| *command != Command::ScrollDown);
+        }
+        keybindings
+            .0
+            .entry(Mode::KeySpace)
+            .or_default()
+            .insert(parse_key_sequence("<x>").unwrap(), Command::ScrollDown);
+
+        let hint = hint_text(&keybindings, HintFocus::KeyList, false);
+        assert!(hint.starts_with("x down"), "{hint}");
+
+        let rows = App::help_rows_with(&keybindings, Mode::KeySpace);
+        let (_, keys) = rows
+            .iter()
+            .find(|(label, _)| label == "Scroll down")
+            .unwrap();
+        assert_eq!(keys, "x");
+    }
+
+    #[test]
+    fn hints_are_shortened_from_the_right_on_whole_hints() {
+        let hint = "j down  k up  Enter open";
+
+        assert_eq!(fit_hint(hint, 100), hint);
+        assert_eq!(fit_hint(hint, 13), "j down  k up");
+        assert_eq!(fit_hint(hint, 12), "j down  k up");
+        assert_eq!(fit_hint(hint, 11), "j down");
+        assert_eq!(fit_hint(hint, 5), "");
     }
 }

@@ -101,13 +101,13 @@ const MINIMAL_FOOTER_BELOW: u16 = 50;
 /// The `? Help` title on the top border.
 const HELP_TITLE: &str = " ? Help ";
 
-/// Rows of the footer at `width`: borders plus three, two or one rows.
+/// Rows of the footer at `width`: borders plus two rows, or one.
 #[must_use]
 pub fn footer_height(width: u16) -> u16 {
-    match width {
-        w if w >= FULL_FOOTER_FROM => 5,
-        w if w >= MINIMAL_FOOTER_BELOW => 4,
-        _ => 3,
+    if width >= FULL_FOOTER_FROM {
+        4
+    } else {
+        3
     }
 }
 
@@ -131,29 +131,20 @@ fn fit_fields(fields: &[&str], width: usize) -> String {
     line
 }
 
-/// The footer below [`FULL_FOOTER_FROM`] columns: one row of whole fields
-/// above the key hints, or under [`MINIMAL_FOOTER_BELOW`] the hints alone.
-fn render_compact_footer(text: &FooterText, hint: &str, width: u16, inner: Rect, buf: &mut Buffer) {
-    let cfg = config::get();
-    let hint_area = if width >= MINIMAL_FOOTER_BELOW {
-        let [info, hint_row] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
-        let fields = [
-            text.db_status.as_str(),
-            text.version.as_str(),
-            text.memory.as_str(),
-        ];
-        Paragraph::new(fit_fields(&fields, usize::from(info.width)))
-            .fg(cfg.colors.base05)
-            .alignment(Alignment::Center)
-            .render(info, buf);
-        hint_row
+/// The footer below [`FULL_FOOTER_FROM`] columns: one row of whole fields,
+/// under [`MINIMAL_FOOTER_BELOW`] only the DB.
+fn render_compact_footer(text: &FooterText, width: u16, inner: Rect, buf: &mut Buffer) {
+    let db = text.db_status.as_str();
+    let all = [db, text.version.as_str(), text.memory.as_str()];
+    let fields: &[&str] = if width >= MINIMAL_FOOTER_BELOW {
+        &all
     } else {
-        inner
+        &all[..1]
     };
-    Paragraph::new(Line::styled(hint, cfg.colors.base04))
+    Paragraph::new(fit_fields(fields, usize::from(inner.width)))
+        .fg(config::get().colors.base05)
         .alignment(Alignment::Center)
-        .render(hint_area, buf);
+        .render(inner, buf);
 }
 
 /// Build the footer legend from the live keymap: `"{key} {label}"` per entry,
@@ -273,18 +264,13 @@ impl StatefulWidget for InfoWidget<'_> {
 
         let text = &self.frame.footer;
         if area.width < FULL_FOOTER_FROM {
-            render_compact_footer(text, &state.hint, area.width, inner, buf);
+            render_compact_footer(text, area.width, inner, buf);
             return;
         }
 
-        // Reserve the last inner row for the always-on key-hint legend (#41).
-        let [top, bottom, hint] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .flex(layout::Flex::Center)
-        .areas(area);
+        let [top, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+            .flex(layout::Flex::Center)
+            .areas(area);
 
         let [version_area, db_area, cpu_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Fill(1), Constraint::Min(0)])
@@ -320,12 +306,6 @@ impl StatefulWidget for InfoWidget<'_> {
         Paragraph::new(Line::from(text.db_status.as_str()).fg(cfg.colors.base05))
             .alignment(Alignment::Center)
             .render(db_area, buf);
-
-        // One-line key-hint legend (#41) so the common actions are discoverable
-        // without opening the full `?` help overlay.
-        Paragraph::new(Line::styled(state.hint.as_str(), cfg.colors.base04))
-            .alignment(Alignment::Center)
-            .render(hint, buf);
     }
 }
 
@@ -372,7 +352,6 @@ mod tests {
         let mut state = Info::new("redis://localhost:6379");
         state.read_only = true;
         state.pubsub_unread = 3;
-        state.hint = "j/k move  / filter  ? help".into();
         draw(&mut state, &mut FrameData::default(), &shared, width)
     }
 
@@ -384,7 +363,7 @@ mod tests {
         width: u16,
     ) -> Vec<String> {
         frame.refresh_footer(shared);
-        let area = Rect::new(0, 0, width, 5);
+        let area = Rect::new(0, 0, width, footer_height(width));
         let mut buf = Buffer::empty(area);
         InfoWidget { frame }.render(area, &mut buf, state);
         (0..area.height)
@@ -402,7 +381,7 @@ mod tests {
     /// what is drawn.
     #[test]
     fn footer_renders_same_text() {
-        let cases: [(u16, bool, [&str; 5]); 4] = [
+        let cases: [(u16, bool, [&str; 4]); 4] = [
             (
                 80,
                 true,
@@ -410,7 +389,6 @@ mod tests {
                 "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────── ? Help ╮",
                 "│  Redis version: 7.2.4         db 0 · 1234 keys                       CPU: -  │",
                 "│  OS: Linux 6.8.0-1012-aws Connected clients: 3/100        RAM: 1.53M/15.47G  │",
-                "│                          j/k move  / filter  ? help                          │",
                 "╰──────────────────────────────────────────────────────────────────────────────╯",
             ],
             ),
@@ -421,7 +399,6 @@ mod tests {
                 "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────────────────────────────────────────────── ? Help ╮",
                 "│  Redis version: 7.2.4                             db 0 · 1234 keys                                           CPU: -  │",
                 "│  OS: Linux 6.8.0-1012-aws x86_64             Connected clients: 3/10000                           RAM: 1.53M/15.47G  │",
-                "│                                              j/k move  / filter  ? help                                              │",
                 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
             ],
             ),
@@ -432,7 +409,6 @@ mod tests {
                 "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────── ? Help ╮",
                 "│  -                                  db 0                             CPU: -  │",
                 "│  -                                    -                                   -  │",
-                "│                          j/k move  / filter  ? help                          │",
                 "╰──────────────────────────────────────────────────────────────────────────────╯",
             ],
             ),
@@ -443,7 +419,6 @@ mod tests {
                 "╭ Info · redis://localhost:6379  LOCAL · RO   PubSub 3  ─────────────────────────────────────────────────────── ? Help ╮",
                 "│  -                                                      db 0                                                 CPU: -  │",
                 "│  -                                                        -                                                       -  │",
-                "│                                              j/k move  / filter  ? help                                              │",
                 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
             ],
             ),

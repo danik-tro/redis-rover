@@ -58,6 +58,8 @@ use crate::{
     },
 };
 
+pub use render::{fit_hint, hint_text, HintFocus};
+
 pub struct App {
     state: SharedState,
 
@@ -152,6 +154,8 @@ pub struct App {
     frame: FrameData,
     /// Read once per action (and per frame) and passed down.
     clock: Arc<dyn Clock>,
+    /// The focus and read-only state the hint bar was built for.
+    hint_key: Option<(render::HintFocus, bool)>,
     /// When `Render` draws (#50).
     redraw: Redraw,
     /// A `Shift-a` load or a `g o` search is running.
@@ -293,6 +297,7 @@ impl App {
             toast: Toast::default(),
             frame: FrameData::default(),
             clock: Arc::new(SystemClock),
+            hint_key: None,
             redraw: Redraw {
                 dirty: true,
                 ..Redraw::default()

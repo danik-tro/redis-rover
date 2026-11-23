@@ -24,16 +24,16 @@ use ratatui::{
     widgets::{StatefulWidget, Widget},
 };
 use redis_rover::internals::{
-    parse_line, render_help, render_help_page, render_monitor_confirm, render_typed_confirm,
-    render_typed_count, Clock, ClusterMetrics, ClusterSummary, ConfirmPopup, ConnStatus,
-    ConsumerInfo, Dashboard, DashboardWidget, Environment, FixedClock, FrameData, GroupDetail,
-    GroupInfo, Info, InfoSnapshot, InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind,
-    KeyMeta, KeySpace, KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MasterNode,
-    MetricsHistory, Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore, MonitorWidget,
-    NodeStrip, PageInfo, PageRow, PendingEntry, PubSub, PubSubWidget, RedisEvent, RedisInfo,
-    RedisType, SharedState, Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey,
-    StreamEntry, StreamValue, Target, Toast, ToastWidget, TypeFilter, ValuePageInfo,
-    MONITOR_NODE_WARNING,
+    default_hint, fit_hint, footer_height, parse_line, render_help, render_help_page,
+    render_monitor_confirm, render_typed_confirm, render_typed_count, Clock, ClusterMetrics,
+    ClusterSummary, ConfirmPopup, ConnStatus, ConsumerInfo, Dashboard, DashboardWidget,
+    Environment, FixedClock, FrameData, GroupDetail, GroupInfo, HintFocus, Info, InfoSnapshot,
+    InfoWidget, ItemEdit, JsonField, JsonPreview, JsonPreviewKind, KeyMeta, KeySpace,
+    KeySpaceWidget, KeyValue, Liveness, LoadProgress, LoadedValue, MasterNode, MetricsHistory,
+    Mode, Monitor, MonitorLimits, MonitorStatus, MonitorStore, MonitorWidget, NodeStrip, PageInfo,
+    PageRow, PendingEntry, PubSub, PubSubWidget, RedisEvent, RedisInfo, RedisType, SharedState,
+    Slowlog, SlowlogData, SlowlogEntry, SlowlogWidget, Sort, SortKey, StreamEntry, StreamValue,
+    Target, Toast, ToastWidget, TypeFilter, ValuePageInfo, MONITOR_NODE_WARNING,
 };
 
 static SETUP: Once = Once::new();
@@ -242,6 +242,42 @@ fn footer_44() {
     check(
         "footer_44",
         &footer_at("redis://localhost:6379", Environment::Prod, true, 44),
+    );
+}
+
+/// The hint bar, as drawn at `width` for `focus`.
+fn hint_frame(focus: HintFocus, read_only: bool, width: u16) -> Buffer {
+    init();
+    let mut buf = buffer(width, 1);
+    let text = fit_hint(&default_hint(focus, read_only), usize::from(width));
+    buf.set_string(0, 0, text, ratatui::style::Style::new());
+    buf
+}
+
+#[test]
+fn hints_key_list_120() {
+    check(
+        "hints_key_list_120",
+        &hint_frame(HintFocus::KeyList, false, 120),
+    );
+}
+
+#[test]
+fn hints_value_80() {
+    check("hints_value_80", &hint_frame(HintFocus::Value, false, 80));
+}
+
+#[test]
+fn hints_text_60() {
+    check("hints_text_60", &hint_frame(HintFocus::Text, false, 60));
+}
+
+/// Read-only: no write key on the bar.
+#[test]
+fn hints_key_list_read_only() {
+    check(
+        "hints_key_list_read_only",
+        &hint_frame(HintFocus::KeyList, true, 120),
     );
 }
 
@@ -828,7 +864,7 @@ fn footer_at(target: &str, env: Environment, read_only: bool, width: u16) -> Buf
     let mut frame = FrameData::default();
     frame.refresh_footer(&shared);
 
-    let mut buf = buffer(width, 5);
+    let mut buf = buffer(width, footer_height(width));
     InfoWidget { frame: &frame }.render(buf.area, &mut buf, &mut info);
     buf
 }
