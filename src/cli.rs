@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, ValueHint};
+use clap::{builder::TypedValueParser, error::ErrorKind, Args, Parser, ValueHint};
 use color_eyre::eyre::{bail, eyre, Result};
 use redis::{ClientTlsConfig, ConnectionAddr, ConnectionInfo, TlsCertificates};
 use rustls::pki_types::{pem::PemObject, CertificateDer};
@@ -45,7 +45,7 @@ pub struct Cli {
         long,
         value_name = "URL",
         help = "Redis connection URL (redis://, rediss://, unix://, or redis-cluster://h1:p1,h2:p2). Default: the profile's url, then $REDIS_URL, then redis://localhost:6379",
-        value_parser = parse_redis_url,
+        value_parser = RedisUrlParser,
     )]
     pub url: Option<String>,
 
@@ -204,12 +204,32 @@ pub(crate) fn apply_tls_flags(info: ConnectionInfo, tls: &TlsArgs) -> Result<Con
 }
 
 /// Validates a Redis URL at parse time so a malformed `--url` fails fast with a
-/// descriptive error instead of a generic "something went wrong" later. Returns
-/// the original string unchanged on success.
-fn parse_redis_url(s: &str) -> Result<String, String> {
-    crate::target::validate_url(s)
-        .map(|()| s.to_string())
-        .map_err(|e| format!("invalid Redis URL: {e}"))
+/// descriptive error. A plain function parser would make clap quote the
+/// rejected value, and the URL may hold a password, so the error is built here
+/// without it.
+#[derive(Clone)]
+struct RedisUrlParser;
+
+impl TypedValueParser for RedisUrlParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        let name = arg.map_or_else(|| "--url".to_owned(), ToString::to_string);
+        let refuse = |detail: &str| {
+            cmd.clone().error(
+                ErrorKind::ValueValidation,
+                format!("invalid Redis URL for '{name}': {detail}"),
+            )
+        };
+        let url = value.to_str().ok_or_else(|| refuse("not valid UTF-8"))?;
+        crate::target::validate_url(url).map_err(|detail| refuse(&detail))?;
+        Ok(url.to_owned())
+    }
 }
 
 /// Human-readable connection target for display, e.g. `redis://localhost:6379`.
@@ -291,6 +311,29 @@ mod tests {
             connection_label(&out),
             "rediss://example.com:6380 (insecure)"
         );
+    }
+
+    /// #92: neither clap nor the URL parser may echo a rejected URL.
+    #[test]
+    fn a_malformed_url_never_prints_its_password() {
+        for url in [
+            "redis://user:s3cret@bad host:6379",
+            "redis://user:s3cret@host:notaport",
+            "rediss://:s3cret@[::1",
+            "nonsense://user:s3cret@host",
+            "redis-cluster://user:s3cret@bad host:7000,h2:7001",
+            "redis+sentinel://user:s3cret@bad host:26379/mymaster",
+            "redis+sentinel://user:s3cret@host:26379/mymaster/notadb",
+        ] {
+            for args in [vec!["rrover", "--url", url], vec!["rrover", "-u", url]] {
+                let Err(error) = Cli::try_parse_from(args) else {
+                    panic!("accepted a malformed URL");
+                };
+                let text = error.render().to_string();
+                assert!(text.contains("invalid Redis URL"), "{text}");
+                assert!(!text.contains("s3cret"), "{text}");
+            }
+        }
     }
 
     #[test]
