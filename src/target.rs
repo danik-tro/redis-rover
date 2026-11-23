@@ -905,6 +905,28 @@ impl Target {
         })
     }
 
+    /// What `session.json` files this target under: the profile's name, or
+    /// its address and DB. Built from those fields alone, so no user name or
+    /// password can reach the file. A `--url` that replaces a profile's
+    /// server is that server, not the profile.
+    #[allow(dead_code)] // Session restore, the next step, is the caller.
+    #[must_use]
+    pub fn session_key(&self) -> String {
+        if let (Some(name), Source::Profile(_)) = (&self.profile, &self.url_source) {
+            return format!("profile:{name}");
+        }
+        let db = self.info.redis_settings().db();
+        if let Some(sentinel) = &self.sentinel {
+            let hosts: Vec<String> = sentinel.hosts.iter().map(session_addr).collect();
+            return format!("sentinel:{}@{}/{db}", sentinel.master, hosts.join(","));
+        }
+        if !self.seeds.is_empty() {
+            let seeds: Vec<String> = self.seeds.iter().map(session_addr).collect();
+            return format!("cluster:{}", seeds.join(","));
+        }
+        format!("{}/{db}", session_addr(self.info.addr()))
+    }
+
     /// What the footer and `--probe` call this target (no credentials).
     #[must_use]
     pub fn label(&self, info: &ConnectionInfo) -> String {
@@ -1094,6 +1116,17 @@ pub fn run_password_command(command: &str) -> Result<String, TargetError> {
         return Err(fail("it printed nothing".into()));
     }
     Ok(password)
+}
+
+/// `host:port` (or a socket path), with nothing else of the connection.
+fn session_addr(addr: &redis::ConnectionAddr) -> String {
+    match addr {
+        redis::ConnectionAddr::Tcp(host, port)
+        | redis::ConnectionAddr::TcpTls { host, port, .. } => format!("{host}:{port}"),
+        redis::ConnectionAddr::Unix(path) => path.display().to_string(),
+        #[allow(unreachable_patterns)]
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
