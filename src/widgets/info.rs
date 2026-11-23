@@ -105,7 +105,7 @@ pub fn build_hint(keybindings: &KeyBindings, mode: Mode, entries: &[(Command, &s
                     keybindings
                         .get_config_for_command(m, *cmd)
                         .into_iter()
-                        .min_by(|a, b| a.chars().count().cmp(&b.chars().count()).then(a.cmp(b)))
+                        .next()
                 })
                 .map(|key| format!("{key} {label}"))
         })
