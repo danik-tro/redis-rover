@@ -196,6 +196,8 @@
     // Come back to the last filter, sort, selection and DB of each target
     // (`--no-restore` turns it off for one launch).
     "restore": true,
+    // Show a line of the most useful keys for the current focus.
+    "hints": true,
   },
   "monitor": {
     // Lines and bytes kept on the MONITOR screen; the oldest go first.

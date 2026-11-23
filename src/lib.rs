@@ -227,6 +227,7 @@ fn resolve_target(args: &Cli) -> Result<target::Target> {
 #[doc(hidden)]
 pub mod internals {
     pub use crate::action::Action;
+    pub use crate::app::{fit_hint, hint_text, HintFocus};
     pub use crate::clock::{Clock, FixedClock, SystemClock};
     pub use crate::mode::Mode;
     pub use crate::probe::report as probe_report;
@@ -265,7 +266,7 @@ pub mod internals {
     pub use crate::target::Environment;
     pub use crate::widgets::confirm::ConfirmPopup;
     pub use crate::widgets::dashboard::{Dashboard, DashboardWidget};
-    pub use crate::widgets::info::{Info, InfoWidget};
+    pub use crate::widgets::info::{footer_height, Info, InfoWidget};
     pub use crate::widgets::keyspace::{KeySpace, KeySpaceWidget, LoadProgress, PageInfo};
     pub use crate::widgets::monitor::{Monitor, MonitorWidget};
     pub use crate::widgets::node_picker::{NodeStrip, MONITOR_NODE_WARNING};
@@ -273,6 +274,12 @@ pub mod internals {
     pub use crate::widgets::slowlog::{Slowlog, SlowlogWidget};
     pub use crate::widgets::text_view::{render as render_text, TextCache, TextLabels, TextView};
     pub use crate::widgets::toast::{Toast, ToastWidget};
+
+    /// The default key bindings' hint bar for `focus`.
+    #[must_use]
+    pub fn default_hint(focus: HintFocus, read_only: bool) -> String {
+        hint_text(&crate::config::get().keybindings, focus, read_only)
+    }
 
     /// Convert a drawn frame the way `App::draw` does, for the configured
     /// theme and this process's environment.
