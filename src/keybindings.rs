@@ -63,8 +63,12 @@ impl KeyBindings {
             .collect_vec()
     }
 
+    /// The keys bound to `command` in `mode`, as text: shortest first, then
+    /// alphabetical, so the help and the generated reference never depend on
+    /// `HashMap` order.
     pub fn get_config_for_command(&self, mode: Mode, command: Command) -> Vec<String> {
-        self.get_keybindings_for_command(mode, command)
+        let mut keys = self
+            .get_keybindings_for_command(mode, command)
             .iter()
             .map(|key_events| {
                 key_events
@@ -73,7 +77,9 @@ impl KeyBindings {
                     .collect_vec()
                     .join(" ")
             })
-            .collect_vec()
+            .collect_vec();
+        keys.sort_by_cached_key(|key| (key.chars().count(), key.clone()));
+        keys
     }
 }
 
@@ -280,6 +286,32 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn command_keys_are_sorted_shortest_first_then_by_name() {
+        let bindings: HashMap<Vec<KeyEvent>, Command> =
+            ["<tab>", "<right>", "<l>", "<g><d>", "<h>"]
+                .into_iter()
+                .map(|raw| (parse_key_sequence(raw).unwrap(), Command::ToggleDashboard))
+                .collect();
+        let kb = KeyBindings(HashMap::from([(Mode::Dashboard, bindings)]));
+
+        let keys = kb.get_config_for_command(Mode::Dashboard, Command::ToggleDashboard);
+
+        let mut expected: Vec<String> = ["<tab>", "<right>", "<l>", "<g><d>", "<h>"]
+            .into_iter()
+            .map(|raw| {
+                parse_key_sequence(raw)
+                    .unwrap()
+                    .iter()
+                    .map(key_event_to_string)
+                    .join(" ")
+            })
+            .collect();
+        expected.sort_by_key(|key| (key.chars().count(), key.clone()));
+        assert_eq!(keys, expected);
+        assert_eq!(keys[..2], ["h".to_owned(), "l".to_owned()]);
+    }
 
     #[test]
     fn test_simple_keys() {
