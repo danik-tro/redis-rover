@@ -18,7 +18,7 @@ use redis_rover::internals::{
     Action, KeyChange, LiveCmd, Liveness, MasterRoute, MonitorCmd, MonitorStatus, PubSubCmd,
     RedisEvent, SentinelTarget, Target, Ttl,
 };
-use sentinel_support::{SentinelFixture, MASTER, SENTINELS, URL};
+use sentinel_support::{SentinelFixture, MASTER, REPLICAS, SENTINELS, URL};
 use support::Harness;
 
 /// AC6: how long after the failover the app must be back.
@@ -108,8 +108,10 @@ fn a_profile_authenticates_to_the_sentinels() {
     assert!(printed.contains("sentinel pw"), "{printed}");
 }
 
-fn route() -> (redis::Client, MasterRoute) {
-    let client = redis::Client::open(format!("redis://127.0.0.1:{MASTER}/0")).expect("a URL");
+/// `credentials` is the URL's `user:password@` part, or empty.
+fn route(credentials: &str) -> (redis::Client, MasterRoute) {
+    let client =
+        redis::Client::open(format!("redis://{credentials}127.0.0.1:{MASTER}/0")).expect("a URL");
     let hosts = SENTINELS
         .iter()
         .map(|port| ConnectionAddr::Tcp("127.0.0.1".to_owned(), *port))
@@ -213,13 +215,20 @@ async fn everything_works_on(
 }
 
 async fn follows(fail: impl FnOnce(&SentinelFixture)) {
-    let fixture = SentinelFixture::start();
-    let (client, route) = route();
+    follows_on(&SentinelFixture::start(), "", fail).await;
+}
+
+async fn follows_on(
+    fixture: &SentinelFixture,
+    credentials: &str,
+    fail: impl FnOnce(&SentinelFixture),
+) {
+    let (client, route) = route(credentials);
     let mut h = Harness::sentinel(client, route).await;
-    open_everything(&fixture, &mut h).await;
+    open_everything(fixture, &mut h).await;
 
     let started = Instant::now();
-    fail(&fixture);
+    fail(fixture);
     let moved = h
         .expect("the new master", |a| matches!(a, Action::MasterChanged(_)))
         .await;
@@ -232,7 +241,7 @@ async fn follows(fail: impl FnOnce(&SentinelFixture)) {
     );
     let master = port_of(&label);
     assert_ne!(master, MASTER, "{label}");
-    everything_works_on(&fixture, &mut h, master, started).await;
+    everything_works_on(fixture, &mut h, master, started).await;
     eprintln!("back on {master} after {:?}", started.elapsed());
     h.shutdown().await;
 }
@@ -248,4 +257,89 @@ async fn a_sentinel_failover_moves_every_connection() {
 #[ignore = "needs Docker"]
 async fn a_killed_master_moves_every_connection() {
     follows(|fixture| fixture.kill(MASTER)).await;
+}
+
+const MASTER_SECRET: &str = "master-s3cret";
+
+/// A named user on every data node (ACLs aren't replicated).
+fn add_user(fixture: &SentinelFixture, user: &str, password: &str) {
+    for port in std::iter::once(MASTER).chain(REPLICAS) {
+        fixture.cli(
+            port,
+            &[
+                "ACL",
+                "SETUSER",
+                user,
+                "on",
+                &format!(">{password}"),
+                "~*",
+                "&*",
+                "+@all",
+            ],
+        );
+    }
+}
+
+fn sentinel_url(credentials: &str) -> String {
+    URL.replacen(
+        "redis+sentinel://",
+        &format!("redis+sentinel://{credentials}"),
+        1,
+    )
+}
+
+/// #94: the URL's credentials reach the master, a missing or wrong password
+/// is refused, and no output shows the password.
+#[test]
+#[ignore = "needs Docker"]
+fn a_password_protected_master_needs_the_urls_password() {
+    let _fixture = SentinelFixture::start_with_password(MASTER_SECRET);
+
+    for credentials in [String::new(), ":wrong-pass@".to_owned()] {
+        let refused = rrover("{}", &["--url", &sentinel_url(&credentials), "--probe"]);
+        let text = format!(
+            "{}{}",
+            stdout(&refused),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(!refused.status.success(), "{text}");
+        assert!(!text.contains("wrong-pass"), "{text}");
+    }
+
+    let url = sentinel_url(&format!(":{MASTER_SECRET}@"));
+    let out = rrover("{}", &["--url", &url, "--probe"]);
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("role      master"), "{text}");
+    assert!(!text.contains(MASTER_SECRET), "{text}");
+
+    let printed = rrover("{}", &["--url", &url, "--print-target"]);
+    assert!(!stdout(&printed).contains(MASTER_SECRET));
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_failover_keeps_the_masters_password() {
+    let fixture = SentinelFixture::start_with_password(MASTER_SECRET);
+    follows_on(
+        &fixture,
+        &format!(":{MASTER_SECRET}@"),
+        SentinelFixture::failover,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_killed_master_keeps_the_masters_password() {
+    let fixture = SentinelFixture::start_with_password(MASTER_SECRET);
+    follows_on(&fixture, &format!(":{MASTER_SECRET}@"), |f| f.kill(MASTER)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_failover_keeps_a_named_acl_user() {
+    let fixture = SentinelFixture::start_with_password(MASTER_SECRET);
+    add_user(&fixture, "app", "app-s3cret");
+    follows_on(&fixture, "app:app-s3cret@", SentinelFixture::failover).await;
 }
