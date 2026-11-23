@@ -29,6 +29,7 @@ use crate::{
         monitor::MonitorWidget,
         pubsub::{PubSubView, PubSubWidget},
         slowlog::SlowlogWidget,
+        tabs::{self, Tab},
         toast::ToastWidget,
     },
 };
@@ -484,6 +485,18 @@ impl StatefulWidget for AppWidget {
             .borders(Borders::TOP)
             .border_style(cfg.colors.env(state.environment))
             .render(Rect { height: 1, ..area }, buf);
+        if cfg.ui.mouse {
+            let active = Tab::of(state.view_mode());
+            // The bottom margin row: the top one is the environment's line.
+            let row = Rect {
+                y: area.bottom().saturating_sub(1),
+                height: 1,
+                ..area
+            };
+            for (rect, tab) in tabs::render(row, active, buf) {
+                state.frame.hits.push(rect, HitTarget::Tab(tab));
+            }
+        }
 
         StatefulWidget::render(
             InfoWidget {
@@ -518,6 +531,7 @@ impl StatefulWidget for AppWidget {
             state.help_page = state.help_page.min(state.help_pages.saturating_sub(1));
         }
         state.render_confirm(main, buf);
+        state.record_popup_buttons(main);
         // Last: above every mode, popup and overlay.
         StatefulWidget::render(ToastWidget, main, buf, &mut state.toast);
     }
@@ -554,6 +568,31 @@ impl App {
         if self.mode == Mode::Popup(PopupMode::Error) {
             self.render_error_popup(area, buf);
         }
+    }
+
+    /// Record the buttons of the popup on top. An overlay under the help, the
+    /// DB picker or an error popup is covered, so it has none.
+    fn record_popup_buttons(&mut self, area: Rect) {
+        if matches!(self.mode, Mode::Popup(_)) {
+            return;
+        }
+        let buttons = match self.question_popup() {
+            Some(popup) => popup.buttons(area),
+            None if self.mode == Mode::KeySpace
+                && !self.help_is_open()
+                && !self.db_picker.is_open() =>
+            {
+                self.keyspace.overlay_buttons(area)
+            }
+            None => None,
+        };
+        let Some(buttons) = buttons else {
+            return;
+        };
+        if let Some(confirm) = buttons.confirm {
+            self.frame.hits.push(confirm, HitTarget::ConfirmYes);
+        }
+        self.frame.hits.push(buttons.cancel, HitTarget::ConfirmNo);
     }
 
     /// The cluster's node row, if any; returns the area left for the screen.

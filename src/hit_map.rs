@@ -2,6 +2,8 @@
 
 use ratatui::layout::{Position, Rect};
 
+use crate::widgets::tabs::Tab;
+
 /// What a screen region belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitTarget {
@@ -17,6 +19,12 @@ pub enum HitTarget {
     PubSubList,
     /// The Pub/Sub tab's log or message detail.
     PubSubLog,
+    /// A tab of the strip on the bottom row.
+    Tab(Tab),
+    /// The open popup's confirm button. Never recorded for a typed confirm.
+    ConfirmYes,
+    /// The open popup's cancel button.
+    ConfirmNo,
 }
 
 /// The regions of the last frame, in drawing order. Rebuilt on every frame.

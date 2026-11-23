@@ -414,40 +414,42 @@ impl App {
         }
     }
 
-    /// Draw the open question, centred in `area`.
-    pub(super) fn render_confirm(&self, area: Rect, buf: &mut Buffer) {
+    /// The open question as a popup.
+    pub(super) fn question_popup(&self) -> Option<ConfirmPopup<'_>> {
         let env = self.environment;
-        match &self.pending {
-            Some(PendingConfirm::LiftReadOnly) => {
-                ConfirmPopup::lift_read_only(env).render(area, buf);
-            }
-            Some(PendingConfirm::Write(write)) => {
+        Some(match self.pending.as_ref()? {
+            PendingConfirm::LiftReadOnly => ConfirmPopup::lift_read_only(env),
+            PendingConfirm::Write(write) => {
                 let popup = ConfirmPopup::write_preview(&write.lines, env)
                     .warning(write.warning.as_deref())
                     .notes(&write.notes);
                 match &write.typed {
-                    Some(typed) => popup
-                        .typed_confirm(&typed.text(), &typed.input, typed.matches())
-                        .render(area, buf),
-                    None => popup.render(area, buf),
+                    Some(typed) => {
+                        popup.typed_confirm(&typed.text(), &typed.input, typed.matches())
+                    }
+                    None => popup,
                 }
             }
-            Some(PendingConfirm::LoadAll { db, keys, bytes }) => {
-                ConfirmPopup::load_all(*db, *keys, *bytes, env).render(area, buf);
+            PendingConfirm::LoadAll { db, keys, bytes } => {
+                ConfirmPopup::load_all(*db, *keys, *bytes, env)
             }
-            Some(PendingConfirm::ClearFilterFor(key)) => {
-                ConfirmPopup::clear_filter_for(key, env).render(area, buf);
-            }
-            Some(PendingConfirm::StartMonitor(typed)) => {
+            PendingConfirm::ClearFilterFor(key) => ConfirmPopup::clear_filter_for(key, env),
+            PendingConfirm::StartMonitor(typed) => {
                 let popup = ConfirmPopup::start_monitor(env);
                 match typed {
-                    Some(typed) => popup
-                        .typed_confirm(&typed.text(), &typed.input, typed.matches())
-                        .render(area, buf),
-                    None => popup.render(area, buf),
+                    Some(typed) => {
+                        popup.typed_confirm(&typed.text(), &typed.input, typed.matches())
+                    }
+                    None => popup,
                 }
             }
-            None => {}
+        })
+    }
+
+    /// Draw the open question, centred in `area`.
+    pub(super) fn render_confirm(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(popup) = self.question_popup() {
+            popup.render(area, buf);
         }
     }
 }

@@ -40,6 +40,44 @@ pub struct TypedText<'t> {
     pub what: &'t str,
 }
 
+/// Where a popup's hint line shows its buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PopupButtons {
+    /// `None` when the popup can't be confirmed with a click.
+    pub confirm: Option<Rect>,
+    pub cancel: Rect,
+}
+
+/// Columns between two hints on a popup's hint line.
+const HINT_GAP: &str = "   ";
+
+/// The buttons of `hint`, drawn centred on `row`: its first segment confirms
+/// (if `can_confirm`), its last one cancels. `None` if the hint doesn't fit,
+/// because then what is on screen isn't what a click would hit.
+#[must_use]
+pub fn hint_buttons(hint: &str, row: Rect, can_confirm: bool) -> Option<PopupButtons> {
+    let width = u16::try_from(hint.width()).ok()?;
+    if width > row.width || row.height == 0 {
+        return None;
+    }
+    let start = row.x + (row.width - width) / 2;
+    let cell = |segment: &str, offset: usize| -> Option<Rect> {
+        Some(Rect {
+            x: start + u16::try_from(hint[..offset].width()).ok()?,
+            y: row.y,
+            width: u16::try_from(segment.width()).ok()?,
+            height: 1,
+        })
+    };
+    let last_at = hint.rfind(HINT_GAP).map_or(0, |at| at + HINT_GAP.len());
+    let cancel = cell(&hint[last_at..], last_at)?;
+    let confirm = match hint.find(HINT_GAP) {
+        Some(end) if can_confirm => Some(cell(&hint[..end], 0)?),
+        _ => None,
+    };
+    Some(PopupButtons { confirm, cancel })
+}
+
 /// Narrowest popup content, so short questions don't look cramped.
 const MIN_CONTENT_WIDTH: usize = 30;
 
@@ -240,18 +278,15 @@ impl<'a> ConfirmPopup<'a> {
         let room = usize::from(area.width.saturating_sub(4)).max(1);
         u16::try_from(widest.min(room)).unwrap_or(u16::MAX)
     }
-}
 
-impl Widget for ConfirmPopup<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let cfg = config::get();
+    /// Where [`Widget::render`] puts the popup in `area`.
+    fn popup_area(&self, area: Rect) -> Rect {
         let width = self.content_width(area);
-        let body = Paragraph::new(self.body).wrap(Wrap { trim: false });
+        let body = Paragraph::new(self.body.clone()).wrap(Wrap { trim: false });
         let body_rows = u16::try_from(body.line_count(width)).unwrap_or(u16::MAX);
         let input_rows = if self.input.is_some() { 3 } else { 0 };
         // Body, blank, input, hint, borders.
         let height = body_rows.saturating_add(input_rows + 4).min(area.height);
-
         let [_, row, _] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(height),
@@ -266,6 +301,37 @@ impl Widget for ConfirmPopup<'_> {
         ])
         .flex(Flex::Center)
         .areas(row);
+        popup
+    }
+
+    /// The popup's clickable buttons when drawn in `area`. A typed confirm
+    /// has only a cancel button: it runs on the typed text and Enter alone.
+    #[must_use]
+    pub fn buttons(&self, area: Rect) -> Option<PopupButtons> {
+        let popup = self.popup_area(area);
+        // The hint is the last row inside the border and the padding.
+        let row = Rect {
+            x: popup.x + 2,
+            y: popup.bottom().checked_sub(2)?,
+            width: popup.width.saturating_sub(4),
+            height: 1,
+        };
+        let hint: String = self
+            .hint
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        hint_buttons(&hint, row, self.input.is_none())
+    }
+}
+
+impl Widget for ConfirmPopup<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let cfg = config::get();
+        let popup = self.popup_area(area);
+        let input_rows = if self.input.is_some() { 3 } else { 0 };
+        let body = Paragraph::new(self.body).wrap(Wrap { trim: false });
 
         Clear.render(popup, buf);
         let block = Block::default()

@@ -2,10 +2,17 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use super::App;
-use crate::{action::Action, hit_map::HitTarget, mode::Mode, widgets::pubsub::Pane};
+use crate::{
+    action::Action,
+    hit_map::HitTarget,
+    mode::Mode,
+    widgets::{pubsub::Pane, tabs::Tab},
+};
 
 /// Longest gap between the two clicks of a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -25,10 +32,18 @@ impl App {
     /// these: terminals can report every pointer move, and those must not
     /// cost a redraw, so whatever changes the screen here marks it dirty.
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
-        if matches!(mouse.kind, MouseEventKind::Moved) || self.mouse_blocked() {
+        if matches!(mouse.kind, MouseEventKind::Moved) {
             return None;
         }
         let target = self.frame.hits.at(mouse.column, mouse.row)?;
+        if matches!(target, HitTarget::ConfirmYes | HitTarget::ConfirmNo) {
+            return (mouse.kind == MouseEventKind::Down(MouseButton::Left))
+                .then(|| self.click_popup_button(target))
+                .flatten();
+        }
+        if self.mouse_blocked() {
+            return None;
+        }
         let now = self.clock.now();
         let action = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click(target, mouse, now),
@@ -51,8 +66,48 @@ impl App {
             || (self.mode == Mode::Monitor && self.monitor.is_filter_open())
     }
 
+    /// A popup button presses the popup's own key, so it runs the keyboard's
+    /// path and nothing else. Refused while a frame is due: the button under
+    /// the pointer may belong to a popup that has since been replaced, and a
+    /// click must never answer a question the user hasn't seen.
+    fn click_popup_button(&mut self, target: HitTarget) -> Option<Action> {
+        if self.redraw.dirty {
+            return None;
+        }
+        let question = self.pending.is_some();
+        let code = match target {
+            HitTarget::ConfirmYes if question && self.typed_confirm_open() => return None,
+            HitTarget::ConfirmYes if question => KeyCode::Char('y'),
+            HitTarget::ConfirmYes if self.keyspace.is_overlay_open() => KeyCode::Enter,
+            HitTarget::ConfirmNo if question || self.keyspace.is_overlay_open() => KeyCode::Esc,
+            _ => return None,
+        };
+        self.redraw.dirty = true;
+        self.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// A tab goes through the same action as its `g` jump.
+    fn click_tab(&mut self, tab: Tab) -> Option<Action> {
+        if Tab::of(self.view_mode()) == tab {
+            return None;
+        }
+        Some(match tab {
+            Tab::Keys => {
+                if self.mode == Mode::PubSub {
+                    self.pubsub.close_detail();
+                }
+                Action::LeaveScreen
+            }
+            Tab::Dashboard => Action::GoToDashboard,
+            Tab::PubSub => Action::GoToPubSub,
+            Tab::Monitor => Action::GoToMonitor,
+            Tab::Slowlog => Action::GoToSlowlog,
+        })
+    }
+
     fn click(&mut self, target: HitTarget, mouse: MouseEvent, now: Instant) -> Option<Action> {
         match target {
+            HitTarget::Tab(tab) => self.click_tab(tab),
             HitTarget::KeysPane => self.click_keys(mouse, now),
             HitTarget::ValuePane => self.click_value(mouse, now),
             HitTarget::PubSubList => {
@@ -63,7 +118,9 @@ impl App {
                 self.focus_pubsub(Pane::Log);
                 None
             }
-            HitTarget::Main | HitTarget::Footer => None,
+            HitTarget::Main | HitTarget::Footer | HitTarget::ConfirmYes | HitTarget::ConfirmNo => {
+                None
+            }
         }
     }
 
@@ -214,12 +271,18 @@ mod tests {
     use super::*;
     use crate::{
         app::{
+            confirm::PendingConfirm,
             render::AppWidget,
-            tests::{app, meta},
+            tests::{app, app_with_channels, meta},
         },
         clock::FixedClock,
-        redis_client::types::{KeyValue, LoadedValue, ValuePageInfo},
+        redis_client::{
+            event::RedisEvent,
+            types::{KeyValue, LoadedValue, ValuePageInfo},
+        },
+        target::Environment,
         tui,
+        widgets::confirm::PopupButtons,
     };
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -415,6 +478,148 @@ mod tests {
         }
 
         assert_eq!(app.keyspace.value_selected_row(), Some(1));
+    }
+
+    /// A frame on screen, as the event loop leaves it after drawing.
+    fn drawn(app: &mut App) {
+        draw(app);
+        app.redraw.dirty = false;
+    }
+
+    fn click_on(app: &mut App, rect: Rect) -> Option<Action> {
+        app.handle_mouse(left(rect.x, rect.y))
+    }
+
+    fn buttons(app: &App) -> PopupButtons {
+        app.question_popup()
+            .and_then(|popup| popup.buttons(main_area()))
+            .expect("the popup has buttons")
+    }
+
+    fn main_area() -> Rect {
+        Rect::new(1, 1, 118, 33)
+    }
+
+    #[test]
+    fn the_confirm_button_answers_like_y() {
+        let mut app = app().environment(Environment::Prod).read_only(true);
+        app.pending = Some(PendingConfirm::LiftReadOnly);
+        drawn(&mut app);
+
+        let confirm = buttons(&app).confirm.unwrap();
+        click_on(&mut app, confirm);
+
+        assert!(app.pending.is_none());
+        assert!(!app.is_read_only());
+    }
+
+    #[test]
+    fn the_cancel_button_answers_like_esc() {
+        let mut app = app().environment(Environment::Prod).read_only(true);
+        app.pending = Some(PendingConfirm::LiftReadOnly);
+        drawn(&mut app);
+
+        let cancel = buttons(&app).cancel;
+        click_on(&mut app, cancel);
+
+        assert!(app.pending.is_none());
+        assert!(app.is_read_only());
+    }
+
+    #[test]
+    fn a_typed_confirm_has_no_confirm_button() {
+        let mut app = app().environment(Environment::Prod);
+        app.pending = Some(PendingConfirm::start_monitor(Environment::Prod));
+        drawn(&mut app);
+        let popup = buttons(&app);
+
+        assert_eq!(popup.confirm, None);
+        // Every cell of the popup's rows: nothing a click can reach confirms.
+        for y in 0..40 {
+            for x in 0..120 {
+                assert_ne!(app.frame.hits.at(x, y), Some(HitTarget::ConfirmYes));
+                if app.frame.hits.at(x, y) != Some(HitTarget::ConfirmNo) {
+                    app.handle_mouse(left(x, y));
+                    app.redraw.dirty = false;
+                }
+            }
+        }
+        assert!(app.pending.is_some(), "only cancel closes it");
+        assert!(!app.monitor_link.on);
+    }
+
+    #[test]
+    fn a_button_from_an_old_frame_does_nothing() {
+        let mut app = app().environment(Environment::Prod).read_only(true);
+        app.pending = Some(PendingConfirm::LiftReadOnly);
+        drawn(&mut app);
+        let confirm = buttons(&app).confirm.unwrap();
+        // Another question replaced it, and no frame has shown that yet.
+        app.pending = Some(PendingConfirm::ClearFilterFor("user:1".into()));
+        app.redraw.dirty = true;
+
+        assert_eq!(click_on(&mut app, confirm), None);
+
+        assert!(matches!(
+            app.pending,
+            Some(PendingConfirm::ClearFilterFor(_))
+        ));
+        assert!(app.is_read_only());
+    }
+
+    #[test]
+    fn the_delete_overlay_button_still_goes_through_the_preview() {
+        let (mut app, _, mut events) = app_with_channels();
+        app.keyspace.set_keys(vec![meta("user:1")]);
+        assert!(app.keyspace.select_key_by_name("user:1"));
+        app.keyspace.open_delete_confirm();
+        drawn(&mut app);
+        let row = app
+            .keyspace
+            .overlay_buttons(main_area())
+            .and_then(|b| b.confirm)
+            .expect("a confirm button");
+
+        let action = click_on(&mut app, row).expect("the overlay's Enter");
+        app.update(&action);
+
+        assert!(
+            matches!(app.pending, Some(PendingConfirm::Write(_))),
+            "the preview opens"
+        );
+        let sent: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(
+            !sent.iter().any(RedisEvent::is_write),
+            "nothing written yet"
+        );
+    }
+
+    #[test]
+    fn a_tab_click_goes_to_its_screen() {
+        let mut app = app();
+        drawn(&mut app);
+        let tab = (0..120)
+            .find(|&x| app.frame.hits.at(x, 39) == Some(HitTarget::Tab(Tab::Slowlog)))
+            .expect("the Slowlog tab");
+
+        assert_eq!(app.handle_mouse(left(tab, 39)), Some(Action::GoToSlowlog));
+    }
+
+    #[test]
+    fn the_active_tab_does_nothing_and_a_modal_blocks_the_rest() {
+        let mut app = app();
+        drawn(&mut app);
+        let at = |app: &App, tab| {
+            (0..120)
+                .find(|&x| app.frame.hits.at(x, 39) == Some(HitTarget::Tab(tab)))
+                .unwrap()
+        };
+        let keys = at(&app, Tab::Keys);
+        assert_eq!(app.handle_mouse(left(keys, 39)), None);
+
+        let slowlog = at(&app, Tab::Slowlog);
+        app.pending = Some(PendingConfirm::LiftReadOnly);
+        assert_eq!(app.handle_mouse(left(slowlog, 39)), None);
     }
 
     #[test]

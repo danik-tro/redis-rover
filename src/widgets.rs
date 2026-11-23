@@ -8,5 +8,6 @@ pub mod monitor;
 pub mod node_picker;
 pub mod pubsub;
 pub mod slowlog;
+pub mod tabs;
 pub mod text_view;
 pub mod toast;
