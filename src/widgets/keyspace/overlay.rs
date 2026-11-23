@@ -12,7 +12,12 @@ use ratatui::{
 };
 use ratatui_textarea::TextArea;
 
-use crate::config;
+use unicode_width::UnicodeWidthStr;
+
+use crate::{
+    config,
+    widgets::confirm::{hint_buttons, PopupButtons},
+};
 
 /// Height of the type-selector popup: 5 radio rows + 2 borders + blank + hint.
 /// (`NewKind::ALL` has 5 entries.)
@@ -67,22 +72,7 @@ impl KeySpaceWidget {
             return;
         };
         let cfg = config::get();
-
-        let [_, popup_area, _] = Layout::vertical([
-            Constraint::Percentage(40),
-            Constraint::Length(5),
-            Constraint::Percentage(40),
-        ])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(area);
-
-        let [_, popup_area, _] = Layout::horizontal([
-            Constraint::Percentage(20),
-            Constraint::Min(30),
-            Constraint::Percentage(20),
-        ])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(popup_area);
+        let popup_area = action_overlay_area(area);
 
         Clear.render(popup_area, buf);
 
@@ -532,4 +522,77 @@ fn render_focused_input(
             .title(title_line),
     );
     clone.render(area, buf);
+}
+
+/// Where the action overlay goes in `area`.
+fn action_overlay_area(area: Rect) -> Rect {
+    let [_, popup_area, _] = Layout::vertical([
+        Constraint::Percentage(40),
+        Constraint::Length(5),
+        Constraint::Percentage(40),
+    ])
+    .flex(ratatui::layout::Flex::Center)
+    .areas(area);
+
+    let [_, popup_area, _] = Layout::horizontal([
+        Constraint::Percentage(20),
+        Constraint::Min(30),
+        Constraint::Percentage(20),
+    ])
+    .flex(ratatui::layout::Flex::Center)
+    .areas(popup_area);
+    popup_area
+}
+
+impl KeySpace {
+    /// The buttons of an open yes / no overlay drawn in `area`. Overlays
+    /// with a text input have none, and neither has one whose question wraps
+    /// and pushes its hint out of the box.
+    #[must_use]
+    pub fn overlay_buttons(&self, area: Rect) -> Option<PopupButtons> {
+        let overlay = self.action_overlay.as_ref()?;
+        if overlay.text_area.is_some() {
+            return None;
+        }
+        let (body_width, hint, can_confirm) = match &overlay.kind {
+            OverlayKind::ConfirmYank { key, size, .. } => (
+                format!(
+                    "{key} is ~{} (estimate). Copy it anyway?",
+                    format_bytes_u128(*size)
+                )
+                .width(),
+                "Enter: copy   Esc: cancel",
+                true,
+            ),
+            OverlayKind::ConfirmDelete => (
+                "Delete the selected key?".width(),
+                "Enter: confirm   Esc: cancel",
+                true,
+            ),
+            OverlayKind::ConfirmDeleteItem { label, .. } => (
+                format!("Delete item: {label}?").width(),
+                "Enter: confirm   Esc: cancel",
+                true,
+            ),
+            OverlayKind::Notice(msg) => (msg.width(), "Esc: dismiss", false),
+            OverlayKind::EditValue
+            | OverlayKind::SetTtl
+            | OverlayKind::RenameKey { .. }
+            | OverlayKind::CopyKey { .. }
+            | OverlayKind::RenameItem { .. } => return None,
+        };
+        let popup = action_overlay_area(area);
+        let inner_width = popup.width.saturating_sub(2);
+        if body_width > usize::from(inner_width) {
+            return None;
+        }
+        // Inside the border: the question, a blank row, the hint.
+        let row = Rect {
+            x: popup.x + 1,
+            y: popup.y + 3,
+            width: inner_width,
+            height: 1,
+        };
+        hint_buttons(hint, row, can_confirm)
+    }
 }
