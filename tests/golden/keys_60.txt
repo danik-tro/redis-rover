@@ -1,0 +1,20 @@
+╭ Keys ────────────────────────────────────────────────────╮
+│ filter *                                                 │
+│ ──────────────────────────────────────────────────────── │
+│   Type   Key                                  TTL   Size │
+│ ──────────────────────────────────────────────────────── │
+│   hash   user:1001                              ∞   312B │
+│   hash   user:1002                              ∞   296B │
+│   str    session:7f3a9c                        1h    96B │
+│   list   queue:jobs                             ∞   2.0K │
+│   set    tags:popular                           ∞   540B │
+│   zset   leaderboard:2024                      1d   1.2K │
+│   stream events:orders                          ∞   8.0K │
+│   json   doc:settings                           ∞   420B │
+│   str    cache:page:/home                      2m    15K │
+│   MBblo… bloom:emails                           ∞   1.0K │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+╰ Page 1 · 1–10 of 10 ───────────────── 10/page · cursor 0 ╯

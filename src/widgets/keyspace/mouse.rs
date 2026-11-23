@@ -38,6 +38,27 @@ impl KeySpace {
         self.panes
     }
 
+    /// The last frame showed one pane at a time.
+    #[must_use]
+    pub fn is_single_pane(&self) -> bool {
+        self.single_pane
+    }
+
+    /// One pane: show the selected key's details.
+    pub fn open_detail(&mut self) {
+        self.detail_open = true;
+    }
+
+    /// Back to the key list. Returns whether the details were open.
+    pub fn close_detail(&mut self) -> bool {
+        std::mem::take(&mut self.detail_open)
+    }
+
+    /// One pane: the value's side is the one to show.
+    pub(super) fn shows_detail(&self) -> bool {
+        self.focus != Focus::Keys || self.detail_open
+    }
+
     /// An overlay, menu or form is open: the panes under it take no clicks.
     #[must_use]
     pub fn has_modal(&self) -> bool {

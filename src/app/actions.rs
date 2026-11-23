@@ -394,6 +394,13 @@ impl App {
         if !self.toggle_group() {
             self.enter_value();
             self.remember_open_key();
+            // One pane: a value Enter can't move into still gets shown.
+            if self.keyspace.is_single_pane()
+                && self.keyspace.is_keys_focused()
+                && self.keyspace.selected_key().is_some()
+            {
+                self.keyspace.open_detail();
+            }
         }
     }
 
@@ -443,6 +450,10 @@ impl App {
             if !self.close_json_field() {
                 self.keyspace.exit_value_focus();
             }
+            return;
+        }
+
+        if self.keyspace.close_detail() {
             return;
         }
 

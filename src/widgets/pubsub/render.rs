@@ -46,9 +46,39 @@ fn outer_border() -> Block<'static> {
         .fg(cfg.colors.base05)
 }
 
+/// Below this width the tab shows one pane at a time.
+const SINGLE_PANE_BELOW: u16 = 70;
+
 /// Pane layout of `area`; the stats panel only shows for a subscription.
-pub(super) fn pane_areas(area: Rect, has_sub: bool) -> PaneAreas {
+/// On a narrow screen only the `focus` pane has an area to draw in; the inner
+/// areas stay sized, so the log cursor and rows keep working while hidden.
+pub(super) fn pane_areas(area: Rect, has_sub: bool, focus: Pane) -> PaneAreas {
     let inner = outer_border().inner(area);
+
+    if area.width < SINGLE_PANE_BELOW {
+        let [log_area, stats_area] = if has_sub && inner.height >= STATS_MIN_PANE {
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(STATS_HEIGHT)]).areas(inner)
+        } else {
+            [inner, Rect::default()]
+        };
+        let list_inner = pane_block("", false).inner(inner);
+        let log_inner = pane_block("", false).inner(log_area);
+        let stats_inner = pane_block("", false).inner(stats_area);
+        let log_shown = focus == Pane::Log;
+        return PaneAreas {
+            list_area: if log_shown { Rect::default() } else { inner },
+            right_area: if log_shown { inner } else { Rect::default() },
+            log_area: if log_shown { log_area } else { Rect::default() },
+            stats_area: if log_shown {
+                stats_area
+            } else {
+                Rect::default()
+            },
+            list_inner,
+            log_inner,
+            stats_inner,
+        };
+    }
 
     let [list_area, right_area] =
         Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Fill(1)]).areas(inner);
@@ -94,7 +124,7 @@ impl StatefulWidget for PubSubWidget {
             stats_area,
             log_inner,
             ..
-        } = pane_areas(area, has_sub);
+        } = pane_areas(area, has_sub, state.focus);
         let log_focused = state.focus == Pane::Log;
 
         let mut title = vec![

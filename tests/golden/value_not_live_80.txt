@@ -1,14 +1,14 @@
-╭ Keys ────────────────────╮╭ Values ─────────────── ✕ not live (reconnecting) ╮
-│ filter *                 ││ Key   user:1001                                  │
-│ ──────────────────────── ││ Type  hash                                       │
-│   Ty      TTL       Size ││ TTL   No expiry                                  │
-│ ──────────────────────── ││ Size  312 B                                      │
-│ ▌ ha        ∞      312 B ││ ──────────────────────────────────────────────── │
-│   ha        ∞      296 B ││   Field                   Value                  │
-│   st       1h       96 B ││ ──────────────────────────────────────────────── │
-│   li        ∞   2.00 KiB ││   name                    Ann Example            │
-│   se        ∞      540 B ││   email                   ann@example.com        │
-│   zs       1d   1.17 KiB ││   plan                    pro                    │
-│   st        ∞   8.00 KiB ││   visits                  42                     │
-│   js        ∞      420 B ││                                                  │
-╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
+╭ Keys ────────────────────────────╮╭ Values ─────── ✕ not live (reconnecting) ╮
+│ filter *                         ││ Key   user:1001                          │
+│ ──────────────────────────────── ││ Type  hash                               │
+│   Type   Key                 TTL ││ TTL   No expiry                          │
+│ ──────────────────────────────── ││ Size  312 B                              │
+│ ▌ hash   user:1001             ∞ ││ ──────────────────────────────────────── │
+│   hash   user:1002             ∞ ││   Field               Value              │
+│   str    session:7f3a9c       1h ││ ──────────────────────────────────────── │
+│   list   queue:jobs            ∞ ││   name                Ann Example        │
+│   set    tags:popular          ∞ ││   email               ann@example.com    │
+│   zset   leaderboard:2024     1d ││   plan                pro                │
+│   stream events:orders         ∞ ││   visits              42                 │
+│   json   doc:settings          ∞ ││                                          │
+╰ Page 1 · 1–10 of 10 ─────────────╯╰──────────────────────────────────────────╯

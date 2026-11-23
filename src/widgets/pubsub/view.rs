@@ -56,7 +56,7 @@ impl PubSub {
             log_inner,
             stats_inner,
             ..
-        } = pane_areas(area, has_sub);
+        } = pane_areas(area, has_sub, self.focus);
         let log_focused = self.focus == Pane::Log;
 
         // Build everything under one short lock, render after releasing it.

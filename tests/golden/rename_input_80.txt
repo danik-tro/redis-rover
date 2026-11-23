@@ -1,20 +1,20 @@
-╭ Keys ────────────────────╮╭ Values ──────────────────────────────────────────╮
-│ filter *                 ││ Key   session:7f3a9c                             │
-│ ──────────────────────── ││ Type  string                                     │
-│   Ty      TTL       Size ││ TTL   1h (3600s)                                 │
-│ ──────────────────────── ││ Size  96 B                                       │
-│   ha        ∞      312 B ││ ──────────────────────────────────────────────── │
-│   ha        ∞      296 B ││                                                  │
-│ ▌ st       1h ╭ Rename key ──────────────────────────────────╮               │
-│   li        ∞ │session:7f3a9c                                │               │
-│   se        ∞ │                                              │               │
-│   zs       1d │                                              │               │
-│   st        ∞ ╰──────────────── Enter: preview   Esc: cancel ╯               │
-│   js        ∞      420 B ││                     Loading…                     │
-│   st       2m  14.65 KiB ││                                                  │
-│   MB        ∞   1.00 KiB ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          ││                                                  │
-╰ Page  10/page · cursor 0 ╯╰──────────────────────────────────────────────────╯
+╭ Keys ────────────────────────────╮╭ Values ──────────────────────────────────╮
+│ filter *                         ││ Key   session:7f3a9c                     │
+│ ──────────────────────────────── ││ Type  string                             │
+│   Type   Key                 TTL ││ TTL   1h (3600s)                         │
+│ ──────────────────────────────── ││ Size  96 B                               │
+│   hash   user:1001             ∞ ││ ──────────────────────────────────────── │
+│   hash   user:1002             ∞ ││                                          │
+│ ▌ str    sessi╭ Rename key ──────────────────────────────────╮               │
+│   list   queue│session:7f3a9c                                │               │
+│   set    tags:│                                              │               │
+│   zset   leade│                                              │               │
+│   stream event╰──────────────── Enter: preview   Esc: cancel ╯               │
+│   json   doc:settings          ∞ ││                 Loading…                 │
+│   str    cache:page:/home     2m ││                                          │
+│   MBblo… bloom:emails          ∞ ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+╰ Page 1 · 1–10 of 10 ─────────────╯╰──────────────────────────────────────────╯

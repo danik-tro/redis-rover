@@ -4,6 +4,8 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, StatefulWidget, Widget};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::{
     command::Command,
     config,
@@ -92,6 +94,68 @@ impl FooterText {
     }
 }
 
+/// From this width the footer has all its rows.
+const FULL_FOOTER_FROM: u16 = 70;
+/// Below this width the footer has only the key hints.
+const MINIMAL_FOOTER_BELOW: u16 = 50;
+/// The `? Help` title on the top border.
+const HELP_TITLE: &str = " ? Help ";
+
+/// Rows of the footer at `width`: borders plus three, two or one rows.
+#[must_use]
+pub fn footer_height(width: u16) -> u16 {
+    match width {
+        w if w >= FULL_FOOTER_FROM => 5,
+        w if w >= MINIMAL_FOOTER_BELOW => 4,
+        _ => 3,
+    }
+}
+
+/// As many of `fields` as fit in `width`, whole, joined with ` · `.
+fn fit_fields(fields: &[&str], width: usize) -> String {
+    let mut line = String::new();
+    for field in fields.iter().filter(|field| !field.is_empty()) {
+        let next = if line.is_empty() {
+            field.width()
+        } else {
+            line.width() + 3 + field.width()
+        };
+        if next > width {
+            break;
+        }
+        if !line.is_empty() {
+            line.push_str(" · ");
+        }
+        line.push_str(field);
+    }
+    line
+}
+
+/// The footer below [`FULL_FOOTER_FROM`] columns: one row of whole fields
+/// above the key hints, or under [`MINIMAL_FOOTER_BELOW`] the hints alone.
+fn render_compact_footer(text: &FooterText, hint: &str, width: u16, inner: Rect, buf: &mut Buffer) {
+    let cfg = config::get();
+    let hint_area = if width >= MINIMAL_FOOTER_BELOW {
+        let [info, hint_row] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+        let fields = [
+            text.db_status.as_str(),
+            text.version.as_str(),
+            text.memory.as_str(),
+        ];
+        Paragraph::new(fit_fields(&fields, usize::from(info.width)))
+            .fg(cfg.colors.base05)
+            .alignment(Alignment::Center)
+            .render(info, buf);
+        hint_row
+    } else {
+        inner
+    };
+    Paragraph::new(Line::styled(hint, cfg.colors.base04))
+        .alignment(Alignment::Center)
+        .render(hint_area, buf);
+}
+
 /// Build the footer legend from the live keymap: `"{key} {label}"` per entry,
 /// using the shortest binding of `mode` (falling back to [`Mode::Common`]) and
 /// skipping unbound commands.
@@ -158,12 +222,26 @@ impl StatefulWidget for InfoWidget<'_> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let cfg = config::get();
-        let mut title = vec![Span::raw(state.title.as_str())];
         let badge = if state.read_only {
             format!(" {} · RO ", state.environment.label())
         } else {
             format!(" {} ", state.environment.label())
         };
+        let unread = if state.pubsub_unread > 0 {
+            format!(" PubSub {} ", state.pubsub_unread).width() + 1
+        } else {
+            0
+        };
+        // What doesn't fit the top border goes whole: first the target,
+        // then the help label. The environment badge always stays.
+        let room = usize::from(area.width.saturating_sub(2));
+        let essential = badge.width() + 1 + unread;
+        let show_target = essential + state.title.width() + HELP_TITLE.width() <= room;
+        let show_help = essential + HELP_TITLE.width() <= room;
+        let mut title = Vec::new();
+        if show_target {
+            title.push(Span::raw(state.title.as_str()));
+        }
         title.push(
             Span::raw(badge)
                 .fg(cfg.colors.base00)
@@ -180,17 +258,24 @@ impl StatefulWidget for InfoWidget<'_> {
             );
             title.push(Span::raw(" "));
         }
-        Block::new()
+        let mut block = Block::new()
             .fg(cfg.colors.base04)
             .bg(cfg.colors.base00)
             .borders(Borders::ALL)
             .title(Line::from(title))
             .title_alignment(Alignment::Left)
-            .title_top(Line::from(" ? Help ").right_aligned())
-            .border_type(BorderType::Rounded)
-            .render(area, buf);
+            .border_type(BorderType::Rounded);
+        if show_help {
+            block = block.title_top(Line::from(HELP_TITLE).right_aligned());
+        }
+        let inner = block.inner(area);
+        block.render(area, buf);
 
         let text = &self.frame.footer;
+        if area.width < FULL_FOOTER_FROM {
+            render_compact_footer(text, &state.hint, area.width, inner, buf);
+            return;
+        }
 
         // Reserve the last inner row for the always-on key-hint legend (#41).
         let [top, bottom, hint] = Layout::vertical([

@@ -12,7 +12,10 @@ mod type_menu;
 
 pub use format::format_bytes;
 pub(crate) use format::truncate_to_width;
-use format::{format_bytes_u128, format_ttl, format_ttl_detail, value_footer};
+use format::{
+    format_bytes_u128, format_size_short, format_ttl, format_ttl_detail, format_ttl_short,
+    value_footer,
+};
 pub(crate) use forms::{build_input_text_area, input_text, set_input_titles};
 pub use input::OverlayRequest;
 pub use mouse::PaneAreas;
@@ -80,6 +83,11 @@ pub struct KeySpace {
     visible_rows: usize,
     /// Where the last frame drew the panes, for the mouse.
     panes: PaneAreas,
+    /// The last frame had room for one pane only.
+    single_pane: bool,
+    /// One pane: the selected key's details show even with focus on the
+    /// list, for a value Enter can't move into.
+    detail_open: bool,
     /// JSON field opened from a preview that the loaded value shows.
     json_path: Vec<String>,
     /// The `o` sort menu is open.
@@ -174,6 +182,8 @@ impl KeySpace {
             cluster_mode: false,
             visible_rows: 0,
             panes: PaneAreas::default(),
+            single_pane: false,
+            detail_open: false,
             json_path: Vec::new(),
             sort_menu: false,
             type_menu: None,
