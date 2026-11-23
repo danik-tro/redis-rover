@@ -1315,6 +1315,28 @@ mod hint_tests {
         assert_eq!(keys, "x");
     }
 
+    /// AC6 as a user does it: their binding is merged with the defaults, so
+    /// `j` still works, and the hint shows the key they chose.
+    #[test]
+    fn an_added_binding_wins_over_the_default_in_the_hint() {
+        let mut keybindings = config::default_keybindings().clone();
+        keybindings
+            .0
+            .entry(Mode::KeySpace)
+            .or_default()
+            .insert(parse_key_sequence("<x>").unwrap(), Command::ScrollDown);
+
+        let hint = hint_text(&keybindings, HintFocus::KeyList, false);
+
+        assert!(hint.starts_with("x down"), "{hint}");
+        let rows = App::help_rows_with(&keybindings, Mode::KeySpace);
+        let (_, keys) = rows
+            .iter()
+            .find(|(label, _)| label == "Scroll down")
+            .unwrap();
+        assert!(keys.split(", ").any(|key| key == "x"), "{keys}");
+    }
+
     #[test]
     fn hints_are_shortened_from_the_right_on_whole_hints() {
         let hint = "j down  k up  Enter open";

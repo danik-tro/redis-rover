@@ -147,21 +147,34 @@ fn render_compact_footer(text: &FooterText, width: u16, inner: Rect, buf: &mut B
         .render(inner, buf);
 }
 
-/// Build the footer legend from the live keymap: `"{key} {label}"` per entry,
-/// using the shortest binding of `mode` (falling back to [`Mode::Common`]) and
-/// skipping unbound commands.
+/// The key to show for `command` in `mode`. A user's bindings are merged
+/// over the defaults, so a rebound command still has its default key too:
+/// the one the user chose comes first, then the shortest.
+fn hint_key(
+    keybindings: &KeyBindings,
+    defaults: &KeyBindings,
+    mode: Mode,
+    command: Command,
+) -> Option<String> {
+    let keys = keybindings.get_config_for_command(mode, command);
+    let default_keys = defaults.get_config_for_command(mode, command);
+    keys.iter()
+        .find(|key| !default_keys.contains(key))
+        .or_else(|| keys.first())
+        .cloned()
+}
+
+/// Build the hint text from the live keymap: `"{key} {label}"` per entry,
+/// using the key of `mode` (falling back to [`Mode::Common`]) that
+/// [`hint_key`] picks and skipping unbound commands.
 pub fn build_hint(keybindings: &KeyBindings, mode: Mode, entries: &[(Command, &str)]) -> String {
+    let defaults = config::default_keybindings();
     entries
         .iter()
         .filter_map(|(cmd, label)| {
             [mode, Mode::Common]
                 .into_iter()
-                .find_map(|m| {
-                    keybindings
-                        .get_config_for_command(m, *cmd)
-                        .into_iter()
-                        .next()
-                })
+                .find_map(|m| hint_key(keybindings, defaults, m, *cmd))
                 .map(|key| format!("{key} {label}"))
         })
         .collect::<Vec<_>>()
