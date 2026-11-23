@@ -19,6 +19,7 @@ mod mode;
 mod probe;
 mod pubsub_notify;
 mod redis_client;
+mod session;
 mod state;
 mod target;
 mod theme;
@@ -251,6 +252,10 @@ pub mod internals {
         StreamValue, SweepApply, SweepResult, Ttl, TypeFilter, TypeScan, ValuePageInfo,
     };
     pub use crate::redis_client::value_edit::{diff, Diff, ValueEdit};
+    pub use crate::session::{
+        load as load_session, path_in as session_path, save as save_session, SavedSort,
+        SavedSortKey, SavedSub, SavedSubKind, SessionFile, SessionState,
+    };
     pub use crate::state::{FrameData, SharedState};
     pub use crate::target::Environment;
     pub use crate::widgets::confirm::ConfirmPopup;

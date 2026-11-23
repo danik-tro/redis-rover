@@ -134,11 +134,23 @@ pub fn get_config_dir() -> PathBuf {
     directory
 }
 
+/// Where `session.json` lives: the platform's state directory, or the data
+/// directory where it has none (macOS, Windows). `REDIS_ROVER_DATA` moves it.
+#[allow(dead_code)] // Session restore, the next step, is the caller.
+pub fn get_state_dir() -> PathBuf {
+    if let Some(dir) = DATA_FOLDER.clone() {
+        return dir;
+    }
+    project_directory()
+        .and_then(|dirs| dirs.state_dir().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(get_data_dir)
+}
+
 /// Create (or truncate) `path` readable and writable by its owner only. The
 /// log holds key names and error text from the server, which other local
 /// users have no business reading. A file left from an older version with
 /// wider permissions is narrowed too.
-fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
