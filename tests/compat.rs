@@ -497,7 +497,10 @@ async fn sharded_pubsub(server: Arc<Server>) -> Outcome {
     } else {
         h.expect("a clear refusal", |a| matches!(a, Action::Error(_)))
             .await;
-        fallback("no SSUBSCRIBE: refused with a message, plain Pub/Sub still works")
+        Outcome {
+            status: Status::NotApplicable,
+            note: "no SSUBSCRIBE: refused with a message, plain Pub/Sub still works".into(),
+        }
     };
     h.shutdown().await;
     outcome
