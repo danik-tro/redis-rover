@@ -142,3 +142,35 @@ The AC2 limit is 60 % of the baseline: 64.8 MiB at 1M with ~20 B names, or
 At 10M the saving is smaller (66 %), because spare capacity in
 `scanned: Vec<String>` (24 B per slot, grown to 2^24 slots) is the same for
 every store.
+
+## musl with mimalloc vs gnu (sol 12)
+
+Fresh 100k runs (`RROVER_BENCH_SHORT=1`), both targets in one `rust:1.97`
+container on the same host (Apple M4 Pro, Docker, linux/arm64), commit
+`58a7838` plus the `mimalloc` change, 2026-11-24. Compare these with each
+other only, not with the macOS numbers above. Times are criterion's median.
+
+| Bench | gnu | musl + mimalloc | musl vs gnu |
+|---|---|---|---|
+| `merge_batch/100k` | 1.85 ms | 1.49 ms | -19 % |
+| `page_turn_deep/100k` | 4.71 µs | 4.75 µs | +1 % |
+| `sort_names/100k` | 6.96 ms | 12.20 ms | +75 % |
+| `sort_snapshot/100k` | 182.39 µs | 155.65 µs | -15 % |
+| `merge_sorted_1000/100k` | 746.25 µs | 853.27 µs | +14 % |
+| `tree_build/100k` | 11.45 µs | 12.41 µs | +8 % |
+| `render/key_table_100` | 143.97 µs | 129.28 µs | -10 % |
+| `render/footer` | 7.94 µs | 7.88 µs | -1 % |
+| `text_cache/5MB_plain` | 4.62 ms | 4.29 ms | -7 % |
+| `text_cache/5MB_json` | 202.31 ms | 116.55 ms | -42 % |
+| `render_text/5MB_plain_wrap` | 121.35 µs | 132.88 µs | +10 % |
+| `render_text/5MB_plain_nowrap` | 105.10 µs | 116.92 µs | +11 % |
+| `render_text/5MB_json_wrap` | 60.66 µs | 58.45 µs | -4 % |
+
+Three benches are over the 10 % limit on musl:
+
+- `sort_names` and `merge_sorted_1000` compare key names with libc `memcmp`.
+  A standalone sort of 100k names took 13.29 ms with musl's `memcmp` and
+  4.81 ms with glibc's. With a word-at-a-time compare it took 5.90 and 5.82 ms,
+  so the cost is musl's `memcmp`, not the allocator. Sorts above 50k keys run
+  off the UI thread.
+- `render_text/5MB_plain_nowrap` is +11 %, about 12 µs on a frame.

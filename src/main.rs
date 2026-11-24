@@ -3,6 +3,11 @@ use std::process::ExitCode;
 use clap::Parser;
 use redis_rover::{Cli, TargetError};
 
+// In the binary only: the benches and tests install their own counting one.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Exit code for a configuration error: unknown profile, failing
 /// `password_command`, invalid config file.
 const EXIT_CONFIG: u8 = 3;
