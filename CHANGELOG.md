@@ -248,7 +248,7 @@ First public release. Requires Rust 1.97 or newer.
   `REDIS_ROVER_LOGLEVEL`, as the README says (they were `RROVER_*` before).
 - A wrapped text longer than 65,535 rows can be scrolled to its end.
 - SCAN cursors are 64-bit on every platform (a 32-bit build could not hold one).
-- A malformed `--url` no longer prints its password in the error (#93).
+- A malformed `--url` no longer prints its password in the error (#92).
 - Live updates work on Dragonfly, which dropped other clients' changes with `NOLOOP`.
 - Copying a key to another DB works on servers whose `COPY` has no `DB` option.
 
