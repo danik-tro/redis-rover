@@ -408,6 +408,21 @@ The `?` help pages with `n` / `p` when it doesn't fit. `Ctrl-←` / `Ctrl-→` m
 
 ---
 
+## Performance
+
+These are [criterion](https://github.com/bheisler/criterion.rs) benches on synthetic key names of about 20 bytes. They run without Redis or a network, so a page turn here is rrover's own work.
+
+**Machine:** Apple M4 Pro, 48 GiB RAM, macOS 26.3.1, `rustc 1.97.1`, release profile. **Recorded:** 2026-11-07 at commit `0d364e7`. Later commits changed the code these benches run and have not been re-measured at 1M and 10M keys. The full record is in [`benches/baseline.md`](benches/baseline.md#after-sol-02).
+
+| Measure | 1M keys | 10M keys | Bench |
+|---|---|---|---|
+| Page turn deep into the sweep (median) | 3.32 µs | 4.39 µs | [`page_turn_deep`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/keyspace.rs#L129) |
+| Memory held by the key sweep | 60.7 MiB | 821.4 MiB | [`merge_batch`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/keyspace.rs#L97) |
+
+One frame of the 100-row key table at 120×40 takes 133.45 µs (median, [`render/key_table_100`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/render.rs#L90)).
+
+---
+
 ## Compatibility
 
 Tested against real servers in Docker. rrover detects what each server can do and uses a fallback when a feature is missing, so older servers keep working. The [full table](docs/compatibility.md) lists every feature, note and image.
