@@ -35,15 +35,31 @@ A Redis terminal-ui client written in rust 🦀
 
 ## Installation
 
-**From crates.io:**
+**Install script** (macOS and Linux). It picks the right archive, a static musl build on Linux, and checks its sha256:
+
+```bash
+curl -LsSf https://github.com/danik-tro/redis-rover/releases/latest/download/install.sh | sh
+```
+
+**Homebrew** (macOS and Linux):
+
+```bash
+brew install danik-tro/tap/rrover
+```
+
+**From crates.io** (requires Rust 1.97 or newer):
 
 ```bash
 cargo install redis-rover --locked
 ```
 
-Requires Rust 1.97 or newer.
+**Windows** (experimental, not verified on every release):
 
-**Prebuilt binaries** for macOS (x86\_64, arm64), Linux (x86\_64, aarch64), and Windows are available on the [GitHub releases page](https://github.com/danik-tro/redis-rover/releases).
+```powershell
+irm https://github.com/danik-tro/redis-rover/releases/latest/download/install.ps1 | iex
+```
+
+**Prebuilt binaries** for macOS (x86\_64, arm64), Linux (x86\_64, aarch64, i686; gnu, and static musl for x86\_64 and aarch64) and Windows are on the [GitHub releases page](https://github.com/danik-tro/redis-rover/releases).
 
 ---
 
