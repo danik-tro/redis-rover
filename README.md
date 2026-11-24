@@ -209,7 +209,7 @@ The open key follows changes made by other clients. When `HSET user:1 name Bob` 
 
 The value pane's title says how the key is followed:
 
-- `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN NOLOOP` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
+- `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
 - `◌ polling 2s`: servers without RESP3 (Redis 5 and older), or that refuse `CLIENT TRACKING` (some proxies and managed services), are polled every `live.poll_interval_ms` instead. Each check is one pipeline: `TYPE` + `PTTL` + `DUMP` for keys up to 64 KiB, otherwise the visible page. The value is fetched again only when that changed. Polling pauses on the server screens (dashboard, Pub/Sub, MONITOR, Slowlog).
 - `✕ not live (reason)`: the connection was lost (`reconnecting`, retried with backoff up to 30 s), or `live.mode = "tracking"` on a server that can't track. After a reconnect the key is fetched again, so a change made in the gap still shows.
 

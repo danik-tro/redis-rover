@@ -940,12 +940,15 @@ pub async fn copy_key(
                 Err(format!("{} is gone", super::bytes::shown(from)).into())
             }
         }
-        Err(err) if unknown_command(&err) => Err(Box::new(CopyUnsupported)),
+        Err(err) if unknown_command(&err) || (db.is_some() && is_syntax_error(&err)) => {
+            Err(Box::new(CopyUnsupported))
+        }
         Err(err) => Err(err.into()),
     }
 }
 
-/// A copy before Redis 6.2: `PTTL` + `DUMP from` on `source`, then
+/// A copy before Redis 6.2, or to another DB on a server without `COPY … DB`
+/// (Dragonfly answers a syntax error): `PTTL` + `DUMP from` on `source`, then
 /// `RESTORE to ttl payload [REPLACE]` on `target` (a connection to the
 /// target DB), so the TTL is kept.
 ///

@@ -36,6 +36,9 @@ pub const REDIS_TAG: &str = "7-alpine";
 /// Redis with modules (`RedisJSON` 2.x), for the JSON tests.
 pub const REDIS_STACK_IMAGE: &str = "redis/redis-stack-server";
 pub const REDIS_STACK_TAG: &str = "7.4.0-v3";
+/// Overrides the image of [`start_redis`]. Tests that pin a version to check
+/// its fallback keep their own tag.
+pub const TEST_IMAGE_ENV: &str = "RROVER_TEST_IMAGE";
 /// How long a test waits for an expected action.
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -90,7 +93,42 @@ impl Server {
 /// Start Redis and wait until it answers `PING` (the log line the image
 /// waits for can come slightly before the port is reachable).
 pub async fn start_redis() -> Server {
-    start_redis_tag(REDIS_TAG).await
+    match std::env::var(TEST_IMAGE_ENV) {
+        Ok(image) if !image.trim().is_empty() => start_image(image.trim()).await,
+        _ => start_redis_tag(REDIS_TAG).await,
+    }
+}
+
+/// Start any Redis-compatible image (`repo:tag`, `repo:tag@sha256:…`), ready
+/// once it answers `PING`, since each server logs something else.
+pub async fn start_image(image: &str) -> Server {
+    init();
+    let (name, tag) = split_image(image);
+    let container = GenericImage::new(name, tag)
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::Nothing)
+        .start()
+        .await
+        .unwrap_or_else(|e| panic!("start {image} (is Docker running?): {e}"));
+    let host = container
+        .get_host()
+        .await
+        .expect("container host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("container port");
+    serve(Container::Stack(container), host, port).await
+}
+
+/// `(name, tag)` as testcontainers joins them again with a `:`. A digest
+/// splits at its own colon; a `:` before a `/` is a registry port.
+fn split_image(image: &str) -> (&str, &str) {
+    match image.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => (name, tag),
+        _ => (image, "latest"),
+    }
 }
 
 /// Like [`start_redis`], on another `redis` image tag (`5-alpine`).
