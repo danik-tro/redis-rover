@@ -1,7 +1,7 @@
 //! Live updates of the open key.
 //!
 //! A background task owns one connection of its own. On a RESP3 server it
-//! runs `CLIENT TRACKING ON OPTIN NOLOOP` and arms the open key with
+//! runs `CLIENT TRACKING ON OPTIN` and arms the open key with
 //! `CLIENT CACHING YES` + `TYPE` (+ `PTTL`); the server then pushes one
 //! `invalidate` when the key changes. The task re-arms the key right away,
 //! before telling the App (`Action::OpenKeyChanged`), so a change that lands
@@ -823,7 +823,7 @@ fn invalidates(data: &[Value], key: &str) -> bool {
 }
 
 /// Check the server and, if it can, open a RESP3 connection with
-/// `CLIENT TRACKING ON OPTIN NOLOOP`. Invalidation pushes (and the
+/// `CLIENT TRACKING ON OPTIN`. Invalidation pushes (and the
 /// library's `Disconnection` notice) go to `push`.
 ///
 /// # Errors
@@ -861,8 +861,10 @@ pub async fn open_tracking(
     {
         log::debug!("CLIENT SETNAME on the live connection failed: {err}");
     }
+    // No `NOLOOP`: this connection never writes, so it would change nothing
+    // on Redis, and Dragonfly then drops every other client's invalidation.
     match redis::cmd("CLIENT")
-        .arg(&["TRACKING", "ON", "OPTIN", "NOLOOP"])
+        .arg(&["TRACKING", "ON", "OPTIN"])
         .exec_async(&mut conn)
         .await
     {

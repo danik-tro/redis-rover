@@ -8,6 +8,8 @@ A Redis terminal-ui client written in rust 🦀
 
 `redis-rover` (`rrover`) is a keyboard-driven TUI client for Redis. It lets you browse keyspaces, inspect and edit values, filter by pattern, and monitor server metrics — all from the terminal. Built with [ratatui](https://github.com/ratatui-org/ratatui) and powered by async I/O via Tokio.
 
+![rrover demo: a key changing live, sort by size, the command preview, the DB switcher and a Pub/Sub notification](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/demo.gif)
+
 ![rrover keyspace view](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/screenshot.png)
 
 **Features:**
@@ -35,15 +37,31 @@ A Redis terminal-ui client written in rust 🦀
 
 ## Installation
 
-**From crates.io:**
+**Install script** (macOS and Linux). It picks the right archive, a static musl build on Linux, and checks its sha256:
+
+```bash
+curl -LsSf https://github.com/danik-tro/redis-rover/releases/latest/download/install.sh | sh
+```
+
+**Homebrew** (macOS and Linux):
+
+```bash
+brew install danik-tro/tap/rrover
+```
+
+**From crates.io** (requires Rust 1.97 or newer):
 
 ```bash
 cargo install redis-rover --locked
 ```
 
-Requires Rust 1.97 or newer.
+**Windows** (experimental, not verified on every release):
 
-**Prebuilt binaries** for macOS (x86\_64, arm64), Linux (x86\_64, aarch64), and Windows are available on the [GitHub releases page](https://github.com/danik-tro/redis-rover/releases).
+```powershell
+irm https://github.com/danik-tro/redis-rover/releases/latest/download/install.ps1 | iex
+```
+
+**Prebuilt binaries** for macOS (x86\_64, arm64), Linux (x86\_64, aarch64, i686; gnu, and static musl for x86\_64 and aarch64) and Windows are on the [GitHub releases page](https://github.com/danik-tro/redis-rover/releases).
 
 ---
 
@@ -209,7 +227,7 @@ The open key follows changes made by other clients. When `HSET user:1 name Bob` 
 
 The value pane's title says how the key is followed:
 
-- `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN NOLOOP` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
+- `● live`: on Redis 6+ (RESP3), `rrover` opens one extra connection with `CLIENT TRACKING ON OPTIN` and reads the open key on it again after every change, so the server pushes the next change too. A change shows up in milliseconds.
 - `◌ polling 2s`: servers without RESP3 (Redis 5 and older), or that refuse `CLIENT TRACKING` (some proxies and managed services), are polled every `live.poll_interval_ms` instead. Each check is one pipeline: `TYPE` + `PTTL` + `DUMP` for keys up to 64 KiB, otherwise the visible page. The value is fetched again only when that changed. Polling pauses on the server screens (dashboard, Pub/Sub, MONITOR, Slowlog).
 - `✕ not live (reason)`: the connection was lost (`reconnecting`, retried with backoff up to 30 s), or `live.mode = "tracking"` on a server that can't track. After a reconnect the key is fetched again, so a change made in the gap still shows.
 
@@ -405,6 +423,43 @@ The state is in `session.json` in your state directory (the data directory on ma
 - **Below 50 columns** the footer shows only the environment and DB.
 
 The `?` help pages with `n` / `p` when it doesn't fit. `Ctrl-←` / `Ctrl-→` move the pane divider between 25 % and 75 %. On macOS these are Mission Control shortcuts by default, so you may need to rebind them. `ui.hints = false` hides the hint bar.
+
+---
+
+## Performance
+
+These are [criterion](https://github.com/bheisler/criterion.rs) benches on synthetic key names of about 20 bytes. They run without Redis or a network, so a page turn here is rrover's own work.
+
+**Machine:** Apple M4 Pro, 48 GiB RAM, macOS 26.3.1, `rustc 1.97.1`, release profile. **Recorded:** 2026-11-07 at commit `0d364e7`. Later commits changed the code these benches run and have not been re-measured at 1M and 10M keys. The full record is in [`benches/baseline.md`](benches/baseline.md#after-sol-02).
+
+| Measure | 1M keys | 10M keys | Bench |
+|---|---|---|---|
+| Page turn deep into the sweep (median) | 3.32 µs | 4.39 µs | [`page_turn_deep`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/keyspace.rs#L129) |
+| Memory held by the key sweep | 60.7 MiB | 821.4 MiB | [`merge_batch`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/keyspace.rs#L97) |
+
+One frame of the 100-row key table at 120×40 takes 133.45 µs (median, [`render/key_table_100`](https://github.com/danik-tro/redis-rover/blob/0d364e78fd54e8410e721fd4506b775659668af4/benches/render.rs#L90)).
+
+---
+
+## Compatibility
+
+Tested against real servers in Docker. rrover detects what each server can do and uses a fallback when a feature is missing, so older servers keep working. The [full table](docs/compatibility.md) lists every feature, note and image.
+
+<!-- compat:start (generated by scripts/compat-report.py) -->
+| Server | Works | Fallback | Fails |
+|---|---|---|---|
+| redis-5 (5.0.14) | 8 of 12 | Copy, Type filter, Live, Streams | – |
+| redis-6.0 (6.0.20) | 10 of 12 | Copy, Streams | – |
+| redis-6.2 (6.2.21) | 11 of 12 | Streams | – |
+| redis-7.2 (7.2.11) | 13 of 13 | – | – |
+| redis-8 (8.12.0) | 14 of 14 | – | – |
+| valkey-8 (valkey 8.1.12 (reports redis 7.2.4)) | 13 of 13 | – | – |
+| keydb (6.3.4) | 11 of 12 | Streams | – |
+| dragonfly (df-v2.1 (reports redis 7.4.0)) | 13 of 14 | Copy | – |
+| redis-stack (7.4.7) | 14 of 14 | – | – |
+<!-- compat:end -->
+
+On Redis 5 (RESP2) you can browse, edit and use Pub/Sub. Live updates of the open key show `◌ polling`.
 
 ---
 

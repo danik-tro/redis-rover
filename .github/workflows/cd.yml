@@ -19,11 +19,73 @@ env:
   BINARY_NAME: rrover
 
 jobs:
+  # A tag that doesn't match Cargo.toml would publish the wrong version.
+  check-version:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "$tag" != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  # A known advisory stops the release.
+  audit:
+    name: Audit dependencies
+    needs: [check-version]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  # Publishing can't be undone, so every server has to pass first.
+  compat:
+    name: Compatibility
+    needs: [audit]
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/compat.yml
+
+  # A draft: `/releases/latest` keeps pointing at the old release until every
+  # asset is there.
+  draft-release:
+    name: Draft the release
+    needs: [compat]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Create the draft with the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME" scripts/install.sh scripts/install.ps1
+
   publish:
     name: Build ${{ matrix.target }}
+    needs: [check-version, draft-release]
+    # On a manual run there is no compat gate and no draft.
+    if: >-
+      ${{ !cancelled() && needs.check-version.result == 'success' &&
+      (needs.draft-release.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && needs.draft-release.result == 'skipped')) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write # the Release step uploads the archives
+      id-token: write # signs the attestation
+      attestations: write
 
     strategy:
       fail-fast: false
@@ -65,27 +127,42 @@ jobs:
             architecture: i686
             binary-postfix: ""
             use-cross: true
+          # Static builds: what install.sh and Homebrew on Linux download.
+          - os: ubuntu-latest
+            os-name: linux
+            target: x86_64-unknown-linux-musl
+            architecture: x86_64
+            libc: "-musl"
+            binary-postfix: ""
+            use-cross: true
+          - os: ubuntu-latest
+            os-name: linux
+            target: aarch64-unknown-linux-musl
+            architecture: arm64
+            libc: "-musl"
+            binary-postfix: ""
+            use-cross: true
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # vergen reads `git describe` for the version string.
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cross
 
@@ -108,7 +185,7 @@ jobs:
 
           BIN="${BINARY_NAME}${{ matrix.binary-postfix }}"
           VERSION="${GITHUB_REF_NAME//\//-}"
-          RELEASE_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.os-name }}-${{ matrix.architecture }}"
+          RELEASE_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.os-name }}-${{ matrix.architecture }}${{ matrix.libc }}"
 
           tar czvf "$RELEASE_NAME.tar.gz" "$BIN"
 
@@ -122,20 +199,27 @@ jobs:
 
       - name: Upload artifacts
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
             target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.tar.gz
             target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.sha256
 
-      - name: Release
+      - name: Attest the archive
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          files: |
-            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.tar.gz
-            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}-*.sha256
+          subject-path: target/${{ matrix.target }}/release/${{ steps.package.outputs.name }}.tar.gz
+
+      - name: Upload to the draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.package.outputs.name }}
+          DIR: target/${{ matrix.target }}/release
+        run: gh release upload "$GITHUB_REF_NAME" "$DIR/$NAME.tar.gz" "$DIR/$NAME.sha256" --clobber
 
   publish-cargo:
     name: Publish to crates.io
@@ -144,14 +228,57 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-release:
+    name: Publish the release
+    needs: [publish-cargo]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Take the release out of draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  homebrew:
+    name: Update the Homebrew tap
+    needs: [publish-release]
+    # Off until the tap repo and its token exist.
+    if: startsWith(github.ref, 'refs/tags/') && vars.HOMEBREW_TAP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Write the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir sums
+          gh release download "$GITHUB_REF_NAME" --pattern '*.sha256' --dir sums
+          scripts/homebrew-formula.sh "$GITHUB_REF_NAME" sums > rrover.rb
+      - name: Push it to the tap
+        env:
+          # Fine-grained token, contents: write on danik-tro/homebrew-tap only.
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/danik-tro/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp rrover.rb tap/Formula/rrover.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/rrover.rb
+          git diff --cached --quiet || git commit -m "rrover ${GITHUB_REF_NAME#v}"
+          git push

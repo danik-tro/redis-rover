@@ -143,6 +143,10 @@ First public release. Requires Rust 1.97 or newer.
 - `--print-target` prints the resolved target and where each setting came from (password
   masked), without connecting. `--probe` connects and reports PING, server version, role,
   cluster and RESP3 support. A pre-6.0 server reports `RESP3: no` and still exits 0.
+- Tested server list: Redis 5, 6.0, 6.2, 7.2 and 8, Valkey 8, KeyDB, Dragonfly and Redis
+  Stack, feature by feature, in `docs/compatibility.md`. It is generated from real runs.
+- Static Linux builds (musl, x86\_64 and aarch64), an install script for macOS and Linux
+  that checks the sha256, an experimental PowerShell installer, and a Homebrew formula.
 
 ### Changed
 
@@ -244,6 +248,9 @@ First public release. Requires Rust 1.97 or newer.
   `REDIS_ROVER_LOGLEVEL`, as the README says (they were `RROVER_*` before).
 - A wrapped text longer than 65,535 rows can be scrolled to its end.
 - SCAN cursors are 64-bit on every platform (a 32-bit build could not hold one).
+- A malformed `--url` no longer prints its password in the error (#92).
+- Live updates work on Dragonfly, which dropped other clients' changes with `NOLOOP`.
+- Copying a key to another DB works on servers whose `COPY` has no `DB` option.
 
 ### Development
 
@@ -269,5 +276,7 @@ First public release. Requires Rust 1.97 or newer.
   state, and the UI reads the time through an injected clock.
 - Benches compile as one codegen unit (`[profile.bench]`), so moving code between modules
   doesn't shift their results.
+- A release runs only if its tag matches `Cargo.toml` and the compatibility suite passes.
+  It stays a draft until every archive is uploaded and the crate is published.
 
 [0.1.0]: https://github.com/danik-tro/redis-rover/releases/tag/v0.1.0

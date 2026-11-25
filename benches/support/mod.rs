@@ -29,11 +29,17 @@ fn on_dealloc(size: usize) {
     LIVE.fetch_sub(size, Relaxed);
 }
 
-// SAFETY: every call is forwarded to `System` unchanged; only counters are
+/// What the release binary allocates with, so a musl bench measures it.
+#[cfg(target_env = "musl")]
+static INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(not(target_env = "musl"))]
+static INNER: System = System;
+
+// SAFETY: every call is forwarded to `INNER` unchanged; only counters are
 // updated around it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = unsafe { INNER.alloc(layout) };
         if !ptr.is_null() {
             on_alloc(layout.size());
         }
@@ -41,7 +47,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
+        let ptr = unsafe { INNER.alloc_zeroed(layout) };
         if !ptr.is_null() {
             on_alloc(layout.size());
         }
@@ -49,12 +55,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
+        unsafe { INNER.dealloc(ptr, layout) };
         on_dealloc(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        let new_ptr = unsafe { INNER.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             on_dealloc(layout.size());
             on_alloc(new_size);

@@ -1,0 +1,87 @@
+name: Compatibility
+
+on:
+  # Nightly, so a changed server shows up without a commit.
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  # Called by cd.yml, so a release tag can't publish past a failing server.
+  workflow_call:
+  # Not on every PR: only when the matrix itself changes.
+  pull_request:
+    paths:
+      - ".github/workflows/compat.yml"
+      - "scripts/compat.sh"
+      - "scripts/compat-report.py"
+      - "tests/compat.rs"
+      - "tests/compat/**"
+      - "tests/support/**"
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Read the matrix
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.read.outputs.labels }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: read
+        run: |
+          labels=$(awk '!/^#/ && NF { print $1 }' tests/compat/images.txt | jq -R . | jq -cs .)
+          echo "labels=$labels" >> "$GITHUB_OUTPUT"
+
+  compat:
+    name: ${{ matrix.label }}
+    needs: [images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        label: ${{ fromJSON(needs.images.outputs.labels) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: compat
+      - name: Run the suite
+        env:
+          LABEL: ${{ matrix.label }}
+          OUT: compat-results
+        run: scripts/compat.sh "$LABEL"
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: compat-${{ matrix.label }}
+          path: compat-results/${{ matrix.label }}.json
+          if-no-files-found: error
+
+  report:
+    name: Compatibility report
+    needs: [compat]
+    if: always() && needs.compat.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: compat-*
+          path: compat-results
+          merge-multiple: true
+      - name: Generate docs/compatibility.md
+        env:
+          SOURCE: "CI run ${{ github.run_id }}, commit ${{ github.sha }}, ubuntu-latest (amd64)"
+        run: |
+          python3 scripts/compat-report.py compat-results --source "$SOURCE"
+          cat docs/compatibility.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: compatibility-report
+          path: docs/compatibility.md

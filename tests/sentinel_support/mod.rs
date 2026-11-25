@@ -12,6 +12,7 @@ use std::{
 
 const IMAGE: &str = "rrover-test-sentinel";
 pub const MASTER: u16 = 7200;
+pub const REPLICAS: [u16; 2] = [7201, 7202];
 pub const SENTINELS: [u16; 3] = [7210, 7211, 7212];
 pub const URL: &str = "redis+sentinel://127.0.0.1:7210,127.0.0.1:7211,127.0.0.1:7212/mymaster/0";
 
@@ -49,14 +50,26 @@ fn build_image() {
 /// panics.
 pub struct SentinelFixture {
     name: String,
+    password: Option<String>,
 }
 
 impl SentinelFixture {
     pub fn start() -> Self {
+        Self::launch(None)
+    }
+
+    /// Every data node requires `password` (`requirepass` + `masterauth`);
+    /// the Sentinels monitor with it and need none themselves.
+    pub fn start_with_password(password: &str) -> Self {
+        Self::launch(Some(password))
+    }
+
+    fn launch(password: Option<&str>) -> Self {
         build_image();
         let name = format!("rrover-test-sentinel-{}", std::process::id());
         let _ = docker(&["rm", "-f", &name]);
-        let out = docker(&[
+        let auth_env = password.map(|p| format!("RROVER_FIXTURE_PASSWORD={p}"));
+        let mut args = vec![
             "run",
             "-d",
             "--name",
@@ -65,14 +78,21 @@ impl SentinelFixture {
             "7200-7202:7200-7202",
             "-p",
             "7210-7212:7210-7212",
-            IMAGE,
-        ]);
+        ];
+        if let Some(env) = &auth_env {
+            args.extend(["-e", env]);
+        }
+        args.push(IMAGE);
+        let out = docker(&args);
         assert!(
             out.status.success(),
             "docker run failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let fixture = Self { name };
+        let fixture = Self {
+            name,
+            password: password.map(str::to_owned),
+        };
         let deadline = Instant::now() + Duration::from_mins(1);
         while !docker(&["exec", &fixture.name, "test", "-f", "/data/ready"])
             .status
@@ -86,8 +106,18 @@ impl SentinelFixture {
 
     /// `redis-cli -p port args…` inside the container; its output.
     pub fn cli(&self, port: u16, args: &[&str]) -> String {
+        let port_number = port;
         let port = port.to_string();
-        let mut full = vec!["exec", &self.name, "redis-cli", "-p", &port];
+        let auth = self
+            .password
+            .as_ref()
+            .filter(|_| !SENTINELS.contains(&port_number))
+            .map(|p| format!("REDISCLI_AUTH={p}"));
+        let mut full = vec!["exec"];
+        if let Some(env) = &auth {
+            full.extend(["-e", env]);
+        }
+        full.extend([self.name.as_str(), "redis-cli", "-p", &port]);
         full.extend_from_slice(args);
         let out = docker(&full);
         assert!(out.status.success(), "redis-cli {args:?} failed");
