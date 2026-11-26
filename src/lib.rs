@@ -64,6 +64,9 @@ const ACTION_CHANNEL_CAPACITY: usize = 256;
 /// settings are invalid, the first connection to Redis fails, or the app loop
 /// returns an error.
 pub async fn run(args: Cli) -> Result<()> {
+    // Load the config before anything reads it with `config::get`, which
+    // panics on a broken file; this way it is a config error (exit 3).
+    config::try_get().map_err(|e| TargetError::Config(e.to_string()))?;
     // `--print-target` opens no socket and writes no log file (creating the
     // log would truncate a running session's).
     if args.print_target {
