@@ -210,6 +210,9 @@ First public release. Requires Rust 1.97 or newer.
 
 ### Fixed
 
+- A broken config file (unknown theme, command or key, bad syntax) stops the app with
+  its message and exit code 3, as `--print-target` does. It used to crash with a panic
+  report.
 - The help lists a command's keys in a stable order, shortest first (#62).
 - At 80 columns the key table shows key names, and its bottom border no longer cuts the
   page range (#59).

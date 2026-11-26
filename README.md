@@ -473,6 +473,27 @@ In the write preview, `y` runs the write and `n` / `Esc` cancels. In the typed c
 
 Key bindings, environment colors, styles, limits, [profiles](#profiles) and the [write preview](#environments) can be set in `config.json5` (or `.json`, `.yaml`, `.toml`, `.ini`) in the config directory. `rrover --version` prints where that is; set `REDIS_ROVER_CONFIG` to use another directory. See [`.config/config.json5`](.config/config.json5) for the defaults and their format.
 
+| OS | Config directory |
+|---|---|
+| Linux | `~/.config/redis-rover` (or `$XDG_CONFIG_HOME/redis-rover`) |
+| macOS | `~/Library/Application Support/io.github.danik-tro.redis-rover` |
+| Windows | `%LOCALAPPDATA%\danik-tro\redis-rover\config` |
+
+No install method creates it; make the directory and the file yourself. The defaults are built into the binary, so your file only needs what you change. A broken file stops rrover with a message and exit code 3.
+
+Your key bindings are added to the defaults per screen (`Common`, `KeySpace`, `Dashboard`, `PubSub`, `Monitor`, `Slowlog`). A key you bind replaces what it did; a default key you don't mention keeps its command, so moving a command to another key leaves the old key working too. Chords are written `"<g><x>"`:
+
+```json5
+{
+  "keybindings": {
+    "Common": { "<Ctrl-q>": "Quit" },
+    "KeySpace": { "x": "LoadNextPage", "<g><x>": "GoToDashboard" },
+  },
+}
+```
+
+The command names are the ones in [`.config/config.json5`](.config/config.json5). Colors other than `colors.env_*` are set with a [theme](#themes), not in this file.
+
 For example, to preview RedisJSON documents only above 4 MiB:
 
 ```json5
