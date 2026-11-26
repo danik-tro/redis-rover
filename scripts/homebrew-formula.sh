@@ -5,7 +5,6 @@ set -euo pipefail
 
 tag="$1"
 dir="$2"
-version="${tag#v}"
 base="https://github.com/danik-tro/redis-rover/releases/download/$tag"
 
 sum() {
@@ -24,7 +23,6 @@ cat <<RUBY
 class Rrover < Formula
   desc "Terminal UI client for Redis"
   homepage "https://github.com/danik-tro/redis-rover"
-  version "$version"
   license "MIT"
 
   on_macos do
