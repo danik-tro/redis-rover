@@ -8,7 +8,7 @@ A Redis terminal-ui client written in rust 🦀
 
 `redis-rover` (`rrover`) is a keyboard-driven TUI client for Redis. It lets you browse keyspaces, inspect and edit values, filter by pattern, and monitor server metrics — all from the terminal. Built with [ratatui](https://github.com/ratatui-org/ratatui) and powered by async I/O via Tokio.
 
-![rrover demo: a key changing live, sort by size, the command preview, the DB switcher and a Pub/Sub notification](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/demo.gif)
+![rrover demo on a local Redis: the key tree, a hash changing live, a JSON value, sort by size, adding a key with the command preview, Pub/Sub, MONITOR and the dashboard](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/demo.gif)
 
 ![rrover keyspace view](https://raw.githubusercontent.com/danik-tro/redis-rover/master/assets/screenshot.png)
 
