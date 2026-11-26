@@ -1,0 +1,44 @@
+name: Feature request
+description: An idea that would make rrover more useful to you.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please search the [open issues](https://github.com/danik-tro/redis-rover/issues) first; a 👍 on an existing request helps too.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task or problem, in your own words. What makes it hard with rrover today?
+      placeholder: I often need to find which keys in a big keyspace have no TTL, and paging through them is slow.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would help?
+      description: How you imagine it working, e.g. a key, a screen or a config option.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do now?
+      description: Workarounds you use today, or how another tool handles it.
+
+  - type: input
+    id: server
+    attributes:
+      label: Redis server
+      description: If it matters for the idea, the server and setup (e.g. Redis 7.2 Cluster, Valkey 8, ElastiCache with TLS).
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this myself.

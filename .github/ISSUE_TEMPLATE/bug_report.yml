@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in rrover doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please search the [open issues](https://github.com/danik-tro/redis-rover/issues) first.
+        **Security problems:** don't file them here; see [SECURITY.md](https://github.com/danik-tro/redis-rover/blob/master/SECURITY.md).
+        **Never paste passwords, tokens or private key names and values.** Replace them with placeholders.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        I filtered with `user:*` and pressed Enter on a hash.
+        I expected its fields, but the value pane stayed on "loading…".
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The keys you pressed, and if you can, the `redis-cli` commands that create the data.
+      placeholder: |
+        1. `redis-cli HSET user:1 name Ada`
+        2. `rrover`
+        3. `f`, `user:*`, Enter
+        4. Enter on `user:1`
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: rrover version
+      description: The first line of `rrover --version`.
+      placeholder: redis-rover 0.1.0-...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Install script
+        - Homebrew
+        - cargo install
+        - Windows installer (install.ps1)
+        - Prebuilt archive from the releases page
+        - Built from source
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and terminal
+      description: The OS and version, the terminal emulator, and tmux / screen / SSH if you use them.
+      placeholder: macOS 15.3, iTerm2 3.5, inside tmux
+    validations:
+      required: true
+
+  - type: textarea
+    id: server
+    attributes:
+      label: Redis server
+      description: The output of `rrover --probe` (with your usual flags or profile), or the server, its version and the setup (standalone, Cluster, Sentinel, a managed service, TLS).
+      render: text
+      placeholder: |
+        server    Redis 7.4.1 (standalone)
+        RESP3     yes
+        live      tracking
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshot
+      description: |
+        A screenshot often helps with UI problems. The log is `redis-rover.log` in the data directory that `rrover --version` prints; run with `RUST_LOG=redis_rover=debug` for more detail. Please check it for key names and values you don't want to share.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: If you changed the config, the relevant part of it (without passwords).
+      render: json5

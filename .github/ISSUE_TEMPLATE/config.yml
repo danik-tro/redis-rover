@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/danik-tro/redis-rover/security/advisories/new
+    about: Please report security problems privately, not in a public issue.
+  - name: Read the guide
+    url: https://github.com/danik-tro/redis-rover/blob/master/docs/guide.md
+    about: Every feature, flag and config option, explained.
